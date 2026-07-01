@@ -44,8 +44,10 @@ body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; backgr
 .msg .thinking .tc { color:#888; font-style:italic; margin-top:4px; max-height:200px; overflow-y:auto; }
 .waiting-dots::after { content:'...'; animation:dots 1.5s steps(4) infinite; }
 @keyframes dots { 0% { content:''; } 25% { content:'.'; } 50% { content:'..'; } 75% { content:'...'; } }
-#sidebar { width:0; overflow:hidden; background:var(--surface); border-right:1px solid var(--border); transition:width 0.2s; flex-shrink:0; display:flex; flex-direction:column; }
-#sidebar.open { width:240px; }
+#sidebar { position:fixed; top:52px; left:0; bottom:0; width:260px; background:var(--surface); border-right:1px solid var(--border); transform:translateX(-100%); transition:transform 0.2s; z-index:10; display:flex; flex-direction:column; box-shadow:2px 0 12px rgba(0,0,0,0.1); }
+#sidebar.open { transform:translateX(0); }
+#sidebar-mask { position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.3); z-index:9; display:none; }
+#sidebar.open ~ #sidebar-mask { display:block; }
 #sidebar .sh { padding:10px 12px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px; }
 #sidebar .sh button { flex:1; padding:6px 0; border:1px solid var(--border); border-radius:6px; background:transparent; color:var(--text); font-size:12px; cursor:pointer; }
 #sidebar .sh button:hover { background:#f0f0f0; }
@@ -57,7 +59,7 @@ body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; backgr
 #sidebar .si .c { font-size:10px; color:#bbb; cursor:pointer; padding:2px; border-radius:3px; visibility:hidden; }
 #sidebar .si:hover .c { visibility:visible; }
 #sidebar .si .c:hover { background:#ddd; color:#666; }
-#main { flex:1; display:flex; flex-direction:column; min-width:0; }
+#main { flex:1; display:flex; flex-direction:column; min-width:0; width:100%; }
 #input-area { padding:10px 16px; background:var(--surface); border-top:1px solid var(--border); display:flex; gap:8px; flex-shrink:0; }
 #input { flex:1; padding:10px 14px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font-size:14px; outline:none; }
 #input:focus { border-color:var(--accent); }
@@ -92,6 +94,7 @@ body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; backgr
     </div>
     <div class="sl" id="session-list"></div>
   </div>
+  <div id="sidebar-mask" onclick="toggleSidebar()"></div>
   <div id="main">
     <div id="msgs"></div>
     <div id="input-area">
