@@ -59,12 +59,12 @@ body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; backgr
 #sidebar .si:hover .c { visibility:visible; }
 #sidebar .si .c:hover { background:#ddd; color:#666; }
 #main { display:flex; flex-direction:column; min-width:400px; overflow:hidden; }
-#input-area { padding:14px 20px; background:var(--surface); border-top:1px solid var(--border); display:flex; gap:10px; flex-shrink:0; }
-#input { flex:1; padding:12px 16px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--text); font-size:14px; outline:none; }
+#input-area { padding:14px 20px; background:var(--surface); border-top:1px solid var(--border); flex-shrink:0; display:flex; justify-content:center; }
+#input { flex:1; padding:12px 16px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--text); font-size:14px; outline:none; min-width:0; }
 #input:focus { border-color:var(--accent); }
 #send { padding:12px 24px; border:none; border-radius:8px; background:var(--accent); color:#fff; font-size:14px; font-weight:500; cursor:pointer; }
 #send:disabled { opacity:0.4; cursor:not-allowed; }
-.iw { display:flex; gap:10px; flex:1; }
+.wrp { display:flex; gap:10px; max-width:900px; width:100%; }
 </style>
 </head>
 <body>
@@ -98,7 +98,7 @@ body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; backgr
   <div id="main">
     <div id="msgs"></div>
     <div id="input-area">
-      <div class="iw">
+      <div class="wrp">
         <input id="input" type="text" placeholder="输入消息..." autofocus>
         <button id="send" disabled>&#x1F680; 发送</button>
       </div>
