@@ -45,12 +45,18 @@ body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; backgr
 .waiting-dots::after { content:'...'; animation:dots 1.5s steps(4) infinite; }
 @keyframes dots { 0% { content:''; } 25% { content:'.'; } 50% { content:'..'; } 75% { content:'...'; } }
 #sidebar { width:0; overflow:hidden; background:var(--surface); border-right:1px solid var(--border); transition:width 0.2s; flex-shrink:0; display:flex; flex-direction:column; }
-#sidebar.open { width:220px; }
-#sidebar h3 { padding:12px 14px; font-size:13px; font-weight:600; color:#888; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:6px; }
+#sidebar.open { width:240px; }
+#sidebar .sh { padding:10px 12px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px; }
+#sidebar .sh button { flex:1; padding:6px 0; border:1px solid var(--border); border-radius:6px; background:transparent; color:var(--text); font-size:12px; cursor:pointer; }
+#sidebar .sh button:hover { background:#f0f0f0; }
 #sidebar .sl { flex:1; overflow-y:auto; padding:4px 0; }
-#sidebar .si { padding:8px 14px; font-size:12px; cursor:pointer; border-left:3px solid transparent; color:#666; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
-#sidebar .si:hover { background:#f0f0f0; }
-#sidebar .si.act { border-left-color:var(--accent); background:#e8f0fe; color:#333; font-weight:500; }
+#sidebar .si { padding:8px 12px; font-size:12px; cursor:pointer; display:flex; align-items:flex-start; gap:6px; border-left:3px solid transparent; color:#555; }
+#sidebar .si:hover { background:#f5f5f5; }
+#sidebar .si.act { border-left-color:var(--accent); background:#e8f0fe; color:#333; }
+#sidebar .si .t { flex:1; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; line-height:1.4; }
+#sidebar .si .c { font-size:10px; color:#bbb; cursor:pointer; padding:2px; border-radius:3px; visibility:hidden; }
+#sidebar .si:hover .c { visibility:visible; }
+#sidebar .si .c:hover { background:#ddd; color:#666; }
 #main { flex:1; display:flex; flex-direction:column; min-width:0; }
 #input-area { padding:10px 16px; background:var(--surface); border-top:1px solid var(--border); display:flex; gap:8px; flex-shrink:0; }
 #input { flex:1; padding:10px 14px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font-size:14px; outline:none; }
@@ -81,7 +87,9 @@ body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; backgr
 
 <div id="chat" style="display:none;flex-direction:row">
   <div id="sidebar">
-    <h3>&#x1F4AC; 会话</h3>
+    <div class="sh">
+      <button onclick="newChat()">+ 新对话</button>
+    </div>
     <div class="sl" id="session-list"></div>
   </div>
   <div id="main">
@@ -109,12 +117,23 @@ async function loadSessions() {
     (d.sessions || []).forEach(s => {
       const div = document.createElement('div'); div.className = 'si';
       if (s.session_id === sessionId) div.classList.add('act');
-      div.textContent = s.summary || '(空)';
-      div.dataset.sid = s.session_id;
+      const txt = document.createElement('span'); txt.className = 't';
+      txt.textContent = s.summary || '(空)';
+      div.appendChild(txt);
+      const close = document.createElement('span'); close.className = 'c';
+      close.textContent = '×';
+      close.onclick = (e) => { e.stopPropagation(); /* close not supported yet */ };
+      div.appendChild(close);
       div.onclick = () => switchSession(s.session_id);
       sl.appendChild(div);
     });
   } catch(e) {}
+}
+
+function newChat() {
+  $('msgs').innerHTML = '';
+  sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).slice(2,6);
+  loadSessions();
 }
 
 async function switchSession(sid) {
