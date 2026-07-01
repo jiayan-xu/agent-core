@@ -160,6 +160,7 @@ fn main() {
 
             let app = Router::new()
                 .route("/", get(handle_index))
+                .route("/logo.png", get(handle_logo))
                 .route("/api/config", get(handle_config))
                 .route("/api/save-config", post(handle_save_config))
                 .route("/api/chat", post(handle_chat))
@@ -208,6 +209,20 @@ fn main() {
 
 async fn handle_index() -> impl axum::response::IntoResponse {
     axum::response::Html(include_str!("chat.html"))
+}
+
+async fn handle_logo() -> impl axum::response::IntoResponse {
+    // 尝试多个可能的 logo 路径
+    for path in &[
+        r"C:\Users\user\dashboard\dashboard-frontend\dist\logo.png",
+        r"C:\Users\user\dashboard\static\logo.png",
+        r"C:\Users\user\dashboard\public\logo.png",
+    ] {
+        if let Ok(data) = tokio::fs::read(path).await {
+            return ([(axum::http::header::CONTENT_TYPE, "image/png")], data);
+        }
+    }
+    ([(axum::http::header::CONTENT_TYPE, "text/plain")], "logo not found".into())
 }
 
 async fn handle_config(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
