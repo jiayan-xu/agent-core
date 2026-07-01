@@ -89,7 +89,12 @@ impl AgentCore {
 
     /// 入口：处理用户消息，返回回复
     pub async fn chat(&self, message: &str, user_id: &str, session_id: &str) -> String {
-        // ── 1. 并行获取上下文 ──
+        // ── 1. 快速路径（Harness 匹配）—— 在最前面，避免浪费后续上下文获取的 token ──
+        if let Some(reply) = self.try_harness_match(message).await {
+            return reply;
+        }
+
+        // ── 2. 并行获取上下文 ──
         let (inbox_result, mem_result) = tokio::join!(
             self.check_inbox(),
             self.search_memory(message),
@@ -120,20 +125,67 @@ impl AgentCore {
             }
         }
 
-        // ── 2. 快速路径（Harness 匹配） ──
-        if let Some(reply) = self.try_harness_match(message).await {
-            return reply;
-        }
+        // ── 3. 加载历史对话（多轮记忆）──
+        let history = self.load_history(session_id, user_id).await;
 
-        // ── 3. 构建消息列表 ──
+        // ── 4. 构建消息列表 ──
         let system_prompt = self.build_system_prompt(&knowledge);
-        let messages = vec![
-            Message { role: "system".to_string(), content: Some(system_prompt), tool_calls: None, tool_call_id: None },
-            Message { role: "user".to_string(), content: Some(enriched_message), tool_calls: None, tool_call_id: None },
-        ];
+        let mut messages = Vec::new();
+        // system prompt 始终在最前
+        messages.push(Message { role: "system".to_string(), content: Some(system_prompt), tool_calls: None, tool_call_id: None });
+        // 历史消息（最近的 10 轮）
+        for h in history.iter().rev().take(20) {
+            messages.push(h.clone());
+        }
+        // 当前用户消息
+        messages.push(Message { role: "user".to_string(), content: Some(enriched_message), tool_calls: None, tool_call_id: None });
 
-        // ── 4. LLM 调用循环 ──
+        // ── 5. LLM 调用循环 ──
         self.llm_loop(messages, session_id, message, user_id).await
+    }
+
+    /// 从 Memoria 加载历史对话
+    async fn load_history(&self, session_id: &str, user_id: &str) -> Vec<Message> {
+        if session_id.is_empty() || session_id == "new" {
+            return Vec::new();
+        }
+        match self
+            .mcp
+            .call_json(
+                "memory_search",
+                &serde_json::json!({
+                    "query": format!("session_id:{}", session_id),
+                    "max_results": 20,
+                    "namespace": self.config.identity.ns(),
+                }),
+            )
+            .await
+        {
+            Ok(data) => {
+                let items = data["results"].as_array().cloned().unwrap_or_default();
+                let mut history = Vec::new();
+                for item in items {
+                    let role = item["source"].as_str().unwrap_or("user");
+                    let dialog = item["dialog"].as_str().unwrap_or("");
+                    if dialog.is_empty() {
+                        continue;
+                    }
+                    let msg_role = if role == user_id || role.contains("user:") {
+                        "user"
+                    } else {
+                        "assistant"
+                    };
+                    history.push(Message {
+                        role: msg_role.to_string(),
+                        content: Some(dialog.to_string()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                }
+                history
+            }
+            Err(_) => Vec::new(),
+        }
     }
 
     /// LLM 调用循环（支持多轮 tool calling）
@@ -182,6 +234,12 @@ impl AgentCore {
                 drop(boundary);
 
                 if !check.allow {
+                    // REQUIRES_REVIEW：黄线 → 触发确认流程
+                    if check.level == Some(crate::boundary::BlockLevel::Yellow) {
+                        return format!("REQUIRES_REVIEW:{}:工具「{}」需要确认——{}",
+                                       tc.name, tc.name, check.reason);
+                    }
+                    // 红线 → 直接拒绝
                     messages.push(Message {
                         role: "assistant".to_string(),
                         content: None,

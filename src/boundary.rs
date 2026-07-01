@@ -196,13 +196,28 @@ pub enum KillState {
     Killed,     // L3：物理终止
 }
 
+/// KillSwitch 熔断器（带 hook 回调）
 pub struct KillSwitch {
     state: Mutex<KillState>,
+    on_trigger: Mutex<Vec<Box<dyn Fn(u32, &str) + Send + Sync>>>,
 }
 
 impl KillSwitch {
     pub fn new() -> Self {
-        KillSwitch { state: Mutex::new(KillState::Running) }
+        KillSwitch {
+            state: Mutex::new(KillState::Running),
+            on_trigger: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 注册熔断回调（Python 版 hook 兼容）
+    pub fn on_trigger<F>(&self, hook: F)
+    where
+        F: Fn(u32, &str) + Send + Sync + 'static,
+    {
+        if let Ok(mut hooks) = self.on_trigger.lock() {
+            hooks.push(Box::new(hook));
+        }
     }
 
     pub fn trigger(&self, level: u32, reason: &str) {
@@ -215,14 +230,20 @@ impl KillSwitch {
         let mut state = self.state.lock().unwrap();
         *state = new_state;
         tracing::warn!("[KILL] L{} 熔断触发: {}", level, reason);
-    }
-
-    pub fn is_alive(&self) -> bool {
-        *self.state.lock().unwrap() == KillState::Running
+        // 执行所有注册的 hook 回调
+        if let Ok(hooks) = self.on_trigger.lock() {
+            for hook in hooks.iter() {
+                hook(level, reason);
+            }
+        }
     }
 
     pub fn state(&self) -> KillState {
         self.state.lock().unwrap().clone()
+    }
+
+    pub fn is_alive(&self) -> bool {
+        *self.state.lock().unwrap() == KillState::Running
     }
 }
 
@@ -230,9 +251,7 @@ impl KillSwitch {
 // 第六条：身份唯一性（补充红线）
 // ══════════════════════════════════════════════════════
 
-/// 身份守卫：每个 Agent 必须有唯一可验证身份。
-/// 实际实现依赖 Memoria 的 agent_registry 表（SHA-256 badge_token）。
-/// 此处为编译期标记 trait。
+/// 身份守卫：每个 Agent 必须有唯一可验证身份
 pub trait IdentityGuard: Send + Sync {
     fn agent_id(&self) -> &str;
     fn namespace(&self) -> &str;
@@ -241,6 +260,7 @@ pub trait IdentityGuard: Send + Sync {
 
 // ══════════════════════════════════════════════════════
 // 第七条：供应链准入红线
+// ══════════════════════════════════════════════════════
 // ══════════════════════════════════════════════════════
 
 pub struct SupplyChainGuard {

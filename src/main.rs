@@ -186,7 +186,9 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
         max_tool_rounds: 3,
         parent_permission: PermissionLevel::Write,
     };
-    let harness = HarnessStore::open_memory()?;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let harness = HarnessStore::open(&cwd.join("harness.db").to_string_lossy())
+        .map_err(|e| format!("创建 Harness 存储失败: {}", e))?;
     Ok(AgentCore::new(agent_config, harness))
 }
 
