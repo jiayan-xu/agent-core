@@ -193,7 +193,7 @@ fn main() {
     let window = WindowBuilder::new()
         .with_title("AI 助手")
         .with_window_icon(_load_icon())
-        .with_inner_size(tao::dpi::LogicalSize::new(480.0, 720.0))
+        .with_inner_size(tao::dpi::LogicalSize::new(1341.0, 710.0))
         .build(&event_loop)
         .expect("创建窗口失败");
 
