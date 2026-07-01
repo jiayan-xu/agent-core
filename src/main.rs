@@ -201,14 +201,11 @@ fn main() {
         .with_url(&url)
         .build(&window);
 
-    let mut close_requested = false;
-
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
-                // 点击关闭 → 退出（后续可改为缩托盘）
                 *control_flow = ControlFlow::Exit;
             }
             _ => (),
