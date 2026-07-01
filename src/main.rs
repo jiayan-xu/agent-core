@@ -26,6 +26,17 @@ struct Config {
     server: String,
     #[serde(default = "default_port")]
     port: u16,
+    /// 额外的 MCP 源，格式: [[mcp_source]] name="dashboard" url="http://127.0.0.1:8000" token=""
+    #[serde(default)]
+    mcp_source: Vec<McpSourceConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct McpSourceConfig {
+    name: String,
+    url: String,
+    #[serde(default)]
+    token: String,
 }
 
 fn default_server() -> String { "http://192.168.1.171:9003".to_string() }
@@ -73,6 +84,7 @@ fn load_or_create_config() -> Config {
         api_key: String::new(),
         server: default_server(),
         port: 9753,
+        mcp_source: Vec::new(),
     };
     let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());
     cfg
@@ -219,11 +231,15 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
         api_key: config.api_key.clone(),
         ..Default::default()
     };
+    let mut additional_mcp = Vec::new();
+    for src in &config.mcp_source {
+        additional_mcp.push((src.name.clone(), src.url.clone(), src.token.clone()));
+    }
     let agent_config = AgentConfig {
         identity,
         llm: llm_config,
         memoria_url: config.server.clone(),
-        additional_mcp: Vec::new(),
+        additional_mcp,
         skill_whitelist: None,
         max_tool_rounds: 3,
         parent_permission: PermissionLevel::Write,
