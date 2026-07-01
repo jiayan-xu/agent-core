@@ -52,7 +52,7 @@ impl Config {
 struct ChatRequest { message: String, #[serde(default = "default_sid")] session_id: String }
 fn default_sid() -> String { "default".to_string() }
 #[derive(Debug, Serialize)]
-struct ChatResponse { reply: String }
+struct ChatResponse { reply: String, session_id: String }
 #[derive(Debug, Deserialize)]
 struct SetupRequest { agent_id: String, api_key: String, #[serde(default)] server: String }
 #[derive(Debug, Serialize)]
@@ -208,9 +208,9 @@ async fn handle_chat(
     let agent_guard = st.agent.lock().await;
     if let Some(ref agent) = *agent_guard {
         let reply = agent.chat(&req.message, "user", &req.session_id).await;
-        Json(ChatResponse { reply })
+        Json(ChatResponse { reply, session_id: req.session_id })
     } else {
-        Json(ChatResponse { reply: "请先在设置页面配置 API 密钥。".to_string() })
+        Json(ChatResponse { reply: "请先在设置页面配置 API 密钥。".to_string(), session_id: req.session_id })
     }
 }
 

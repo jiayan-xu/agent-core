@@ -237,8 +237,10 @@ impl AgentCore {
                 if !check.allow {
                     // REQUIRES_REVIEW：黄线 → 触发确认流程
                     if check.level == Some(crate::boundary::BlockLevel::Yellow) {
-                        return format!("REQUIRES_REVIEW:{}:工具「{}」需要确认——{}",
+                        let reply = format!("REQUIRES_REVIEW:{}:工具「{}」需要确认——{}",
                                        tc.name, tc.name, check.reason);
+                        self.save_to_history(session_id, raw_message, &reply).await;
+                        return reply;
                     }
                     // 红线 → 直接拒绝
                     messages.push(Message {
@@ -319,7 +321,12 @@ impl AgentCore {
         });
 
         match self.llm.chat(&messages, &[]).await {
-            Ok(r) => r.text,
+            Ok(r) => {
+                let reply = r.text;
+                // 保存到内存缓存（工具调用后的总结也需要保存）
+                self.save_to_history(session_id, raw_message, &reply).await;
+                reply
+            }
             Err(e) => format!("LLM 总结失败: {}", e),
         }
     }
