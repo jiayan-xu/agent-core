@@ -298,7 +298,7 @@ fn whoami() -> Option<String> {
     std::env::var("USERNAME").or_else(|_| std::env::var("USER")).ok()
 }
 
-/// 加载窗口图标（从 logo.png 解码）
+/// 加载窗口图标（从 logo.png 解码，缩放到 48x48）
 fn _load_icon() -> Option<tao::window::Icon> {
     for path in &[
         r"C:\Users\user\dashboard\dashboard-frontend\dist\logo.png",
@@ -306,7 +306,8 @@ fn _load_icon() -> Option<tao::window::Icon> {
     ] {
         if let Ok(data) = std::fs::read(path) {
             if let Ok(img) = image::load_from_memory(&data) {
-                let rgba = img.to_rgba8();
+                let resized = img.resize_exact(48, 48, image::imageops::FilterType::Lanczos3);
+                let rgba = resized.to_rgba8();
                 let (w, h) = rgba.dimensions();
                 if let Ok(icon) = tao::window::Icon::from_rgba(rgba.into_raw(), w, h) {
                     return Some(icon);
