@@ -49,7 +49,8 @@ impl Config {
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatRequest { message: String }
+struct ChatRequest { message: String, #[serde(default = "default_sid")] session_id: String }
+fn default_sid() -> String { "default".to_string() }
 #[derive(Debug, Serialize)]
 struct ChatResponse { reply: String }
 #[derive(Debug, Deserialize)]
@@ -206,7 +207,7 @@ async fn handle_chat(
 ) -> Json<ChatResponse> {
     let agent_guard = st.agent.lock().await;
     if let Some(ref agent) = *agent_guard {
-        let reply = agent.chat(&req.message, "user", "default").await;
+        let reply = agent.chat(&req.message, "user", &req.session_id).await;
         Json(ChatResponse { reply })
     } else {
         Json(ChatResponse { reply: "请先在设置页面配置 API 密钥。".to_string() })

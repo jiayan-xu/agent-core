@@ -9,6 +9,7 @@ use crate::boundary::{self, ComplianceBoundary, PermissionLevel, ToolCheck};
 use crate::harness::{ExecutionLog, HarnessStore};
 use crate::llm::{LlmClient, LlmConfig, Message, ToolCall, ToolDef};
 use crate::mcp_client::{McpClient, McpSource};
+use std::collections::HashMap;
 
 /// Agent 身份
 #[derive(Debug, Clone)]
@@ -49,6 +50,8 @@ pub struct AgentCore {
     pub execution_log: Arc<Mutex<Vec<ExecutionLog>>>,
     /// 收件箱缓存
     inbox_cache: tokio::sync::Mutex<InboxCache>,
+    /// 多轮会话历史缓存（session_id → messages）
+    session_history: tokio::sync::Mutex<HashMap<String, Vec<Message>>>,
 }
 
 struct InboxCache {
@@ -95,6 +98,7 @@ impl AgentCore {
             harness: Arc::new(Mutex::new(harness)),
             execution_log: Arc::new(Mutex::new(Vec::new())),
             inbox_cache: tokio::sync::Mutex::new(InboxCache::new()),
+            session_history: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -137,7 +141,7 @@ impl AgentCore {
         }
 
         // ── 3. 加载历史对话（多轮记忆）──
-        let history = self.load_history(session_id, user_id).await;
+        let history = self.load_history(session_id).await;
 
         // ── 4. 构建消息列表 ──
         let system_prompt = self.build_system_prompt(&knowledge);
@@ -155,48 +159,32 @@ impl AgentCore {
         self.llm_loop(messages, session_id, message, user_id).await
     }
 
-    /// 从 Memoria 加载历史对话
-    async fn load_history(&self, session_id: &str, user_id: &str) -> Vec<Message> {
-        if session_id.is_empty() || session_id == "new" {
-            return Vec::new();
+    /// 从内存缓存加载历史对话
+    async fn load_history(&self, session_id: &str) -> Vec<Message> {
+        let cache = self.session_history.lock().await;
+        cache.get(session_id).cloned().unwrap_or_default()
+    }
+
+    /// 保存对话到内存缓存
+    async fn save_to_history(&self, session_id: &str, user_msg: &str, assistant_reply: &str) {
+        let mut cache = self.session_history.lock().await;
+        let history = cache.entry(session_id.to_string()).or_insert_with(Vec::new);
+        // 只保留最近 10 轮（20 条消息）
+        if history.len() > 20 {
+            history.drain(0..history.len() - 20);
         }
-        match self
-            .mcp
-            .call_json(
-                "memory_search",
-                &serde_json::json!({
-                    "query": format!("session_id:{}", session_id),
-                    "max_results": 20,
-                    "namespace": self.config.identity.ns(),
-                }),
-            )
-            .await
-        {
-            Ok(data) => {
-                let items = data["results"].as_array().cloned().unwrap_or_default();
-                let mut history = Vec::new();
-                for item in items {
-                    let role = item["source"].as_str().unwrap_or("user");
-                    let dialog = item["dialog"].as_str().unwrap_or("");
-                    if dialog.is_empty() {
-                        continue;
-                    }
-                    let msg_role = if role == user_id || role.contains("user:") {
-                        "user"
-                    } else {
-                        "assistant"
-                    };
-                    history.push(Message {
-                        role: msg_role.to_string(),
-                        content: Some(dialog.to_string()),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                }
-                history
-            }
-            Err(_) => Vec::new(),
-        }
+        history.push(Message {
+            role: "user".to_string(),
+            content: Some(user_msg.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        history.push(Message {
+            role: "assistant".to_string(),
+            content: Some(assistant_reply.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
     }
 
     /// LLM 调用循环（支持多轮 tool calling）
@@ -230,6 +218,8 @@ impl AgentCore {
                     "source": &self.config.identity.agent_id, "session_id": session_id,
                     "namespace": self.config.identity.ns(),
                 })).await;
+                // 保存到内存缓存
+                self.save_to_history(session_id, raw_message, &reply).await;
                 return reply;
             }
 
@@ -424,7 +414,7 @@ impl AgentCore {
         for source in &self.mcp_sources {
             match source.client.list_tools().await {
                 Ok(tools) => {
-                    for (name, desc) in tools {
+                    for (name, desc, params) in tools {
                         if seen_names.contains(&name) {
                             continue;
                         }
@@ -434,7 +424,7 @@ impl AgentCore {
                             function: crate::llm::ToolDefFunction {
                                 name,
                                 description: desc,
-                                parameters: serde_json::json!({"type": "object", "properties": {}}),
+                                parameters: params,
                             },
                         });
                     }
@@ -518,13 +508,74 @@ impl AgentCore {
 
     /// 构建 system prompt
     fn build_system_prompt(&self, knowledge: &[String]) -> String {
-        let mut prompt = format!("你是 {}, 一个 AI 助手。\n\n", self.config.identity.agent_id);
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+        let mut prompt = format!(
+            r#"你是 {agent}，固废智能运营台的 AI 助手，负责帮助运营人员查询数据、排查问题、管理系统。
+
+## 回答风格
+- 基于数据，引用来源，不猜测
+- 查车牌等简单查询直接秒回，不绕弯
+- 遇到问题先查数据再给分析，不要反问"请提供更多信息"
+- 能修的直接调工具修，不能修的说明原因
+- 修改前向用户确认，确认后直接执行
+
+## 工具使用
+你有以下可用的工具（由系统自动提供）：
+- query_plate：查车牌对应的企业信息
+- query_sql：执行 SQL 查询（只允许 SELECT）
+- manage_whitelist：管理白名单
+- fill_excel_log：填写入厂日志
+- 以及其他系统提供的工具
+
+调用工具时：
+1. 直接传递正确的参数，不要猜测参数名
+2. query_sql 的 SQL 必须是合法的 SQLite SELECT 语句
+3. 查询类工具不需要确认，修改类工具需要先确认
+
+## 边界
+- ❌ 不能执行 INSERT/UPDATE/DELETE SQL
+- ❌ 不能改代码、不能执行系统命令
+- ❌ 不能导出数据到外部
+- ❌ 不能泄露敏感信息（密码、API Key）
+- ✅ 查询类直接执行，不需要确认
+- ✅ 改数据前要确认，确认后直接执行
+
+当前时间：{now}
+"#,
+            agent = self.config.identity.agent_id,
+            now = now,
+        );
+
         if !knowledge.is_empty() {
-            prompt.push_str("相关知识：\n");
+            prompt.push_str("## 相关知识（来自记忆系统）\n");
             for k in knowledge {
                 prompt.push_str(&format!("- {}\n", k));
             }
+            prompt.push('\n');
         }
+
+        prompt.push_str(
+            "## 故障排查规则\n\
+             - 用户说'为什么没变化'时：先查 DB 确认状态，再分析原因，给出结论\n\
+             - 遇到问题按链路思考：判断类型→查数据→对比定位→解释原因→给出步骤\n\
+             - 能修的直接调工具修，不要只给建议\n\
+             - 记住对话中提到过的车牌、日期、公司，不要重复问\n\
+             - 做不到的直接说'做不到'并说明原因\n\n\
+             ## 数据库结构\n\
+             核心表 vehicle_entrance 的字段：\n\
+             - id, entrance_date, license_plate, company_name, weight, waste_type\n\
+             - entrance_time, status, remark, goods_name\n\n\
+             实验数据表 experiment_data 的字段：\n\
+             - id, entrance_date, license_plate, company_name\n\
+             - test_item（检测项目，如'含水率'）, test_value（数值）, test_unit（单位如'%'）\n\
+             - sample_weight（样品重量）, source, remark\n\
+             注意：experiment_data 不是每车都有，用户问'含水率'时查此表。\n\n\
+             其他核心表：\n\
+             - vehicle_whitelist（白名单）: license_plate, company_name, waste_type\n\
+             - indicator_history（指标）: indicator_name, indicator_value, data_date\n\
+             - sample_records（取样）: serial_no, license_plate, sample_weight, sample_time\n"
+        );
+
         prompt
     }
 }

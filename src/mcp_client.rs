@@ -94,8 +94,8 @@ impl McpClient {
         Err("unreachable".to_string())
     }
 
-    /// 获取 MCP 源的工具列表
-    pub async fn list_tools(&self) -> Result<Vec<(String, String)>, String> {
+    /// 获取 MCP 源的工具列表（含完整参数 schema）
+    pub async fn list_tools(&self) -> Result<Vec<(String, String, serde_json::Value)>, String> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -120,7 +120,10 @@ impl McpClient {
                     .and_then(|n| n.as_str()).unwrap_or("?").to_string();
                 let desc = func.get("description")
                     .and_then(|d| d.as_str()).unwrap_or("").to_string();
-                result.push((name, desc));
+                let params = func.get("parameters")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({"type": "object", "properties": {}}));
+                result.push((name, desc, params));
             }
         }
         Ok(result)
