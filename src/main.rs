@@ -160,7 +160,6 @@ fn main() {
 
             let app = Router::new()
                 .route("/", get(handle_index))
-                .route("/logo.png", get(handle_logo))
                 .route("/api/config", get(handle_config))
                 .route("/api/save-config", post(handle_save_config))
                 .route("/api/chat", post(handle_chat))
@@ -182,6 +181,7 @@ fn main() {
 
     let window = WindowBuilder::new()
         .with_title("AI 助手")
+        .with_window_icon(_load_icon())
         .with_inner_size(tao::dpi::LogicalSize::new(480.0, 720.0))
         .build(&event_loop)
         .expect("创建窗口失败");
@@ -209,20 +209,6 @@ fn main() {
 
 async fn handle_index() -> impl axum::response::IntoResponse {
     axum::response::Html(include_str!("chat.html"))
-}
-
-async fn handle_logo() -> impl axum::response::IntoResponse {
-    // 尝试多个可能的 logo 路径
-    for path in &[
-        r"C:\Users\user\dashboard\dashboard-frontend\dist\logo.png",
-        r"C:\Users\user\dashboard\static\logo.png",
-        r"C:\Users\user\dashboard\public\logo.png",
-    ] {
-        if let Ok(data) = tokio::fs::read(path).await {
-            return ([(axum::http::header::CONTENT_TYPE, "image/png")], data);
-        }
-    }
-    ([(axum::http::header::CONTENT_TYPE, "text/plain")], "logo not found".into())
 }
 
 async fn handle_config(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -310,4 +296,23 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
 
 fn whoami() -> Option<String> {
     std::env::var("USERNAME").or_else(|_| std::env::var("USER")).ok()
+}
+
+/// 加载窗口图标（从 logo.png 解码）
+fn _load_icon() -> Option<tao::window::Icon> {
+    for path in &[
+        r"C:\Users\user\dashboard\dashboard-frontend\dist\logo.png",
+        r"C:\Users\user\dashboard\static\logo.png",
+    ] {
+        if let Ok(data) = std::fs::read(path) {
+            if let Ok(img) = image::load_from_memory(&data) {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                if let Ok(icon) = tao::window::Icon::from_rgba(rgba.into_raw(), w, h) {
+                    return Some(icon);
+                }
+            }
+        }
+    }
+    None
 }
