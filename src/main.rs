@@ -1,17 +1,20 @@
 //! agent-core Desktop — 双击即用，零配置
 //!
 //! 首次运行自动打开浏览器，填个名字和密钥就能聊。
+//! 内置巡检循环：每 30 分钟调用 Dashboard MCP 执行定时任务。
 
 use std::sync::Arc;
+use std::time::Duration;
 use axum::{Router, routing::get, routing::post, Json, extract::State};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio::time::interval;
 
 use agent_core::agent::{AgentConfig, AgentCore, AgentIdentity};
 use agent_core::boundary::PermissionLevel;
 use agent_core::harness::HarnessStore;
 use agent_core::llm::LlmConfig;
-use agent_core::mcp_client::McpClient;
+use agent_core::mcp_client::{McpClient, McpSource};
 
 /// 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +94,44 @@ async fn main() {
         config: Mutex::new(config.clone()),
         agent: Mutex::new(None),
         config_path: path,
+    });
+
+    // 先尝试构建 Agent（如果已配置）
+    if config.configured() {
+        match build_agent(&config).await {
+            Ok(agent) => {
+                println!("✓ Agent 已就绪（{}@{}）", config.agent_id, config.server);
+                *state.agent.lock().await = Some(agent);
+            }
+            Err(e) => {
+                println!("! Agent 初始化失败: {}（可在设置页重试）", e);
+            }
+        }
+    }
+
+    // 巡检循环（后台任务）
+    let patrol_state = state.clone();
+    tokio::spawn(async move {
+        let mut timer = interval(Duration::from_secs(1800)); // 30 分钟
+        timer.tick().await; // 跳过首次
+        loop {
+            timer.tick().await;
+            let agent_guard = patrol_state.agent.lock().await;
+            if let Some(ref agent) = *agent_guard {
+                tracing::info!("巡检: 开始定时检查");
+                // 所有 MCP 源中尝试调用巡检类工具
+                let tasks = [
+                    ("system_ops", serde_json::json!({"action": "status"})),
+                ];
+                for (tool, args) in &tasks {
+                    match agent.call_tool_routed(tool, args).await {
+                        Ok(reply) => tracing::info!("巡检 {}: {}", tool, &reply.chars().take(60).collect::<String>()),
+                        Err(e) => tracing::info!("巡检 {} 跳过: {}", tool, e),
+                    }
+                }
+            }
+            drop(agent_guard);
+        }
     });
 
     let app = Router::new()

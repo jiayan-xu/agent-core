@@ -383,7 +383,7 @@ impl AgentCore {
 
     /// 查找能处理该工具的 MCP 源
     /// 按工具名在 mcp_sources 中查找对应的 MCP 客户端
-    fn find_mcp_for_tool(&self, tool_name: &str) -> &McpClient {
+    pub fn find_mcp_for_tool(&self, tool_name: &str) -> &McpClient {
         // Memoria 特有工具走第一个源
         let memoria_tools = [
             "memory_search", "memory_search_v2", "memory_remember",
@@ -411,7 +411,7 @@ impl AgentCore {
     }
 
     /// 路由到正确的 MCP 源执行工具调用
-    async fn call_tool_routed(&self, tool_name: &str, args: &serde_json::Value) -> Result<String, String> {
+    pub async fn call_tool_routed(&self, tool_name: &str, args: &serde_json::Value) -> Result<String, String> {
         let client = self.find_mcp_for_tool(tool_name);
         client.call(tool_name, args).await
     }
