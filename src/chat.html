@@ -8,46 +8,46 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github-dark.min.css">
 <style>
-:root { --bg: #0f0f0f; --surface: #1a1a1a; --border: #2a2a2a; --text: #e0e0e0; --accent: #d4a853; --msg-user: #1a2a1a; --msg-agent: #1a1a2a; --tool-bg: #111122; }
+:root { --bg: #f5f5f5; --surface: #ffffff; --border: #e0e0e0; --text: #333333; --accent: #1a73e8; --msg-user: #e3f2fd; --msg-agent: #ffffff; --tool-bg: #f0f0f0; }
 * { margin:0; padding:0; box-sizing:border-box; }
 body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; background:var(--bg); color:var(--text); height:100vh; display:flex; flex-direction:column; overflow:hidden; }
-#header { padding:10px 20px; background:var(--surface); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:12px; flex-shrink:0; height:52px; }
-#header .logo { height:36px; width:auto; display:block; }
-#header h1 { font-size:17px; font-weight:600; color:var(--accent); }
-#header .st { font-size:11px; color:#888; }
+#header { padding:10px 20px; background:var(--surface); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:12px; flex-shrink:0; height:52px; box-shadow:0 1px 2px rgba(0,0,0,0.05); }
+#header .logo { height:32px; width:auto; display:block; }
+#header h1 { font-size:16px; font-weight:600; color:var(--text); }
+#header .st { font-size:11px; color:#999; }
 #header .st.ok { color:#4caf50; }
-#header .st.busy { color:#d4a853; }
-#setup { flex:1; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:16px; padding:40px; }
-#setup h2 { color:var(--accent); font-size:20px; }
+#header .st.busy { color:#f57c00; }
+#setup { flex:1; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:16px; padding:40px; background:var(--bg); }
+#setup h2 { color:var(--text); font-size:20px; }
 #setup input { width:100%; max-width:340px; padding:10px; border:1px solid var(--border); border-radius:6px; background:var(--surface); color:var(--text); font-size:14px; }
 #setup input:focus { border-color:var(--accent); outline:none; }
-#setup button { padding:10px 28px; border:none; border-radius:6px; background:var(--accent); color:#000; font-size:14px; font-weight:600; cursor:pointer; }
-#chat { flex:1; display:none; flex-direction:column; min-height:0; }
+#setup button { padding:10px 28px; border:none; border-radius:6px; background:var(--accent); color:#fff; font-size:14px; font-weight:500; cursor:pointer; }
+#chat { flex:1; display:none; flex-direction:column; min-height:0; background:var(--bg); }
 #msgs { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:8px; }
 .msg { max-width:85%; padding:10px 14px; border-radius:8px; line-height:1.6; font-size:14px; }
-.msg.user { align-self:flex-end; background:var(--msg-user); border:1px solid #2a3a2a; }
-.msg.agent { align-self:flex-start; background:var(--msg-agent); border:1px solid #2a2a3a; }
+.msg.user { align-self:flex-end; background:var(--msg-user); border:1px solid #bbdefb; }
+.msg.agent { align-self:flex-start; background:var(--msg-agent); border:1px solid var(--border); box-shadow:0 1px 2px rgba(0,0,0,0.05); }
 .msg .md { line-height:1.7; }
 .msg .md p { margin:4px 0; }
-.msg .md pre { background:#0a0a1a; border-radius:4px; padding:8px; overflow-x:auto; margin:6px 0; }
+.msg .md pre { background:#f0f0f0; border-radius:4px; padding:8px; overflow-x:auto; margin:6px 0; }
 .msg .md code { font-size:13px; font-family:'Cascadia Code','Fira Code',monospace; }
-.msg .md p > code { background:#2a2a3a; padding:1px 5px; border-radius:3px; font-size:13px; }
+.msg .md p > code { background:#e8e8e8; padding:1px 5px; border-radius:3px; font-size:13px; }
 .msg .md table { border-collapse:collapse; width:100%; margin:6px 0; font-size:13px; }
 .msg .md th,.md td { border:1px solid var(--border); padding:6px 10px; text-align:left; }
 .msg .md th { background:var(--surface); }
-.msg .md blockquote { border-left:3px solid var(--accent); padding:4px 12px; margin:6px 0; color:#aaa; }
-.msg .time { font-size:11px; color:#555; margin-top:4px; }
+.msg .md blockquote { border-left:3px solid var(--accent); padding:4px 12px; margin:6px 0; color:#888; }
+.msg .time { font-size:11px; color:#bbb; margin-top:4px; }
 .msg .tools { margin-top:6px; display:flex; flex-wrap:wrap; gap:4px; }
-.msg .tool-tag { font-size:11px; background:var(--tool-bg); color:#888; padding:2px 8px; border-radius:4px; border:1px solid var(--border); }
-.msg .thinking { margin-top:6px; font-size:12px; color:#666; background:var(--tool-bg); border-radius:4px; padding:6px 10px; cursor:pointer; }
-.msg .thinking summary { cursor:pointer; color:#888; }
-.msg .thinking .tc { color:#666; font-style:italic; margin-top:4px; max-height:200px; overflow-y:auto; }
+.msg .tool-tag { font-size:11px; background:var(--tool-bg); color:#666; padding:2px 8px; border-radius:4px; border:1px solid var(--border); }
+.msg .thinking { margin-top:6px; font-size:12px; color:#888; background:var(--tool-bg); border-radius:4px; padding:6px 10px; cursor:pointer; border:1px solid var(--border); }
+.msg .thinking summary { cursor:pointer; color:#666; }
+.msg .thinking .tc { color:#888; font-style:italic; margin-top:4px; max-height:200px; overflow-y:auto; }
 .waiting-dots::after { content:'...'; animation:dots 1.5s steps(4) infinite; }
 @keyframes dots { 0% { content:''; } 25% { content:'.'; } 50% { content:'..'; } 75% { content:'...'; } }
 #input-area { padding:10px 16px; background:var(--surface); border-top:1px solid var(--border); display:flex; gap:8px; flex-shrink:0; }
 #input { flex:1; padding:10px 14px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font-size:14px; outline:none; }
 #input:focus { border-color:var(--accent); }
-#send { padding:10px 22px; border:none; border-radius:6px; background:var(--accent); color:#000; font-size:14px; font-weight:600; cursor:pointer; }
+#send { padding:10px 22px; border:none; border-radius:6px; background:var(--accent); color:#fff; font-size:14px; font-weight:500; cursor:pointer; }
 #send:disabled { opacity:0.4; cursor:not-allowed; }
 </style>
 </head>
