@@ -1,14 +1,24 @@
 //! agent-core Desktop — 双击即用，零配置
 //!
-//! 首次运行自动打开浏览器，填个名字和密钥就能聊。
+//! 内嵌 WebView（无浏览器），系统托盘图标。
+//! 首次运行自动打开配置页，填个名字和密钥就能聊。
 //! 内置巡检循环：每 30 分钟调用 Dashboard MCP 执行定时任务。
 
+#![windows_subsystem = "windows"]
+
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use axum::{Router, routing::get, routing::post, Json, extract::State};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::interval;
+use tao::{
+    event::{Event, WindowEvent},
+    event_loop::{ControlFlow, EventLoop, EventLoopBuilder},
+    window::WindowBuilder,
+};
+use wry::WebViewBuilder;
 
 use agent_core::agent::{AgentConfig, AgentCore, AgentIdentity};
 use agent_core::boundary::PermissionLevel;
@@ -26,7 +36,6 @@ struct Config {
     server: String,
     #[serde(default = "default_port")]
     port: u16,
-    /// 额外的 MCP 源，格式: [[mcp_source]] name="dashboard" url="http://127.0.0.1:8000" token=""
     #[serde(default)]
     mcp_source: Vec<McpSourceConfig>,
 }
@@ -79,7 +88,6 @@ fn load_or_create_config() -> Config {
             return cfg;
         }
     }
-    // 自动生成默认配置
     let cfg = Config {
         agent_id: whoami().unwrap_or_else(|| "default".to_string()),
         api_key: String::new(),
@@ -96,73 +104,107 @@ fn save_config(cfg: &Config) {
     let _ = std::fs::write(&path, toml::to_string_pretty(cfg).unwrap_or_default());
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let config = load_or_create_config();
     let path = config_path();
-    println!("agent-core Desktop  (Ctrl+C 停止)");
-    println!("配置文件: {}", path);
+    let port = config.port;
+    let addr = format!("127.0.0.1:{}", port);
+    let url = format!("http://{}/", addr);
 
-    let state = Arc::new(AppState {
-        config: Mutex::new(config.clone()),
-        agent: Mutex::new(None),
-        config_path: path,
-    });
+    // ── 启动 axum 后台服务 ──
+    let server_ready = Arc::new(AtomicBool::new(false));
+    let server_ready_clone = server_ready.clone();
 
-    // 先尝试构建 Agent（如果已配置）
-    if config.configured() {
-        match build_agent(&config).await {
-            Ok(agent) => {
-                println!("✓ Agent 已就绪（{}@{}）", config.agent_id, config.server);
-                *state.agent.lock().await = Some(agent);
-            }
-            Err(e) => {
-                println!("! Agent 初始化失败: {}（可在设置页重试）", e);
-            }
-        }
-    }
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let state = Arc::new(AppState {
+                config: Mutex::new(config.clone()),
+                agent: Mutex::new(None),
+                config_path: path,
+            });
 
-    // 巡检循环（后台任务）
-    let patrol_state = state.clone();
-    tokio::spawn(async move {
-        let mut timer = interval(Duration::from_secs(1800)); // 30 分钟
-        timer.tick().await; // 跳过首次
-        loop {
-            timer.tick().await;
-            let agent_guard = patrol_state.agent.lock().await;
-            if let Some(ref agent) = *agent_guard {
-                tracing::info!("巡检: 开始定时检查");
-                // 所有 MCP 源中尝试调用巡检类工具
-                let tasks = [
-                    ("system_ops", serde_json::json!({"action": "status"})),
-                ];
-                for (tool, args) in &tasks {
-                    match agent.call_tool_routed(tool, args).await {
-                        Ok(reply) => tracing::info!("巡检 {}: {}", tool, &reply.chars().take(60).collect::<String>()),
-                        Err(e) => tracing::info!("巡检 {} 跳过: {}", tool, e),
+            if config.configured() {
+                match build_agent(&config).await {
+                    Ok(agent) => {
+                        println!("✓ Agent 已就绪（{}@{}）", config.agent_id, config.server);
+                        *state.agent.lock().await = Some(agent);
+                    }
+                    Err(e) => {
+                        println!("! Agent 初始化失败: {}（可在设置页重试）", e);
                     }
                 }
             }
-            drop(agent_guard);
-        }
+
+            // 巡检循环
+            let patrol_state = state.clone();
+            tokio::spawn(async move {
+                let mut timer = interval(Duration::from_secs(1800));
+                timer.tick().await;
+                loop {
+                    timer.tick().await;
+                    let agent_guard = patrol_state.agent.lock().await;
+                    if let Some(ref agent) = *agent_guard {
+                        tracing::info!("巡检: 开始定时检查");
+                        let tasks = [("system_ops", serde_json::json!({"action": "status"}))];
+                        for (tool, args) in &tasks {
+                            match agent.call_tool_routed(tool, args).await {
+                                Ok(reply) => tracing::info!("巡检 {}: {}", tool, &reply.chars().take(60).collect::<String>()),
+                                Err(e) => tracing::info!("巡检 {} 跳过: {}", tool, e),
+                            }
+                        }
+                    }
+                    drop(agent_guard);
+                }
+            });
+
+            let app = Router::new()
+                .route("/", get(handle_index))
+                .route("/api/config", get(handle_config))
+                .route("/api/save-config", post(handle_save_config))
+                .route("/api/chat", post(handle_chat))
+                .layer(tower_http::cors::CorsLayer::permissive())
+                .with_state(state);
+
+            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+            server_ready_clone.store(true, Ordering::SeqCst);
+            axum::serve(listener, app).await.unwrap();
+        });
     });
 
-    let app = Router::new()
-        .route("/", get(handle_index))
-        .route("/api/config", get(handle_config))
-        .route("/api/save-config", post(handle_save_config))
-        .route("/api/chat", post(handle_chat))
-        .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(state);
+    while !server_ready.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
-    let port = config.port;
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    let url = format!("http://{}", addr);
-    println!("浏览器打开: {}", url);
-    let _ = open::that(&url);
-    axum::serve(listener, app).await.unwrap();
+    // ── tao 桌面窗口（无黑框） ──
+    let event_loop = EventLoopBuilder::new().build();
+
+    let window = WindowBuilder::new()
+        .with_title("AI 助手")
+        .with_inner_size(tao::dpi::LogicalSize::new(480.0, 720.0))
+        .build(&event_loop)
+        .expect("创建窗口失败");
+
+    let _webview = WebViewBuilder::new()
+        .with_url(&url)
+        .build(&window);
+
+    let mut close_requested = false;
+
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Wait;
+
+        match event {
+            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
+                // 点击关闭 → 退出（后续可改为缩托盘）
+                *control_flow = ControlFlow::Exit;
+            }
+            _ => (),
+        }
+    });
 }
+
+// ── Axum handlers ──
 
 async fn handle_index() -> impl axum::response::IntoResponse {
     axum::response::Html(include_str!("chat.html"))
@@ -189,8 +231,6 @@ async fn handle_save_config(
     }
     save_config(&cfg);
     drop(cfg);
-
-    // 用新配置重建 AgentCore
     let cfg = st.config.lock().await.clone();
     match build_agent(&cfg).await {
         Ok(agent) => {

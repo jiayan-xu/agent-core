@@ -159,14 +159,65 @@ impl AgentCore {
         self.llm_loop(messages, session_id, message, user_id).await
     }
 
-    /// 从内存缓存加载历史对话
+    /// 从内存缓存 + SQLite 加载历史对话
     async fn load_history(&self, session_id: &str) -> Vec<Message> {
+        // 先从内存缓存
         let cache = self.session_history.lock().await;
-        cache.get(session_id).cloned().unwrap_or_default()
+        if let Some(msgs) = cache.get(session_id) {
+            if !msgs.is_empty() {
+                return msgs.clone();
+            }
+        }
+        drop(cache);
+
+        // 内存没有 → 从 SQLite 恢复
+        let ns = self.config.identity.ns();
+        let harness = self.harness.clone();
+        let db_path = harness.lock().await.db_path();
+
+        if db_path.is_empty() {
+            return Vec::new();
+        }
+
+        let sid = session_id.to_string();
+        let msgs = tokio::task::spawn_blocking(move || {
+            let mut result = Vec::new();
+            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT role, content FROM chat_history WHERE session_id=?1 AND namespace=?2 ORDER BY id DESC LIMIT 20"
+                ) {
+                    if let Ok(rows) = stmt.query_map(rusqlite::params![sid, ns], |row| {
+                        let role: String = row.get(0)?;
+                        let content: String = row.get(1)?;
+                        Ok((role, content))
+                    }) {
+                        for row in rows.flatten() {
+                            result.push(Message {
+                                role: row.0,
+                                content: Some(row.1),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            });
+                        }
+                    }
+                }
+            }
+            result.reverse();
+            result
+        }).await.unwrap_or_default();
+
+        // 写回内存缓存
+        if !msgs.is_empty() {
+            let mut cache = self.session_history.lock().await;
+            cache.insert(session_id.to_string(), msgs.clone());
+        }
+
+        msgs
     }
 
-    /// 保存对话到内存缓存
+    /// 保存对话到内存缓存 + SQLite 持久化
     async fn save_to_history(&self, session_id: &str, user_msg: &str, assistant_reply: &str) {
+        // 内存缓存
         let mut cache = self.session_history.lock().await;
         let history = cache.entry(session_id.to_string()).or_insert_with(Vec::new);
         // 只保留最近 10 轮（20 条消息）
@@ -185,6 +236,26 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         });
+        drop(cache);
+
+        // SQLite 持久化（通过 harness 的 DB）
+        let ns = self.config.identity.ns();
+        let db_path = self.harness.clone().lock().await.db_path();
+        let sid = session_id.to_string();
+        let u_msg = user_msg.to_string();
+        let a_msg = assistant_reply.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                conn.execute(
+                    "INSERT INTO chat_history (session_id, namespace, role, content, created_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                    rusqlite::params![sid, ns, "user", u_msg],
+                ).ok();
+                conn.execute(
+                    "INSERT INTO chat_history (session_id, namespace, role, content, created_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                    rusqlite::params![sid, ns, "assistant", a_msg],
+                ).ok();
+            }
+        }).await;
     }
 
     /// LLM 调用循环（支持多轮 tool calling）

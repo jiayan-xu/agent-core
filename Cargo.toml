@@ -24,3 +24,5 @@ axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
 toml = "0.8"
 open = "5"
+wry = "0.49"
+tao = "0.31"

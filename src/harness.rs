@@ -26,21 +26,28 @@ pub struct Harness {
 /// HarnessStore — 管理模板的 CRUD、模糊匹配与日志提炼
 pub struct HarnessStore {
     conn: Connection,
+    db_path: String,
 }
 
 impl HarnessStore {
     /// 创建或打开存储
     pub fn open(path: &str) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("open db: {}", e))?;
-        let mut store = HarnessStore { conn };
+        let db_path = path.to_string();
+        let mut store = HarnessStore { conn, db_path };
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// 返回数据库路径
+    pub fn db_path(&self) -> String {
+        self.db_path.clone()
     }
 
     /// 内存模式（用于测试）
     pub fn open_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| format!("open memory: {}", e))?;
-        let mut store = HarnessStore { conn };
+        let mut store = HarnessStore { conn, db_path: String::new() };
         store.init_schema()?;
         Ok(store)
     }
@@ -62,7 +69,16 @@ impl HarnessStore {
                     created_at      REAL DEFAULT 0,
                     updated_at      REAL DEFAULT 0,
                     is_active       INTEGER DEFAULT 1
-                );",
+                );
+                CREATE TABLE IF NOT EXISTS chat_history (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id      TEXT NOT NULL,
+                    namespace       TEXT NOT NULL DEFAULT 'default',
+                    role            TEXT NOT NULL,
+                    content         TEXT NOT NULL,
+                    created_at      TEXT DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_history(session_id, namespace);",
             )
             .map_err(|e| format!("init schema: {}", e))?;
         Ok(())
