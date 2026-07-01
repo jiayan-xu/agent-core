@@ -3,145 +3,180 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI 助手</title>
+<title>Agent</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/15.0.6/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github-dark.min.css">
 <style>
-  :root { --bg: #0f0f0f; --surface: #1a1a1a; --border: #2a2a2a; --text: #e0e0e0; --accent: #d4a853; --msg-user: #1e2a1e; --msg-agent: #1a1a2e; }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system,'Segoe UI',sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
-  #header { padding: 12px 20px; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
-  #header h1 { font-size: 16px; font-weight: 600; color: var(--accent); }
-  #header .status { font-size: 12px; color: #888; margin-left: auto; }
-  #header .status.ok { color: #4caf50; }
-  #header .status.nok { color: #ff6b6b; }
-  #setup { flex:1; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:20px; padding:40px; }
-  #setup h2 { color: var(--accent); font-size: 22px; }
-  #setup p { color: #888; font-size: 14px; max-width: 400px; text-align: center; line-height: 1.8; }
-  #setup input { width: 100%; max-width: 360px; padding: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); font-size: 14px; }
-  #setup input:focus { border-color: var(--accent); outline: none; }
-  #setup button { padding: 10px 30px; border: none; border-radius: 6px; background: var(--accent); color: #000; font-size: 14px; font-weight: 600; cursor: pointer; }
-  #setup button:hover { opacity: 0.9; }
-  #messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
-  .msg { max-width: 80%; padding: 10px 14px; border-radius: 8px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; }
-  .msg.user { align-self: flex-end; background: var(--msg-user); border: 1px solid #2a4a2a; }
-  .msg.agent { align-self: flex-start; background: var(--msg-agent); border: 1px solid #2a2a4a; }
-  .msg .time { font-size: 11px; color: #666; margin-top: 4px; }
-  #input-area { padding: 12px 20px; background: var(--surface); border-top: 1px solid var(--border); display: flex; gap: 10px; }
-  #input { flex: 1; padding: 10px 14px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-size: 14px; outline: none; }
-  #input:focus { border-color: var(--accent); }
-  #send { padding: 10px 20px; border: none; border-radius: 6px; background: var(--accent); color: #000; font-size: 14px; font-weight: 600; cursor: pointer; }
-  #send:disabled { opacity: 0.5; cursor: not-allowed; }
-  .welcome { text-align: center; color: #666; padding: 40px 20px; font-size: 14px; line-height: 1.8; }
+:root { --bg: #0f0f0f; --surface: #1a1a1a; --border: #2a2a2a; --text: #e0e0e0; --accent: #d4a853; --msg-user: #1a2a1a; --msg-agent: #1a1a2a; --tool-bg: #111122; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; background:var(--bg); color:var(--text); height:100vh; display:flex; flex-direction:column; overflow:hidden; }
+#header { padding:8px 16px; background:var(--surface); border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px; flex-shrink:0; }
+#header h1 { font-size:15px; font-weight:600; color:var(--accent); flex:1; }
+#header .st { font-size:11px; color:#888; }
+#header .st.ok { color:#4caf50; }
+#header .st.busy { color:#d4a853; }
+#setup { flex:1; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:16px; padding:40px; }
+#setup h2 { color:var(--accent); font-size:20px; }
+#setup input { width:100%; max-width:340px; padding:10px; border:1px solid var(--border); border-radius:6px; background:var(--surface); color:var(--text); font-size:14px; }
+#setup input:focus { border-color:var(--accent); outline:none; }
+#setup button { padding:10px 28px; border:none; border-radius:6px; background:var(--accent); color:#000; font-size:14px; font-weight:600; cursor:pointer; }
+#chat { flex:1; display:none; flex-direction:column; min-height:0; }
+#msgs { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:8px; }
+.msg { max-width:85%; padding:10px 14px; border-radius:8px; line-height:1.6; font-size:14px; }
+.msg.user { align-self:flex-end; background:var(--msg-user); border:1px solid #2a3a2a; }
+.msg.agent { align-self:flex-start; background:var(--msg-agent); border:1px solid #2a2a3a; }
+.msg .md { line-height:1.7; }
+.msg .md p { margin:4px 0; }
+.msg .md pre { background:#0a0a1a; border-radius:4px; padding:8px; overflow-x:auto; margin:6px 0; }
+.msg .md code { font-size:13px; font-family:'Cascadia Code','Fira Code',monospace; }
+.msg .md p > code { background:#2a2a3a; padding:1px 5px; border-radius:3px; font-size:13px; }
+.msg .md table { border-collapse:collapse; width:100%; margin:6px 0; font-size:13px; }
+.msg .md th,.md td { border:1px solid var(--border); padding:6px 10px; text-align:left; }
+.msg .md th { background:var(--surface); }
+.msg .md blockquote { border-left:3px solid var(--accent); padding:4px 12px; margin:6px 0; color:#aaa; }
+.msg .time { font-size:11px; color:#555; margin-top:4px; }
+.msg .tools { margin-top:6px; display:flex; flex-wrap:wrap; gap:4px; }
+.msg .tool-tag { font-size:11px; background:var(--tool-bg); color:#888; padding:2px 8px; border-radius:4px; border:1px solid var(--border); }
+.msg .thinking { margin-top:6px; font-size:12px; color:#666; background:var(--tool-bg); border-radius:4px; padding:6px 10px; cursor:pointer; }
+.msg .thinking summary { cursor:pointer; color:#888; }
+.msg .thinking .tc { color:#666; font-style:italic; margin-top:4px; max-height:200px; overflow-y:auto; }
+.waiting-dots::after { content:'...'; animation:dots 1.5s steps(4) infinite; }
+@keyframes dots { 0% { content:''; } 25% { content:'.'; } 50% { content:'..'; } 75% { content:'...'; } }
+#input-area { padding:10px 16px; background:var(--surface); border-top:1px solid var(--border); display:flex; gap:8px; flex-shrink:0; }
+#input { flex:1; padding:10px 14px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font-size:14px; outline:none; }
+#input:focus { border-color:var(--accent); }
+#send { padding:10px 22px; border:none; border-radius:6px; background:var(--accent); color:#000; font-size:14px; font-weight:600; cursor:pointer; }
+#send:disabled { opacity:0.4; cursor:not-allowed; }
 </style>
 </head>
 <body>
+
 <div id="header">
-  <h1>&#x1F916; <span id="title">AI 助手</span></h1>
-  <span class="status" id="status">&#x25CF;</span>
+  <h1 id="title">&#x1F916; Agent</h1>
+  <span class="st" id="st">&#x25CB; 未连接</span>
 </div>
 
 <div id="setup">
-  <h2>&#x1F44B; 首次使用</h2>
-  <p>填写下面的信息就可以开始聊天了。<br>API 密钥找管理员获取。</p>
-  <input id="s-name" placeholder="你的名字" value="">
-  <input id="s-apikey" type="password" placeholder="API 密钥">
-  <details style="max-width:360px;width:100%">
-    <summary style="color:#666;font-size:12px;cursor:pointer;text-align:left">高级设置</summary>
-    <input id="s-server" placeholder="服务器地址" value="http://192.168.1.171:9003" style="margin-top:8px">
+  <h2>&#x1F44B; 首次配置</h2>
+  <input id="s-name" placeholder="名称（如 dashboard-agent）">
+  <input id="s-key" type="password" placeholder="API 密钥">
+  <details style="max-width:340px;width:100%">
+    <summary style="color:#666;font-size:12px;cursor:pointer">高级</summary>
+    <input id="s-srv" placeholder="Memoria 地址" value="http://192.168.1.171:9003" style="margin-top:8px">
   </details>
-  <button onclick="saveConfig()">开始使用</button>
+  <button onclick="saveCfg()">&#x1F680; 开始</button>
 </div>
 
-<div id="chat" style="display:none;flex:1;display:none;flex-direction:column">
-  <div id="messages">
-    <div class="welcome"><p>你好！有什么可以帮你的？</p></div>
-  </div>
+<div id="chat">
+  <div id="msgs"></div>
   <div id="input-area">
     <input id="input" type="text" placeholder="输入消息..." autofocus>
-    <button id="send">发送</button>
+    <button id="send" disabled>&#x1F680; 发送</button>
   </div>
 </div>
 
 <script>
-async function saveConfig() {
-  const name = document.getElementById('s-name').value.trim();
-  const apikey = document.getElementById('s-apikey').value.trim();
-  const server = document.getElementById('s-server').value.trim();
-  if (!name || !apikey) { alert('请填写名字和 API 密钥'); return; }
-  const resp = await fetch('/api/save-config', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({agent_id: name, api_key: apikey, server: server}),
+let sessionId = null;
+const $ = id => document.getElementById(id);
+
+marked.setOptions({ breaks: true, gfm: true });
+
+function esc(t) { return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function renderMd(text) {
+  // 先转义，再用 marked 渲染
+  let html = marked.parse(text);
+  // 代码高亮
+  document.querySelectorAll('pre code').forEach(b => {
+    try { hljs.highlightElement(b); } catch(e) {}
   });
-  const data = await resp.json();
-  if (data.ok) {
-    document.getElementById('title').textContent = name;
-    document.getElementById('status').textContent = '\u25CF 已连接';
-    document.getElementById('status').className = 'status ok';
-    document.getElementById('setup').style.display = 'none';
-    document.getElementById('chat').style.display = 'flex';
-    document.getElementById('input').focus();
-  } else {
-    alert('保存失败: ' + (data.error || ''));
+  return html;
+}
+
+function addMsg(role, html, opts) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.innerHTML = '<div class="md">' + html + '</div>';
+  if (opts?.tools?.length) {
+    const tw = document.createElement('div'); tw.className = 'tools';
+    opts.tools.forEach(t => {
+      const tag = document.createElement('span'); tag.className = 'tool-tag';
+      tag.textContent = '&#x1F527; ' + t;
+      tw.appendChild(tag);
+    });
+    div.appendChild(tw);
   }
+  if (opts?.thinking) {
+    const dt = document.createElement('details'); dt.className = 'thinking';
+    dt.innerHTML = '<summary>&#x1F4AD; 推理过程</summary><div class="tc">' + esc(opts.thinking) + '</div>';
+    div.appendChild(dt);
+  }
+  const time = document.createElement('div'); time.className = 'time';
+  time.textContent = new Date().toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'});
+  div.appendChild(time);
+  $('msgs').appendChild(div);
+  $('msgs').scrollTop = $('msgs').scrollHeight;
+  return div;
+}
+
+function addWait() {
+  const div = document.createElement('div'); div.className = 'msg agent';
+  div.id = 'wait-msg';
+  div.innerHTML = '<div class="md"><p class="waiting-dots">思考中</p></div>';
+  $('msgs').appendChild(div);
+  $('msgs').scrollTop = $('msgs').scrollHeight;
+  return div;
+}
+
+function rmWait() { const w = $('wait-msg'); if (w) w.remove(); }
+
+async function saveCfg() {
+  const name = $('s-name').value.trim();
+  const key = $('s-key').value.trim();
+  if (!name || !key) { alert('请填写名称和密钥'); return; }
+  const r = await fetch('/api/save-config', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({agent_id: name, api_key: key, server: $('s-srv').value.trim()}),
+  });
+  const d = await r.json();
+  if (d.ok) { $('title').textContent = name; $('st').textContent = '\u25CF 就绪'; $('st').className = 'st ok'; $('setup').style.display = 'none'; $('chat').style.display = 'flex'; $('input').focus(); $('send').disabled = false; }
+  else alert('失败: ' + (d.error||''));
 }
 
 async function chat() {
-  const input = document.getElementById('input');
-  const text = input.value.trim();
-  if (!text) return;
-  input.value = '';
-
-  const msgs = document.getElementById('messages');
-  const addMsg = (role, text) => {
-    const div = document.createElement('div');
-    div.className = 'msg ' + role;
-    div.textContent = text;
-    const time = document.createElement('div');
-    time.className = 'time';
-    time.textContent = new Date().toLocaleTimeString();
-    div.appendChild(time);
-    msgs.appendChild(div);
-    msgs.scrollTop = msgs.scrollHeight;
-  };
-
-  addMsg('user', text);
-  const sendBtn = document.getElementById('send');
-  sendBtn.disabled = true; sendBtn.textContent = '...';
-  document.getElementById('status').textContent = '\u25CF 思考中';
-  document.getElementById('status').className = 'status';
-
+  const inp = $('input'); const txt = inp.value.trim(); if (!txt) return;
+  inp.value = '';
+  addMsg('user', esc(txt).replace(/\n/g,'<br>'));
+  $('send').disabled = true; $('st').textContent = '\u25CF 处理中'; $('st').className = 'st busy';
+  addWait();
   try {
-    const resp = await fetch('/api/chat', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({message: text}),
+    const r = await fetch('/api/chat', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({message: txt, session_id: sessionId || 'default'}),
     });
-    const data = await resp.json();
-    if (data.reply) addMsg('agent', data.reply);
+    const d = await r.json();
+    if (d.session_id) sessionId = d.session_id;
+    rmWait();
+    if (d.reply) addMsg('agent', renderMd(d.reply));
   } catch(e) {
-    addMsg('agent', '连接失败: ' + e.message);
+    rmWait();
+    addMsg('agent', esc('连接失败: ' + e.message));
   }
-
-  sendBtn.disabled = false; sendBtn.textContent = '发送';
-  document.getElementById('status').textContent = '\u25CF 已连接';
-  document.getElementById('status').className = 'status ok';
+  $('send').disabled = false; $('st').textContent = '\u25CF 就绪'; $('st').className = 'st ok';
+  $('input').focus();
 }
 
-document.getElementById('send').addEventListener('click', chat);
-document.getElementById('input').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chat(); }
-});
+// Events
+$('send').addEventListener('click', chat);
+$('input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chat(); } });
 
-// 检查是否已配置
-fetch('/api/config').then(r=>r.json()).then(cfg => {
-  if (cfg.configured) {
-    document.getElementById('s-name').value = cfg.agent_id;
-    document.getElementById('s-server').value = cfg.server || 'http://192.168.1.171:9003';
-    document.getElementById('title').textContent = cfg.agent_id;
-    document.getElementById('status').textContent = '\u25CF 已连接';
-    document.getElementById('status').className = 'status ok';
-    document.getElementById('setup').style.display = 'none';
-    document.getElementById('chat').style.display = 'flex';
+// Check config
+fetch('/api/config').then(r=>r.json()).then(c => {
+  if (c.configured) {
+    $('s-name').value = c.agent_id; $('s-srv').value = c.server;
+    $('title').textContent = c.agent_id; $('st').textContent = '\u25CF 就绪'; $('st').className = 'st ok';
+    $('setup').style.display = 'none'; $('chat').style.display = 'flex'; $('input').focus(); $('send').disabled = false;
   }
 });
 </script>

@@ -1,9 +1,27 @@
-//! LLM 客户端 — 兼容 DeepSeek / OpenAI API
+//! LLM 客户端 — 兼容 DeepSeek / OpenAI API（支持流式）
 
 use std::time::Duration;
 
 use reqwest::Client;
 use serde::Serialize;
+use tokio::sync::mpsc;
+
+/// SSE 流式事件
+#[derive(Debug, Clone, Serialize)]
+pub enum SseEvent {
+    #[serde(rename = "thinking")]
+    ThinkingEvt { content: String },
+    #[serde(rename = "text")]
+    TextEvt { content: String },
+    #[serde(rename = "tool_call")]
+    ToolCallEvt { name: String, arguments: serde_json::Value, id: String },
+    #[serde(rename = "tool_result")]
+    ToolResultEvt { name: String, result: String },
+    #[serde(rename = "done")]
+    DoneEvt,
+    #[serde(rename = "error")]
+    ErrorEvt { message: String },
+}
 
 /// LLM 配置
 #[derive(Debug, Clone)]
@@ -209,5 +227,103 @@ impl LlmClient {
         }
 
         Err(format!("LLM 所有 Provider 均失败，最后错误: {}", last_error))
+    }
+
+    /// 流式聊天（SSE 事件通过 sender 发送）
+    pub async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        sender: mpsc::UnboundedSender<SseEvent>,
+    ) -> Result<(), String> {
+        let url = format!("{}/v1/chat/completions", self.config.base_url.trim_end_matches('/'));
+
+        let mut body = serde_json::json!({
+            "model": self.config.model,
+            "messages": messages,
+            "max_tokens": self.config.max_tokens,
+            "temperature": self.config.temperature,
+            "stream": true,
+        });
+
+        if !tools.is_empty() {
+            body["tools"] = serde_json::to_value(tools).map_err(|e| format!("tools json: {}", e))?;
+        }
+
+        // DeepSeek 专用：禁用 thinking 输出（避免中文乱码）
+        body["extra_body"] = serde_json::json!({"thinking": {"type": "disabled"}});
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .send()
+            .await
+            .map_err(|e| format!("stream request: {}", e))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(format!("HTTP {}: {}", status.as_u16(), err_body.chars().take(200).collect::<String>()));
+        }
+
+        use futures::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut tool_call_buf: Option<String> = None;
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.map_err(|e| format!("stream read: {}", e))?;
+            let text = String::from_utf8_lossy(&chunk);
+
+            for line in text.lines() {
+                if !line.starts_with("data: ") {
+                    continue;
+                }
+                let data = &line[6..];
+                if data == "[DONE]" {
+                    let _ = sender.send(SseEvent::DoneEvt);
+                    return Ok(());
+                }
+
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(choices) = val["choices"].as_array() {
+                        if choices.is_empty() { continue; }
+                        let delta = &choices[0]["delta"];
+
+                        // thinking
+                        if let Some(tc) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+                            if !tc.is_empty() {
+                                let _ = sender.send(SseEvent::ThinkingEvt { content: tc.to_string() });
+                            }
+                        }
+
+                        // text
+                        if let Some(tc) = delta.get("content").and_then(|c| c.as_str()) {
+                            if !tc.is_empty() {
+                                let _ = sender.send(SseEvent::TextEvt { content: tc.to_string() });
+                            }
+                        }
+
+                        // tool_calls
+                        if let Some(tcs) = delta.get("tool_calls").and_then(|tc| tc.as_array()) {
+                            for tc in tcs {
+                                let id = tc["id"].as_str().unwrap_or("").to_string();
+                                let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                                let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
+                                if let Ok(args) = serde_json::from_str(args_str) {
+                                    let _ = sender.send(SseEvent::ToolCallEvt {
+                                        name, arguments: args, id,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ = sender.send(SseEvent::DoneEvt);
+        Ok(())
     }
 }

@@ -254,6 +254,8 @@ async fn handle_chat(
     }
 }
 
+/// SSE 流式聊天（包装 chat() 的回复，分块推送）
+
 async fn build_agent(config: &Config) -> Result<AgentCore, String> {
     let mcp = McpClient::new(&config.server, &config.agent_id, &config.api_key);
     let _ = mcp.call_json("register_agent", &serde_json::json!({
