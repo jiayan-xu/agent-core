@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use crate::boundary::{self, ComplianceBoundary, PermissionLevel, ToolCheck};
 use crate::harness::{ExecutionLog, HarnessStore};
 use crate::llm::{LlmClient, LlmConfig, Message, ToolCall, ToolDef};
-use crate::mcp_client::McpClient;
+use crate::mcp_client::{McpClient, McpSource};
 
 /// Agent 身份
 #[derive(Debug, Clone)]
@@ -30,6 +30,8 @@ pub struct AgentConfig {
     pub identity: AgentIdentity,
     pub llm: LlmConfig,
     pub memoria_url: String,
+    /// 可选 MCP 源（名称 + URL + 令牌），例：[("dashboard", "http://127.0.0.1:8000", "")]
+    pub additional_mcp: Vec<(String, String, String)>,
     pub skill_whitelist: Option<Vec<String>>,
     pub max_tool_rounds: u32,
     pub parent_permission: PermissionLevel,
@@ -38,7 +40,8 @@ pub struct AgentConfig {
 /// Agent 核心
 pub struct AgentCore {
     pub config: AgentConfig,
-    pub mcp: McpClient,
+    pub mcp: McpClient,  // Memoria MCP（主）
+    pub mcp_sources: Vec<McpSource>,  // 全部 MCP 源（含 Memoria）
     pub llm: LlmClient,
     pub boundary: Arc<Mutex<ComplianceBoundary>>,
     pub harness: Arc<Mutex<HarnessStore>>,
@@ -67,6 +70,13 @@ impl AgentCore {
     /// 创建 Agent 核心
     pub fn new(config: AgentConfig, harness: HarnessStore) -> Self {
         let mcp = McpClient::new(&config.memoria_url, &config.identity.agent_id, &config.identity.badge_token);
+        // 构建 MCP 源列表（Memoria 始终为第一个源）
+        let mut mcp_sources = vec![McpSource::memoria(mcp.clone())];
+        for (name, url, token) in &config.additional_mcp {
+            let badge = if token.is_empty() { &config.identity.badge_token } else { token };
+            let client = McpClient::new(url, &config.identity.agent_id, badge);
+            mcp_sources.push(McpSource::new(name, client));
+        }
         let llm = LlmClient::new(config.llm.clone());
         let boundary = ComplianceBoundary::new(config.skill_whitelist.clone());
         // 注册 agent 自身到权限链
@@ -79,6 +89,7 @@ impl AgentCore {
         AgentCore {
             config,
             mcp,
+            mcp_sources,
             llm,
             boundary: Arc::new(Mutex::new(boundary)),
             harness: Arc::new(Mutex::new(harness)),
@@ -262,10 +273,9 @@ impl AgentCore {
                     continue;
                 }
 
-                // 通过 MCP 调用工具
+                // 通过 MCP 调用工具（按名称路由到正确的源）
                 let result = match self
-                    .mcp
-                    .call(&tc.name, &tc.arguments)
+                    .call_tool_routed(&tc.name, &tc.arguments)
                     .await
                 {
                     Ok(text) => text,
@@ -371,78 +381,93 @@ impl AgentCore {
         }
     }
 
-    /// 从 Memoria 获取工具列表
-    pub async fn fetch_tools(&self) -> Vec<ToolDef> {
-        // 从 Memoria Skill Market 获取已安装的工具列表
-        match self
-            .mcp
-            .call_json(
-                "skill_market_list_installed",
-                &serde_json::json!({"agent_id": self.config.identity.agent_id}),
-            )
-            .await
-        {
-            Ok(data) => {
-                let skills = data["skills"].as_array().cloned().unwrap_or_default();
-                if skills.is_empty() {
-                    tracing::warn!("Skill Market 返回空列表，使用 fallback");
-                } else {
-                    return skills
-                        .iter()
-                        .filter_map(|s| {
-                            let name = s["name"].as_str()?;
-                            let desc = s
-                                .get("description")
-                                .and_then(|d| d.as_str())
-                                .unwrap_or("");
-                            Some(ToolDef {
-                                type_: "function".to_string(),
-                                function: crate::llm::ToolDefFunction {
-                                    name: name.to_string(),
-                                    description: desc.to_string(),
-                                    parameters: s
-                                        .get("parameters")
-                                        .cloned()
-                                        .unwrap_or(serde_json::json!({
-                                            "type": "object",
-                                            "properties": {}
-                                        })),
-                                },
-                            })
-                        })
-                        .collect();
-                }
+    /// 查找能处理该工具的 MCP 源
+    /// 按工具名在 mcp_sources 中查找对应的 MCP 客户端
+    fn find_mcp_for_tool(&self, tool_name: &str) -> &McpClient {
+        // Memoria 特有工具走第一个源
+        let memoria_tools = [
+            "memory_search", "memory_search_v2", "memory_remember",
+            "memory_observe", "a2a_send", "a2a_recv", "register_agent",
+            "audit_query", "db_stats", "skill_market_list_installed",
+            "skill_market_search", "agent_list", "agent_revoke",
+        ];
+        if memoria_tools.contains(&tool_name) {
+            return &self.mcp;
+        }
+        // 在其他 MCP 源中查找（简化版：按源名前缀匹配）
+        // 生产环境应缓存每个源的 tools/list 结果做精确匹配
+        for source in &self.mcp_sources[1..] {
+            if tool_name.starts_with(&source.name) {
+                return &source.client;
             }
-            Err(e) => {
-                tracing::warn!("fetch_tools 调用失败: {}，使用 fallback", e);
+        }
+        // 非 memory_ 开头的工具，尝试找第一个非 Memoria 源
+        if !tool_name.starts_with("memory_") && !tool_name.starts_with("db_") {
+            for source in &self.mcp_sources[1..] {
+                return &source.client;
+            }
+        }
+        &self.mcp
+    }
+
+    /// 路由到正确的 MCP 源执行工具调用
+    async fn call_tool_routed(&self, tool_name: &str, args: &serde_json::Value) -> Result<String, String> {
+        let client = self.find_mcp_for_tool(tool_name);
+        client.call(tool_name, args).await
+    }
+
+    /// 从所有 MCP 源获取工具列表（合并去重）
+    pub async fn fetch_tools(&self) -> Vec<ToolDef> {
+        let mut all_tools: Vec<ToolDef> = Vec::new();
+        let mut seen_names = std::collections::HashSet::new();
+
+        for source in &self.mcp_sources {
+            match source.client.list_tools().await {
+                Ok(tools) => {
+                    for (name, desc) in tools {
+                        if seen_names.contains(&name) {
+                            continue;
+                        }
+                        seen_names.insert(name.clone());
+                        all_tools.push(ToolDef {
+                            type_: "function".to_string(),
+                            function: crate::llm::ToolDefFunction {
+                                name,
+                                description: desc,
+                                parameters: serde_json::json!({"type": "object", "properties": {}}),
+                            },
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("{} tools/list 失败: {}", source.name, e);
+                }
             }
         }
 
-        // fallback: 硬编码 2 个基础工具
-        vec![
-            ToolDef {
-                type_: "function".to_string(),
-                function: crate::llm::ToolDefFunction {
-                    name: "query_plate".to_string(),
-                    description: "查询车牌信息".to_string(),
-                    parameters: serde_json::json!({
-                        "type": "object",
-                        "properties": {"plate": {"type": "string"}},
-                    }),
+        if all_tools.is_empty() {
+            tracing::warn!("所有 MCP 源工具列表为空，使用 fallback");
+            return vec![
+                ToolDef {
+                    type_: "function".to_string(),
+                    function: crate::llm::ToolDefFunction {
+                        name: "query_plate".to_string(),
+                        description: "查询车牌信息".to_string(),
+                        parameters: serde_json::json!({"type": "object", "properties": {"plate": {"type": "string"}}}),
+                    },
                 },
-            },
-            ToolDef {
-                type_: "function".to_string(),
-                function: crate::llm::ToolDefFunction {
-                    name: "query_sql".to_string(),
-                    description: "执行 SQL 查询".to_string(),
-                    parameters: serde_json::json!({
-                        "type": "object",
-                        "properties": {"query": {"type": "string"}},
-                    }),
+                ToolDef {
+                    type_: "function".to_string(),
+                    function: crate::llm::ToolDefFunction {
+                        name: "query_sql".to_string(),
+                        description: "执行 SQL 查询".to_string(),
+                        parameters: serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}}}),
+                    },
                 },
-            },
-        ]
+            ];
+        }
+
+        all_tools
     }
 
     /// 快速路径：Harness 模板匹配
@@ -473,7 +498,7 @@ impl AgentCore {
             for step in steps {
                 let tool_name = step["tool"].as_str()?;
                 let args = step.get("args").cloned().unwrap_or(serde_json::Value::Null);
-                let result = self.mcp.call(tool_name, &args).await;
+                let result = self.call_tool_routed(tool_name, &args).await;
                 if result.is_err() {
                     all_ok = false;
                     break;

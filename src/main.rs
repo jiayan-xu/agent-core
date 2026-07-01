@@ -182,6 +182,7 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
         identity,
         llm: llm_config,
         memoria_url: config.server.clone(),
+        additional_mcp: Vec::new(),
         skill_whitelist: None,
         max_tool_rounds: 3,
         parent_permission: PermissionLevel::Write,

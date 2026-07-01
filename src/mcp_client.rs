@@ -13,7 +13,9 @@ pub struct McpResult {
     pub text: String,
 }
 
+use serde::{Serialize, Deserialize};
 /// MCP 客户端
+#[derive(Clone)]
 pub struct McpClient {
     client: Client,
     base_url: String,
@@ -92,10 +94,59 @@ impl McpClient {
         Err("unreachable".to_string())
     }
 
-    /// 调用并解析为 JSON Value（工具返回的 JSON 文本）
+    /// 获取 MCP 源的工具列表
+    pub async fn list_tools(&self) -> Result<Vec<(String, String)>, String> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        });
+        let url = format!("{}/mcp", self.base_url);
+        let resp = self.client.post(&url)
+            .json(&body)
+            .header("X-Agent-Id", &self.agent_id)
+            .header("X-Agent-Key", &self.badge_token)
+            .send().await
+            .map_err(|e| format!("tools/list: {}", e))?;
+        let data: serde_json::Value = resp.json().await
+            .map_err(|e| format!("tools/list JSON: {}", e))?;
+        let tools = data["result"]["tools"].as_array()
+            .ok_or("tools/list 返回格式异常")?;
+        let mut result = Vec::new();
+        for t in tools {
+            if let Some(func) = t.get("function") {
+                let name = func.get("name")
+                    .and_then(|n| n.as_str()).unwrap_or("?").to_string();
+                let desc = func.get("description")
+                    .and_then(|d| d.as_str()).unwrap_or("").to_string();
+                result.push((name, desc));
+            }
+        }
+        Ok(result)
+    }
+
+    /// 调用并解析为 JSON Value
     pub async fn call_json(&self, tool: &str, args: &serde_json::Value) -> Result<serde_json::Value, String> {
         let text = self.call(tool, args).await?;
         serde_json::from_str(&text).map_err(|e| format!("parse result: {}", e))
+    }
+}
+
+/// MCP 源：命名 + 客户端
+#[derive(Clone)]
+pub struct McpSource {
+    pub name: String,
+    pub client: McpClient,
+}
+
+impl McpSource {
+    pub fn new(name: &str, client: McpClient) -> Self {
+        McpSource { name: name.to_string(), client }
+    }
+
+    pub fn memoria(client: McpClient) -> Self {
+        McpSource { name: "memoria".to_string(), client }
     }
 }
 
