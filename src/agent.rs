@@ -11,6 +11,13 @@ use crate::llm::{LlmClient, LlmConfig, Message, ToolCall, ToolDef};
 use crate::mcp_client::{McpClient, McpSource};
 use std::collections::HashMap;
 
+/// 待确认操作
+struct PendingAction {
+    tool_name: String,
+    arguments: serde_json::Value,
+    description: String,
+}
+
 /// Agent 身份
 #[derive(Debug, Clone)]
 pub struct AgentIdentity {
@@ -52,6 +59,8 @@ pub struct AgentCore {
     inbox_cache: tokio::sync::Mutex<InboxCache>,
     /// 多轮会话历史缓存（session_id → messages）
     session_history: tokio::sync::Mutex<HashMap<String, Vec<Message>>>,
+    /// 待确认操作（session_id → pending action）
+    pending_actions: tokio::sync::Mutex<HashMap<String, PendingAction>>,
 }
 
 struct InboxCache {
@@ -99,12 +108,33 @@ impl AgentCore {
             execution_log: Arc::new(Mutex::new(Vec::new())),
             inbox_cache: tokio::sync::Mutex::new(InboxCache::new()),
             session_history: tokio::sync::Mutex::new(HashMap::new()),
+            pending_actions: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
     /// 入口：处理用户消息，返回回复
     pub async fn chat(&self, message: &str, user_id: &str, session_id: &str) -> String {
-        // ── 1. 快速路径（Harness 匹配）—— 在最前面，避免浪费后续上下文获取的 token ──
+        // ── 0. 确认关键词 → 执行待确认操作 ──
+        let confirm_words = ["确认", "确认添加", "确认执行", "添加", "是", "是的", "对", "执行", "确定", "可以"];
+        let trimmed = message.trim();
+        if confirm_words.contains(&trimmed) {
+            let mut pending = self.pending_actions.lock().await;
+            if let Some(action) = pending.remove(session_id) {
+                drop(pending);
+                let result = match self.call_tool_routed(&action.tool_name, &action.arguments).await {
+                    Ok(text) => text,
+                    Err(e) => format!("执行失败: {}", e),
+                };
+                let desc = action.description.chars().take(120).collect::<String>();
+                let result_short = result.chars().take(300).collect::<String>();
+                let reply = format!("✅ 操作已执行成功！\n\n操作内容：{}\n\n{}", desc, result_short);
+                self.save_to_history(session_id, message, &reply).await;
+                return reply;
+            }
+            drop(pending);
+        }
+
+        // ── 1. 快速路径（Harness 匹配）──
         if let Some(reply) = self.try_harness_match(message).await {
             return reply;
         }
@@ -358,6 +388,23 @@ impl AgentCore {
                         verify_rule: String::new(),
                         success: !result.starts_with("执行失败"),
                     });
+                }
+
+                // 需要确认的操作 → 保存到 pending_actions
+                if result.contains("require_confirm") || result.contains("确认") {
+                    let mut pending = self.pending_actions.lock().await;
+                    pending.insert(session_id.to_string(), PendingAction {
+                        tool_name: tc.name.clone(),
+                        arguments: {
+                            let mut args = tc.arguments.clone();
+                            if let Some(obj) = args.as_object_mut() {
+                                obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
+                            }
+                            args
+                        },
+                        description: format!("{} ({})", tc.name, tc.arguments),
+                    });
+                    drop(pending);
                 }
 
                 // 将工具调用 + 结果加入消息列表
