@@ -19,12 +19,7 @@ body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; backgr
 #header .st { font-size:11px; color:#999; }
 #header .st.ok { color:#4caf50; }
 #header .st.busy { color:#f57c00; }
-#setup { flex:1; display:flex;   flex-direction:column; gap:16px; padding:40px; background:var(--bg); }
-#setup h2 { color:var(--text); font-size:20px; }
-#setup input { width:100%; max-width:340px; padding:10px; border:1px solid var(--border); border-radius:6px; background:var(--surface); color:var(--text); font-size:14px; }
-#setup input:focus { border-color:var(--accent); outline:none; }
-#setup button { padding:10px 28px; border:none; border-radius:6px; background:var(--accent); color:#fff; font-size:14px; font-weight:500; cursor:pointer; }
-#chat { flex:1; display:none; flex-direction:row; min-height:0; background:var(--bg);  }
+#chat { flex:1; display:flex; flex-direction:row; min-height:0; background:var(--bg);  }
 #msgs { flex:1; overflow-y:auto; padding:16px 24px; display:flex; flex-direction:column; gap:8px;  width:100%; box-sizing:border-box; }
 .msg { max-width:85%; padding:10px 14px; border-radius:8px; line-height:1.6; font-size:14px; }
 .msg.user { align-self:flex-end; background:var(--msg-user); border:1px solid #bbdefb; }
@@ -78,18 +73,7 @@ body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; backgr
   <span class="st" id="st">&#x25CB; 未连接</span>
 </div>
 
-<div id="setup">
-  <h2>&#x1F44B; 首次配置</h2>
-  <input id="s-name" placeholder="名称（如 dashboard-agent）">
-  <input id="s-key" type="password" placeholder="API 密钥">
-  <details style="max-width:340px;width:100%">
-    <summary style="color:#666;font-size:12px;cursor:pointer">高级</summary>
-    <input id="s-srv" placeholder="Memoria 地址" value="http://192.168.1.171:9003" style="margin-top:8px">
-  </details>
-  <button onclick="saveCfg()">&#x1F680; 开始</button>
-</div>
-
-<div id="chat" style="display:none;flex-direction:row">
+<div id="chat" style="display:flex;flex-direction:row">
   <div id="sidebar">
     <div class="sh">
       <button onclick="newChat()">+ 新对话</button>
