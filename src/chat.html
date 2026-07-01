@@ -44,6 +44,14 @@ body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; backgr
 .msg .thinking .tc { color:#888; font-style:italic; margin-top:4px; max-height:200px; overflow-y:auto; }
 .waiting-dots::after { content:'...'; animation:dots 1.5s steps(4) infinite; }
 @keyframes dots { 0% { content:''; } 25% { content:'.'; } 50% { content:'..'; } 75% { content:'...'; } }
+#sidebar { width:0; overflow:hidden; background:var(--surface); border-right:1px solid var(--border); transition:width 0.2s; flex-shrink:0; display:flex; flex-direction:column; }
+#sidebar.open { width:220px; }
+#sidebar h3 { padding:12px 14px; font-size:13px; font-weight:600; color:#888; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:6px; }
+#sidebar .sl { flex:1; overflow-y:auto; padding:4px 0; }
+#sidebar .si { padding:8px 14px; font-size:12px; cursor:pointer; border-left:3px solid transparent; color:#666; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+#sidebar .si:hover { background:#f0f0f0; }
+#sidebar .si.act { border-left-color:var(--accent); background:#e8f0fe; color:#333; font-weight:500; }
+#main { flex:1; display:flex; flex-direction:column; min-width:0; }
 #input-area { padding:10px 16px; background:var(--surface); border-top:1px solid var(--border); display:flex; gap:8px; flex-shrink:0; }
 #input { flex:1; padding:10px 14px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font-size:14px; outline:none; }
 #input:focus { border-color:var(--accent); }
@@ -54,6 +62,7 @@ body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; backgr
 <body>
 
 <div id="header">
+  <button id="menu-btn" style="background:none;border:none;color:var(--text);font-size:18px;cursor:pointer;padding:2px 6px;">&#x2630;</button>
   <img class="logo" src="/logo.png" alt="">
   <h1 id="title">Agent</h1>
   <span class="st" id="st">&#x25CB; 未连接</span>
@@ -70,11 +79,17 @@ body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; backgr
   <button onclick="saveCfg()">&#x1F680; 开始</button>
 </div>
 
-<div id="chat">
-  <div id="msgs"></div>
-  <div id="input-area">
-    <input id="input" type="text" placeholder="输入消息..." autofocus>
-    <button id="send" disabled>&#x1F680; 发送</button>
+<div id="chat" style="display:none;flex-direction:row">
+  <div id="sidebar">
+    <h3>&#x1F4AC; 会话</h3>
+    <div class="sl" id="session-list"></div>
+  </div>
+  <div id="main">
+    <div id="msgs"></div>
+    <div id="input-area">
+      <input id="input" type="text" placeholder="输入消息..." autofocus>
+      <button id="send" disabled>&#x1F680; 发送</button>
+    </div>
   </div>
 </div>
 
@@ -85,6 +100,41 @@ const $ = id => document.getElementById(id);
 marked.setOptions({ breaks: true, gfm: true });
 
 function esc(t) { return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+async function loadSessions() {
+  try {
+    const r = await fetch('/api/sessions');
+    const d = await r.json();
+    const sl = $('session-list'); sl.innerHTML = '';
+    (d.sessions || []).forEach(s => {
+      const div = document.createElement('div'); div.className = 'si';
+      if (s.session_id === sessionId) div.classList.add('act');
+      div.textContent = s.summary || '(空)';
+      div.dataset.sid = s.session_id;
+      div.onclick = () => switchSession(s.session_id);
+      sl.appendChild(div);
+    });
+  } catch(e) {}
+}
+
+async function switchSession(sid) {
+  $('msgs').innerHTML = '';
+  sessionId = sid;
+  try {
+    const r = await fetch('/api/sessions/' + encodeURIComponent(sid));
+    const d = await r.json();
+    (d.messages || []).forEach(m => {
+      addMsg(m.role === 'user' ? 'user' : 'agent',
+             m.role === 'user' ? esc(m.content).replace(/\n/g,'<br>') : renderMd(m.content));
+    });
+  } catch(e) { addMsg('agent', esc('加载失败: ' + e.message)); }
+  loadSessions(); // 刷新高亮
+}
+
+function toggleSidebar() {
+  const sb = $('sidebar');
+  sb.classList.toggle('open');
+}
 
 function renderMd(text) {
   // 先转义，再用 marked 渲染
@@ -187,6 +237,7 @@ async function chat() {
 // Events
 $('send').addEventListener('click', chat);
 $('input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chat(); } });
+$('menu-btn').addEventListener('click', toggleSidebar);
 
 // Check config
 fetch('/api/config').then(r=>r.json()).then(c => {
@@ -194,6 +245,7 @@ fetch('/api/config').then(r=>r.json()).then(c => {
     $('s-name').value = c.agent_id; $('s-srv').value = c.server;
     $('title').textContent = c.agent_id; $('st').textContent = '\u25CF 就绪'; $('st').className = 'st ok';
     $('setup').style.display = 'none'; $('chat').style.display = 'flex'; $('input').focus(); $('send').disabled = false;
+    loadSessions();
   }
 });
 </script>

@@ -172,6 +172,8 @@ fn main() {
                 .route("/api/save-config", post(handle_save_config))
                 .route("/api/chat", post(handle_chat))
                 .route("/api/chat/stream", get(handle_chat_stream))
+                .route("/api/sessions", get(handle_sessions))
+                .route("/api/sessions/{id}", get(handle_session_load))
                 .layer(tower_http::cors::CorsLayer::permissive())
                 .with_state(state);
 
@@ -313,6 +315,79 @@ async fn handle_chat_stream(
     }
 
     Sse::new(UnboundedReceiverStream::new(rx))
+}
+
+/// 获取会话列表
+async fn handle_sessions(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let db_path = std::env::current_dir().unwrap_or_default().join("harness.db").to_string_lossy().to_string();
+
+    let sessions = tokio::task::spawn_blocking(move || {
+        let mut result = Vec::new();
+        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT session_id, role, content, created_at FROM chat_history WHERE id IN (
+                    SELECT MIN(id) FROM chat_history GROUP BY session_id
+                ) AND role = 'user' ORDER BY id DESC LIMIT 50"
+            ) {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    let sid: String = row.get(0)?;
+                    let content: String = row.get(2)?;
+                    let created: String = row.get(3)?;
+                    Ok((sid, content, created))
+                }) {
+                    for row in rows.flatten() {
+                        let summary = row.1.chars().take(40).collect::<String>();
+                        result.push(serde_json::json!({
+                            "session_id": row.0,
+                            "summary": summary,
+                            "created_at": row.2,
+                        }));
+                    }
+                }
+            }
+        }
+        result
+    }).await.unwrap_or_default();
+
+    Json(serde_json::json!({"sessions": sessions}))
+}
+
+/// 加载指定会话的历史
+async fn handle_session_load(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let db_path = {
+        std::env::current_dir().unwrap_or_default().join("harness.db").to_string_lossy().to_string()
+    };
+
+    let sid = id.clone();
+    let messages = tokio::task::spawn_blocking(move || {
+        let mut result = Vec::new();
+        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT role, content, created_at FROM chat_history WHERE session_id=?1 ORDER BY id ASC"
+            ) {
+                if let Ok(rows) = stmt.query_map(rusqlite::params![sid], |row| {
+                    let role: String = row.get(0)?;
+                    let content: String = row.get(1)?;
+                    let created: String = row.get(2)?;
+                    Ok((role, content, created))
+                }) {
+                    for row in rows.flatten() {
+                        result.push(serde_json::json!({
+                            "role": row.0,
+                            "content": row.1,
+                            "time": row.2,
+                        }));
+                    }
+                }
+            }
+        }
+        result
+    }).await.unwrap_or_default();
+
+    Json(serde_json::json!({"messages": messages, "session_id": id}))
 }
 
 async fn build_agent(config: &Config) -> Result<AgentCore, String> {
