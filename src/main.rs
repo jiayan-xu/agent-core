@@ -9,10 +9,17 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use axum::{Router, routing::get, routing::post, Json, extract::State};
+use std::convert::Infallible;
+use axum::{
+    Router, routing::get, routing::post,
+    Json, extract::State,
+    response::sse::{Sse, Event as SseEvent},
+};
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::interval;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tao::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop, EventLoopBuilder},
@@ -164,6 +171,7 @@ fn main() {
                 .route("/api/config", get(handle_config))
                 .route("/api/save-config", post(handle_save_config))
                 .route("/api/chat", post(handle_chat))
+                .route("/api/chat/stream", get(handle_chat_stream))
                 .layer(tower_http::cors::CorsLayer::permissive())
                 .with_state(state);
 
@@ -268,7 +276,44 @@ async fn handle_chat(
     }
 }
 
-/// SSE 流式聊天（包装 chat() 的回复，分块推送）
+/// SSE 流式聊天（包装 chat() 结果，分块推送）
+async fn handle_chat_stream(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<ChatRequest>,
+) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let agent_guard = st.agent.lock().await;
+    let has_agent = agent_guard.is_some();
+    drop(agent_guard);
+
+    if has_agent {
+        let st_clone = st.clone();
+        let msg = params.message.clone();
+        let sid = params.session_id.clone();
+        tokio::spawn(async move {
+            let guard = st_clone.agent.lock().await;
+            if let Some(ref agent) = *guard {
+                let reply = agent.chat(&msg, "user", &sid).await;
+                let chars: Vec<char> = reply.chars().collect();
+                let mut i = 0;
+                while i < chars.len() {
+                    let end = (i + 3).min(chars.len());
+                    let chunk: String = chars[i..end].iter().collect();
+                    let _ = tx.send(Ok(SseEvent::default().data(chunk).event("text")));
+                    i = end;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+            let _ = tx.send(Ok(SseEvent::default().data("").event("done")));
+        });
+    } else {
+        let _ = tx.send(Ok(SseEvent::default().data("请先在设置页面配置 API 密钥。").event("text")));
+        let _ = tx.send(Ok(SseEvent::default().data("").event("done")));
+    }
+
+    Sse::new(UnboundedReceiverStream::new(rx))
+}
 
 async fn build_agent(config: &Config) -> Result<AgentCore, String> {
     let mcp = McpClient::new(&config.server, &config.agent_id, &config.api_key);

@@ -151,22 +151,37 @@ async function chat() {
   inp.value = '';
   addMsg('user', esc(txt).replace(/\n/g,'<br>'));
   $('send').disabled = true; $('st').textContent = '\u25CF 处理中'; $('st').className = 'st busy';
-  addWait();
-  try {
-    const r = await fetch('/api/chat', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({message: txt, session_id: sessionId || 'default'}),
-    });
-    const d = await r.json();
-    if (d.session_id) sessionId = d.session_id;
-    rmWait();
-    if (d.reply) addMsg('agent', renderMd(d.reply));
-  } catch(e) {
-    rmWait();
-    addMsg('agent', esc('连接失败: ' + e.message));
-  }
-  $('send').disabled = false; $('st').textContent = '\u25CF 就绪'; $('st').className = 'st ok';
-  $('input').focus();
+  rmWait();
+
+  // SSE 流式聊天
+  const url = '/api/chat/stream?message=' + encodeURIComponent(txt) + '&session_id=' + (sessionId || 'default');
+  const evtSource = new EventSource(url);
+
+  let msgDiv = null;
+  let fullText = '';
+
+  evtSource.addEventListener('text', e => {
+    if (!msgDiv) { msgDiv = addMsg('agent', ''); }
+    fullText += e.data;
+    msgDiv.querySelector('.md').innerHTML = renderMd(fullText);
+    $('msgs').scrollTop = $('msgs').scrollHeight;
+  });
+
+  evtSource.addEventListener('done', e => {
+    evtSource.close();
+    if (!fullText && !msgDiv) addMsg('agent', esc('(空回复)'));
+    $('send').disabled = false; $('st').textContent = '\u25CF 就绪'; $('st').className = 'st ok';
+    $('input').focus();
+    // 更新 sessionId（从 URL 参数获取）
+    const urlParams = new URLSearchParams(evtSource.url.split('?')[1]);
+    if (urlParams.get('session_id')) sessionId = urlParams.get('session_id');
+  });
+
+  evtSource.onerror = () => {
+    evtSource.close();
+    if (!msgDiv) addMsg('agent', esc('连接中断'));
+    $('send').disabled = false; $('st').textContent = '\u25CF 就绪'; $('st').className = 'st ok';
+  };
 }
 
 // Events
