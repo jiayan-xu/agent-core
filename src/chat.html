@@ -137,7 +137,13 @@ async function loadSessions() {
       div.appendChild(txt);
       const close = document.createElement('span'); close.className = 'c';
       close.textContent = '×';
-      close.onclick = (e) => { e.stopPropagation(); /* close not supported yet */ };
+      close.onclick = async (e) => { 
+        e.stopPropagation(); 
+        if (!confirm('删除此对话？')) return;
+        await fetch('/api/sessions/' + encodeURIComponent(s.session_id), { method: 'DELETE' });
+        loadSessions();
+        if (s.session_id === sessionId) newChat();
+      };
       div.appendChild(close);
       div.onclick = () => switchSession(s.session_id);
       sl.appendChild(div);

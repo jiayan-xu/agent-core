@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::convert::Infallible;
 use axum::{
-    Router, routing::get, routing::post,
+    Router, routing::{get, post, delete},
     Json, extract::State,
     response::sse::{Sse, Event as SseEvent},
 };
@@ -174,6 +174,7 @@ fn main() {
                 .route("/api/chat/stream", get(handle_chat_stream))
                 .route("/api/sessions", get(handle_sessions))
                 .route("/api/sessions/{id}", get(handle_session_load))
+                .route("/api/sessions/{id}", delete(handle_session_delete))
                 .layer(tower_http::cors::CorsLayer::permissive())
                 .with_state(state);
 
@@ -385,6 +386,25 @@ async fn handle_session_load(
     }).await.unwrap_or_default();
 
     Json(serde_json::json!({"messages": messages, "session_id": id}))
+}
+
+/// 删除指定会话
+async fn handle_session_delete(
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let db_path = std::env::current_dir().unwrap_or_default().join("harness.db").to_string_lossy().to_string();
+    let sid = id.clone();
+
+    let deleted = tokio::task::spawn_blocking(move || {
+        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+            if let Ok(cnt) = conn.execute("DELETE FROM chat_history WHERE session_id=?1", rusqlite::params![sid]) {
+                return cnt;
+            }
+        }
+        0
+    }).await.unwrap_or(0);
+
+    Json(serde_json::json!({"deleted": deleted, "session_id": id}))
 }
 
 async fn build_agent(config: &Config) -> Result<AgentCore, String> {
