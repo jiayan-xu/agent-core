@@ -275,6 +275,7 @@ $('input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftK
 $('menu-btn').addEventListener('click', toggleSidebar);
 
 // &#x68C0;&#x67E5;&#x662F;&#x5426;&#x5DF2;&#x6CE8;&#x518C;
+if (location.search.includes('reset=1')) { localStorage.clear(); location.href = location.pathname; }
 const savedAgentId = localStorage.getItem('agent_id');
 const savedToken = localStorage.getItem('badge_token');
 if (savedAgentId && savedToken) {
