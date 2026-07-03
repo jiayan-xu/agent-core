@@ -115,7 +115,7 @@ fn main() {
     let config = load_or_create_config();
     let path = config_path();
     let port = config.port;
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("0.0.0.0:{}", port);
     let url = format!("http://{}/", addr);
 
     // ── 启动 axum 后台服务 ──
@@ -175,6 +175,7 @@ fn main() {
                 .route("/api/sessions", get(handle_sessions))
                 .route("/api/sessions/{id}", get(handle_session_load))
                 .route("/api/sessions/{id}", delete(handle_session_delete))
+                .route("/v1/chat/completions", post(handle_v1_chat))
                 .layer(tower_http::cors::CorsLayer::permissive())
                 .with_state(state);
 
@@ -405,6 +406,56 @@ async fn handle_session_delete(
     }).await.unwrap_or(0);
 
     Json(serde_json::json!({"deleted": deleted, "session_id": id}))
+}
+
+/// OpenAI 兼容聊天补全端点（供 JAN / 第三方客户端调用）
+#[derive(Deserialize)]
+struct V1ChatRequest {
+    model: Option<String>,
+    messages: Vec<V1Message>,
+    stream: Option<bool>,
+}
+#[derive(Deserialize)]
+struct V1Message {
+    role: String,
+    content: Option<String>,
+}
+
+async fn handle_v1_chat(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<V1ChatRequest>,
+) -> Json<serde_json::Value> {
+    let agent_guard = st.agent.lock().await;
+    let reply = if let Some(ref agent) = *agent_guard {
+        // 拼接用户消息
+        let user_text = req.messages.iter()
+            .filter_map(|m| m.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if user_text.is_empty() {
+            "请输入消息".to_string()
+        } else {
+            agent.chat(&user_text, "user", "jan").await
+        }
+    } else {
+        "Agent 未就绪".to_string()
+    };
+    drop(agent_guard);
+
+    Json(serde_json::json!({
+        "id": "chatcmpl-agent",
+        "object": "chat.completion",
+        "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+        "model": req.model.unwrap_or_else(|| "agent-core".to_string()),
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": reply,
+            },
+            "finish_reason": "stop",
+        }],
+    }))
 }
 
 async fn build_agent(config: &Config) -> Result<AgentCore, String> {

@@ -1,0 +1,2 @@
+✓ Agent 已就绪（dashboard-agent@http://127.0.0.1:9003）
+[0703/102755.757:ERROR:ui\gfx\win\window_impl.cc:134] Failed to unregister class Chrome_WidgetWin_0. Error = 1412
