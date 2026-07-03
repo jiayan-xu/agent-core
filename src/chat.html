@@ -281,6 +281,7 @@ const savedToken = localStorage.getItem('badge_token');
 if (savedAgentId && savedToken) {
   $('register').style.display = 'none';
   $('chat').style.display = 'flex';
+  $('chat').style.flexDirection = 'row';
   $('input').focus();
   $('title').textContent = savedAgentId;
   $('st').textContent = '\u25CF &#x5C31;&#x7EEA;';
