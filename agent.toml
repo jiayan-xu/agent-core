@@ -2,6 +2,7 @@ agent_id = "dashboard-agent"
 api_key = "sk-e64d9f088c0f4e099124419477002e2d"
 server = "http://127.0.0.1:9003"
 port = 9753
+memoria_admin_key = "mem-admin-fixed-key-2026"
 
 [[mcp_source]]
 name = "dashboard"

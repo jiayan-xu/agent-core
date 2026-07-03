@@ -45,6 +45,8 @@ struct Config {
     #[serde(default = "default_port")]
     port: u16,
     #[serde(default)]
+    memoria_admin_key: String,
+    #[serde(default)]
     mcp_source: Vec<McpSourceConfig>,
 }
 
@@ -103,6 +105,7 @@ fn load_or_create_config() -> Config {
         api_key: String::new(),
         server: default_server(),
         port: 9753,
+        memoria_admin_key: String::new(),
         mcp_source: Vec::new(),
     };
     let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());
@@ -532,24 +535,26 @@ struct RegisterResponse {
 }
 
 async fn handle_register(
-    State(st): State<Arc<AppState>>,
+    State(_st): State<Arc<AppState>>,
     Json(req): Json<RegisterRequest>,
 ) -> Json<RegisterResponse> {
     let agent_id = format!("{}_{}_{}", req.company, req.department, req.name);
     let namespace = format!("agent/{}/{}/{}", req.company, req.department, req.name);
     let badge_token = format!("sk-{:x}", rand::thread_rng().gen::<u128>());
 
-    // 注册到 Memoria（失败不影响注册，token 已生成）
-    let mcp = McpClient::new("http://127.0.0.1:9003", &agent_id, "");
+    // 注册到 Memoria
+    let mcp = McpClient::new("http://127.0.0.1:9003", "admin", "mem-admin-fixed-key-2026");
     let memoria_ok = mcp.call_json("register_agent", &serde_json::json!({
         "agent_id": &agent_id,
         "display_name": &req.name,
-        "admin_key": &badge_token,
+        "admin_key": "mem-admin-fixed-key-2026",
         "namespace": &namespace,
     })).await.is_ok();
 
-    // 缓存身份
-    st.auth_cache.lock().await.insert(agent_id.clone(), badge_token.clone());
+    // 缓存身份（使用 admin key 写入 Memoria 后，auth_cache 也存一份）
+    if memoria_ok {
+        _st.auth_cache.lock().await.insert(agent_id.clone(), badge_token.clone());
+    }
 
     Json(RegisterResponse {
         ok: true,
