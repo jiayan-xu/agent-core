@@ -10,10 +10,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::convert::Infallible;
+use std::collections::HashMap;
 use axum::{
     Router, routing::{get, post, delete},
-    Json, extract::State,
-    response::sse::{Sse, Event as SseEvent},
+    Json, extract::State, response::{sse::{Sse, Event as SseEvent}, IntoResponse},
 };
 use futures::stream::Stream;
 use rand::Rng;
@@ -79,6 +79,8 @@ struct AppState {
     config: Mutex<Config>,
     agent: Mutex<Option<AgentCore>>,
     config_path: String,
+    /// 身份认证缓存 (agent_id → badge_token)
+    auth_cache: tokio::sync::Mutex<HashMap<String, String>>,
 }
 
 fn config_path() -> String {
@@ -133,6 +135,7 @@ fn main() {
                 config: Mutex::new(config.clone()),
                 agent: Mutex::new(None),
                 config_path: path,
+                auth_cache: tokio::sync::Mutex::new(HashMap::new()),
             });
 
             if config.configured() {
@@ -434,11 +437,39 @@ struct V1Message {
 
 async fn handle_v1_chat(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<V1ChatRequest>,
-) -> Json<serde_json::Value> {
+) -> axum::response::Response {
+    // 身份认证：从 header 取 X-Agent-Id + X-Agent-Key
+    let agent_id = headers
+        .get("x-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let agent_key = headers
+        .get("x-agent-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // 验证令牌
+    if !agent_id.is_empty() {
+        let cache = st.auth_cache.lock().await;
+        if let Some(expected_key) = cache.get(&agent_id) {
+            if &agent_key != expected_key {
+                return axum::response::Json(serde_json::json!({
+                    "error": "unauthorized",
+                    "message": "X-Agent-Key 不匹配"
+                })).into_response();
+            }
+        }
+        // 未注册的 agent_id 也放行（兼容旧客户端）
+        drop(cache);
+    }
+
     let agent_guard = st.agent.lock().await;
     let reply = if let Some(ref agent) = *agent_guard {
-        // 拼接用户消息
         let user_text = req.messages.iter()
             .filter_map(|m| m.content.as_deref())
             .collect::<Vec<_>>()
@@ -446,14 +477,14 @@ async fn handle_v1_chat(
         if user_text.is_empty() {
             "请输入消息".to_string()
         } else {
-            agent.chat(&user_text, "user", "jan").await
+            agent.chat(&user_text, &agent_id, &format!("jan/{}", agent_id)).await
         }
     } else {
         "Agent 未就绪".to_string()
     };
     drop(agent_guard);
 
-    Json(serde_json::json!({
+    axum::response::Json(serde_json::json!({
         "id": "chatcmpl-agent",
         "object": "chat.completion",
         "created": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
@@ -466,7 +497,7 @@ async fn handle_v1_chat(
             },
             "finish_reason": "stop",
         }],
-    }))
+    })).into_response()
 }
 
 /// 用户注册（boarding）—— 姓名 + 部门 → 登记到 Memoria，返回 badge_token
@@ -486,6 +517,7 @@ struct RegisterResponse {
 }
 
 async fn handle_register(
+    State(st): State<Arc<AppState>>,
     Json(req): Json<RegisterRequest>,
 ) -> Json<RegisterResponse> {
     let agent_id = format!("{}_{}_{}", req.company, req.department, req.name);
@@ -500,6 +532,9 @@ async fn handle_register(
         "admin_key": &badge_token,
         "namespace": &namespace,
     })).await.is_ok();
+
+    // 缓存身份
+    st.auth_cache.lock().await.insert(agent_id.clone(), badge_token.clone());
 
     Json(RegisterResponse {
         ok: true,
