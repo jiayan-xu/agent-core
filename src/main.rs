@@ -454,18 +454,33 @@ async fn handle_v1_chat(
         .to_string();
 
     // 验证令牌
-    if !agent_id.is_empty() {
+    if agent_id.is_empty() {
+        return axum::response::Json(serde_json::json!({
+            "error": "unauthorized",
+            "message": "请先通过 /api/register 注册身份"
+        })).into_response();
+    }
+    {
         let cache = st.auth_cache.lock().await;
-        if let Some(expected_key) = cache.get(&agent_id) {
-            if &agent_key != expected_key {
+        match cache.get(&agent_id) {
+            Some(expected_key) if expected_key == &agent_key => {
+                // 认证通过
+                drop(cache);
+            }
+            Some(_) => {
                 return axum::response::Json(serde_json::json!({
                     "error": "unauthorized",
                     "message": "X-Agent-Key 不匹配"
                 })).into_response();
             }
+            None => {
+                // 未注册的 agent_id
+                return axum::response::Json(serde_json::json!({
+                    "error": "unauthorized",
+                    "message": "未注册的身份，请先通过 /api/register 注册"
+                })).into_response();
+            }
         }
-        // 未注册的 agent_id 也放行（兼容旧客户端）
-        drop(cache);
     }
 
     let agent_guard = st.agent.lock().await;

@@ -22,12 +22,6 @@ body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; backgr
 #header .st.busy { color:#f57c00; }
 #header #menu-btn { font-size:15px; padding:2px 5px; }
 
-#setup { flex:1; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:14px; padding:34px; background:var(--bg); }
-#setup h2 { color:var(--text); font-size:17px; }
-#setup input { width:100%; max-width:290px; padding:9px; border:1px solid var(--border); border-radius:5px; background:var(--surface); color:var(--text); font-size:14px; }
-#setup input:focus { border-color:var(--accent); outline:none; }
-#setup button { padding:9px 24px; border:none; border-radius:5px; background:var(--accent); color:#fff; font-size:14px; font-weight:500; cursor:pointer; }
-
 #chat { flex:1; display:none; flex-direction:column; min-height:0; background:var(--bg); }
 #chat-body { flex:1; display:flex; flex-direction:row; min-height:0; }
 
@@ -85,15 +79,15 @@ body { font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif; backgr
   <span class="st" id="st">&#x25CB; 未连接</span>
 </div>
 
-<div id="setup">
-  <h2>&#x1F44B; 首次配置</h2>
-  <input id="s-name" placeholder="名称（如 dashboard-agent）">
-  <input id="s-key" type="password" placeholder="API 密钥">
-  <details style="max-width:340px;width:100%">
-    <summary style="color:#666;font-size:14px;cursor:pointer">高级</summary>
-    <input id="s-srv" placeholder="Memoria 地址" value="http://192.168.1.171:9003" style="margin-top:8px">
-  </details>
-  <button onclick="saveCfg()">&#x1F680; 开始</button>
+<div id="register" style="flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px;padding:34px;background:var(--bg);">
+  <img src="/logo.png" style="height:48px;width:auto;margin-bottom:4px;" alt="">
+  <h2 style="color:var(--text);font-size:20px;font-weight:600;">AI &#x52A9;&#x624B;</h2>
+  <p style="color:#888;font-size:13px;max-width:320px;text-align:center;">&#x9996;&#x6B21;&#x4F7F;&#x7528;&#x8BF7;&#x586B;&#x5199;&#x4FE1;&#x606F;&#x5B8C;&#x6210;&#x6CE8;&#x518C;</p>
+  <input id="r-name" placeholder="&#x59D3;&#x540D;" style="width:100%;max-width:290px;padding:9px;border:1px solid var(--border);border-radius:5px;background:var(--surface);color:var(--text);font-size:14px;">
+  <input id="r-dept" placeholder="&#x90E8;&#x95E8;&#xFF08;&#x5982;&#xFF1A;&#x56FA;&#x5E9F;&#x90E8;&#xFF09;" style="width:100%;max-width:290px;padding:9px;border:1px solid var(--border);border-radius:5px;background:var(--surface);color:var(--text);font-size:14px;">
+  <input id="r-company" placeholder="&#x516C;&#x53F8;" value="&#x6D66;&#x53D1;" style="width:100%;max-width:290px;padding:9px;border:1px solid var(--border);border-radius:5px;background:var(--surface);color:var(--text);font-size:14px;">
+  <div id="r-error" style="color:#e53935;font-size:13px;display:none;"></div>
+  <button id="r-btn" onclick="doRegister()" style="width:100%;max-width:290px;padding:10px;border:none;border-radius:5px;background:var(--accent);color:#fff;font-size:14px;font-weight:500;cursor:pointer;">&#x1F680; &#x6CE8;&#x518C;&#x5E76;&#x5F00;&#x59CB;&#x4F7F;&#x7528;</button>
 </div>
 
 <div id="chat" style="display:none;flex-direction:column">
@@ -221,17 +215,23 @@ function addWait() {
 
 function rmWait() { const w = $('wait-msg'); if (w) w.remove(); }
 
-async function saveCfg() {
-  const name = $('s-name').value.trim();
-  const key = $('s-key').value.trim();
-  if (!name || !key) { alert('请填写名称和密钥'); return; }
-  const r = await fetch('/api/save-config', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({agent_id: name, api_key: key, server: $('s-srv').value.trim()}),
-  });
-  const d = await r.json();
-  if (d.ok) { $('title').textContent = name; $('st').textContent = '\u25CF 就绪'; $('st').className = 'st ok'; $('setup').style.display = 'none'; $('chat').style.display = 'flex'; $('input').focus(); $('send').disabled = false; }
-  else alert('失败: ' + (d.error||''));
+async function doRegister() {
+  const name = .value.trim();
+  const dept = .value.trim();
+  const company = .value.trim();
+  const errEl = ;
+  if (!name || !dept) { errEl.textContent = "请填写姓名和部门"; errEl.style.display = "block"; return; }
+  errEl.style.display = "none"; .disabled = true; .textContent = "注册中...";
+  try {
+    const r = await fetch("/api/register", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({name, department: dept, company}) });
+    const d = await r.json();
+    if (d.ok) {
+      localStorage.setItem("agent_id", d.agent_id);
+      localStorage.setItem("badge_token", d.badge_token);
+      .style.display = "none"; .style.display = "flex"; .focus();
+    } else { errEl.textContent = d.error || "注册失败"; errEl.style.display = "block"; }
+  } catch(e) { errEl.textContent = "连接失败: " + e.message; errEl.style.display = "block"; }
+  .disabled = false; .textContent = "注册并开始使用";
 }
 
 async function chat() {
@@ -274,14 +274,18 @@ $('send').addEventListener('click', chat);
 $('input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chat(); } });
 $('menu-btn').addEventListener('click', toggleSidebar);
 
-fetch('/api/config').then(r=>r.json()).then(c => {
-  if (c.configured) {
-    $('s-name').value = c.agent_id; $('s-srv').value = c.server;
-    $('title').textContent = c.agent_id; $('st').textContent = '\u25CF 就绪'; $('st').className = 'st ok';
-    $('setup').style.display = 'none'; $('chat').style.display = 'flex'; $('input').focus(); $('send').disabled = false;
-    loadSessions();
-  }
-});
+// &#x68C0;&#x67E5;&#x662F;&#x5426;&#x5DF2;&#x6CE8;&#x518C;
+const savedAgentId = localStorage.getItem('agent_id');
+const savedToken = localStorage.getItem('badge_token');
+if (savedAgentId && savedToken) {
+  $('register').style.display = 'none';
+  $('chat').style.display = 'flex';
+  $('input').focus();
+  $('title').textContent = savedAgentId;
+  $('st').textContent = '\u25CF &#x5C31;&#x7EEA;';
+  $('st').className = 'st ok';
+  loadSessions();
+}
 </script>
 </body>
 </html>
