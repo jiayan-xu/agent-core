@@ -16,6 +16,7 @@ use axum::{
     response::sse::{Sse, Event as SseEvent},
 };
 use futures::stream::Stream;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::interval;
@@ -112,6 +113,9 @@ fn save_config(cfg: &Config) {
 }
 
 fn main() {
+    // --service 模式：无窗口后台服务
+    let is_service = std::env::args().any(|a| a == "--service");
+
     let config = load_or_create_config();
     let path = config_path();
     let port = config.port;
@@ -176,6 +180,7 @@ fn main() {
                 .route("/api/sessions/{id}", get(handle_session_load))
                 .route("/api/sessions/{id}", delete(handle_session_delete))
                 .route("/v1/chat/completions", post(handle_v1_chat))
+                .route("/api/register", post(handle_register))
                 .layer(tower_http::cors::CorsLayer::permissive())
                 .with_state(state);
 
@@ -187,6 +192,12 @@ fn main() {
 
     while !server_ready.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(100));
+    }
+
+    if is_service {
+        // 服务模式：保持后台运行
+        println!("[agent-core] 服务模式运行中 :{}", port);
+        loop { std::thread::sleep(Duration::from_secs(3600)); }
     }
 
     // ── tao 桌面窗口（无黑框） ──
@@ -456,6 +467,47 @@ async fn handle_v1_chat(
             "finish_reason": "stop",
         }],
     }))
+}
+
+/// 用户注册（boarding）—— 姓名 + 部门 → 登记到 Memoria，返回 badge_token
+#[derive(Deserialize)]
+struct RegisterRequest {
+    name: String,
+    department: String,
+    company: String,
+}
+#[derive(Serialize)]
+struct RegisterResponse {
+    ok: bool,
+    agent_id: String,
+    badge_token: String,
+    namespace: String,
+    error: Option<String>,
+}
+
+async fn handle_register(
+    Json(req): Json<RegisterRequest>,
+) -> Json<RegisterResponse> {
+    let agent_id = format!("{}_{}_{}", req.company, req.department, req.name);
+    let namespace = format!("agent/{}/{}/{}", req.company, req.department, req.name);
+    let badge_token = format!("sk-{:x}", rand::thread_rng().gen::<u128>());
+
+    // 注册到 Memoria（失败不影响注册，token 已生成）
+    let mcp = McpClient::new("http://127.0.0.1:9003", &agent_id, "");
+    let memoria_ok = mcp.call_json("register_agent", &serde_json::json!({
+        "agent_id": &agent_id,
+        "display_name": &req.name,
+        "admin_key": &badge_token,
+        "namespace": &namespace,
+    })).await.is_ok();
+
+    Json(RegisterResponse {
+        ok: true,
+        agent_id,
+        badge_token,
+        namespace,
+        error: if memoria_ok { None } else { Some("Memoria 暂时不可用，token 已生成".to_string()) },
+    })
 }
 
 async fn build_agent(config: &Config) -> Result<AgentCore, String> {

@@ -17,6 +17,7 @@ dependencies = [
  "futures",
  "image",
  "open",
+ "rand 0.8.6",
  "reqwest",
  "rusqlite",
  "serde",
