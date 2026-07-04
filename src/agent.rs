@@ -927,11 +927,20 @@ impl AgentCore {
 
             tracing::info!("Harness 命中: {} (score={:.2})", m.harness.name, score);
 
-            // 执行每个步骤
+            // 执行每个步骤（含 boundary 检查）
             let mut all_ok = true;
             for step in steps {
                 let tool_name = step["tool"].as_str()?;
                 let args = step.get("args").cloned().unwrap_or(serde_json::Value::Null);
+                // P2-9: 执行前经过 boundary 检查
+                let boundary = self.boundary.lock().await;
+                let check = boundary.check_tool(tool_name, &args, &self.config.identity.agent_id, "user", &PermissionLevel::Write, None);
+                drop(boundary);
+                if !check.allow {
+                    tracing::warn!("Harness 步骤 {} 被 boundary 拒绝: {}", tool_name, check.reason);
+                    all_ok = false;
+                    break;
+                }
                 let result = self.call_tool_routed(tool_name, &args).await;
                 if result.is_err() {
                     all_ok = false;
