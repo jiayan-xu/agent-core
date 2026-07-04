@@ -1,6 +1,10 @@
 pub mod agent;
+pub mod approval;
+pub mod audit;
 pub mod boundary;
 pub mod composer;
 pub mod harness;
 pub mod llm;
 pub mod mcp_client;
+pub mod namespace;
+pub mod session;

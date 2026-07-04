@@ -1,5 +1,2 @@
 ✓ Agent 已就绪（dashboard-agent@http://127.0.0.1:9003）
-
-thread '<unnamed>' (34660) panicked at src\main.rs:203:71:
-called `Result::unwrap()` on an `Err` value: Os { code: 10048, kind: AddrInUse, message: "通常每个套接字地址(协议/网络地址/端口)只允许使用一次。" }
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+✗ 端口 0.0.0.0:9753 绑定失败: 通常每个套接字地址(协议/网络地址/端口)只允许使用一次。 (os error 10048)

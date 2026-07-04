@@ -5,7 +5,47 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+
+// ── 安全锁辅助函数（锁中毒时优雅降级，不 panic）──
+
+/// 安全获取 KillState 锁，中毒时假定 Running
+fn lock_state(mutex: &Mutex<KillState>) -> KillState {
+    match mutex.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => {
+            tracing::error!("KillState Mutex 中毒，降级为 Running");
+            KillState::Running
+        }
+    }
+}
+
+/// 安全获取 ToolClassifier 锁并执行操作
+fn with_classifier<F, R>(mutex: &Mutex<ToolClassifier>, default: R, f: F) -> R
+where
+    F: FnOnce(&ToolClassifier) -> R,
+{
+    match mutex.lock() {
+        Ok(guard) => f(&guard),
+        Err(_) => {
+            tracing::error!("ToolClassifier Mutex 中毒，使用默认值");
+            default
+        }
+    }
+}
+
+/// 安全获取 PermissionChain 锁并执行操作
+pub fn with_perm_chain<F, R>(mutex: &Mutex<PermissionChain>, default: R, f: F) -> R
+where
+    F: FnOnce(&PermissionChain) -> R,
+{
+    match mutex.lock() {
+        Ok(guard) => f(&guard),
+        Err(_) => {
+            tracing::error!("PermissionChain Mutex 中毒，使用默认值");
+            default
+        }
+    }
+}
 
 // ── 基本类型 ──────────────────────────────────────────
 
@@ -227,8 +267,10 @@ impl KillSwitch {
             3 => KillState::Killed,
             _ => KillState::SoftStop,
         };
-        let mut state = self.state.lock().unwrap();
-        *state = new_state;
+        match self.state.lock() {
+            Ok(mut state) => { *state = new_state; }
+            Err(_) => { tracing::error!("KillState Mutex 中毒，跳过状态更新"); }
+        }
         tracing::warn!("[KILL] L{} 熔断触发: {}", level, reason);
         // 执行所有注册的 hook 回调
         if let Ok(hooks) = self.on_trigger.lock() {
@@ -239,11 +281,11 @@ impl KillSwitch {
     }
 
     pub fn state(&self) -> KillState {
-        self.state.lock().unwrap().clone()
+        lock_state(&self.state)
     }
 
     pub fn is_alive(&self) -> bool {
-        *self.state.lock().unwrap() == KillState::Running
+        lock_state(&self.state) == KillState::Running
     }
 }
 
@@ -295,6 +337,9 @@ pub struct ComplianceBoundary {
     pub perm_chain: Mutex<PermissionChain>,
     pub supply_chain: SupplyChainGuard,
     kill_switch: KillSwitch,
+    pub classifier: Mutex<ToolClassifier>,
+    /// 审批管理器（P2-D 接入 check_tool）
+    pub approval_manager: crate::approval::ApprovalManager,
 }
 
 impl ComplianceBoundary {
@@ -303,6 +348,24 @@ impl ComplianceBoundary {
             perm_chain: Mutex::new(PermissionChain::new()),
             supply_chain: SupplyChainGuard::new(whitelist),
             kill_switch: KillSwitch::new(),
+            classifier: Mutex::new(ToolClassifier::new()),
+            approval_manager: crate::approval::ApprovalManager::new(),
+        }
+    }
+
+    /// 注册工具分类（运行时动态添加）
+    pub fn register_tool(&self, tool_name: &str, level: &str) {
+        match self.classifier.lock() {
+            Ok(mut c) => c.register(tool_name, level),
+            Err(_) => tracing::error!("ToolClassifier Mutex 中毒，跳过注册"),
+        }
+    }
+
+    /// 从 MCP 工具列表批量学习分类
+    pub fn learn_tools(&self, tools: &[(String, String)]) {
+        match self.classifier.lock() {
+            Ok(mut c) => c.register_from_tools(tools),
+            Err(_) => tracing::error!("ToolClassifier Mutex 中毒，跳过学习"),
         }
     }
 
@@ -352,6 +415,14 @@ impl ComplianceBoundary {
             }
         }
 
+        // ── ⑨ 审批检查：dangerous 级别工具需要审批（P2-D 接入）──
+        if !crate::approval::has_pending_approval_sync(&self.approval_manager, tool_name) {
+            let tool_level = with_classifier(&self.classifier, "read".to_string(), |c| c.classify(tool_name).to_string());
+            if tool_level == "dangerous" {
+                return ToolCheck::yellow(&format!("{} 需要审批，请等待审批人确认", tool_name));
+            }
+        }
+
         // ── ① 权限递减（使用 user_role + parent_permission）──
         let role_base = match user_role {
             "admin" => PermissionLevel::Admin,
@@ -363,9 +434,12 @@ impl ComplianceBoundary {
         // parent_permission 限制：子代权限不能超过父代
         let effective_max = role_base.min(parent_permission.clone());
 
-        let level = classify_skill(tool_name);
+        let level = with_classifier(&self.classifier, "unknown", |c| c.classify(tool_name));
         if level == "unknown" {
-            return ToolCheck::allow();
+            // P1-7 修复：unknown 工具不再直接放行，改为黄线需确认
+            return ToolCheck::yellow(&format!(
+                "工具 {} 未分类，需要确认后执行", tool_name
+            ));
         }
 
         let requested = PermissionLevel::from_str(level);
@@ -375,8 +449,13 @@ impl ComplianceBoundary {
             for (key, val) in obj {
                 if val.is_string() {
                     let s = val.as_str().unwrap_or("");
-                    // SQL 注入检测
-                    if s.contains("' --") || s.contains("';") || s.to_uppercase().contains(" UNION ") {
+                    // SQL 注入检测（P2-7 增强）
+                    let s_upper = s.to_uppercase();
+                    if s.contains("' --") || s.contains("';") || s_upper.contains(" UNION ")
+                        || s_upper.contains(" OR 1=1") || s_upper.contains(" AND 1=1")
+                        || s_upper.contains("DROP TABLE") || s_upper.contains("INSERT INTO")
+                        || s_upper.contains("DELETE FROM") || s_upper.contains("UPDATE ") && s_upper.contains("SET ")
+                    {
                         return ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key));
                     }
                     // 路径穿越检测
@@ -388,7 +467,7 @@ impl ComplianceBoundary {
         }
 
         // 权限逐级检查：当前授予权限 >= 角色基础 >= 工具要求
-        if !self.perm_chain.lock().unwrap().check_escalation(agent_id, &requested) {
+        if !with_perm_chain(&self.perm_chain, false, |c| c.check_escalation(agent_id, &requested)) {
             return ToolCheck::yellow(&format!(
                 "权限递减：{} 需要 {}，但当前 Agent 权限不足", tool_name, requested.as_str()
             ));
@@ -410,30 +489,75 @@ impl ComplianceBoundary {
     }
 }
 
-/// 技能分类（简化版，从 Python GUFEI_CLASSIFICATION 翻译）
-fn classify_skill(tool_name: &str) -> &'static str {
-    let read_tools = [
-        "query_plate", "query_sql", "search_memory",
-        "check_status", "get_statistics", "validate_data",
-        "detect_anomaly", "get_context", "check_media",
-        "review_data", "diagnose_system", "archive_ocr",
-        "query_archive_log", "system_ops", "code_reader",
-        "summarize_url", "read_docx", "read_xlsx",
-    ];
-    let write_tools = [
-        "fill_excel_log", "update_whitelist", "archive_manifest",
-        "manage_whitelist", "manage_holiday", "generate_month_log",
-        "archive_operate", "organize_folders",
-    ];
-    let dangerous_tools = [
-        "delete_entrance_record", "batch_update_whitelist",
-        "shutdown_agent", "batch_delete_memories",
-    ];
+/// 工具分类器（P1-7 修复：配置驱动 + 自动学习）
+///
+/// 保留内置默认分类，同时支持运行时动态注册和从 MCP tools/list 自动学习。
+/// 新工具不再因 unknown 而绕过权限检查。
+pub struct ToolClassifier {
+    read_tools: std::collections::HashSet<String>,
+    write_tools: std::collections::HashSet<String>,
+    dangerous_tools: std::collections::HashSet<String>,
+}
 
-    if read_tools.contains(&tool_name) { return "read"; }
-    if write_tools.contains(&tool_name) { return "write"; }
-    if dangerous_tools.contains(&tool_name) { return "dangerous"; }
-    "unknown"
+impl ToolClassifier {
+    pub fn new() -> Self {
+        let mut c = ToolClassifier {
+            read_tools: std::collections::HashSet::new(),
+            write_tools: std::collections::HashSet::new(),
+            dangerous_tools: std::collections::HashSet::new(),
+        };
+        // 内置默认分类（保留原有列表）
+        for t in [
+            "query_plate", "query_sql", "search_memory",
+            "check_status", "get_statistics", "validate_data",
+            "detect_anomaly", "get_context", "check_media",
+            "review_data", "diagnose_system", "archive_ocr",
+            "query_archive_log", "system_ops", "code_reader",
+            "summarize_url", "read_docx", "read_xlsx",
+        ] { c.read_tools.insert(t.to_string()); }
+        for t in [
+            "fill_excel_log", "update_whitelist", "archive_manifest",
+            "manage_whitelist", "manage_holiday", "generate_month_log",
+            "archive_operate", "organize_folders",
+        ] { c.write_tools.insert(t.to_string()); }
+        for t in [
+            "delete_entrance_record", "batch_update_whitelist",
+            "shutdown_agent", "batch_delete_memories",
+        ] { c.dangerous_tools.insert(t.to_string()); }
+        c
+    }
+
+    /// 注册工具到指定权限级别
+    pub fn register(&mut self, tool_name: &str, level: &str) {
+        match level {
+            "read" => { self.read_tools.insert(tool_name.to_string()); }
+            "write" => { self.write_tools.insert(tool_name.to_string()); }
+            "dangerous" => { self.dangerous_tools.insert(tool_name.to_string()); }
+            _ => {}
+        }
+    }
+
+    /// 批量注册（从 MCP tools/list 结果中自动学习分类）
+    pub fn register_from_tools(&mut self, tools: &[(String, String)]) {
+        for (name, _desc) in tools {
+            if name.starts_with("query_") || name.starts_with("search_") || name.starts_with("get_")
+                || name.starts_with("check_") || name.starts_with("read_") || name.starts_with("list_")
+            {
+                self.read_tools.insert(name.clone());
+            } else if name.starts_with("delete_") || name.starts_with("batch_delete") || name.starts_with("shutdown_") {
+                self.dangerous_tools.insert(name.clone());
+            } else if !self.read_tools.contains(name) && !self.dangerous_tools.contains(name) {
+                self.write_tools.insert(name.clone());
+            }
+        }
+    }
+
+    pub fn classify(&self, tool_name: &str) -> &'static str {
+        if self.read_tools.contains(tool_name) { return "read"; }
+        if self.write_tools.contains(tool_name) { return "write"; }
+        if self.dangerous_tools.contains(tool_name) { return "dangerous"; }
+        "unknown"
+    }
 }
 
 // ══════════════════════════════════════════════════════

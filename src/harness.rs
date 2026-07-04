@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, Result as SqlResult};
+use rusqlite::{params, Connection};
 
 /// 单条 Harness 记录（数据库行对应的 Rust 结构）
 #[derive(Debug, Clone)]
@@ -251,19 +251,20 @@ impl HarnessStore {
     // ── 日志提炼 ─────────────────────────────────────
 
     /// 从执行日志中提取模式生成 Harness
+    /// P1-6 修复：使用 canonical JSON 序列化做去重，避免 key 顺序导致重复
     pub fn distill_from_logs(
         &mut self,
         logs: &[ExecutionLog],
         min_similar: usize,
     ) -> Result<Vec<i64>, String> {
-        // 按 trigger_conditions 的 JSON 摘要分组
+        // 按 trigger_conditions 的 canonical JSON 摘要分组
         let mut groups: HashMap<String, Vec<&ExecutionLog>> = HashMap::new();
         for log in logs {
             if !log.success {
                 continue;
             }
-            let key = serde_json::to_string(&log.trigger_conditions)
-                .unwrap_or_default();
+            // P1-6: canonical 序列化（key 排序后序列化）
+            let key = canonical_json_string(&log.trigger_conditions);
             groups.entry(key).or_default().push(log);
         }
 
@@ -286,7 +287,8 @@ impl HarnessStore {
             for log in group {
                 if let Some(arr) = log.steps.as_array() {
                     for step in arr {
-                        let step_str = serde_json::to_string(step).unwrap_or_default();
+                        // P1-6: canonical 序列化做去重
+                        let step_str = canonical_json_string(step);
                         if seen_steps.insert(step_str) {
                             merged_steps.push(step.clone());
                         }
@@ -297,7 +299,7 @@ impl HarnessStore {
             // 用最常见的 verify_rule
             let best_rule = most_common(group.iter().map(|g| g.verify_rule.as_str()));
 
-            // 检查是否已存在相同 conditions 的 harness
+            // 检查是否已存在相同 conditions 的 harness（P1-6: 用 canonical key）
             let exists = self
                 .conn
                 .query_row(
@@ -365,15 +367,19 @@ fn map_row(row: &rusqlite::Row) -> rusqlite::Result<Harness> {
     })
 }
 
-fn now_secs() -> f64 {
+pub fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
 }
 
+// P2-4: 统一暴露 now_secs 供其他模块使用
+pub use now_secs as current_timestamp;
+
 /// 计算 trigger_conditions 与 context 的模糊匹配分数
-fn compute_match_score(
+#[allow(unused_assignments, unused_variables)]
+    fn compute_match_score(
     conditions: &serde_json::Map<String, serde_json::Value>,
     context: &serde_json::Map<String, serde_json::Value>,
 ) -> f64 {
@@ -437,6 +443,33 @@ fn most_common<'a>(items: impl Iterator<Item = &'a str>) -> String {
         .max_by_key(|&(_, count)| count)
         .map(|(name, _)| name.to_string())
         .unwrap_or_default()
+}
+
+/// P1-6 修复：canonical JSON 序列化（key 排序后序列化）
+/// 确保 {"a":1,"b":2} 和 {"b":2,"a":1} 生成相同的字符串
+fn canonical_json_string(val: &serde_json::Value) -> String {
+    canonicalize(val)
+}
+
+fn canonicalize(val: &serde_json::Value) -> String {
+    match val {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut parts: Vec<String> = Vec::new();
+            for k in keys {
+                let v = &map[k];
+                parts.push(format!("{:?}:{}", k, canonicalize(v)));
+            }
+            format!("{{{}}}", parts.join(","))
+        }
+        serde_json::Value::Array(arr) => {
+            let parts: Vec<String> = arr.iter().map(canonicalize).collect();
+            format!("[{}]", parts.join(","))
+        }
+        serde_json::Value::String(s) => format!("{:?}", s),
+        other => other.to_string(),
+    }
 }
 
 // ══════════════════════════════════════════════════════

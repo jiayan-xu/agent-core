@@ -4,7 +4,9 @@
 //! 首次运行自动打开配置页，填个名字和密钥就能聊。
 //! 内置巡检循环：每 30 分钟调用 Dashboard MCP 执行定时任务。
 
-#![windows_subsystem = "windows"]
+// P2-1 修复：仅 release 模式下隐藏控制台窗口，debug 模式保留
+// --service 模式仍需控制台输出用于调试，通过 Cargo features 控制
+#![cfg_attr(all(not(debug_assertions), not(feature = "service")), windows_subsystem = "windows")]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,16 +25,17 @@ use tokio::time::interval;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tao::{
     event::{Event, WindowEvent},
-    event_loop::{ControlFlow, EventLoop, EventLoopBuilder},
+    event_loop::{ControlFlow, EventLoopBuilder},
     window::WindowBuilder,
 };
 use wry::WebViewBuilder;
 
 use agent_core::agent::{AgentConfig, AgentCore, AgentIdentity};
+use agent_core::audit::AuditLogger;
 use agent_core::boundary::PermissionLevel;
 use agent_core::harness::HarnessStore;
 use agent_core::llm::LlmConfig;
-use agent_core::mcp_client::{McpClient, McpSource};
+use agent_core::mcp_client::McpClient;
 
 /// 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,9 +83,11 @@ struct SetupResponse { ok: bool, error: Option<String> }
 struct AppState {
     config: Mutex<Config>,
     agent: Mutex<Option<AgentCore>>,
+    #[allow(dead_code)]
     config_path: String,
-    /// 身份认证缓存 (agent_id → badge_token)
-    auth_cache: tokio::sync::Mutex<HashMap<String, String>>,
+    /// 身份认证缓存 (agent_id → (badge_token, expires_at))
+    /// P2-10 修复：添加 TTL 过期
+    auth_cache: tokio::sync::Mutex<HashMap<String, (String, std::time::Instant)>>,
 }
 
 fn config_path() -> String {
@@ -132,7 +137,13 @@ fn main() {
     let server_ready_clone = server_ready.clone();
 
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("✗ Tokio 运行时创建失败: {}", e);
+                std::process::exit(1);
+            }
+        };
         rt.block_on(async move {
             let state = Arc::new(AppState {
                 config: Mutex::new(config.clone()),
@@ -200,9 +211,17 @@ fn main() {
                 .layer(tower_http::cors::CorsLayer::permissive())
                 .with_state(state);
 
-            let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("✗ 端口 {} 绑定失败: {}", &addr, e);
+                    std::process::exit(1);
+                }
+            };
             server_ready_clone.store(true, Ordering::SeqCst);
-            axum::serve(listener, app).await.unwrap();
+            if let Err(e) = axum::serve(listener, app).await {
+                tracing::error!("HTTP 服务异常终止: {}", e);
+            }
         });
     });
 
@@ -249,9 +268,14 @@ async fn handle_index() -> impl axum::response::IntoResponse {
 }
 
 async fn handle_logo() -> impl axum::response::IntoResponse {
+    // P2-2 修复：优先用相对路径，fallback 到绝对路径
+    let cwd = std::env::current_dir().unwrap_or_default();
     for path in &[
-        r"C:\Users\user\dashboard\dashboard-frontend\dist\logo.png",
-        r"C:\Users\user\dashboard\static\logo.png",
+        cwd.join("logo.png"),
+        cwd.join("static").join("logo.png"),
+        cwd.join("assets").join("logo.png"),
+        std::path::PathBuf::from(r"C:\Users\user\dashboard\dashboard-frontend\dist\logo.png"),
+        std::path::PathBuf::from(r"C:\Users\user\dashboard\static\logo.png"),
     ] {
         if let Ok(data) = tokio::fs::read(path).await {
             return ([(axum::http::header::CONTENT_TYPE, "image/png")], data);
@@ -344,7 +368,7 @@ async fn handle_chat_stream(
 }
 
 /// 获取会话列表
-async fn handle_sessions(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+async fn handle_sessions(State(_st): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let db_path = std::env::current_dir().unwrap_or_default().join("harness.db").to_string_lossy().to_string();
 
     let sessions = tokio::task::spawn_blocking(move || {
@@ -380,7 +404,7 @@ async fn handle_sessions(State(st): State<Arc<AppState>>) -> Json<serde_json::Va
 
 /// 加载指定会话的历史
 async fn handle_session_load(
-    State(st): State<Arc<AppState>>,
+    State(_st): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
     let db_path = {
@@ -440,10 +464,12 @@ async fn handle_session_delete(
 struct V1ChatRequest {
     model: Option<String>,
     messages: Vec<V1Message>,
+    #[allow(dead_code)]
     stream: Option<bool>,
 }
 #[derive(Deserialize)]
 struct V1Message {
+    #[allow(dead_code)]
     role: String,
     content: Option<String>,
 }
@@ -475,9 +501,18 @@ async fn handle_v1_chat(
     }
     {
         let cache = st.auth_cache.lock().await;
+        // P2-10: 检查过期（TTL = 1 小时）
+        const AUTH_TTL: Duration = Duration::from_secs(3600);
         match cache.get(&agent_id) {
-            Some(expected_key) if expected_key == &agent_key => {
-                // 认证通过
+            Some((expected_key, created_at)) if expected_key == &agent_key => {
+                // 检查是否过期
+                if created_at.elapsed() > AUTH_TTL {
+                    drop(cache);
+                    return axum::response::Json(serde_json::json!({
+                        "error": "unauthorized",
+                        "message": "身份已过期，请重新注册"
+                    })).into_response();
+                }
                 drop(cache);
             }
             Some(_) => {
@@ -581,9 +616,16 @@ async fn handle_register(
     })).await.is_ok();
 
     // 缓存身份（使用 admin key 写入 Memoria 后，auth_cache 也存一份）
+    // P2-10: 记录创建时间用于 TTL
     if memoria_ok {
-        st.auth_cache.lock().await.insert(agent_id.clone(), badge_token.clone());
+        st.auth_cache.lock().await.insert(agent_id.clone(), (badge_token.clone(), std::time::Instant::now()));
     }
+
+    // 审计日志：记录身份注册
+    let audit = AuditLogger::new(McpClient::new("http://127.0.0.1:9003", "admin", &admin_key));
+    audit.log_identity(&agent_id, "register",
+        &format!("name={}, department={}, company={}", req.name, req.department, req.company)
+    ).await;
 
     Json(RegisterResponse {
         ok: true,
@@ -613,10 +655,21 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
         "namespace": format!("agent/{}", config.agent_id),
     })).await;
 
+    // P2-C: 从 agent_id 解析多租户命名空间（handle_register 格式：{company}_{department}_{name}）
+    let ns_full_path = {
+        let parts: Vec<&str> = config.agent_id.splitn(3, '_').collect();
+        if parts.len() == 3 {
+            Some(format!("/dept/{}/project/{}/user/{}", parts[0], parts[1], parts[2]))
+        } else {
+            None
+        }
+    };
+
     let identity = AgentIdentity {
         agent_id: config.agent_id.clone(),
         namespace: format!("agent/{}", config.agent_id),
         badge_token: badge_token.clone(),
+        ns_full_path,
     };
     // P0-1: 设置 failover fallbacks
     let doubao_key = std::env::var("DOUBAO_API_KEY").unwrap_or_default();
@@ -647,11 +700,16 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
         max_tool_rounds: 3,
         parent_permission: PermissionLevel::Write,
         enable_compositional_routing: true,
+        system_prompt_template: None, // P2-3: 使用内置默认模板
+        approver_id: None, // P2-D: 无审批人（保持现有行为）
     };
     let cwd = std::env::current_dir().unwrap_or_default();
     let harness = HarnessStore::open(&cwd.join("harness.db").to_string_lossy())
         .map_err(|e| format!("创建 Harness 存储失败: {}", e))?;
-    Ok(AgentCore::new(agent_config, harness))
+    let agent = AgentCore::new(agent_config, harness);
+    // P2-C: 同步 Memoria 注册的 namespace 到本地 NamespaceRegistry
+    agent.sync_namespace_from_identity();
+    Ok(agent)
 }
 
 fn whoami() -> Option<String> {
@@ -659,10 +717,15 @@ fn whoami() -> Option<String> {
 }
 
 /// 加载窗口图标（从 logo.png 解码，保留 2:1 比例）
+/// P2-2 修复：优先用相对路径
 fn _load_icon() -> Option<tao::window::Icon> {
+    let cwd = std::env::current_dir().unwrap_or_default();
     for path in &[
-        r"C:\Users\user\dashboard\dashboard-frontend\dist\logo.png",
-        r"C:\Users\user\dashboard\static\logo.png",
+        cwd.join("logo.png"),
+        cwd.join("static").join("logo.png"),
+        cwd.join("assets").join("logo.png"),
+        std::path::PathBuf::from(r"C:\Users\user\dashboard\dashboard-frontend\dist\logo.png"),
+        std::path::PathBuf::from(r"C:\Users\user\dashboard\static\logo.png"),
     ] {
         if let Ok(data) = std::fs::read(path) {
             if let Ok(img) = image::load_from_memory(&data) {

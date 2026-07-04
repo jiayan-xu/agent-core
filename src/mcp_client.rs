@@ -13,7 +13,6 @@ pub struct McpResult {
     pub text: String,
 }
 
-use serde::{Serialize, Deserialize};
 /// MCP 客户端
 #[derive(Clone)]
 pub struct McpClient {
@@ -21,14 +20,21 @@ pub struct McpClient {
     base_url: String,
     agent_id: String,
     badge_token: String,
+    /// P2-5: 可配置超时（秒）
+    timeout_secs: u64,
 }
 
 impl McpClient {
     /// 创建新的 MCP 客户端
     pub fn new(base_url: &str, agent_id: &str, badge_token: &str) -> Self {
+        Self::with_timeout(base_url, agent_id, badge_token, 30)
+    }
+
+    /// P2-5: 指定超时时间创建客户端
+    pub fn with_timeout(base_url: &str, agent_id: &str, badge_token: &str, timeout_secs: u64) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .pool_max_idle_per_host(4) // 连接池
+            .timeout(Duration::from_secs(timeout_secs))
+            .pool_max_idle_per_host(4)
             .build()
             .expect("reqwest Client::build");
         McpClient {
@@ -36,7 +42,13 @@ impl McpClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             agent_id: agent_id.to_string(),
             badge_token: badge_token.to_string(),
+            timeout_secs,
         }
+    }
+
+    /// 获取当前超时配置
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
     }
 
     /// 调用 MCP 工具（带重试）

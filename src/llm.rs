@@ -230,16 +230,58 @@ impl LlmClient {
     }
 
     /// 流式聊天（SSE 事件通过 sender 发送）
+    /// P2-6 修复：添加 failover 支持
     pub async fn chat_stream(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
         sender: mpsc::UnboundedSender<SseEvent>,
     ) -> Result<(), String> {
-        let url = format!("{}/v1/chat/completions", self.config.base_url.trim_end_matches('/'));
+        // P2-6: 主 Provider 失败时尝试备用 Provider
+        let mut providers = Vec::new();
+        providers.push((self.config.base_url.clone(), self.config.model.clone(), self.config.api_key.clone()));
+        for fb in &self.config.fallbacks {
+            providers.push(fb.clone());
+        }
+
+        let mut last_error = String::new();
+
+        for (idx, (base_url, model, api_key)) in providers.iter().enumerate() {
+            match self.chat_stream_single(base_url, model, api_key, messages, tools, &sender).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if idx == 0 {
+                        tracing::warn!("流式主 Provider 失败，尝试 failover: {}", e);
+                    }
+                    last_error = e;
+                    // 发送错误事件让前端知道在重试
+                    if idx < providers.len() - 1 {
+                        let _ = sender.send(SseEvent::ThinkingEvt {
+                            content: format!("⚠️ 连接失败，正在切换到备用服务器..."),
+                        });
+                    }
+                }
+            }
+        }
+
+        let _ = sender.send(SseEvent::ErrorEvt { message: last_error.clone() });
+        Err(last_error)
+    }
+
+    /// 单个 Provider 的流式聊天
+    async fn chat_stream_single(
+        &self,
+        base_url: &str,
+        model: &str,
+        api_key: &str,
+        messages: &[Message],
+        tools: &[ToolDef],
+        sender: &mpsc::UnboundedSender<SseEvent>,
+    ) -> Result<(), String> {
+        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
 
         let mut body = serde_json::json!({
-            "model": self.config.model,
+            "model": model,
             "messages": messages,
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
@@ -257,7 +299,7 @@ impl LlmClient {
             .client
             .post(&url)
             .json(&body)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .header("Authorization", format!("Bearer {}", api_key))
             .send()
             .await
             .map_err(|e| format!("stream request: {}", e))?;
@@ -270,7 +312,7 @@ impl LlmClient {
 
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
-        let mut tool_call_buf: Option<String> = None;
+        let _tool_call_buf: Option<String> = None;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result.map_err(|e| format!("stream read: {}", e))?;

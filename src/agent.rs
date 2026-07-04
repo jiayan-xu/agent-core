@@ -1,33 +1,18 @@
 //! Agent 核心 — chat 循环 + 工具执行
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
 
-use crate::boundary::{self, ComplianceBoundary, PermissionLevel, ToolCheck};
-use crate::harness::{ExecutionLog, HarnessStore};
-use crate::llm::{LlmClient, LlmConfig, Message, ToolCall, ToolDef};
+use crate::audit::AuditLogger;
+use crate::boundary::{self, ComplianceBoundary, PermissionLevel};
+use crate::harness::{self, ExecutionLog, HarnessStore};
+use crate::llm::{LlmClient, LlmConfig, Message, ToolDef};
 use crate::mcp_client::{McpClient, McpSource};
+use crate::session::{PendingAction, SessionManager, SessionState};
+use crate::namespace::NamespaceRegistry;
+use crate::approval::ApprovalManager;
 use std::collections::HashMap;
-
-/// 待确认操作
-struct PendingAction {
-    tool_name: String,
-    arguments: serde_json::Value,
-    description: String,
-}
-
-/// 会话状态（任务级确认状态机）
-#[derive(Clone, PartialEq)]
-enum SessionState {
-    /// 新会话或刚结束上一个任务
-    New,
-    /// 等待用户确认理解
-    AwaitingConfirmation,
-    /// 已确认，可正常执行
-    Confirmed,
-}
 
 /// Agent 身份
 #[derive(Debug, Clone)]
@@ -35,11 +20,25 @@ pub struct AgentIdentity {
     pub agent_id: String,
     pub namespace: String,
     pub badge_token: String,
+    /// 多租户层级命名空间完整路径（如 `/dept/运营部/project/固废平台`）
+    /// 为 None 时保持旧行为：`agent/{agent_id}`
+    pub ns_full_path: Option<String>,
 }
 
 impl AgentIdentity {
     pub fn ns(&self) -> String {
-        format!("agent/{}", self.agent_id)
+        match &self.ns_full_path {
+            Some(path) => {
+                let flat = path.trim_start_matches('/');
+                format!("agent/{}/{}", self.agent_id, flat)
+            }
+            None => format!("agent/{}", self.agent_id),
+        }
+    }
+
+    /// 获取纯 namespace 路径（不含 agent/ 前缀）
+    pub fn ns_path(&self) -> Option<&str> {
+        self.ns_full_path.as_deref()
     }
 }
 
@@ -56,6 +55,11 @@ pub struct AgentConfig {
     pub parent_permission: PermissionLevel,
     /// 启用组合路由（多 Skill 分解 + 按序执行）
     pub enable_compositional_routing: bool,
+    /// P2-3: 自定义 system prompt 模板（可选）
+    /// 如果为 None，使用内置默认模板
+    pub system_prompt_template: Option<String>,
+    /// P2-D: 审批人 ID（可选）。设置后 YELLOW 工具需经此人审批
+    pub approver_id: Option<String>,
 }
 
 /// Agent 核心
@@ -70,14 +74,17 @@ pub struct AgentCore {
     pub execution_log: Arc<Mutex<Vec<ExecutionLog>>>,
     /// 收件箱缓存
     inbox_cache: tokio::sync::Mutex<InboxCache>,
-    /// 多轮会话历史缓存（session_id → messages）
-    session_history: tokio::sync::Mutex<HashMap<String, Vec<Message>>>,
-    /// 待确认操作（session_id → pending action）
-    pending_actions: tokio::sync::Mutex<HashMap<String, PendingAction>>,
-    /// 会话状态追踪（session_id → state）
-    session_state: tokio::sync::Mutex<HashMap<String, SessionState>>,
-    /// 待确认的原始消息（session_id → original message）
-    pending_original_message: tokio::sync::Mutex<HashMap<String, String>>,
+    /// 会话管理器
+    pub session_manager: SessionManager,
+    /// 审计日志记录器
+    pub audit_logger: AuditLogger,
+    /// 工具路由缓存（P1-3 修复：精确匹配而非 starts_with）
+    /// tool_name → MCP 源索引
+    tool_route_cache: tokio::sync::Mutex<HashMap<String, usize>>,
+    /// 多租户命名空间注册表（P2-C）
+    pub namespace_registry: std::sync::Mutex<NamespaceRegistry>,
+    /// 审批管理器（P2-D）
+    pub approval_manager: ApprovalManager,
 }
 
 struct InboxCache {
@@ -108,13 +115,15 @@ impl AgentCore {
         }
         let llm = LlmClient::new(config.llm.clone());
         let boundary = ComplianceBoundary::new(config.skill_whitelist.clone());
-        // 注册 agent 自身到权限链
-        boundary.perm_chain.lock().unwrap().register(
-            &config.identity.agent_id,
-            None,
-            PermissionLevel::Write,
-        );
+        // 注册 agent 自身到权限链（锁中毒时跳过）
+        match boundary.perm_chain.lock() {
+            Ok(mut chain) => {
+                chain.register(&config.identity.agent_id, None, PermissionLevel::Write);
+            }
+            Err(_) => tracing::error!("PermissionChain Mutex 中毒，跳过注册"),
+        }
 
+        let mcp_for_audit = mcp.clone();
         AgentCore {
             config,
             mcp,
@@ -124,10 +133,11 @@ impl AgentCore {
             harness: Arc::new(Mutex::new(harness)),
             execution_log: Arc::new(Mutex::new(Vec::new())),
             inbox_cache: tokio::sync::Mutex::new(InboxCache::new()),
-            session_history: tokio::sync::Mutex::new(HashMap::new()),
-            pending_actions: tokio::sync::Mutex::new(HashMap::new()),
-            session_state: tokio::sync::Mutex::new(HashMap::new()),
-            pending_original_message: tokio::sync::Mutex::new(HashMap::new()),
+            session_manager: SessionManager::new(),
+            audit_logger: AuditLogger::new(mcp_for_audit),
+            tool_route_cache: tokio::sync::Mutex::new(HashMap::new()),
+            namespace_registry: std::sync::Mutex::new(NamespaceRegistry::new()),
+            approval_manager: ApprovalManager::new(),
         }
     }
 
@@ -143,9 +153,7 @@ impl AgentCore {
 
         // ── 0a. 工具级确认（现有）：pending_actions 中的操作等待确认 ──
         if confirm_words.contains(&trimmed) {
-            let mut pending = self.pending_actions.lock().await;
-            if let Some(action) = pending.remove(session_id) {
-                drop(pending);
+            if let Some(action) = self.session_manager.take_pending_action(session_id).await {
                 let result = match self.call_tool_routed(&action.tool_name, &action.arguments).await {
                     Ok(text) => text,
                     Err(e) => format!("执行失败: {}", e),
@@ -153,55 +161,48 @@ impl AgentCore {
                 let desc = action.description.chars().take(120).collect::<String>();
                 let result_short = result.chars().take(300).collect::<String>();
                 let reply = format!("✅ 操作已执行成功！\n\n操作内容：{}\n\n{}", desc, result_short);
-                self.save_to_history(session_id, message, &reply).await;
+                let ns = self.config.identity.ns();
+                let db_path = self.harness.lock().await.db_path();
+                self.session_manager.save_to_history(session_id, &ns, &db_path, message, &reply).await;
                 return reply;
             }
-            drop(pending);
         }
 
         // ── 0b. 任务级确认状态机 ──
-        let mut states = self.session_state.lock().await;
-        let state = states.get(session_id).cloned().unwrap_or(SessionState::New);
+        let state = self.session_manager.get_state(session_id).await;
 
         match state {
             // ── 等待用户确认理解 ──
             SessionState::AwaitingConfirmation => {
                 if confirm_words.contains(&trimmed) {
-                    let original = self.pending_original_message.lock().await
-                        .remove(session_id)
+                    let original = self.session_manager.take_original_message(session_id).await
                         .unwrap_or_else(|| message.to_string());
-                    states.insert(session_id.to_string(), SessionState::Confirmed);
-                    drop(states);
+                    self.session_manager.set_state(session_id, SessionState::Confirmed).await;
                     return self.execute_chat(&original, user_id, session_id).await;
                 }
                 // 修改/补充 → 保留 AwaitingConfirmation，重新复述
-                drop(states);
                 return self.rephrase_and_confirm(message, user_id, session_id).await;
             }
 
             // ── 已确认，正常执行 ──
             SessionState::Confirmed => {
                 // 话题切换检测
-                if let Some(task) = self.pending_original_message.lock().await.get(session_id).cloned() {
+                if let Some(task) = self.session_manager.get_original_message(session_id).await {
                     if boundary::TaskConfirmationGate::detect_topic_switch(message, &task) {
-                        drop(states);
                         return self.handle_topic_switch(message, session_id).await;
                     }
                 }
-                drop(states);
                 return self.execute_chat(message, user_id, session_id).await;
             }
 
             // ── 新会话 ──
             SessionState::New => {
                 if boundary::TaskConfirmationGate::requires_confirmation(message) {
-                    states.insert(session_id.to_string(), SessionState::AwaitingConfirmation);
-                    drop(states);
+                    self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
                     return self.rephrase_and_confirm(message, user_id, session_id).await;
                 }
                 // 简单查询 → 直接执行
-                states.insert(session_id.to_string(), SessionState::Confirmed);
-                drop(states);
+                self.session_manager.set_state(session_id, SessionState::Confirmed).await;
                 return self.execute_chat(message, user_id, session_id).await;
             }
         }
@@ -244,7 +245,9 @@ impl AgentCore {
 
                         return format!("[Step 2/3: 执行 → Step 3/3: 交付]\n\n{}", result);
                     }
-                    _ => {} // 单步或失败 → 降级到普通 LLM loop
+                    _ => {
+                        tracing::info!("合成路由降级到普通 LLM（单步或分解失败）");
+                    } // 单步或失败 → 降级到普通 LLM loop
                 }
             }
         }
@@ -259,6 +262,16 @@ impl AgentCore {
             self.check_inbox(),
             self.search_memory(message),
         );
+
+        // P2-D: 检查审批响应
+        self.check_approval_responses().await;
+        // 如果有审批通过的请求，立即执行
+        if let Some(reply) = self.execute_approved_request(session_id).await {
+            let ns = self.config.identity.ns();
+            let db_path = self.harness.lock().await.db_path();
+            self.session_manager.save_to_history(session_id, &ns, &db_path, message, &reply).await;
+            return reply;
+        }
 
         let mut knowledge = Vec::new();
         let mut enriched_message = message.to_string();
@@ -284,7 +297,9 @@ impl AgentCore {
         }
 
         // ── 3. 加载历史对话 ──
-        let history = self.load_history(session_id).await;
+        let ns = self.config.identity.ns();
+        let db_path = self.harness.lock().await.db_path();
+        let history = self.session_manager.load_history(session_id, &ns, &db_path).await;
 
         // ── 4. 构建消息列表 ──
         let system_prompt = self.build_system_prompt(&knowledge);
@@ -307,9 +322,8 @@ impl AgentCore {
     /// SAD（Skill-Aware Decomposition）风格增强：
     /// 并行获取记忆 + 可用工具列表，注入到 system prompt 中，
     /// 让 LLM 在复述时就能感知可用能力，对齐措辞。
-    async fn rephrase_and_confirm(&self, message: &str, user_id: &str, session_id: &str) -> String {
-        self.pending_original_message.lock().await
-            .insert(session_id.to_string(), message.to_string());
+    async fn rephrase_and_confirm(&self, message: &str, _user_id: &str, session_id: &str) -> String {
+        self.session_manager.set_original_message(session_id, message).await;
 
         // SAD 风格：并行获取上下文（记忆）和可用能力（工具列表）
         let (mem_result, tools) = tokio::join!(
@@ -361,7 +375,7 @@ impl AgentCore {
     }
 
     /// 按依赖序执行组合计划（支持并行执行无依赖步骤）
-    async fn execute_plan(&self, plan: &crate::composer::ExecutionPlan, session_id: &str) -> Result<String, String> {
+    async fn execute_plan(&self, plan: &crate::composer::ExecutionPlan, _session_id: &str) -> Result<String, String> {
         use std::collections::HashMap;
 
         let mut step_results: HashMap<u32, String> = HashMap::new();
@@ -428,18 +442,26 @@ impl AgentCore {
                     // 边界检查
                     {
                         let boundary = this.boundary.lock().await;
+                        let ns = this.current_ns_paths();
                         let check = boundary.check_tool(
                             &tool, &args,
                             &this.config.identity.agent_id, "user",
-                            &this.config.parent_permission, None,
+                            &this.config.parent_permission, ns.as_deref(),
                         );
                         if !check.allow {
+                            this.audit_logger.log_decision(
+                                &this.config.identity.agent_id, &tool,
+                                &check.reason, false
+                            ).await;
                             return (step_id, Err(format!("被安全边界拦截: {}", check.reason)));
                         }
                     }
 
                     match this.call_tool_routed(&tool, &args).await {
                         Ok(result) => {
+                            this.audit_logger.log_tool_call(
+                                &this.config.identity.agent_id, &tool, &args, true
+                            ).await;
                             // 记录执行日志
                             {
                                 let mut log = this.execution_log.lock().await;
@@ -499,112 +521,26 @@ impl AgentCore {
     }
 
     /// 话题切换检测：当前任务未完成，检测到话题切换
-    async fn handle_topic_switch(&self, message: &str, session_id: &str) -> String {
-        let task = self.pending_original_message.lock().await
-            .get(session_id).cloned().unwrap_or_default();
+    async fn handle_topic_switch(&self, _message: &str, session_id: &str) -> String {
+        let task = self.session_manager.get_original_message(session_id).await.unwrap_or_default();
         let task_preview: String = task.chars().take(80).collect();
         format!(
             "[Task 管理]\n\n检测到您可能换了话题。当前任务还在处理：{task_preview}\n\n请选择：\n- \"继续\" → 继续当前任务\n- \"暂停\" → 暂停当前任务\n- \"结束\" → 结束当前任务"
         )
     }
 
-    /// 从内存缓存 + SQLite 加载历史对话
+    /// 从 SessionManager 加载历史对话
     async fn load_history(&self, session_id: &str) -> Vec<Message> {
-        // 先从内存缓存
-        let cache = self.session_history.lock().await;
-        if let Some(msgs) = cache.get(session_id) {
-            if !msgs.is_empty() {
-                return msgs.clone();
-            }
-        }
-        drop(cache);
-
-        // 内存没有 → 从 SQLite 恢复
         let ns = self.config.identity.ns();
-        let harness = self.harness.clone();
-        let db_path = harness.lock().await.db_path();
-
-        if db_path.is_empty() {
-            return Vec::new();
-        }
-
-        let sid = session_id.to_string();
-        let msgs = tokio::task::spawn_blocking(move || {
-            let mut result = Vec::new();
-            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                if let Ok(mut stmt) = conn.prepare(
-                    "SELECT role, content FROM chat_history WHERE session_id=?1 AND namespace=?2 ORDER BY id DESC LIMIT 20"
-                ) {
-                    if let Ok(rows) = stmt.query_map(rusqlite::params![sid, ns], |row| {
-                        let role: String = row.get(0)?;
-                        let content: String = row.get(1)?;
-                        Ok((role, content))
-                    }) {
-                        for row in rows.flatten() {
-                            result.push(Message {
-                                role: row.0,
-                                content: Some(row.1),
-                                tool_calls: None,
-                                tool_call_id: None,
-                            });
-                        }
-                    }
-                }
-            }
-            result.reverse();
-            result
-        }).await.unwrap_or_default();
-
-        // 写回内存缓存
-        if !msgs.is_empty() {
-            let mut cache = self.session_history.lock().await;
-            cache.insert(session_id.to_string(), msgs.clone());
-        }
-
-        msgs
+        let db_path = self.harness.lock().await.db_path();
+        self.session_manager.load_history(session_id, &ns, &db_path).await
     }
 
-    /// 保存对话到内存缓存 + SQLite 持久化
+    /// 保存对话到 SessionManager（内存缓存 + SQLite 持久化）
     async fn save_to_history(&self, session_id: &str, user_msg: &str, assistant_reply: &str) {
-        // 内存缓存
-        let mut cache = self.session_history.lock().await;
-        let history = cache.entry(session_id.to_string()).or_insert_with(Vec::new);
-        // 只保留最近 10 轮（20 条消息）
-        if history.len() > 20 {
-            history.drain(0..history.len() - 20);
-        }
-        history.push(Message {
-            role: "user".to_string(),
-            content: Some(user_msg.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-        history.push(Message {
-            role: "assistant".to_string(),
-            content: Some(assistant_reply.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-        drop(cache);
-
-        // SQLite 持久化（通过 harness 的 DB）
         let ns = self.config.identity.ns();
-        let db_path = self.harness.clone().lock().await.db_path();
-        let sid = session_id.to_string();
-        let u_msg = user_msg.to_string();
-        let a_msg = assistant_reply.to_string();
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                conn.execute(
-                    "INSERT INTO chat_history (session_id, namespace, role, content, created_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-                    rusqlite::params![sid, ns, "user", u_msg],
-                ).ok();
-                conn.execute(
-                    "INSERT INTO chat_history (session_id, namespace, role, content, created_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-                    rusqlite::params![sid, ns, "assistant", a_msg],
-                ).ok();
-            }
-        }).await;
+        let db_path = self.harness.lock().await.db_path();
+        self.session_manager.save_to_history(session_id, &ns, &db_path, user_msg, assistant_reply).await;
     }
 
     /// LLM 调用循环（支持多轮 tool calling）
@@ -618,7 +554,7 @@ impl AgentCore {
         // 从 Memoria 取可用工具列表
         let tools = self.fetch_tools().await;
 
-        for round in 0..self.config.max_tool_rounds {
+        for _round in 0..self.config.max_tool_rounds {
             let response = match self.llm.chat(&messages, &tools).await {
                 Ok(r) => r,
                 Err(e) => return format!("LLM 调用失败: {}", e),
@@ -647,16 +583,52 @@ impl AgentCore {
             for tc in &response.tool_calls {
                 // 边界检查
                 let boundary = self.boundary.lock().await;
+                let ns = self.current_ns_paths();
                 let check = boundary.check_tool(
                     &tc.name, &tc.arguments,
                     &self.config.identity.agent_id, "user",
-                    &self.config.parent_permission, None,
+                    &self.config.parent_permission, ns.as_deref(),
                 );
                 drop(boundary);
 
                 if !check.allow {
+                    // 审计日志：记录拒绝决策
+                    self.audit_logger.log_decision(
+                        &self.config.identity.agent_id, &tc.name,
+                        &check.reason, false
+                    ).await;
                     // REQUIRES_REVIEW：黄线 → 触发确认流程
                     if check.level == Some(crate::boundary::BlockLevel::Yellow) {
+                        // P2-D: 如果有审批人，走外部审批流程
+                        if let Some(approver_id) = &self.config.approver_id {
+                            let aid = self.approval_manager.create_request(
+                                &tc.name,
+                                &tc.arguments,
+                                &check.reason,
+                                approver_id,
+                                &self.config.identity.agent_id,
+                            ).await;
+                            // 通过 A2A 发送审批请求
+                            let msg = serde_json::json!({
+                                "type": "approval_request",
+                                "approval_id": aid,
+                                "tool_name": tc.name,
+                                "description": check.reason,
+                                "arguments": tc.arguments,
+                                "requester_id": self.config.identity.agent_id,
+                                "requester_ns": self.config.identity.ns(),
+                            });
+                            let _ = self.mcp.call("a2a_send", &serde_json::json!({
+                                "to": approver_id,
+                                "content": msg.to_string(),
+                                "namespace": format!("agent/{}", approver_id),
+                            })).await;
+                            let reply = format!("AWAITING_APPROVAL:等待审批人「{}」审批工具「{}」，请稍后",
+                                           approver_id, tc.name);
+                            self.save_to_history(session_id, raw_message, &reply).await;
+                            return reply;
+                        }
+                        // 无审批人：原有的 REQUIRES_REVIEW 流程
                         let reply = format!("REQUIRES_REVIEW:{}:工具「{}」需要确认——{}",
                                        tc.name, tc.name, check.reason);
                         self.save_to_history(session_id, raw_message, &reply).await;
@@ -711,8 +683,7 @@ impl AgentCore {
 
                 // 需要确认的操作 → 保存到 pending_actions
                 if result.contains("require_confirm") || result.contains("确认") {
-                    let mut pending = self.pending_actions.lock().await;
-                    pending.insert(session_id.to_string(), PendingAction {
+                    let action = PendingAction {
                         tool_name: tc.name.clone(),
                         arguments: {
                             let mut args = tc.arguments.clone();
@@ -722,8 +693,8 @@ impl AgentCore {
                             args
                         },
                         description: format!("{} ({})", tc.name, tc.arguments),
-                    });
-                    drop(pending);
+                    };
+                    self.session_manager.set_pending_action(session_id, action).await;
                 }
 
                 // 将工具调用 + 结果加入消息列表
@@ -815,10 +786,86 @@ impl AgentCore {
         }
     }
 
+    /// 检查 A2A 收件箱中的审批响应
+    /// 扫描收件箱消息，识别 approval_response 类型，记录到 ApprovalManager
+    async fn check_approval_responses(&self) {
+        let inbox = match self.mcp.call_json("a2a_recv", &serde_json::json!({
+            "limit": 10,
+            "namespace": self.config.identity.ns(),
+        })).await {
+            Ok(val) => val["messages"].as_array().cloned().unwrap_or_default(),
+            Err(_) => return,
+        };
+
+        for msg in &inbox {
+            let content = match msg.get("content").and_then(|c| c.as_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let parsed: serde_json::Value = match serde_json::from_str(content) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Some(resp) = ApprovalManager::parse_approval_response(&parsed) {
+                self.approval_manager.record_response(resp).await;
+            }
+        }
+    }
+
+    /// 执行审批通过的请求
+    /// 检查所有 pending 审批项，如果有已批准的，执行该工具并返回结果
+    async fn execute_approved_request(&self, _session_id: &str) -> Option<String> {
+        let pending_list = self.approval_manager.list_pending().await;
+        for approval in &pending_list {
+            if let Some(true) = self.approval_manager.is_approved(&approval.approval_id).await {
+                // 审批通过，执行工具
+                let result = match self.call_tool_routed(&approval.tool_name, &approval.arguments).await {
+                    Ok(text) => text,
+                    Err(e) => format!("执行失败: {}", e),
+                };
+                let desc = approval.description.chars().take(120).collect::<String>();
+                let result_short = result.chars().take(300).collect::<String>();
+                let reply = format!(
+                    "✅ 审批通过！操作已执行。\n\n操作内容：{}\n审批人：{}\n\n{}",
+                    desc, approval.approver_id, result_short
+                );
+                // 审计日志
+                self.audit_logger.log_tool_call(
+                    &self.config.identity.agent_id,
+                    &approval.tool_name,
+                    &approval.arguments,
+                    true,
+                ).await;
+                self.approval_manager.remove(&approval.approval_id).await;
+                return Some(reply);
+            } else if let Some(false) = self.approval_manager.is_approved(&approval.approval_id).await {
+                // 审批被拒绝
+                let desc = approval.description.chars().take(120).collect::<String>();
+                let reply = format!(
+                    "❌ 审批被拒绝。\n\n操作内容：{}\n审批人：{}",
+                    desc, approval.approver_id
+                );
+                self.approval_manager.remove(&approval.approval_id).await;
+                return Some(reply);
+            }
+        }
+        None
+    }
+
     /// 查找能处理该工具的 MCP 源
-    /// 按工具名在 mcp_sources 中查找对应的 MCP 客户端
+    /// P1-3 修复：优先从 tool_route_cache 精确查找，fallback 到 Memoria 特有工具列表
     pub fn find_mcp_for_tool(&self, tool_name: &str) -> &McpClient {
-        // Memoria 特有工具走第一个源
+        // 1. 先查缓存
+        {
+            let cache = self.tool_route_cache.blocking_lock();
+            if let Some(&idx) = cache.get(tool_name) {
+                if idx < self.mcp_sources.len() {
+                    return &self.mcp_sources[idx].client;
+                }
+            }
+        }
+
+        // 2. Memoria 特有工具走第一个源
         let memoria_tools = [
             "memory_search", "memory_search_v2", "memory_remember",
             "memory_observe", "a2a_send", "a2a_recv", "register_agent",
@@ -828,36 +875,142 @@ impl AgentCore {
         if memoria_tools.contains(&tool_name) {
             return &self.mcp;
         }
-        // 在其他 MCP 源中查找（简化版：按源名前缀匹配）
-        // 生产环境应缓存每个源的 tools/list 结果做精确匹配
-        for source in &self.mcp_sources[1..] {
-            if tool_name.starts_with(&source.name) {
-                return &source.client;
-            }
-        }
-        // 非 memory_ 开头的工具，尝试找第一个非 Memoria 源
+
+        // 3. 非 memory_ 开头的工具，尝试找第一个非 Memoria 源
         if !tool_name.starts_with("memory_") && !tool_name.starts_with("db_") {
-            for source in &self.mcp_sources[1..] {
-                return &source.client;
+            if self.mcp_sources.len() > 1 {
+                return &self.mcp_sources[1].client;
             }
         }
+
+        // 4. fallback 到 Memoria
         &self.mcp
+    }
+
+    /// 异步查找 MCP 源（会尝试更新缓存）
+    pub async fn find_mcp_for_tool_async(&self, tool_name: &str) -> &McpClient {
+        // 先同步检查缓存
+        {
+            let cache = self.tool_route_cache.lock().await;
+            if let Some(&idx) = cache.get(tool_name) {
+                if idx < self.mcp_sources.len() {
+                    return &self.mcp_sources[idx].client;
+                }
+            }
+        }
+
+        // 缓存未命中 → 查询所有 MCP 源的 tools/list
+        for (idx, source) in self.mcp_sources.iter().enumerate() {
+            if let Ok(tools) = source.client.list_tools().await {
+                let mut cache = self.tool_route_cache.lock().await;
+                for (name, _desc, _) in &tools {
+                    cache.insert(name.clone(), idx);
+                }
+                // 同时学习工具分类
+                let boundary = self.boundary.lock().await;
+                let tool_names_descs: Vec<(String, String)> = tools.iter().map(|(n, d, _)| (n.clone(), d.clone())).collect();
+                boundary.learn_tools(&tool_names_descs);
+                drop(boundary);
+
+                // 检查目标工具是否在此源中
+                if tools.iter().any(|(name, _, _)| name == tool_name) {
+                    return &source.client;
+                }
+            }
+        }
+
+        // 最终 fallback
+        self.find_mcp_for_tool(tool_name)
     }
 
     /// 路由到正确的 MCP 源执行工具调用
     pub async fn call_tool_routed(&self, tool_name: &str, args: &serde_json::Value) -> Result<String, String> {
-        let client = self.find_mcp_for_tool(tool_name);
+        let client = self.find_mcp_for_tool_async(tool_name).await;
         client.call(tool_name, args).await
     }
 
+    /// 获取当前 agent 的命名空间路径列表（用于 boundary check_tool 的 namespaces 参数）
+    fn current_ns_paths(&self) -> Option<Vec<String>> {
+        self.config.identity.ns_path().map(|p| vec![p.to_string()])
+    }
+
+    /// 从 agent_id 解析命名空间并同步到 NamespaceRegistry
+    ///
+    /// agent_id 格式（来自 handle_register）：{company}_{department}_{name}
+    /// 构建层级：Dept(dept_name) → Project(project_name, 可选) → User(user_name, 可选)
+    pub fn sync_namespace_from_identity(&self) {
+        let agent_id = &self.config.identity.agent_id;
+        let ns_full_path = match &self.config.identity.ns_full_path {
+            Some(p) => Some(p.clone()),
+            None => {
+                // 尝试从 agent_id 解析：{company}_{department}_{name}
+                let parts: Vec<&str> = agent_id.splitn(3, '_').collect();
+                if parts.len() == 3 {
+                    let company = parts[0];
+                    let department = parts[1];
+                    let name = parts[2];
+                    let path = format!("/dept/{}/project/{}/user/{}", company, department, name);
+                    Some(path)
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(ref full_path) = ns_full_path {
+            // 确保 ns_full_path 被设置
+            // 注意：config.identity 不是 pub 可写的，所以我们通过替换来更新
+            // 这里只注册到 registry
+            let mut reg = self.namespace_registry.lock().unwrap();
+            let parts: Vec<&str> = full_path.trim_start_matches('/').split('/').collect();
+            // parts 格式：["dept", "公司名", "project", "部门名", "user", "用户名"]
+            if parts.len() >= 2 && parts[0] == "dept" {
+                let dept_name = parts[1];
+                let _ = reg.register(
+                    crate::namespace::Namespace::dept(dept_name),
+                    None,
+                );
+                if parts.len() >= 4 && parts[2] == "project" {
+                    let proj_name = parts[3];
+                    let dept_path = format!("/dept/{}", dept_name);
+                    let _ = reg.register(
+                        crate::namespace::Namespace::project(proj_name),
+                        Some(&dept_path),
+                    );
+                    if parts.len() >= 6 && parts[4] == "user" {
+                        let user_name = parts[5];
+                        let proj_path = format!("/dept/{}/project/{}", dept_name, proj_name);
+                        let _ = reg.register(
+                            crate::namespace::Namespace::user(user_name),
+                            Some(&proj_path),
+                        );
+                    }
+                }
+            }
+            drop(reg);
+        }
+    }
+
     /// 从所有 MCP 源获取工具列表（合并去重）
+    /// P1-3 修复：同时更新 tool_route_cache 和 classifier
     pub async fn fetch_tools(&self) -> Vec<ToolDef> {
         let mut all_tools: Vec<ToolDef> = Vec::new();
         let mut seen_names = std::collections::HashSet::new();
 
-        for source in &self.mcp_sources {
+        for (idx, source) in self.mcp_sources.iter().enumerate() {
             match source.client.list_tools().await {
                 Ok(tools) => {
+                    // 更新路由缓存和分类器
+                    {
+                        let mut cache = self.tool_route_cache.lock().await;
+                        let boundary = self.boundary.lock().await;
+                        let tool_names_descs: Vec<(String, String)> = tools.iter().map(|(n, d, _)| (n.clone(), d.clone())).collect();
+                        for (name, _desc) in &tool_names_descs {
+                            cache.insert(name.clone(), idx);
+                        }
+                        boundary.learn_tools(&tool_names_descs);
+                    }
+
                     for (name, desc, params) in tools {
                         if seen_names.contains(&name) {
                             continue;
@@ -934,7 +1087,7 @@ impl AgentCore {
                 let args = step.get("args").cloned().unwrap_or(serde_json::Value::Null);
                 // P2-9: 执行前经过 boundary 检查
                 let boundary = self.boundary.lock().await;
-                let check = boundary.check_tool(tool_name, &args, &self.config.identity.agent_id, "user", &PermissionLevel::Write, None);
+                let check = boundary.check_tool(tool_name, &args, &self.config.identity.agent_id, "user", &PermissionLevel::Write, self.current_ns_paths().as_deref());
                 drop(boundary);
                 if !check.allow {
                     tracing::warn!("Harness 步骤 {} 被 boundary 拒绝: {}", tool_name, check.reason);
@@ -960,10 +1113,19 @@ impl AgentCore {
     }
 
     /// 构建 system prompt
+    /// P2-3 修复：支持自定义模板
     fn build_system_prompt(&self, knowledge: &[String]) -> String {
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-        let mut prompt = format!(
-            r#"你是 {agent}，固废智能运营台的 AI 助手，负责帮助运营人员查询数据、排查问题、管理系统。
+
+        // P2-3: 如果有自定义模板，使用它
+        let mut prompt = if let Some(ref template) = self.config.system_prompt_template {
+            template
+                .replace("{agent}", &self.config.identity.agent_id)
+                .replace("{now}", &now)
+        } else {
+            // 内置默认模板
+            format!(
+                r#"你是 {agent}，固废智能运营台的 AI 助手，负责帮助运营人员查询数据、排查问题、管理系统。
 
 ## 回答风格
 - 基于数据，引用来源，不猜测
@@ -995,9 +1157,10 @@ impl AgentCore {
 
 当前时间：{now}
 "#,
-            agent = self.config.identity.agent_id,
-            now = now,
-        );
+                agent = self.config.identity.agent_id,
+                now = now,
+            )
+        };
 
         if !knowledge.is_empty() {
             prompt.push_str("## 相关知识（来自记忆系统）\n");
@@ -1034,8 +1197,5 @@ impl AgentCore {
 }
 
 fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    harness::now_secs()
 }
