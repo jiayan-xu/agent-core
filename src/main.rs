@@ -58,7 +58,7 @@ struct McpSourceConfig {
     token: String,
 }
 
-fn default_server() -> String { "http://192.168.1.171:9003".to_string() }
+fn default_server() -> String { "http://127.0.0.1:9003".to_string() }
 fn default_port() -> u16 { 9753 }
 
 impl Config {
@@ -153,21 +153,31 @@ fn main() {
                 }
             }
 
-            // 巡检循环
+            // 巡检循环（含失败计数）
             let patrol_state = state.clone();
             tokio::spawn(async move {
                 let mut timer = interval(Duration::from_secs(1800));
                 timer.tick().await;
+                let mut fail_count = 0u32;
                 loop {
                     timer.tick().await;
                     let agent_guard = patrol_state.agent.lock().await;
                     if let Some(ref agent) = *agent_guard {
-                        tracing::info!("巡检: 开始定时检查");
                         let tasks = [("system_ops", serde_json::json!({"action": "status"}))];
                         for (tool, args) in &tasks {
                             match agent.call_tool_routed(tool, args).await {
-                                Ok(reply) => tracing::info!("巡检 {}: {}", tool, &reply.chars().take(60).collect::<String>()),
-                                Err(e) => tracing::info!("巡检 {} 跳过: {}", tool, e),
+                                Ok(reply) => {
+                                    fail_count = 0;
+                                    tracing::info!("巡检 {}: {}", tool, &reply.chars().take(60).collect::<String>());
+                                }
+                                Err(e) => {
+                                    fail_count = fail_count.saturating_add(1);
+                                    if fail_count >= 3 {
+                                        tracing::error!("巡检连续失败 {} 次，工具 {}", fail_count, tool);
+                                    } else {
+                                        tracing::warn!("巡检 {} 失败: {}（第 {} 次）", tool, e, fail_count);
+                                    }
+                                }
                             }
                         }
                     }
@@ -488,10 +498,25 @@ async fn handle_v1_chat(
 
     let agent_guard = st.agent.lock().await;
     let reply = if let Some(ref agent) = *agent_guard {
-        let user_text = req.messages.iter()
+        // 输入校验：消息长度限制 32KB，消息数限制 100
+        if req.messages.len() > 100 {
+            return axum::response::Json(serde_json::json!({
+                "error": "too many messages"
+            })).into_response();
+        }
+        let session_id = format!("jan/{}", agent_id);
+        if session_id.len() > 128 || !session_id.chars().all(|c| c.is_alphanumeric() || c == '/' || c == '-' || c == '_') {
+            return axum::response::Json(serde_json::json!({
+                "error": "invalid session_id"
+            })).into_response();
+        }
+        let user_text: String = req.messages.iter()
             .filter_map(|m| m.content.as_deref())
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n")
+            .chars()
+            .take(32768)
+            .collect();
         if user_text.is_empty() {
             "请输入消息".to_string()
         } else {
@@ -535,25 +560,29 @@ struct RegisterResponse {
 }
 
 async fn handle_register(
-    State(_st): State<Arc<AppState>>,
+    State(st): State<Arc<AppState>>,
     Json(req): Json<RegisterRequest>,
 ) -> Json<RegisterResponse> {
     let agent_id = format!("{}_{}_{}", req.company, req.department, req.name);
     let namespace = format!("agent/{}/{}/{}", req.company, req.department, req.name);
     let badge_token = format!("sk-{:x}", rand::thread_rng().gen::<u128>());
 
-    // 注册到 Memoria
-    let mcp = McpClient::new("http://127.0.0.1:9003", "admin", "mem-admin-fixed-key-2026");
-    let memoria_ok = mcp.call_json("register_agent", &serde_json::json!({
+    // 注册到 Memoria — 从环境变量或配置读取 admin_key
+    let admin_key = match std::env::var("MEMORIA_ADMIN_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => st.config.lock().await.memoria_admin_key.clone(),
+    };
+    let mcp = McpClient::new("http://127.0.0.1:9003", "admin", &admin_key);
+    let memoria_ok = !admin_key.is_empty() && mcp.call_json("register_agent", &serde_json::json!({
         "agent_id": &agent_id,
         "display_name": &req.name,
-        "admin_key": "mem-admin-fixed-key-2026",
+        "admin_key": &admin_key,
         "namespace": &namespace,
     })).await.is_ok();
 
     // 缓存身份（使用 admin key 写入 Memoria 后，auth_cache 也存一份）
     if memoria_ok {
-        _st.auth_cache.lock().await.insert(agent_id.clone(), badge_token.clone());
+        st.auth_cache.lock().await.insert(agent_id.clone(), badge_token.clone());
     }
 
     Json(RegisterResponse {

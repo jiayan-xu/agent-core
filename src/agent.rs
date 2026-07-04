@@ -18,6 +18,17 @@ struct PendingAction {
     description: String,
 }
 
+/// 会话状态（任务级确认状态机）
+#[derive(Clone, PartialEq)]
+enum SessionState {
+    /// 新会话或刚结束上一个任务
+    New,
+    /// 等待用户确认理解
+    AwaitingConfirmation,
+    /// 已确认，可正常执行
+    Confirmed,
+}
+
 /// Agent 身份
 #[derive(Debug, Clone)]
 pub struct AgentIdentity {
@@ -61,6 +72,10 @@ pub struct AgentCore {
     session_history: tokio::sync::Mutex<HashMap<String, Vec<Message>>>,
     /// 待确认操作（session_id → pending action）
     pending_actions: tokio::sync::Mutex<HashMap<String, PendingAction>>,
+    /// 会话状态追踪（session_id → state）
+    session_state: tokio::sync::Mutex<HashMap<String, SessionState>>,
+    /// 待确认的原始消息（session_id → original message）
+    pending_original_message: tokio::sync::Mutex<HashMap<String, String>>,
 }
 
 struct InboxCache {
@@ -109,14 +124,22 @@ impl AgentCore {
             inbox_cache: tokio::sync::Mutex::new(InboxCache::new()),
             session_history: tokio::sync::Mutex::new(HashMap::new()),
             pending_actions: tokio::sync::Mutex::new(HashMap::new()),
+            session_state: tokio::sync::Mutex::new(HashMap::new()),
+            pending_original_message: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
     /// 入口：处理用户消息，返回回复
+    ///
+    /// 集成确认状态机（借鉴 task-workflow）：
+    /// - 新任务 → 复述确认（Step 1）→ 执行（Step 2）→ 交付（Step 3）
+    /// - 简单查询 → 直接执行
+    /// - 已确认会话 → 话题切换检测
     pub async fn chat(&self, message: &str, user_id: &str, session_id: &str) -> String {
-        // ── 0. 确认关键词 → 执行待确认操作 ──
         let confirm_words = ["确认", "确认添加", "确认执行", "添加", "是", "是的", "对", "执行", "确定", "可以"];
         let trimmed = message.trim();
+
+        // ── 0a. 工具级确认（现有）：pending_actions 中的操作等待确认 ──
         if confirm_words.contains(&trimmed) {
             let mut pending = self.pending_actions.lock().await;
             if let Some(action) = pending.remove(session_id) {
@@ -134,6 +157,56 @@ impl AgentCore {
             drop(pending);
         }
 
+        // ── 0b. 任务级确认状态机 ──
+        let mut states = self.session_state.lock().await;
+        let state = states.get(session_id).cloned().unwrap_or(SessionState::New);
+
+        match state {
+            // ── 等待用户确认理解 ──
+            SessionState::AwaitingConfirmation => {
+                if confirm_words.contains(&trimmed) {
+                    let original = self.pending_original_message.lock().await
+                        .remove(session_id)
+                        .unwrap_or_else(|| message.to_string());
+                    states.insert(session_id.to_string(), SessionState::Confirmed);
+                    drop(states);
+                    return self.execute_chat(&original, user_id, session_id).await;
+                }
+                // 修改/补充 → 保留 AwaitingConfirmation，重新复述
+                drop(states);
+                return self.rephrase_and_confirm(message, user_id, session_id).await;
+            }
+
+            // ── 已确认，正常执行 ──
+            SessionState::Confirmed => {
+                // 话题切换检测
+                if let Some(task) = self.pending_original_message.lock().await.get(session_id).cloned() {
+                    if boundary::TaskConfirmationGate::detect_topic_switch(message, &task) {
+                        drop(states);
+                        return self.handle_topic_switch(message, session_id).await;
+                    }
+                }
+                drop(states);
+                return self.execute_chat(message, user_id, session_id).await;
+            }
+
+            // ── 新会话 ──
+            SessionState::New => {
+                if boundary::TaskConfirmationGate::requires_confirmation(message) {
+                    states.insert(session_id.to_string(), SessionState::AwaitingConfirmation);
+                    drop(states);
+                    return self.rephrase_and_confirm(message, user_id, session_id).await;
+                }
+                // 简单查询 → 直接执行
+                states.insert(session_id.to_string(), SessionState::Confirmed);
+                drop(states);
+                return self.execute_chat(message, user_id, session_id).await;
+            }
+        }
+    }
+
+    /// 已确认会话的执行路径（原 chat() 主体 + Step 前缀）
+    async fn execute_chat(&self, message: &str, user_id: &str, session_id: &str) -> String {
         // ── 1. 快速路径（Harness 匹配）──
         if let Some(reply) = self.try_harness_match(message).await {
             return reply;
@@ -148,7 +221,6 @@ impl AgentCore {
         let mut knowledge = Vec::new();
         let mut enriched_message = message.to_string();
 
-        // 收件箱消息拼接到用户消息前
         if let Ok(Some(inbox_msgs)) = &inbox_result {
             let mut prefix = String::from("你有以下来自其他 Agent 的消息:\n");
             for m in inbox_msgs.iter().take(3) {
@@ -159,7 +231,6 @@ impl AgentCore {
             enriched_message = format!("{}\n---\n{}", prefix, message);
         }
 
-        // 记忆搜索结果
         if let Ok(Some(results)) = &mem_result {
             for item in results.iter().take(3) {
                 if let Some(content) = item.get("content").and_then(|c| c.as_str()) {
@@ -170,23 +241,70 @@ impl AgentCore {
             }
         }
 
-        // ── 3. 加载历史对话（多轮记忆）──
+        // ── 3. 加载历史对话 ──
         let history = self.load_history(session_id).await;
 
         // ── 4. 构建消息列表 ──
         let system_prompt = self.build_system_prompt(&knowledge);
         let mut messages = Vec::new();
-        // system prompt 始终在最前
         messages.push(Message { role: "system".to_string(), content: Some(system_prompt), tool_calls: None, tool_call_id: None });
-        // 历史消息（最近的 10 轮）
         for h in history.iter().rev().take(20) {
             messages.push(h.clone());
         }
-        // 当前用户消息
         messages.push(Message { role: "user".to_string(), content: Some(enriched_message), tool_calls: None, tool_call_id: None });
 
         // ── 5. LLM 调用循环 ──
-        self.llm_loop(messages, session_id, message, user_id).await
+        let result = self.llm_loop(messages, session_id, message, user_id).await;
+
+        // 给结果加 Step 前缀
+        format!("[Step 2/3: 执行 → Step 3/3: 交付]\n\n{}", result)
+    }
+
+    /// 复述确认：用 LLM 复述用户需求，等待确认
+    async fn rephrase_and_confirm(&self, message: &str, user_id: &str, session_id: &str) -> String {
+        self.pending_original_message.lock().await
+            .insert(session_id.to_string(), message.to_string());
+
+        let mem_result = self.search_memory(message).await;
+        let mut knowledge = Vec::new();
+        if let Ok(Some(results)) = &mem_result {
+            for item in results.iter().take(3) {
+                if let Some(content) = item.get("content").and_then(|c| c.as_str()) {
+                    if content.len() > 10 {
+                        knowledge.push(content.to_string());
+                    }
+                }
+            }
+        }
+
+        let system_prompt = self.build_system_prompt(&knowledge);
+        let msgs = vec![
+            Message { role: "system".to_string(), content: Some(system_prompt), tool_calls: None, tool_call_id: None },
+            Message { role: "user".to_string(), content: Some(message.to_string()), tool_calls: None, tool_call_id: None },
+        ];
+
+        // 无工具 LLM 调用 — 只复述，不执行
+        let response = match self.llm.chat(&msgs, &[]).await {
+            Ok(r) => r,
+            Err(e) => return format!("[Step 1/3: 确认理解]\n\n抱歉，理解时遇到问题：{}", e),
+        };
+
+        let rephrase = response.text.trim().to_string();
+        format!(
+            "[Step 1/3: 确认理解]\n\n{}，我理解你的需求是：\n\n{}\n\n方向对吗？",
+            self.config.identity.agent_id,
+            if rephrase.is_empty() { message } else { &rephrase },
+        )
+    }
+
+    /// 话题切换检测：当前任务未完成，检测到话题切换
+    async fn handle_topic_switch(&self, message: &str, session_id: &str) -> String {
+        let task = self.pending_original_message.lock().await
+            .get(session_id).cloned().unwrap_or_default();
+        let task_preview: String = task.chars().take(80).collect();
+        format!(
+            "[Task 管理]\n\n检测到您可能换了话题。当前任务还在处理：{task_preview}\n\n请选择：\n- \"继续\" → 继续当前任务\n- \"暂停\" → 暂停当前任务\n- \"结束\" → 结束当前任务"
+        )
     }
 
     /// 从内存缓存 + SQLite 加载历史对话

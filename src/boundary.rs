@@ -437,6 +437,85 @@ fn classify_skill(tool_name: &str) -> &'static str {
 }
 
 // ══════════════════════════════════════════════════════
+// 第八条：任务确认红线
+// ══════════════════════════════════════════════════════
+
+/// 任务确认守卫：判断用户消息是否需要先复述确认
+///
+/// 简单查询（查车牌、查数据等）直接执行，
+/// 复杂任务（写文档、做分析、改数据等）需要先确认理解。
+pub struct TaskConfirmationGate;
+
+impl TaskConfirmationGate {
+    /// 判断用户消息是否需要先确认理解
+    pub fn requires_confirmation(message: &str) -> bool {
+        let trimmed = message.trim();
+
+        // 确认/否定/元词 → 不是新任务
+        let meta_words = ["对", "是", "确认", "行", "好", "可以", "不对", "改", "补充", "继续", "停", "结束"];
+        if meta_words.contains(&trimmed) {
+            return false;
+        }
+
+        // 以查询前缀开头 → 直接执行，不需要确认
+        let query_prefixes = ["查", "查一下", "查询", "看看", "搜一搜", "搜"];
+        if query_prefixes.iter().any(|p| trimmed.starts_with(p)) {
+            return false;
+        }
+
+        // 短消息（<4 字）且无任务关键词 → 简单回应
+        if trimmed.chars().count() < 4 {
+            return false;
+        }
+
+        // 任务类关键词 → 需要确认
+        let task_keywords = [
+            "帮我", "写", "做", "分析", "整理", "设计", "方案",
+            "报告", "文档", "总结", "规划", "开发", "实现",
+            "创建", "生成", "修改", "更新", "重构", "调整",
+            "给我", "出一份", "做一个", "搞一个",
+        ];
+        task_keywords.iter().any(|k| trimmed.contains(k))
+    }
+
+    /// 话题切换检测：判断用户输入是否与当前任务上下文相关
+    ///
+    /// 如果输入很短或不含任务中的关键词，可能是切换话题。
+    /// 支持中文（用 2-char 滑动窗口提取关键词）。
+    pub fn detect_topic_switch(message: &str, current_task: &str) -> bool {
+        let msg = message.trim();
+        // 元命令 → 不是切换
+        let meta = ["对", "是", "确认", "行", "好", "可以", "继续", "停", "结束", "先这样"];
+        if meta.contains(&msg) {
+            return false;
+        }
+        // 输入太短 → 可能是切换
+        if msg.chars().count() < 5 {
+            return true;
+        }
+        // 从任务中提取 2-char 关键词（中文滑动窗口）
+        let task_chars: Vec<char> = current_task.trim().chars().collect();
+        let mut task_tokens: Vec<String> = Vec::new();
+        for w in task_chars.windows(2) {
+            let token: String = w.iter().collect();
+            if !task_tokens.contains(&token) {
+                task_tokens.push(token);
+            }
+        }
+        // 也处理英文/混合文本的分词
+        for w in current_task.split_whitespace().filter(|w| w.chars().count() >= 2) {
+            if !task_tokens.contains(&w.to_string()) {
+                task_tokens.push(w.to_string());
+            }
+        }
+        if task_tokens.is_empty() {
+            return false;
+        }
+        !task_tokens.iter().any(|t| msg.contains(t.as_str()))
+    }
+}
+
+// ══════════════════════════════════════════════════════
 // 测试
 // ══════════════════════════════════════════════════════
 
@@ -555,6 +634,42 @@ mod tests {
         let r = boundary.check_tool("query_plate", &serde_json::json!({}),
                                     "test-agent", "user", &PermissionLevel::Write, None);
         assert!(!r.allow, "query_plate 应被白名单拦截: {:?}", r);
+    }
+
+    #[test]
+    fn test_task_confirmation_simple_query() {
+        // 简单查询 → 不需要确认
+        assert!(!TaskConfirmationGate::requires_confirmation("查一下京A12345"));
+        assert!(!TaskConfirmationGate::requires_confirmation("查询昨天的车辆数据"));
+        assert!(!TaskConfirmationGate::requires_confirmation("看看白名单有没有这个企业"));
+    }
+
+    #[test]
+    fn test_task_confirmation_meta_words() {
+        // 元词 → 不是新任务
+        assert!(!TaskConfirmationGate::requires_confirmation("对"));
+        assert!(!TaskConfirmationGate::requires_confirmation("确认"));
+        assert!(!TaskConfirmationGate::requires_confirmation("继续"));
+    }
+
+    #[test]
+    fn test_task_confirmation_task_request() {
+        // 任务类请求 → 需要确认
+        assert!(TaskConfirmationGate::requires_confirmation("帮我分析上个月的车辆数据"));
+        assert!(TaskConfirmationGate::requires_confirmation("写一份固废分析报告"));
+        assert!(TaskConfirmationGate::requires_confirmation("整理一下这个月的入厂记录"));
+    }
+
+    #[test]
+    fn test_topic_switch_detection() {
+        // 相关输入 → 非切换
+        assert!(!TaskConfirmationGate::detect_topic_switch("看看车辆数据的趋势", "分析上个月车辆入厂数据"));
+        // 无关输入 → 切换
+        assert!(TaskConfirmationGate::detect_topic_switch("今天天气怎么样", "分析上个月车辆入厂数据"));
+        // 元命令 → 非切换
+        assert!(!TaskConfirmationGate::detect_topic_switch("继续", "分析数据"));
+        // 太短 → 可能是切换
+        assert!(TaskConfirmationGate::detect_topic_switch("哦", "分析数据"));
     }
 
     #[test]
