@@ -54,6 +54,8 @@ pub struct AgentConfig {
     pub skill_whitelist: Option<Vec<String>>,
     pub max_tool_rounds: u32,
     pub parent_permission: PermissionLevel,
+    /// 启用组合路由（多 Skill 分解 + 按序执行）
+    pub enable_compositional_routing: bool,
 }
 
 /// Agent 核心
@@ -207,6 +209,46 @@ impl AgentCore {
 
     /// 已确认会话的执行路径（原 chat() 主体 + Step 前缀）
     async fn execute_chat(&self, message: &str, user_id: &str, session_id: &str) -> String {
+        // ── 0. 组合路由路径：多 Skill 分解 + 按序执行 ──
+        if self.config.enable_compositional_routing {
+            let tools = self.fetch_tools().await;
+            if !tools.is_empty() {
+                match crate::composer::decompose(&self.llm, message, &tools).await {
+                    Ok(plan) if plan.steps.len() > 1 => {
+                        let result = self.execute_plan(&plan, session_id).await
+                            .unwrap_or_else(|e| format!("组合执行失败: {}", e));
+
+                        // 蒸馏闭环：记录组合执行的摘要日志，触发 Harness 蒸馏
+                        let is_success = result.starts_with("执行结果") && !result.contains("失败");
+                        {
+                            let mut log = self.execution_log.lock().await;
+                            // 用消息中的关键词作为 trigger_conditions（供后续 Harness 匹配）
+                            let query_preview: String = message.chars().take(80).collect();
+                            log.push(crate::harness::ExecutionLog {
+                                name: format!("composer_{}", message.chars().take(20).collect::<String>()),
+                                trigger_conditions: serde_json::json!({"query": query_preview}),
+                                steps: serde_json::json!(plan.steps.iter().map(|s| serde_json::json!({
+                                    "tool": s.tool,
+                                    "args": s.arguments,
+                                })).collect::<Vec<serde_json::Value>>()),
+                                verify_rule: String::new(),
+                                success: is_success,
+                            });
+                        }
+                        // 从积累的执行日志中蒸馏新模板
+                        {
+                            let logs = self.execution_log.lock().await;
+                            let mut harness = self.harness.lock().await;
+                            let _ = harness.distill_from_logs(&logs, 2);
+                        }
+
+                        return format!("[Step 2/3: 执行 → Step 3/3: 交付]\n\n{}", result);
+                    }
+                    _ => {} // 单步或失败 → 降级到普通 LLM loop
+                }
+            }
+        }
+
         // ── 1. 快速路径（Harness 匹配）──
         if let Some(reply) = self.try_harness_match(message).await {
             return reply;
@@ -261,11 +303,20 @@ impl AgentCore {
     }
 
     /// 复述确认：用 LLM 复述用户需求，等待确认
+    ///
+    /// SAD（Skill-Aware Decomposition）风格增强：
+    /// 并行获取记忆 + 可用工具列表，注入到 system prompt 中，
+    /// 让 LLM 在复述时就能感知可用能力，对齐措辞。
     async fn rephrase_and_confirm(&self, message: &str, user_id: &str, session_id: &str) -> String {
         self.pending_original_message.lock().await
             .insert(session_id.to_string(), message.to_string());
 
-        let mem_result = self.search_memory(message).await;
+        // SAD 风格：并行获取上下文（记忆）和可用能力（工具列表）
+        let (mem_result, tools) = tokio::join!(
+            self.search_memory(message),
+            self.fetch_tools(),
+        );
+
         let mut knowledge = Vec::new();
         if let Ok(Some(results)) = &mem_result {
             for item in results.iter().take(3) {
@@ -277,7 +328,19 @@ impl AgentCore {
             }
         }
 
-        let system_prompt = self.build_system_prompt(&knowledge);
+        // 构建增强版 system prompt
+        let mut system_prompt = self.build_system_prompt(&knowledge);
+
+        // SAD 核心：注入可用工具信息，让 LLM 复述时对齐能力
+        if !tools.is_empty() {
+            system_prompt.push_str("\n\n## 可用工具\n你可以使用以下工具来完成请求。复述时请结合工具来描述你的执行方案：\n");
+            for t in tools.iter().take(15) {
+                let desc: String = t.function.description.chars().take(100).collect();
+                system_prompt.push_str(&format!("- `{}`: {}\n", t.function.name, desc));
+            }
+            system_prompt.push_str("\n在复述中列出你的执行计划（需要几步、用什么工具），让用户确认方案后再执行。\n");
+        }
+
         let msgs = vec![
             Message { role: "system".to_string(), content: Some(system_prompt), tool_calls: None, tool_call_id: None },
             Message { role: "user".to_string(), content: Some(message.to_string()), tool_calls: None, tool_call_id: None },
@@ -295,6 +358,144 @@ impl AgentCore {
             self.config.identity.agent_id,
             if rephrase.is_empty() { message } else { &rephrase },
         )
+    }
+
+    /// 按依赖序执行组合计划（支持并行执行无依赖步骤）
+    async fn execute_plan(&self, plan: &crate::composer::ExecutionPlan, session_id: &str) -> Result<String, String> {
+        use std::collections::HashMap;
+
+        let mut step_results: HashMap<u32, String> = HashMap::new();
+        let mut step_errors: Vec<String> = Vec::new();
+        let mut executed: Vec<u32> = Vec::new();
+        let total = plan.steps.len();
+
+        while executed.len() < total {
+            // 找出本轮可执行的步骤（所有依赖已就绪）
+            let ready: Vec<&crate::composer::StepPlan> = plan.steps.iter()
+                .filter(|s| !executed.contains(&s.step_id))
+                .filter(|s| s.depends_on.iter().all(|d| executed.contains(d)))
+                .collect();
+
+            if ready.is_empty() {
+                // 死锁：有步骤未执行但无可就绪的
+                for step in &plan.steps {
+                    if !executed.contains(&step.step_id) {
+                        step_errors.push(format!("Step {} 无法执行（依赖未就绪）", step.step_id));
+                    }
+                }
+                break;
+            }
+
+            // 并行执行所有就绪步骤
+            let futures: Vec<_> = ready.iter().map(|step| {
+                // 解析参数中的依赖占位符（step_N → 第 N 步的实际结果）
+                let mut args = step.arguments.clone();
+                if let Some(obj) = args.as_object_mut() {
+                    for val in obj.values_mut() {
+                        if let Some(s) = val.as_str() {
+                            if let Some(rest) = s.strip_prefix("step_") {
+                                // 解析 step_N[_result] 中的 N
+                                let step_num: u32 = rest.split(['_', ' ']).next()
+                                    .and_then(|n| n.parse().ok())
+                                    .unwrap_or(0);
+                                if step_num > 0 {
+                                    if let Some(prev) = step_results.get(&step_num) {
+                                        *val = serde_json::Value::String(prev.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 捕获所需引用
+                let step_id = step.step_id;
+                let tool = step.tool.clone();
+                let desc = step.description.clone();
+
+                async move {
+                    (step_id, tool, desc, args)
+                }
+            }).collect();
+
+            // 先解析完参数再逐个执行
+            let parsed: Vec<_> = futures::future::join_all(futures).await;
+
+            // 并发执行所有就绪步骤
+            let exec_futures: Vec<_> = parsed.into_iter().map(|(step_id, tool, desc, args)| {
+                let this = &self;
+                async move {
+                    // 边界检查
+                    {
+                        let boundary = this.boundary.lock().await;
+                        let check = boundary.check_tool(
+                            &tool, &args,
+                            &this.config.identity.agent_id, "user",
+                            &this.config.parent_permission, None,
+                        );
+                        if !check.allow {
+                            return (step_id, Err(format!("被安全边界拦截: {}", check.reason)));
+                        }
+                    }
+
+                    match this.call_tool_routed(&tool, &args).await {
+                        Ok(result) => {
+                            // 记录执行日志
+                            {
+                                let mut log = this.execution_log.lock().await;
+                                log.push(crate::harness::ExecutionLog {
+                                    name: tool.clone(),
+                                    trigger_conditions: serde_json::json!({"composer_step": step_id}),
+                                    steps: serde_json::json!([{"tool": tool, "args": args}]),
+                                    verify_rule: String::new(),
+                                    success: true,
+                                });
+                            }
+                            (step_id, Ok(result))
+                        }
+                        Err(e) => {
+                            tracing::warn!("[Composer] Step {} ({}): {}", step_id, desc, e);
+                            (step_id, Err(e))
+                        }
+                    }
+                }
+            }).collect();
+
+            // 收集结果
+            let results = futures::future::join_all(exec_futures).await;
+            for (step_id, result) in results {
+                match result {
+                    Ok(text) => {
+                        step_results.insert(step_id, text);
+                    }
+                    Err(e) => {
+                        step_errors.push(format!("Step {}: {}", step_id, e));
+                    }
+                }
+                executed.push(step_id);
+            }
+        }
+
+        let success_count = step_results.len();
+        let error_count = step_errors.len();
+        let mut report = format!("执行结果：{}/{} 步骤成功", success_count, total);
+
+        if error_count > 0 {
+            report.push_str(&format!("，{} 步失败\n", error_count));
+            for e in &step_errors {
+                report.push_str(&format!("- {}\n", e));
+            }
+        }
+
+        if success_count == total && !step_results.is_empty() {
+            if let Some(last_result) = step_results.values().last() {
+                if !last_result.is_empty() && last_result.len() < 500 {
+                    report.push_str(&format!("\n最终结果：{}", last_result));
+                }
+            }
+        }
+
+        Ok(report)
     }
 
     /// 话题切换检测：当前任务未完成，检测到话题切换

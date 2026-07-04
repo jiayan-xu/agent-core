@@ -595,21 +595,43 @@ async fn handle_register(
 }
 
 async fn build_agent(config: &Config) -> Result<AgentCore, String> {
-    let mcp = McpClient::new(&config.server, &config.agent_id, &config.api_key);
+    // P1-1: 分离密钥用途
+    let badge_token = std::env::var("MEMORIA_ADMIN_KEY").unwrap_or_default();
+    let admin_key = if !config.memoria_admin_key.is_empty() {
+        config.memoria_admin_key.clone()
+    } else if !badge_token.is_empty() {
+        badge_token.clone()
+    } else {
+        config.api_key.clone()
+    };
+
+    let mcp = McpClient::new(&config.server, &config.agent_id, &badge_token);
     let _ = mcp.call_json("register_agent", &serde_json::json!({
         "agent_id": &config.agent_id,
         "display_name": &config.agent_id,
-        "admin_key": &config.api_key,
+        "admin_key": &admin_key,
         "namespace": format!("agent/{}", config.agent_id),
     })).await;
 
     let identity = AgentIdentity {
         agent_id: config.agent_id.clone(),
         namespace: format!("agent/{}", config.agent_id),
-        badge_token: config.api_key.clone(),
+        badge_token: badge_token.clone(),
+    };
+    // P0-1: 设置 failover fallbacks
+    let doubao_key = std::env::var("DOUBAO_API_KEY").unwrap_or_default();
+    let fallbacks = if !doubao_key.is_empty() {
+        vec![
+            ("https://ark.cn-beijing.volces.com/api/v3".to_string(),
+             "doubao-lite-32k".to_string(),
+             doubao_key),
+        ]
+    } else {
+        Vec::new()
     };
     let llm_config = LlmConfig {
         api_key: config.api_key.clone(),
+        fallbacks,
         ..Default::default()
     };
     let mut additional_mcp = Vec::new();
@@ -624,6 +646,7 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
         skill_whitelist: None,
         max_tool_rounds: 3,
         parent_permission: PermissionLevel::Write,
+        enable_compositional_routing: true,
     };
     let cwd = std::env::current_dir().unwrap_or_default();
     let harness = HarnessStore::open(&cwd.join("harness.db").to_string_lossy())
