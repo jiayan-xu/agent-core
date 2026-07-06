@@ -195,7 +195,7 @@ impl Default for ApprovalManager {
 ///
 /// check_tool 是同步方法，不能 await，所以用这个辅助函数
 /// 快速检查当前工具是否需要走审批流程。
-pub fn has_pending_approval_sync(manager: &ApprovalManager, tool_name: &str) -> bool {
+pub fn has_pending_approval_sync(_manager: &ApprovalManager, _tool_name: &str) -> bool {
     // 简单实现：检查 dangerous 工具是否需要审批
     // 完整实现需要 tokio::runtime 或 async 调用，这里保持同步
     false

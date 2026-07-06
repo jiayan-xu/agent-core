@@ -131,7 +131,6 @@ fn extract_code_block(text: &str) -> String {
         if trimmed.starts_with("```") {
             if in_block {
                 // 代码块结束
-                in_block = false;
                 break;
             } else {
                 // 代码块开始
