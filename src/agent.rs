@@ -1,6 +1,7 @@
 //! Agent 核心 — chat 循环 + 工具执行
 
 use std::sync::Arc;
+use chrono::Datelike;
 
 use tokio::sync::Mutex;
 
@@ -1207,6 +1208,36 @@ impl AgentCore {
         );
 
         prompt
+    }
+
+    /// 洞见发现：拉取最近 7 天数据，LLM 分析模式，存入 Memoria
+    pub async fn run_insights(&self) -> String {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let week_ago = (chrono::Local::now() - chrono::Duration::days(7)).format("%Y-%m-%d").to_string();
+        let data = self.call_tool_routed("query_entrance", &serde_json::json!({
+            "date_from": week_ago, "date_to": today, "limit": 500,
+        })).await.unwrap_or_default();
+        let stats = self.call_tool_routed("query_monthly_stats", &serde_json::json!({
+            "year": chrono::Local::now().year(), "month": chrono::Local::now().month(),
+        })).await.unwrap_or_default();
+
+        let prompt = format!(
+            "你是固废运营数据分析师。分析最近7天入厂数据，找出有意义的模式或异常。\
+             没有发现就输出'无异常'。每个发现一句话，最多3个。\n\n## 近7天数据\n{}\n\n## 本月统计\n{}",
+            data.chars().take(3000).collect::<String>(),
+            stats.chars().take(1000).collect::<String>(),
+        );
+        let msg = crate::llm::Message { role: "system".to_string(), content: Some(prompt), tool_calls: None, tool_call_id: None };
+        let reply = match self.llm.chat(&[msg], &[]).await {
+            Ok(r) => r.text.trim().to_string(),
+            Err(e) => return format!("洞见失败: {}", e),
+        };
+        if reply.is_empty() || reply == "无异常" { return "洞见: 无异常".to_string(); }
+        let _ = self.mcp.call("memory_remember", &serde_json::json!({
+            "content": format!("[洞见] {} | {}~{}", reply, week_ago, today),
+            "tags": ["insight", "auto_discovered"], "confidence": 70,
+        })).await;
+        format!("洞见: {}", reply)
     }
 }
 

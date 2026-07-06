@@ -177,8 +177,10 @@ fn main() {
                 let mut timer = interval(Duration::from_secs(1800));
                 timer.tick().await;
                 let mut fail_count = 0u32;
+                let mut insight_cycle = 0u32;
                 loop {
                     timer.tick().await;
+                    insight_cycle += 1;
                     let agent_guard = patrol_state.agent.lock().await;
                     if let Some(ref agent) = *agent_guard {
                         let tasks = [("system_ops", serde_json::json!({"action": "status"}))];
@@ -197,6 +199,11 @@ fn main() {
                                     }
                                 }
                             }
+                        }
+                        // 每 4 轮（约 2 小时）执行一次洞见发现
+                        if insight_cycle % 4 == 0 {
+                            let insight = agent.run_insights().await;
+                            tracing::info!("{}", insight);
                         }
                     }
                     drop(agent_guard);
