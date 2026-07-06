@@ -200,10 +200,33 @@ fn main() {
                                 }
                             }
                         }
-                        // 每 4 轮（约 2 小时）执行一次洞见发现
+                    // 每 4 轮（约 2 小时）执行一次洞见发现
                         if insight_cycle % 4 == 0 {
                             let insight = agent.run_insights().await;
                             tracing::info!("{}", insight);
+                        }
+                        // 每轮检查 dashboard agent_worker 健康（端口 8011）
+                        let agent_ok = reqwest::get("http://127.0.0.1:8011/health")
+                            .await
+                            .map(|r| r.status().is_success())
+                            .unwrap_or(false);
+                        if !agent_ok {
+                            tracing::warn!("Agent worker 无响应，通过 dashboard API 重启");
+                            let client = reqwest::Client::new();
+                            if let Ok(login) = client.post("http://127.0.0.1:8000/api/login")
+                                .form(&[("username", "admin"), ("password", "admin123")])
+                                .send().await
+                            {
+                                let cookie = login.headers().get("set-cookie")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if !cookie.is_empty() {
+                                    let _ = client.post("http://127.0.0.1:8000/api/snmis/agent/start")
+                                        .header("Cookie", &cookie)
+                                        .send().await;
+                                }
+                            }
                         }
                     }
                     drop(agent_guard);
