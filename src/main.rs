@@ -56,9 +56,16 @@ struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct McpSourceConfig {
     name: String,
+    #[serde(default)]
     url: String,
     #[serde(default)]
     token: String,
+    /// stdio 模式：可执行文件路径
+    #[serde(default)]
+    command: String,
+    /// stdio 模式：命令行参数
+    #[serde(default)]
+    args: Vec<String>,
 }
 
 fn default_server() -> String { "http://127.0.0.1:9003".to_string() }
@@ -689,7 +696,11 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
     };
     let mut additional_mcp = Vec::new();
     for src in &config.mcp_source {
-        additional_mcp.push((src.name.clone(), src.url.clone(), src.token.clone()));
+        if !src.command.is_empty() {
+            additional_mcp.push((src.name.clone(), src.url.clone(), src.token.clone(), Some((src.command.clone(), src.args.clone()))));
+        } else {
+            additional_mcp.push((src.name.clone(), src.url.clone(), src.token.clone(), None));
+        }
     }
     let agent_config = AgentConfig {
         identity,

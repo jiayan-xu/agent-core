@@ -1,5 +1,26 @@
 # agent-core 演进日志
 
+## 2026-07-06 — McpClient 枚举重构 + Stdio 传输支持
+
+### 背景
+dashboard 剥离 LLM 后，agent-core 需要通过新的方式连接 dashboard 能力。原有的 HTTP-only MCP 客户端无法覆盖子进程场景。
+
+### 变更
+- **`src/mcp_client.rs`** — `McpClient` 从单一 struct 重构为枚举：
+  - `McpClient::Http(HttpMcpClient)` — HTTP(S) 远程连接
+  - `McpClient::Stdio(Arc<StdioMcpClient>)` — 子进程 stdin/stdout JSON-RPC
+  - 所有方法（`call`、`list_tools`、`call_json`）通过枚举代理，调用方零改动
+- **`src/main.rs`** — `McpSourceConfig` 新增 `command`/`args` 字段，`build_agent()` 根据配置创建对应客户端
+- **`src/agent.rs`** — `AgentConfig.additional_mcp` 类型扩展为 4 元组，`AgentCore::new()` 支持 stdio 分支
+- **`agent.toml`** — 新增 `dashboard`（HTTP）和 `dashboard-stdio`（stdio）双源配置
+
+### 验证
+- 编译通过（8925 KB）
+- stdio MCP 端到端测试通过：系统状态查询、车牌查询、日统计
+- 向后兼容：所有 HTTP MCP 调用（Memoria）零改动
+
+---
+
 ## 2026-07-09 — Task Workflow 确认机制 + 阿里 SkillWeaver 组合路由 + Harness 蒸馏闭环
 
 ### 新增功能

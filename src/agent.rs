@@ -48,8 +48,10 @@ pub struct AgentConfig {
     pub identity: AgentIdentity,
     pub llm: LlmConfig,
     pub memoria_url: String,
-    /// 可选 MCP 源（名称 + URL + 令牌），例：[("dashboard", "http://127.0.0.1:8000", "")]
-    pub additional_mcp: Vec<(String, String, String)>,
+    /// 可选 MCP 源（名称 + URL + 令牌 + 可选的 stdio (命令, 参数)），
+    /// 例 HTTP:  [("dashboard", "http://127.0.0.1:8000", "", None)]
+    /// 例 stdio: [("dashboard", "", "", Some(("python".into(), ["-m","mcp_server"].map(String::from).to_vec())))]
+    pub additional_mcp: Vec<(String, String, String, Option<(String, Vec<String>)>)>,
     pub skill_whitelist: Option<Vec<String>>,
     pub max_tool_rounds: u32,
     pub parent_permission: PermissionLevel,
@@ -108,10 +110,15 @@ impl AgentCore {
         let mcp = McpClient::new(&config.memoria_url, &config.identity.agent_id, &config.identity.badge_token);
         // 构建 MCP 源列表（Memoria 始终为第一个源）
         let mut mcp_sources = vec![McpSource::memoria(mcp.clone())];
-        for (name, url, token) in &config.additional_mcp {
-            let badge = if token.is_empty() { &config.identity.badge_token } else { token };
-            let client = McpClient::new(url, &config.identity.agent_id, badge);
-            mcp_sources.push(McpSource::new(name, client));
+        for (name, url, token, stdio_opt) in &config.additional_mcp {
+            if let Some((cmd, args)) = stdio_opt {
+                let client = McpClient::new_stdio(cmd, args);
+                mcp_sources.push(McpSource::new(name, client));
+            } else {
+                let badge = if token.is_empty() { &config.identity.badge_token } else { token };
+                let client = McpClient::new(url, &config.identity.agent_id, badge);
+                mcp_sources.push(McpSource::new(name, client));
+            }
         }
         let llm = LlmClient::new(config.llm.clone());
         let boundary = ComplianceBoundary::new(config.skill_whitelist.clone());
@@ -530,6 +537,7 @@ impl AgentCore {
     }
 
     /// 从 SessionManager 加载历史对话
+    #[allow(dead_code)]
     async fn load_history(&self, session_id: &str) -> Vec<Message> {
         let ns = self.config.identity.ns();
         let db_path = self.harness.lock().await.db_path();
@@ -961,7 +969,13 @@ impl AgentCore {
             // 确保 ns_full_path 被设置
             // 注意：config.identity 不是 pub 可写的，所以我们通过替换来更新
             // 这里只注册到 registry
-            let mut reg = self.namespace_registry.lock().unwrap();
+            let mut reg = match self.namespace_registry.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    tracing::error!("namespace_registry Mutex 中毒，跳过命名空间注册");
+                    return;
+                }
+            };
             let parts: Vec<&str> = full_path.trim_start_matches('/').split('/').collect();
             // parts 格式：["dept", "公司名", "project", "部门名", "user", "用户名"]
             if parts.len() >= 2 && parts[0] == "dept" {

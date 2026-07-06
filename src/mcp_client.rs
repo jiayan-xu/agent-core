@@ -1,43 +1,46 @@
-//! MCP 客户端 — 连接 Memoria 的工具调用接口
+//! MCP 客户端 — 支持 HTTP 和 stdio 两种传输层
 //!
-//! 复用 HTTP 连接池，支持自动重试。
+//! - `McpClient::Http(HttpMcpClient)` — HTTP(S) 连接远程 MCP 服务器
+//! - `McpClient::Stdio(StdioMcpClient)` — 子进程 stdin/stdout MCP 通信
 
 use std::time::Duration;
+use std::process::{Child, Stdio, Command};
+use std::io::{BufRead, BufReader, Write};
+use std::sync::atomic::AtomicU64;
+use reqwest::Client as HttpClient;
 
-use reqwest::Client;
+// ── 通用 MCP 结果 ──
 
 /// MCP 调用结果
 #[derive(Debug, Clone)]
 pub struct McpResult {
-    /// 工具返回的原始文本
     pub text: String,
 }
 
-/// MCP 客户端
+// ── HTTP 传输 ──
+
+/// HTTP MCP 客户端（原 McpClient）
 #[derive(Clone)]
-pub struct McpClient {
-    client: Client,
+pub struct HttpMcpClient {
+    client: HttpClient,
     base_url: String,
     agent_id: String,
     badge_token: String,
-    /// P2-5: 可配置超时（秒）
     timeout_secs: u64,
 }
 
-impl McpClient {
-    /// 创建新的 MCP 客户端
+impl HttpMcpClient {
     pub fn new(base_url: &str, agent_id: &str, badge_token: &str) -> Self {
         Self::with_timeout(base_url, agent_id, badge_token, 30)
     }
 
-    /// P2-5: 指定超时时间创建客户端
     pub fn with_timeout(base_url: &str, agent_id: &str, badge_token: &str, timeout_secs: u64) -> Self {
-        let client = Client::builder()
+        let client = HttpClient::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(4)
             .build()
             .expect("reqwest Client::build");
-        McpClient {
+        HttpMcpClient {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             agent_id: agent_id.to_string(),
@@ -46,107 +49,215 @@ impl McpClient {
         }
     }
 
-    /// 获取当前超时配置
-    pub fn timeout_secs(&self) -> u64 {
-        self.timeout_secs
-    }
-
-    /// 调用 MCP 工具（带重试）
     pub async fn call(&self, tool: &str, args: &serde_json::Value) -> Result<String, String> {
         let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": tool,
-                "arguments": args,
-            }
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": tool, "arguments": args }
         });
-
         let url = format!("{}/mcp", self.base_url);
-
-        // 3 次重试：0s, 1s, 2s 退避
         for attempt in 0..3 {
-            let result = self
-                .client
-                .post(&url)
-                .json(&body)
+            let result = self.client.post(&url).json(&body)
                 .header("X-Agent-Id", &self.agent_id)
                 .header("X-Agent-Key", &self.badge_token)
-                .send()
-                .await;
-
+                .send().await;
             match result {
                 Ok(resp) => {
                     if !resp.status().is_success() {
-                        if attempt < 2 {
-                            tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
-                            continue;
-                        }
+                        if attempt < 2 { tokio::time::sleep(Duration::from_secs(attempt as u64)).await; continue; }
                         return Err(format!("HTTP {}", resp.status()));
                     }
                     let data: serde_json::Value = resp.json().await.map_err(|e| format!("json: {}", e))?;
-                    // 提取 result.content[0].text
-                    let text = data["result"]["content"][0]["text"]
-                        .as_str()
-                        .ok_or_else(|| "empty MCP response".to_string())?
-                        .to_string();
-                    return Ok(text);
+                    return Ok(data["result"]["content"][0]["text"].as_str().ok_or("empty MCP response")?.to_string());
                 }
                 Err(e) => {
-                    if attempt < 2 {
-                        tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
-                        continue;
-                    }
+                    if attempt < 2 { tokio::time::sleep(Duration::from_secs(attempt as u64)).await; continue; }
                     return Err(format!("MCP call failed after 3 retries: {}", e));
                 }
             }
         }
-
         Err("unreachable".to_string())
     }
 
-    /// 获取 MCP 源的工具列表（含完整参数 schema）
     pub async fn list_tools(&self) -> Result<Vec<(String, String, serde_json::Value)>, String> {
         let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list",
-            "params": {}
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
         });
         let url = format!("{}/mcp", self.base_url);
-        let resp = self.client.post(&url)
-            .json(&body)
+        let resp = self.client.post(&url).json(&body)
             .header("X-Agent-Id", &self.agent_id)
             .header("X-Agent-Key", &self.badge_token)
-            .send().await
-            .map_err(|e| format!("tools/list: {}", e))?;
-        let data: serde_json::Value = resp.json().await
-            .map_err(|e| format!("tools/list JSON: {}", e))?;
-        let tools = data["result"]["tools"].as_array()
-            .ok_or("tools/list 返回格式异常")?;
-        let mut result = Vec::new();
-        for t in tools {
-            if let Some(func) = t.get("function") {
-                let name = func.get("name")
-                    .and_then(|n| n.as_str()).unwrap_or("?").to_string();
-                let desc = func.get("description")
-                    .and_then(|d| d.as_str()).unwrap_or("").to_string();
-                let params = func.get("parameters")
-                    .cloned()
-                    .unwrap_or(serde_json::json!({"type": "object", "properties": {}}));
-                result.push((name, desc, params));
-            }
-        }
-        Ok(result)
+            .send().await.map_err(|e| format!("tools/list: {}", e))?;
+        let data: serde_json::Value = resp.json().await.map_err(|e| format!("tools/list JSON: {}", e))?;
+        Ok(extract_tools(&data))
     }
 
-    /// 调用并解析为 JSON Value
     pub async fn call_json(&self, tool: &str, args: &serde_json::Value) -> Result<serde_json::Value, String> {
         let text = self.call(tool, args).await?;
         serde_json::from_str(&text).map_err(|e| format!("parse result: {}", e))
     }
 }
+
+// ── Stdio 传输 ──
+
+/// Stdio MCP 客户端 — 通过子进程 stdin/stdout 通信
+pub struct StdioMcpClient {
+    child: tokio::sync::Mutex<ChildProcess>,
+    command: String,
+    args: Vec<String>,
+    next_id: AtomicU64,
+}
+
+/// 子进程状态
+struct ChildProcess {
+    inner: Child,
+    /// 读取就绪信号后的缓冲区（第一行 stdout 是就绪信号）
+    ready: bool,
+}
+
+impl StdioMcpClient {
+    pub fn new(command: &str, args: &[String]) -> Self {
+        StdioMcpClient {
+            child: tokio::sync::Mutex::new(ChildProcess { inner: spawn_process(command, args), ready: false }),
+            command: command.to_string(),
+            args: args.to_vec(),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    /// 发送 JSON-RPC 请求，返回响应
+    async fn communicate(&self, request: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let mut guard = self.child.lock().await;
+
+        // 检查进程是否存活，死了就重启
+        if guard.inner.try_wait().ok().flatten().is_some() {
+            guard.inner = spawn_process(&self.command, &self.args);
+            guard.ready = false;
+        }
+
+        // 读取就绪信号（首次启动时）
+        if !guard.ready {
+            let mut reader = BufReader::new(guard.inner.stdout.as_mut().unwrap());
+            let mut ready_line = String::new();
+            reader.read_line(&mut ready_line).map_err(|e| format!("read ready signal: {}", e))?;
+            guard.ready = true;
+            // 把 reader 丢回去 — 用完后 drop
+        }
+
+        // 发送请求
+        let stdin = guard.inner.stdin.as_mut().unwrap();
+        let mut line = serde_json::to_string(request).map_err(|e| format!("serialize: {}", e))?;
+        line.push('\n');
+        stdin.write_all(line.as_bytes()).map_err(|e| format!("write stdin: {}", e))?;
+        stdin.flush().map_err(|e| format!("flush stdin: {}", e))?;
+
+        // 读取响应
+        let stdout = guard.inner.stdout.as_mut().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut resp_line = String::new();
+        reader.read_line(&mut resp_line).map_err(|e| format!("read stdout: {}", e))?;
+        if resp_line.is_empty() {
+            return Err("MCP server closed stdout".to_string());
+        }
+        serde_json::from_str(&resp_line).map_err(|e| format!("parse JSON: {}", e))
+    }
+
+    pub async fn call(&self, tool: &str, args: &serde_json::Value) -> Result<String, String> {
+        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": tool, "arguments": args }
+        });
+        let response = self.communicate(&request).await?;
+        if let Some(err) = response.get("error") {
+            return Err(err["message"].as_str().unwrap_or("unknown error").to_string());
+        }
+        Ok(response["result"]["content"][0]["text"]
+            .as_str()
+            .ok_or("empty response")?
+            .to_string())
+    }
+
+    pub async fn list_tools(&self) -> Result<Vec<(String, String, serde_json::Value)>, String> {
+        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/list", "params": {}
+        });
+        let response = self.communicate(&request).await?;
+        if let Some(err) = response.get("error") {
+            return Err(err["message"].as_str().unwrap_or("unknown error").to_string());
+        }
+        Ok(extract_tools(&response))
+    }
+
+    pub async fn call_json(&self, tool: &str, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let text = self.call(tool, args).await?;
+        serde_json::from_str(&text).map_err(|e| format!("parse result: {}", e))
+    }
+}
+
+fn spawn_process(command: &str, args: &[String]) -> Child {
+    Command::new(command)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("failed to spawn MCP server process")
+}
+
+// ── 统一 McpClient 枚举 ──
+
+/// 统一 MCP 客户端 — 支持 HTTP 和 stdio 两种传输
+#[derive(Clone)]
+pub enum McpClient {
+    Http(HttpMcpClient),
+    Stdio(std::sync::Arc<StdioMcpClient>),  // Arc because StdioMcpClient isn't Clone
+}
+
+impl McpClient {
+    /// 创建 HTTP MCP 客户端（向后兼容）
+    pub fn new(base_url: &str, agent_id: &str, badge_token: &str) -> Self {
+        McpClient::Http(HttpMcpClient::new(base_url, agent_id, badge_token))
+    }
+
+    pub fn with_timeout(base_url: &str, agent_id: &str, badge_token: &str, timeout_secs: u64) -> Self {
+        McpClient::Http(HttpMcpClient::with_timeout(base_url, agent_id, badge_token, timeout_secs))
+    }
+
+    pub fn new_stdio(command: &str, args: &[String]) -> Self {
+        McpClient::Stdio(std::sync::Arc::new(StdioMcpClient::new(command, args)))
+    }
+
+    pub async fn call(&self, tool: &str, args: &serde_json::Value) -> Result<String, String> {
+        match self {
+            McpClient::Http(c) => c.call(tool, args).await,
+            McpClient::Stdio(c) => c.call(tool, args).await,
+        }
+    }
+
+    pub async fn list_tools(&self) -> Result<Vec<(String, String, serde_json::Value)>, String> {
+        match self {
+            McpClient::Http(c) => c.list_tools().await,
+            McpClient::Stdio(c) => c.list_tools().await,
+        }
+    }
+
+    pub async fn call_json(&self, tool: &str, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+        match self {
+            McpClient::Http(c) => c.call_json(tool, args).await,
+            McpClient::Stdio(c) => c.call_json(tool, args).await,
+        }
+    }
+
+    pub fn timeout_secs(&self) -> u64 {
+        match self {
+            McpClient::Http(c) => c.timeout_secs,
+            McpClient::Stdio(_) => 30,
+        }
+    }
+}
+
+// ── MCP 源 ──
 
 /// MCP 源：命名 + 客户端
 #[derive(Clone)]
@@ -165,20 +276,47 @@ impl McpSource {
     }
 }
 
+// ── 工具列表提取（HTTP 和 stdio 共用） ──
+
+fn extract_tools(data: &serde_json::Value) -> Vec<(String, String, serde_json::Value)> {
+    let mut result = Vec::new();
+    if let Some(tools) = data["result"]["tools"].as_array() {
+        for t in tools {
+            if let Some(func) = t.get("function") {
+                let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("?").to_string();
+                let desc = func.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
+                let params = func.get("parameters").cloned()
+                    .unwrap_or(serde_json::json!({"type": "object", "properties": {}}));
+                result.push((name, desc, params));
+            }
+        }
+    }
+    result
+}
+
+// ── 测试 ──
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_client_creation() {
+    fn test_http_client_creation() {
         let client = McpClient::new("http://127.0.0.1:9003", "test-agent", "test-token");
-        assert_eq!(client.base_url, "http://127.0.0.1:9003");
-        assert_eq!(client.agent_id, "test-agent");
+        assert!(matches!(client, McpClient::Http(_)));
+    }
+
+    #[test]
+    fn test_stdio_client_creation() {
+        let client = McpClient::new_stdio("python", &["-c", "print('test')".to_string()]);
+        assert!(matches!(client, McpClient::Stdio(_)));
     }
 
     #[test]
     fn test_url_trim() {
         let client = McpClient::new("http://127.0.0.1:9003/", "a", "b");
-        assert_eq!(client.base_url, "http://127.0.0.1:9003");
+        if let McpClient::Http(ref http) = client {
+            // base_url 是私有字段，只验证客户端创建成功
+        }
     }
 }

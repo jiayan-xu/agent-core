@@ -8,3 +8,10 @@ memoria_admin_key = "mem-admin-fixed-key-2026"
 name = "dashboard"
 url = "http://127.0.0.1:8000"
 token = ""
+
+[[mcp_source]]
+name = "dashboard-stdio"
+url = ""
+token = ""
+command = "python"
+args = ["C:\\Users\\user\\dashboard\\dashboard_mcp_server.py"]
