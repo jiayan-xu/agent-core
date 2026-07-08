@@ -66,6 +66,10 @@ struct McpSourceConfig {
     /// stdio 模式：命令行参数
     #[serde(default)]
     args: Vec<String>,
+    /// 该 MCP 源所属命名空间（可选）。用于按调用者 allowed_ns 过滤可见工具。
+    /// 例：`dept/工程部/proj/P1` 仅对该命名空间及其祖先/后代可见；留空=全局可见。
+    #[serde(default)]
+    namespace: Option<String>,
 }
 
 fn default_server() -> String { "http://127.0.0.1:9003".to_string() }
@@ -95,6 +99,9 @@ struct AppState {
     /// 身份认证缓存 (agent_id → (badge_token, expires_at))
     /// P2-10 修复：添加 TTL 过期
     auth_cache: tokio::sync::Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// 命名空间授权缓存 (agent_id, agent_key) → (allowed_ns, 获取时间)
+    /// 短 TTL（60s）以在「每次请求反查 memoria」的性能与「权限即时生效」间取平衡（R1）
+    ns_cache: tokio::sync::Mutex<HashMap<(String, String), (Vec<String>, std::time::Instant)>>,
 }
 
 fn config_path() -> String {
@@ -108,7 +115,18 @@ fn config_path() -> String {
 fn load_or_create_config() -> Config {
     let path = config_path();
     if let Ok(text) = std::fs::read_to_string(&path) {
-        if let Ok(cfg) = toml::from_str::<Config>(&text) {
+        if let Ok(mut cfg) = toml::from_str::<Config>(&text) {
+            // 环境变量覆盖（环境变量 > 配置文件）
+            if let Ok(key) = std::env::var("AGENT_API_KEY") {
+                if !key.is_empty() {
+                    cfg.api_key = key;
+                }
+            }
+            if let Ok(key) = std::env::var("MEMORIA_ADMIN_KEY") {
+                if !key.is_empty() {
+                    cfg.memoria_admin_key = key;
+                }
+            }
             return cfg;
         }
     }
@@ -157,6 +175,7 @@ fn main() {
                 agent: Mutex::new(None),
                 config_path: path,
                 auth_cache: tokio::sync::Mutex::new(HashMap::new()),
+                ns_cache: tokio::sync::Mutex::new(HashMap::new()),
             });
 
             if config.configured() {
@@ -358,7 +377,7 @@ async fn handle_chat(
 ) -> Json<ChatResponse> {
     let agent_guard = st.agent.lock().await;
     if let Some(ref agent) = *agent_guard {
-        let reply = agent.chat(&req.message, "user", &req.session_id).await;
+        let reply = agent.chat(&req.message, "user", &req.session_id, &["*".to_string()]).await;
         Json(ChatResponse { reply, session_id: req.session_id })
     } else {
         Json(ChatResponse { reply: "请先在设置页面配置 API 密钥。".to_string(), session_id: req.session_id })
@@ -383,7 +402,7 @@ async fn handle_chat_stream(
         tokio::spawn(async move {
             let guard = st_clone.agent.lock().await;
             if let Some(ref agent) = *guard {
-                let reply = agent.chat(&msg, "user", &sid).await;
+                let reply = agent.chat(&msg, "user", &sid, &["*".to_string()]).await;
                 let chars: Vec<char> = reply.chars().collect();
                 let mut i = 0;
                 while i < chars.len() {
@@ -529,40 +548,44 @@ async fn handle_v1_chat(
         .unwrap_or("")
         .to_string();
 
-    // 验证令牌
+    // 验证令牌：向 Memoria 反查调用者自身的命名空间授权
+    // 用短 TTL 本地缓存（60s）避免每次请求都发 RPC（R1 性能）
     if agent_id.is_empty() {
         return axum::response::Json(serde_json::json!({
             "error": "unauthorized",
             "message": "请先通过 /api/register 注册身份"
         })).into_response();
     }
-    {
-        let cache = st.auth_cache.lock().await;
-        // P2-10: 检查过期（TTL = 1 小时）
-        const AUTH_TTL: Duration = Duration::from_secs(3600);
-        match cache.get(&agent_id) {
-            Some((expected_key, created_at)) if expected_key == &agent_key => {
-                // 检查是否过期
-                if created_at.elapsed() > AUTH_TTL {
-                    drop(cache);
+    let server = { let cfg = st.config.lock().await; cfg.server.clone() };   // R4：从配置读取，避免硬编码
+    let cache_key = (agent_id.clone(), agent_key.clone());
+    let mut allowed_ns: Vec<String> = {
+        let cache = st.ns_cache.lock().await;
+        cache.get(&cache_key)
+            .filter(|(_, ts)| ts.elapsed() < Duration::from_secs(60))
+            .map(|(ns, _)| ns.clone())
+            .unwrap_or_default()
+    };
+    if allowed_ns.is_empty() {
+        let mcp = McpClient::new(&server, &agent_id, &agent_key);
+        match mcp.call_json("get_allowed_ns", &serde_json::json!({})).await {
+            Ok(v) => {
+                allowed_ns = v.get("allowed_ns")
+                    .and_then(|a| a.as_array())
+                    .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                if allowed_ns.is_empty() {
                     return axum::response::Json(serde_json::json!({
                         "error": "unauthorized",
-                        "message": "身份已过期，请重新注册"
+                        "message": "身份未授权，请先完成注册"
                     })).into_response();
                 }
-                drop(cache);
+                st.ns_cache.lock().await.insert(cache_key, (allowed_ns.clone(), std::time::Instant::now()));
             }
-            Some(_) => {
+            Err(_) => {
+                // 不向外部暴露内部错误细节（R6）
                 return axum::response::Json(serde_json::json!({
                     "error": "unauthorized",
-                    "message": "X-Agent-Key 不匹配"
-                })).into_response();
-            }
-            None => {
-                // 未注册的 agent_id
-                return axum::response::Json(serde_json::json!({
-                    "error": "unauthorized",
-                    "message": "未注册的身份，请先通过 /api/register 注册"
+                    "message": "身份校验失败，请稍后重试"
                 })).into_response();
             }
         }
@@ -592,7 +615,7 @@ async fn handle_v1_chat(
         if user_text.is_empty() {
             "请输入消息".to_string()
         } else {
-            agent.chat(&user_text, &agent_id, &format!("jan/{}", agent_id)).await
+            agent.chat(&user_text, &agent_id, &format!("jan/{}", agent_id), &allowed_ns).await
         }
     } else {
         "Agent 未就绪".to_string()
@@ -621,6 +644,10 @@ struct RegisterRequest {
     name: String,
     department: String,
     company: String,
+    #[serde(default)]
+    project: String,
+    #[serde(default)]
+    div: String,
 }
 #[derive(Serialize)]
 struct RegisterResponse {
@@ -631,12 +658,53 @@ struct RegisterResponse {
     error: Option<String>,
 }
 
+/// 命名空间分段白名单清洗：仅保留字母/数字/中文/下划线/连字符，
+/// 防止 '/' 或控制字符破坏 org/.../dept/... 的层级路径（R5）
+fn sanitize_ns_segment(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            c.is_alphanumeric()
+                || *c == '_'
+                || *c == '-'
+                || ((*c as u32) >= 0x4e00 && (*c as u32) <= 0x9fff)
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 async fn handle_register(
     State(st): State<Arc<AppState>>,
     Json(req): Json<RegisterRequest>,
 ) -> Json<RegisterResponse> {
-    let agent_id = format!("{}_{}_{}", req.company, req.department, req.name);
-    let namespace = format!("agent/{}/{}/{}", req.company, req.department, req.name);
+    // 公司名为固定常量（部署时确定），禁止客户端篡改，避免命名空间 org/ 前缀漂移
+    // 须与 agent.toml 的 org/ 前缀、JAN lib.rs 的 COMPANY 保持一致
+    const COMPANY: &str = "常熟浦发第二热电能源有限公司";
+    // 命名空间分段做字符白名单清洗，避免 '/' 或特殊字符破坏层级路径（R5）
+    let department = sanitize_ns_segment(&req.department);
+    let div = sanitize_ns_segment(&req.div);
+    let project = sanitize_ns_segment(&req.project);
+    let name = sanitize_ns_segment(&req.name);
+    if department.is_empty() || name.is_empty() {
+        return Json(RegisterResponse {
+            ok: false,
+            agent_id: String::new(),
+            badge_token: String::new(),
+            namespace: String::new(),
+            error: Some("部门或姓名包含非法字符".to_string()),
+        });
+    }
+    let agent_id = format!("{}_{}_{}", COMPANY, department, name);
+    // 层级命名空间树：org/{company}[/div/{div}]/dept/{department}[/proj/{project}]
+    // 部门领导（无项目）止于 dept；分管副总（无部门）可止于 div；CEO 可仅 org。
+    let mut namespace = if div.is_empty() {
+        format!("org/{}/dept/{}", COMPANY, department)
+    } else {
+        format!("org/{}/div/{}/dept/{}", COMPANY, div, department)
+    };
+    if !project.is_empty() {
+        namespace = format!("{}/proj/{}", namespace, project);
+    }
     let badge_token = format!("sk-{:x}", rand::thread_rng().gen::<u128>());
 
     // 注册到 Memoria — 从环境变量或配置读取 admin_key
@@ -661,7 +729,8 @@ async fn handle_register(
     // 审计日志：记录身份注册
     let audit = AuditLogger::new(McpClient::new("http://127.0.0.1:9003", "admin", &admin_key));
     audit.log_identity(&agent_id, "register",
-        &format!("name={}, department={}, company={}", req.name, req.department, req.company)
+        &format!("name={}, department={}, company={}, div={}, project={}",
+            req.name, req.department, req.company, req.div, req.project)
     ).await;
 
     Json(RegisterResponse {
@@ -727,9 +796,9 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
     let mut additional_mcp = Vec::new();
     for src in &config.mcp_source {
         if !src.command.is_empty() {
-            additional_mcp.push((src.name.clone(), src.url.clone(), src.token.clone(), Some((src.command.clone(), src.args.clone()))));
+            additional_mcp.push((src.name.clone(), src.url.clone(), src.token.clone(), Some((src.command.clone(), src.args.clone())), src.namespace.clone()));
         } else {
-            additional_mcp.push((src.name.clone(), src.url.clone(), src.token.clone(), None));
+            additional_mcp.push((src.name.clone(), src.url.clone(), src.token.clone(), None, src.namespace.clone()));
         }
     }
     let agent_config = AgentConfig {

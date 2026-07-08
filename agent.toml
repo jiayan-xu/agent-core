@@ -1,13 +1,25 @@
 agent_id = "dashboard-agent"
-api_key = "sk-e64d9f088c0f4e099124419477002e2d"
+# api_key 和 memoria_admin_key 从环境变量读取（AGENT_API_KEY / MEMORIA_ADMIN_KEY）
 server = "http://127.0.0.1:9003"
 port = 9753
-memoria_admin_key = "mem-admin-fixed-key-2026"
+
+# ── 命名空间树（与 memoria agent_registry.namespace 对齐）────────────
+# org/常熟浦发第二热电能源有限公司
+# └── div/工程线
+#     └── dept/工程部
+#         ├── proj/P1
+#         ├── proj/P2
+#         └── proj/P3
+# MCP 源的 namespace 决定“谁能调用该工具”（包含匹配，见 memoria auth.rs check_ns_access）：
+#   - 源省略 namespace      → 全局可见（人人可调用）
+#   - 源带 namespace         → 仅当调用者的 allowed_ns 与之存在祖先/后代/自身关系时可见
 
 [[mcp_source]]
 name = "dashboard"
 url = "http://127.0.0.1:8000"
 token = ""
+# 部门级：工程部全体成员（领导 + 各项目负责人）可见
+namespace = "org/常熟浦发第二热电能源有限公司/div/工程线/dept/工程部"
 
 [[mcp_source]]
 name = "dashboard-stdio"
@@ -15,3 +27,17 @@ url = ""
 token = ""
 command = "python"
 args = ["C:\\Users\\user\\dashboard\\dashboard_mcp_server.py"]
+
+# 示例：部门级财务系统（工程线/工程部可见）
+[[mcp_source]]
+name = "finance_dept"
+url = "http://<财务系统IP>:9000"
+token = ""
+namespace = "org/常熟浦发第二热电能源有限公司/div/工程线/dept/工程部"
+
+# 示例：某项目专属 dashboard（仅 proj/P1 及其上级可见）
+[[mcp_source]]
+name = "dashboard_p1"
+url = "http://127.0.0.1:8001"
+token = ""
+namespace = "org/常熟浦发第二热电能源有限公司/div/工程线/dept/工程部/proj/P1"

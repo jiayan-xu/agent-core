@@ -259,20 +259,21 @@ impl McpClient {
 
 // ── MCP 源 ──
 
-/// MCP 源：命名 + 客户端
+/// MCP 源：命名 + 客户端 + 所属命名空间（可选，用于工具级门控）
 #[derive(Clone)]
 pub struct McpSource {
     pub name: String,
     pub client: McpClient,
+    pub namespace: Option<String>,
 }
 
 impl McpSource {
-    pub fn new(name: &str, client: McpClient) -> Self {
-        McpSource { name: name.to_string(), client }
+    pub fn new(name: &str, client: McpClient, namespace: Option<String>) -> Self {
+        McpSource { name: name.to_string(), client, namespace }
     }
 
     pub fn memoria(client: McpClient) -> Self {
-        McpSource { name: "memoria".to_string(), client }
+        McpSource { name: "memoria".to_string(), client, namespace: None }
     }
 }
 
@@ -308,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_stdio_client_creation() {
-        let client = McpClient::new_stdio("python", &["-c", "print('test')".to_string()]);
+        let client = McpClient::new_stdio("python", &["-c".to_string(), "print('test')".to_string()]);
         assert!(matches!(client, McpClient::Stdio(_)));
     }
 

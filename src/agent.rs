@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 
 use crate::audit::AuditLogger;
 use crate::boundary::{self, ComplianceBoundary, PermissionLevel};
+use crate::boundary::prompt_injection::{PromptInjectionDetector, ThreatLevel};
 use crate::harness::{self, ExecutionLog, HarnessStore};
 use crate::llm::{LlmClient, LlmConfig, Message, ToolDef};
 use crate::mcp_client::{McpClient, McpSource};
@@ -49,10 +50,10 @@ pub struct AgentConfig {
     pub identity: AgentIdentity,
     pub llm: LlmConfig,
     pub memoria_url: String,
-    /// 可选 MCP 源（名称 + URL + 令牌 + 可选的 stdio (命令, 参数)），
-    /// 例 HTTP:  [("dashboard", "http://127.0.0.1:8000", "", None)]
-    /// 例 stdio: [("dashboard", "", "", Some(("python".into(), ["-m","mcp_server"].map(String::from).to_vec())))]
-    pub additional_mcp: Vec<(String, String, String, Option<(String, Vec<String>)>)>,
+    /// 可选 MCP 源（名称 + URL + 令牌 + 可选的 stdio (命令, 参数) + 可选的命名空间），
+    /// 例 HTTP:  [("dashboard", "http://127.0.0.1:8000", "", None, Some("dept/工程部/proj/P1".into()))]
+    /// 例 stdio: [("dashboard", "", "", Some(("python".into(), ["-m","mcp_server"].map(String::from).to_vec())), None)]
+    pub additional_mcp: Vec<(String, String, String, Option<(String, Vec<String>)>, Option<String>)>,
     pub skill_whitelist: Option<Vec<String>>,
     pub max_tool_rounds: u32,
     pub parent_permission: PermissionLevel,
@@ -111,14 +112,14 @@ impl AgentCore {
         let mcp = McpClient::new(&config.memoria_url, &config.identity.agent_id, &config.identity.badge_token);
         // 构建 MCP 源列表（Memoria 始终为第一个源）
         let mut mcp_sources = vec![McpSource::memoria(mcp.clone())];
-        for (name, url, token, stdio_opt) in &config.additional_mcp {
+        for (name, url, token, stdio_opt, src_ns) in &config.additional_mcp {
             if let Some((cmd, args)) = stdio_opt {
                 let client = McpClient::new_stdio(cmd, args);
-                mcp_sources.push(McpSource::new(name, client));
+                mcp_sources.push(McpSource::new(name, client, src_ns.clone()));
             } else {
                 let badge = if token.is_empty() { &config.identity.badge_token } else { token };
                 let client = McpClient::new(url, &config.identity.agent_id, badge);
-                mcp_sources.push(McpSource::new(name, client));
+                mcp_sources.push(McpSource::new(name, client, src_ns.clone()));
             }
         }
         let llm = LlmClient::new(config.llm.clone());
@@ -155,9 +156,43 @@ impl AgentCore {
     /// - 新任务 → 复述确认（Step 1）→ 执行（Step 2）→ 交付（Step 3）
     /// - 简单查询 → 直接执行
     /// - 已确认会话 → 话题切换检测
-    pub async fn chat(&self, message: &str, user_id: &str, session_id: &str) -> String {
+    pub async fn chat(&self, message: &str, user_id: &str, session_id: &str, allowed_ns: &[String]) -> String {
         let confirm_words = ["确认", "确认添加", "确认执行", "添加", "是", "是的", "对", "执行", "确定", "可以"];
         let trimmed = message.trim();
+
+        // ── 提示词注入检测 ──
+        let detector = PromptInjectionDetector::new();
+        if let Some(level) = detector.quick_check(trimmed) {
+            match level {
+                ThreatLevel::High => {
+                    tracing::warn!("[INJECTION-HIGH] session={}: {}", session_id, trimmed);
+                    let ns = self.config.identity.ns();
+                    let db_path = self.harness.lock().await.db_path();
+                    let reply = "⚠️ 检测到可疑指令，已拒绝执行。\n\n本次请求因安全风险被拦截。";
+                    self.session_manager.save_to_history(session_id, &ns, &db_path, message, reply).await;
+                    return reply.to_string();
+                }
+                ThreatLevel::Medium => {
+                    tracing::info!("[INJECTION-MED] session={}: {}", session_id, trimmed);
+                    self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
+                    let reply = "⚠️ 检测到不太常规的请求模式。\n\n您确定要执行这个操作吗？请回复\"确认\"继续，或修改您的请求。";
+                    return reply.to_string();
+                }
+                ThreatLevel::Low => {
+                    tracing::info!("[INJECTION-LOW] session={}: {}", session_id, trimmed);
+                }
+            }
+        }
+
+        // ── 确认超时检查（5分钟）──
+        let timed_out = self.session_manager.check_confirm_timeouts(300).await;
+        if timed_out.contains(&session_id.to_string()) {
+            let reply = "⏰ 确认已超时，如需继续请重新发送指令。";
+            let ns = self.config.identity.ns();
+            let db_path = self.harness.lock().await.db_path();
+            self.session_manager.save_to_history(session_id, &ns, &db_path, message, reply).await;
+            return reply.to_string();
+        }
 
         // ── 0a. 工具级确认（现有）：pending_actions 中的操作等待确认 ──
         if confirm_words.contains(&trimmed) {
@@ -186,10 +221,10 @@ impl AgentCore {
                     let original = self.session_manager.take_original_message(session_id).await
                         .unwrap_or_else(|| message.to_string());
                     self.session_manager.set_state(session_id, SessionState::Confirmed).await;
-                    return self.execute_chat(&original, user_id, session_id).await;
+                    return self.execute_chat(&original, user_id, session_id, allowed_ns).await;
                 }
                 // 修改/补充 → 保留 AwaitingConfirmation，重新复述
-                return self.rephrase_and_confirm(message, user_id, session_id).await;
+                return self.rephrase_and_confirm(message, user_id, session_id, allowed_ns).await;
             }
 
             // ── 已确认，正常执行 ──
@@ -200,27 +235,27 @@ impl AgentCore {
                         return self.handle_topic_switch(message, session_id).await;
                     }
                 }
-                return self.execute_chat(message, user_id, session_id).await;
+                return self.execute_chat(message, user_id, session_id, allowed_ns).await;
             }
 
             // ── 新会话 ──
             SessionState::New => {
                 if boundary::TaskConfirmationGate::requires_confirmation(message) {
                     self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
-                    return self.rephrase_and_confirm(message, user_id, session_id).await;
+                    return self.rephrase_and_confirm(message, user_id, session_id, allowed_ns).await;
                 }
                 // 简单查询 → 直接执行
                 self.session_manager.set_state(session_id, SessionState::Confirmed).await;
-                return self.execute_chat(message, user_id, session_id).await;
+                return self.execute_chat(message, user_id, session_id, allowed_ns).await;
             }
         }
     }
 
     /// 已确认会话的执行路径（原 chat() 主体 + Step 前缀）
-    async fn execute_chat(&self, message: &str, user_id: &str, session_id: &str) -> String {
+    async fn execute_chat(&self, message: &str, user_id: &str, session_id: &str, allowed_ns: &[String]) -> String {
         // ── 0. 组合路由路径：多 Skill 分解 + 按序执行 ──
         if self.config.enable_compositional_routing {
-            let tools = self.fetch_tools().await;
+            let tools = self.fetch_tools_filtered(allowed_ns).await;
             if !tools.is_empty() {
                 match crate::composer::decompose(&self.llm, message, &tools).await {
                     Ok(plan) if plan.steps.len() > 1 => {
@@ -319,7 +354,7 @@ impl AgentCore {
         messages.push(Message { role: "user".to_string(), content: Some(enriched_message), tool_calls: None, tool_call_id: None });
 
         // ── 5. LLM 调用循环 ──
-        let result = self.llm_loop(messages, session_id, message, user_id).await;
+        let result = self.llm_loop(messages, session_id, message, user_id, allowed_ns).await;
 
         // 给结果加 Step 前缀
         format!("[Step 2/3: 执行 → Step 3/3: 交付]\n\n{}", result)
@@ -330,13 +365,13 @@ impl AgentCore {
     /// SAD（Skill-Aware Decomposition）风格增强：
     /// 并行获取记忆 + 可用工具列表，注入到 system prompt 中，
     /// 让 LLM 在复述时就能感知可用能力，对齐措辞。
-    async fn rephrase_and_confirm(&self, message: &str, _user_id: &str, session_id: &str) -> String {
+    async fn rephrase_and_confirm(&self, message: &str, _user_id: &str, session_id: &str, allowed_ns: &[String]) -> String {
         self.session_manager.set_original_message(session_id, message).await;
 
         // SAD 风格：并行获取上下文（记忆）和可用能力（工具列表）
         let (mem_result, tools) = tokio::join!(
             self.search_memory(message),
-            self.fetch_tools(),
+            self.fetch_tools_filtered(allowed_ns),
         );
 
         let mut knowledge = Vec::new();
@@ -559,9 +594,10 @@ impl AgentCore {
         session_id: &str,
         raw_message: &str,
         user_id: &str,
+        allowed_ns: &[String],
     ) -> String {
         // 从 Memoria 取可用工具列表
-        let tools = self.fetch_tools().await;
+        let tools = self.fetch_tools_filtered(allowed_ns).await;
 
         for _round in 0..self.config.max_tool_rounds {
             let response = match self.llm.chat(&messages, &tools).await {
@@ -1008,6 +1044,28 @@ impl AgentCore {
 
     /// 从所有 MCP 源获取工具列表（合并去重）
     /// P1-3 修复：同时更新 tool_route_cache 和 classifier
+    /// 无可用 MCP 工具时的兜底工具（query_plate / query_sql），供 fetch_tools 与 fetch_tools_filtered 共用（R9）
+    fn fallback_tools() -> Vec<ToolDef> {
+        vec![
+            ToolDef {
+                type_: "function".to_string(),
+                function: crate::llm::ToolDefFunction {
+                    name: "query_plate".to_string(),
+                    description: "查询车牌信息".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {"plate": {"type": "string"}}}),
+                },
+            },
+            ToolDef {
+                type_: "function".to_string(),
+                function: crate::llm::ToolDefFunction {
+                    name: "query_sql".to_string(),
+                    description: "执行 SQL 查询".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}}}),
+                },
+            },
+        ]
+    }
+
     pub async fn fetch_tools(&self) -> Vec<ToolDef> {
         let mut all_tools: Vec<ToolDef> = Vec::new();
         let mut seen_names = std::collections::HashSet::new();
@@ -1049,24 +1107,77 @@ impl AgentCore {
 
         if all_tools.is_empty() {
             tracing::warn!("所有 MCP 源工具列表为空，使用 fallback");
-            return vec![
-                ToolDef {
-                    type_: "function".to_string(),
-                    function: crate::llm::ToolDefFunction {
-                        name: "query_plate".to_string(),
-                        description: "查询车牌信息".to_string(),
-                        parameters: serde_json::json!({"type": "object", "properties": {"plate": {"type": "string"}}}),
-                    },
-                },
-                ToolDef {
-                    type_: "function".to_string(),
-                    function: crate::llm::ToolDefFunction {
-                        name: "query_sql".to_string(),
-                        description: "执行 SQL 查询".to_string(),
-                        parameters: serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}}}),
-                    },
-                },
-            ];
+            return Self::fallback_tools();
+        }
+
+        all_tools
+    }
+
+    /// 判断授权命名空间 `granted` 是否覆盖目标命名空间 `target`（层级 / 包含匹配）。
+    /// 与 memoria `check_ns_access` 语义一致：
+    /// - 完全一致；
+    /// - target 是 granted 的后代（`granted/` 前缀）；
+    /// - granted 是 target 的后代（两者共享同一子树，用于部门级工具对下属项目可见）。
+    fn ns_covers(granted: &str, target: &str) -> bool {
+        granted == "*"   // 超管通配：allowed_ns 含 "*" 即放行一切
+            || granted == target
+            || target.starts_with(&format!("{}/", granted))
+            || granted.starts_with(&format!("{}/", target))
+    }
+
+    /// 仅返回调用者 `allowed_ns` 可见的 MCP 工具（按命名空间门控）。
+    ///
+    /// 规则：
+    /// - 源未声明 `namespace` → 视为全局工具，人人可见；
+    /// - 源声明了 `namespace` → 仅当 `allowed_ns` 中存在与其构成包含关系的授权 ns 时可见。
+    pub async fn fetch_tools_filtered(&self, allowed_ns: &[String]) -> Vec<ToolDef> {
+        let mut all_tools: Vec<ToolDef> = Vec::new();
+        let mut seen_names = std::collections::HashSet::new();
+
+        for (idx, source) in self.mcp_sources.iter().enumerate() {
+            // 命名空间门控：无 ns 的源全局可见；有 ns 的源需与 allowed_ns 存在包含关系
+            if let Some(src_ns) = &source.namespace {
+                let visible = allowed_ns.iter().any(|g| Self::ns_covers(g, src_ns));
+                if !visible {
+                    continue;
+                }
+            }
+            match source.client.list_tools().await {
+                Ok(tools) => {
+                    {
+                        let mut cache = self.tool_route_cache.lock().await;
+                        let boundary = self.boundary.lock().await;
+                        let tool_names_descs: Vec<(String, String)> =
+                            tools.iter().map(|(n, d, _)| (n.clone(), d.clone())).collect();
+                        for (name, _desc) in &tool_names_descs {
+                            cache.insert(name.clone(), idx);
+                        }
+                        boundary.learn_tools(&tool_names_descs);
+                    }
+                    for (name, desc, params) in tools {
+                        if seen_names.contains(&name) {
+                            continue;
+                        }
+                        seen_names.insert(name.clone());
+                        all_tools.push(ToolDef {
+                            type_: "function".to_string(),
+                            function: crate::llm::ToolDefFunction {
+                                name,
+                                description: desc,
+                                parameters: params,
+                            },
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("{} tools/list 失败(过滤模式): {}", source.name, e);
+                }
+            }
+        }
+
+        if all_tools.is_empty() {
+            tracing::warn!("命名空间过滤后无可用 MCP 工具，使用 fallback");
+            return Self::fallback_tools();
         }
 
         all_tools

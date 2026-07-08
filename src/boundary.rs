@@ -3,6 +3,8 @@
 //! 从 Python agent-base/core/boundary.py 翻译为 Rust。
 //! 每条红线是一个独立模块，组合在 ComplianceBoundary 中统一检查。
 
+pub mod prompt_injection;
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

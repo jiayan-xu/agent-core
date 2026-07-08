@@ -3,6 +3,7 @@
 //! 从 AgentCore 中提取的独立模块，纯逻辑可测。
 
 use std::collections::HashMap;
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 use crate::llm::Message;
@@ -42,6 +43,8 @@ pub struct SessionManager {
     session_state: Mutex<HashMap<String, SessionState>>,
     /// 待确认的原始消息（session_id → original message）
     pending_original_message: Mutex<HashMap<String, String>>,
+    /// 确认状态开始时间（session_id → Instant）
+    confirm_started_at: Mutex<HashMap<String, Instant>>,
     /// session_history LRU 追踪（限制缓存的 session 数量）
     session_lru: Mutex<Vec<String>>,
 }
@@ -57,6 +60,7 @@ impl SessionManager {
             pending_actions: Mutex::new(HashMap::new()),
             session_state: Mutex::new(HashMap::new()),
             pending_original_message: Mutex::new(HashMap::new()),
+            confirm_started_at: Mutex::new(HashMap::new()),
             session_lru: Mutex::new(Vec::new()),
         }
     }
@@ -71,6 +75,14 @@ impl SessionManager {
 
     /// 设置会话状态
     pub async fn set_state(&self, session_id: &str, state: SessionState) {
+        // 进入 AwaitingConfirmation 时记录开始时间
+        if state == SessionState::AwaitingConfirmation {
+            self.confirm_started_at.lock().await
+                .insert(session_id.to_string(), Instant::now());
+        } else {
+            // 离开确认状态时清除时间戳
+            self.confirm_started_at.lock().await.remove(session_id);
+        }
         self.session_state.lock().await
             .insert(session_id.to_string(), state);
     }
@@ -262,7 +274,35 @@ impl SessionManager {
         self.pending_actions.lock().await.remove(session_id);
         self.session_state.lock().await.remove(session_id);
         self.pending_original_message.lock().await.remove(session_id);
+        self.confirm_started_at.lock().await.remove(session_id);
         self.session_lru.lock().await.retain(|s| s != session_id);
+    }
+
+    /// 检查所有 pending 确认是否超时（默认5分钟）
+    ///
+    /// 返回超时的 session_id 列表，并自动重置这些会话状态。
+    pub async fn check_confirm_timeouts(&self, timeout_secs: u64) -> Vec<String> {
+        let now = Instant::now();
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+        let mut timed_out = Vec::new();
+
+        let started = self.confirm_started_at.lock().await;
+        for (session_id, start) in started.iter() {
+            if now.duration_since(*start) > timeout {
+                timed_out.push(session_id.clone());
+            }
+        }
+        drop(started);
+
+        // 重置超时会话
+        for sid in &timed_out {
+            self.session_state.lock().await.remove(sid);
+            self.confirm_started_at.lock().await.remove(sid);
+            self.pending_actions.lock().await.remove(sid);
+            self.pending_original_message.lock().await.remove(sid);
+        }
+
+        timed_out
     }
 
     /// 当前缓存的 session 数量
