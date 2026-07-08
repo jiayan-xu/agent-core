@@ -17,7 +17,6 @@ use axum::{
     Router, routing::{get, post, delete},
     Json, extract::State, response::{sse::{Sse, Event as SseEvent}, IntoResponse},
 };
-use futures::stream::Stream;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -99,9 +98,73 @@ struct AppState {
     /// 身份认证缓存 (agent_id → (badge_token, expires_at))
     /// P2-10 修复：添加 TTL 过期
     auth_cache: tokio::sync::Mutex<HashMap<String, (String, std::time::Instant)>>,
-    /// 命名空间授权缓存 (agent_id, agent_key) → (allowed_ns, 获取时间)
+    /// 命名空间授权缓存 agent_id → (allowed_ns, 获取时间)
+    /// 仅以 agent_id 为 key（token 已在 Memoria 端验证过，不在内存留存明文 key，P1-1）
     /// 短 TTL（60s）以在「每次请求反查 memoria」的性能与「权限即时生效」间取平衡（R1）
-    ns_cache: tokio::sync::Mutex<HashMap<(String, String), (Vec<String>, std::time::Instant)>>,
+    ns_cache: tokio::sync::Mutex<HashMap<String, (Vec<String>, std::time::Instant)>>,
+}
+
+/// 构造 401 未授权响应
+fn unauthorized(message: &str) -> axum::response::Response {
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({"error": "unauthorized", "message": message})),
+    ).into_response()
+}
+
+/// 身份认证：从 header 取 X-Agent-Id + X-Agent-Key，向 Memoria 反查调用者命名空间授权。
+/// 成功返回 (agent_id, allowed_ns)；失败返回 401 Response（由调用方 ? 直接返回）。
+async fn authenticate(
+    headers: &axum::http::HeaderMap,
+    st: &Arc<AppState>,
+) -> Result<(String, Vec<String>), axum::response::Response> {
+    let agent_id = headers
+        .get("x-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let agent_key = headers
+        .get("x-agent-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    if agent_id.is_empty() {
+        return Err(unauthorized("请先通过 /api/register 注册身份"));
+    }
+    let server = { let cfg = st.config.lock().await; cfg.server.clone() };
+    let mut allowed_ns: Vec<String> = {
+        let cache = st.ns_cache.lock().await;
+        cache
+            .get(&agent_id)
+            .filter(|(_, ts)| ts.elapsed() < Duration::from_secs(60))
+            .map(|(ns, _)| ns.clone())
+            .unwrap_or_default()
+    };
+    if allowed_ns.is_empty() {
+        let mcp = McpClient::new(&server, &agent_id, &agent_key);
+        match mcp.call_json("get_allowed_ns", &serde_json::json!({})).await {
+            Ok(v) => {
+                allowed_ns = v
+                    .get("allowed_ns")
+                    .and_then(|a| a.as_array())
+                    .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                if allowed_ns.is_empty() {
+                    return Err(unauthorized("身份未授权，请先完成注册"));
+                }
+                st.ns_cache
+                    .lock()
+                    .await
+                    .insert(agent_id.clone(), (allowed_ns.clone(), std::time::Instant::now()));
+            }
+            Err(_) => {
+                // 不向外部暴露内部错误细节（R6）
+                return Err(unauthorized("身份校验失败，请稍后重试"));
+            }
+        }
+    }
+    Ok((agent_id, allowed_ns))
 }
 
 fn config_path() -> String {
@@ -230,20 +293,28 @@ fn main() {
                             .map(|r| r.status().is_success())
                             .unwrap_or(false);
                         if !agent_ok {
-                            tracing::warn!("Agent worker 无响应，通过 dashboard API 重启");
-                            let client = reqwest::Client::new();
-                            if let Ok(login) = client.post("http://127.0.0.1:8000/api/login")
-                                .form(&[("username", "admin"), ("password", "admin123")])
-                                .send().await
-                            {
-                                let cookie = login.headers().get("set-cookie")
-                                    .and_then(|v| v.to_str().ok())
-                                    .unwrap_or("")
-                                    .to_string();
-                                if !cookie.is_empty() {
-                                    let _ = client.post("http://127.0.0.1:8000/api/snmis/agent/start")
-                                        .header("Cookie", &cookie)
-                                        .send().await;
+                            // P0-3 修复：dashboard 凭据移出源码，改读环境变量。
+                            // DASHBOARD_USER 默认 admin；DASHBOARD_PASSWORD 未设置则跳过重启（不泄露/不崩溃）。
+                            let dash_user = std::env::var("DASHBOARD_USER").unwrap_or_else(|_| "admin".to_string());
+                            let dash_pass = std::env::var("DASHBOARD_PASSWORD").unwrap_or_default();
+                            if dash_pass.is_empty() {
+                                tracing::warn!("未设置 DASHBOARD_PASSWORD，跳过 dashboard agent worker 重启");
+                            } else {
+                                tracing::warn!("Agent worker 无响应，通过 dashboard API 重启");
+                                let client = reqwest::Client::new();
+                                if let Ok(login) = client.post("http://127.0.0.1:8000/api/login")
+                                    .form(&[("username", dash_user.as_str()), ("password", dash_pass.as_str())])
+                                    .send().await
+                                {
+                                    let cookie = login.headers().get("set-cookie")
+                                        .and_then(|v| v.to_str().ok())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    if !cookie.is_empty() {
+                                        let _ = client.post("http://127.0.0.1:8000/api/snmis/agent/start")
+                                            .header("Cookie", &cookie)
+                                            .send().await;
+                                    }
                                 }
                             }
                         }
@@ -324,14 +395,12 @@ async fn handle_index() -> impl axum::response::IntoResponse {
 }
 
 async fn handle_logo() -> impl axum::response::IntoResponse {
-    // P2-2 修复：优先用相对路径，fallback 到绝对路径
+    // 仅用相对/工作目录解析，避免硬编码绝对路径（P2-1 修复）
     let cwd = std::env::current_dir().unwrap_or_default();
     for path in &[
         cwd.join("logo.png"),
         cwd.join("static").join("logo.png"),
         cwd.join("assets").join("logo.png"),
-        std::path::PathBuf::from(r"C:\Users\user\dashboard\dashboard-frontend\dist\logo.png"),
-        std::path::PathBuf::from(r"C:\Users\user\dashboard\static\logo.png"),
     ] {
         if let Ok(data) = tokio::fs::read(path).await {
             return ([(axum::http::header::CONTENT_TYPE, "image/png")], data);
@@ -351,8 +420,17 @@ async fn handle_config(State(st): State<Arc<AppState>>) -> Json<serde_json::Valu
 
 async fn handle_save_config(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SetupRequest>,
-) -> Json<SetupResponse> {
+) -> axum::response::Response {
+    // P0-2 修复：已配置后重新保存（改写 api_key/server）必须鉴权，
+    // 仅首次引导（尚未配置）允许无凭据，避免 LAN 攻击者覆写指向恶意 MCP。
+    let configured = st.config.lock().await.configured();
+    if configured {
+        if authenticate(&headers, &st).await.is_err() {
+            return unauthorized("保存配置需要身份认证");
+        }
+    }
     let mut cfg = st.config.lock().await;
     cfg.agent_id = req.agent_id;
     cfg.api_key = req.api_key;
@@ -365,31 +443,45 @@ async fn handle_save_config(
     match build_agent(&cfg).await {
         Ok(agent) => {
             *st.agent.lock().await = Some(agent);
-            Json(SetupResponse { ok: true, error: None })
+            Json(SetupResponse { ok: true, error: None }).into_response()
         }
-        Err(e) => Json(SetupResponse { ok: false, error: Some(e) }),
+        Err(e) => Json(SetupResponse { ok: false, error: Some(e) }).into_response(),
     }
 }
 
 async fn handle_chat(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ChatRequest>,
-) -> Json<ChatResponse> {
+) -> axum::response::Response {
+    // P0-1 修复：统一鉴权（与 /v1/chat 一致），并传真实 allowed_ns 取代 ["*"] 绕过
+    let (agent_id, allowed_ns) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let agent_guard = st.agent.lock().await;
     if let Some(ref agent) = *agent_guard {
-        let reply = agent.chat(&req.message, "user", &req.session_id, &["*".to_string()]).await;
-        Json(ChatResponse { reply, session_id: req.session_id })
+        let reply = agent.chat(&req.message, &agent_id, &req.session_id, &allowed_ns).await;
+        Json(ChatResponse { reply, session_id: req.session_id }).into_response()
     } else {
-        Json(ChatResponse { reply: "请先在设置页面配置 API 密钥。".to_string(), session_id: req.session_id })
+        Json(ChatResponse { reply: "请先在设置页面配置 API 密钥。".to_string(), session_id: req.session_id }).into_response()
     }
 }
 
 /// SSE 流式聊天（包装 chat() 结果，分块推送）
 async fn handle_chat_stream(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<ChatRequest>,
-) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+) -> axum::response::Response {
+    // P0-1 修复：统一鉴权 + 真实 allowed_ns（与 /api/chat 一致）
+    let (agent_id, allowed_ns) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let (tx, rx): (tokio::sync::mpsc::UnboundedSender<Result<SseEvent, Infallible>>,
+                   tokio::sync::mpsc::UnboundedReceiver<Result<SseEvent, Infallible>>)
+        = tokio::sync::mpsc::unbounded_channel();
 
     let agent_guard = st.agent.lock().await;
     let has_agent = agent_guard.is_some();
@@ -402,7 +494,7 @@ async fn handle_chat_stream(
         tokio::spawn(async move {
             let guard = st_clone.agent.lock().await;
             if let Some(ref agent) = *guard {
-                let reply = agent.chat(&msg, "user", &sid, &["*".to_string()]).await;
+                let reply = agent.chat(&msg, &agent_id, &sid, &allowed_ns).await;
                 let chars: Vec<char> = reply.chars().collect();
                 let mut i = 0;
                 while i < chars.len() {
@@ -420,7 +512,7 @@ async fn handle_chat_stream(
         let _ = tx.send(Ok(SseEvent::default().data("").event("done")));
     }
 
-    Sse::new(UnboundedReceiverStream::new(rx))
+    Sse::new(UnboundedReceiverStream::new(rx)).into_response()
 }
 
 /// 获取会话列表
@@ -535,61 +627,11 @@ async fn handle_v1_chat(
     headers: axum::http::HeaderMap,
     Json(req): Json<V1ChatRequest>,
 ) -> axum::response::Response {
-    // 身份认证：从 header 取 X-Agent-Id + X-Agent-Key
-    let agent_id = headers
-        .get("x-agent-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    let agent_key = headers
-        .get("x-agent-key")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    // 验证令牌：向 Memoria 反查调用者自身的命名空间授权
-    // 用短 TTL 本地缓存（60s）避免每次请求都发 RPC（R1 性能）
-    if agent_id.is_empty() {
-        return axum::response::Json(serde_json::json!({
-            "error": "unauthorized",
-            "message": "请先通过 /api/register 注册身份"
-        })).into_response();
-    }
-    let server = { let cfg = st.config.lock().await; cfg.server.clone() };   // R4：从配置读取，避免硬编码
-    let cache_key = (agent_id.clone(), agent_key.clone());
-    let mut allowed_ns: Vec<String> = {
-        let cache = st.ns_cache.lock().await;
-        cache.get(&cache_key)
-            .filter(|(_, ts)| ts.elapsed() < Duration::from_secs(60))
-            .map(|(ns, _)| ns.clone())
-            .unwrap_or_default()
+    // 身份认证：复用 authenticate()（X-Agent-Id/Key → Memoria 反查 allowed_ns）
+    let (agent_id, allowed_ns) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
-    if allowed_ns.is_empty() {
-        let mcp = McpClient::new(&server, &agent_id, &agent_key);
-        match mcp.call_json("get_allowed_ns", &serde_json::json!({})).await {
-            Ok(v) => {
-                allowed_ns = v.get("allowed_ns")
-                    .and_then(|a| a.as_array())
-                    .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
-                    .unwrap_or_default();
-                if allowed_ns.is_empty() {
-                    return axum::response::Json(serde_json::json!({
-                        "error": "unauthorized",
-                        "message": "身份未授权，请先完成注册"
-                    })).into_response();
-                }
-                st.ns_cache.lock().await.insert(cache_key, (allowed_ns.clone(), std::time::Instant::now()));
-            }
-            Err(_) => {
-                // 不向外部暴露内部错误细节（R6）
-                return axum::response::Json(serde_json::json!({
-                    "error": "unauthorized",
-                    "message": "身份校验失败，请稍后重试"
-                })).into_response();
-            }
-        }
-    }
 
     let agent_guard = st.agent.lock().await;
     let reply = if let Some(ref agent) = *agent_guard {

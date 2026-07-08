@@ -35,6 +35,94 @@ where
     }
 }
 
+// ── SQL 只读校验（P1-6 修复）──
+// query_sql 等工具归为 read 级，但 read 权限不应等同于"可执行任意 SQL"。
+// 这里做**正向** SELECT-only 校验：语句必须以 SELECT/WITH/EXPLAIN/PRAGMA 开头，
+// 且不得包含任何写/DDL 关键字（INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/...）。
+
+/// 去除 SQL 中的注释与字符串字面量，避免关键字出现在注释/字符串内误判
+fn normalize_sql_for_check(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut in_single = false;
+    let mut in_block = false;
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_block {
+            if c == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                in_block = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '-' && i + 1 < chars.len() && chars[i + 1] == '-' {
+            // 跳过整行注释
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            in_block = true;
+            i += 2;
+            continue;
+        }
+        if c == '\'' {
+            in_single = true;
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out.to_lowercase()
+}
+
+/// 整词匹配关键字
+fn contains_word(haystack: &str, word: &str) -> bool {
+    for w in haystack.split_whitespace() {
+        // 去掉尾随标点后再比较（如 "delete;" / "delete"）
+        let cleaned: String = w.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+        if cleaned == word {
+            return true;
+        }
+    }
+    false
+}
+
+/// 正向校验 SQL 为只读语句
+fn is_select_only(sql: &str) -> bool {
+    let norm = normalize_sql_for_check(sql);
+    let first = norm.split_whitespace().next().unwrap_or("");
+    let starts_ok = matches!(first, "select" | "with" | "explain" | "pragma");
+    let forbidden = [
+        "insert", "update", "delete", "drop", "alter", "create", "truncate",
+        "attach", "replace", "merge", "grant", "revoke", "vacuum",
+    ];
+    let no_write = !forbidden.iter().any(|kw| contains_word(&norm, kw));
+    starts_ok && no_write
+}
+
+/// 是否为 SQL 执行类工具的查询参数（需要 SELECT-only 校验）
+fn is_sql_query_param(tool_name: &str, key: &str) -> bool {
+    let key = key.to_lowercase();
+    let is_sql_tool = tool_name == "query_sql"
+        || tool_name.starts_with("query_")
+        || tool_name.contains("sql");
+    let is_sql_arg = matches!(key.as_str(), "query" | "sql" | "statement" | "sql_text");
+    is_sql_tool && is_sql_arg
+}
+
 /// 安全获取 PermissionChain 锁并执行操作
 pub fn with_perm_chain<F, R>(mutex: &Mutex<PermissionChain>, default: R, f: F) -> R
 where
@@ -463,6 +551,13 @@ impl ComplianceBoundary {
                     // 路径穿越检测
                     if s.contains("../") || s.contains("..\\") {
                         return ToolCheck::red(&format!("参数安全检查：{} 含路径穿越", key));
+                    }
+                    // P1-6 修复：SQL 只读强制（正向 SELECT-only 校验，替代仅靠负向 blocklist）
+                    if is_sql_query_param(tool_name, key) && !is_select_only(s) {
+                        return ToolCheck::red(&format!(
+                            "参数安全检查：{} 必须是只读 SELECT 语句（禁止 INSERT/UPDATE/DELETE/DROP/ALTER 等写操作）",
+                            key
+                        ));
                     }
                 }
             }
