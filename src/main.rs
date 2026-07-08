@@ -876,8 +876,6 @@ fn _load_icon() -> Option<tao::window::Icon> {
         cwd.join("logo.png"),
         cwd.join("static").join("logo.png"),
         cwd.join("assets").join("logo.png"),
-        std::path::PathBuf::from(r"C:\Users\user\dashboard\dashboard-frontend\dist\logo.png"),
-        std::path::PathBuf::from(r"C:\Users\user\dashboard\static\logo.png"),
     ] {
         if let Ok(data) = std::fs::read(path) {
             if let Ok(img) = image::load_from_memory(&data) {

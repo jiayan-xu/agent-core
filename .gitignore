@@ -15,3 +15,12 @@ temp_run/
 
 # Reasonix 元数据
 .reasonix/
+
+# 内部审查/设计文档（不公开，含路径与内部结论）
+CODE_REVIEW_*.md
+RUST_REWRITE_*.md
+DESIGN_*.md
+FULL_REVIEW_*.md
+PLAN.md
+agent_core_*_review_*.md
+agent_core_*_audit_*.md
