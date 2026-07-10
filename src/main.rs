@@ -118,20 +118,46 @@ async fn authenticate(
     headers: &axum::http::HeaderMap,
     st: &Arc<AppState>,
 ) -> Result<(String, Vec<String>), axum::response::Response> {
-    let agent_id = headers
+    // 主身份来自 x-agent-id；PFAiX 分发版只发 x-user-tag（随机安装ID），
+    // 故在其为空时回退到 x-user-tag，实现「安装即身份」。
+    let raw_agent_id = headers
         .get("x-agent-id")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let agent_key = headers
-        .get("x-agent-key")
+    let user_tag = headers
+        .get("x-user-tag")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    if agent_id.is_empty() {
+        .map(|s| {
+            s.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+    let (agent_id, from_usertag) = if !raw_agent_id.is_empty() {
+        (raw_agent_id, false)
+    } else if !user_tag.is_empty() {
+        (user_tag, true)
+    } else {
         return Err(unauthorized("请先通过 /api/register 注册身份"));
-    }
+    };
+
+    // 鉴权密钥：显式 x-agent-key 优先；回退到安装ID身份时改用 admin key
+    // （安装实例自身没有独立 key，由 agent-core 以管理员身份代为在 Memoria 注册）。
+    let admin_key = match std::env::var("MEMORIA_ADMIN_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => st.config.lock().await.memoria_admin_key.clone(),
+    };
+    let agent_key = if !from_usertag {
+        headers
+            .get("x-agent-key")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        admin_key.clone()
+    };
     let server = { let cfg = st.config.lock().await; cfg.server.clone() };
     let mut allowed_ns: Vec<String> = {
         let cache = st.ns_cache.lock().await;
@@ -150,19 +176,29 @@ async fn authenticate(
                     .and_then(|a| a.as_array())
                     .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default();
-                if allowed_ns.is_empty() {
-                    return Err(unauthorized("身份未授权，请先完成注册"));
-                }
-                st.ns_cache
-                    .lock()
-                    .await
-                    .insert(agent_id.clone(), (allowed_ns.clone(), std::time::Instant::now()));
             }
-            Err(_) => {
-                // 不向外部暴露内部错误细节（R6）
-                return Err(unauthorized("身份校验失败，请稍后重试"));
-            }
+            Err(_) => {}
         }
+        // 安装实例首次使用：Memoria 中尚无该身份 → 以管理员身份自动注册为公司组织成员，
+        // 使其获得基础命名空间（org 根），随后即可通过鉴权闸门。
+        if allowed_ns.is_empty() && !admin_key.is_empty() {
+            let reg = McpClient::new(&server, "admin", &admin_key);
+            let _ = reg.call_json("register_agent", &serde_json::json!({
+                "agent_id": &agent_id,
+                "display_name": &agent_id,
+                "admin_key": &admin_key,
+                "namespace": "org/cs-pufa-2nd-thermal"
+            })).await;
+            allowed_ns = vec!["org/cs-pufa-2nd-thermal".to_string()];
+        }
+        if allowed_ns.is_empty() {
+            // 不向外部暴露内部错误细节（R6）
+            return Err(unauthorized("身份校验失败，请稍后重试"));
+        }
+        st.ns_cache
+            .lock()
+            .await
+            .insert(agent_id.clone(), (allowed_ns.clone(), std::time::Instant::now()));
     }
     Ok((agent_id, allowed_ns))
 }
@@ -241,16 +277,31 @@ fn main() {
                 ns_cache: tokio::sync::Mutex::new(HashMap::new()),
             });
 
-            if config.configured() {
-                match build_agent(&config).await {
-                    Ok(agent) => {
-                        println!("✓ Agent 已就绪（{}@{}）", config.agent_id, config.server);
-                        *state.agent.lock().await = Some(agent);
-                    }
-                    Err(e) => {
-                        println!("! Agent 初始化失败: {}（可在设置页重试）", e);
-                    }
+            // 先绑定端口，确保服务立即可用（即使 Memoria 慢/未就绪也不阻塞启动）
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("✗ 端口 {} 绑定失败: {}", &addr, e);
+                    std::process::exit(1);
                 }
+            };
+            server_ready_clone.store(true, Ordering::SeqCst);
+
+            if config.configured() {
+                // 后台异步注册 Agent：避免 register_agent 阻塞端口绑定与请求服务
+                let reg_state = state.clone();
+                let reg_config = config.clone();
+                tokio::spawn(async move {
+                    match build_agent(&reg_config).await {
+                        Ok(agent) => {
+                            println!("✓ Agent 已就绪（{}@{}）", reg_config.agent_id, reg_config.server);
+                            *reg_state.agent.lock().await = Some(agent);
+                        }
+                        Err(e) => {
+                            println!("! Agent 初始化失败: {}（可在设置页重试）", e);
+                        }
+                    }
+                });
             }
 
             // 巡检循环（含失败计数）
@@ -338,14 +389,6 @@ fn main() {
                 .layer(tower_http::cors::CorsLayer::permissive())
                 .with_state(state);
 
-            let listener = match tokio::net::TcpListener::bind(&addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("✗ 端口 {} 绑定失败: {}", &addr, e);
-                    std::process::exit(1);
-                }
-            };
-            server_ready_clone.store(true, Ordering::SeqCst);
             if let Err(e) = axum::serve(listener, app).await {
                 tracing::error!("HTTP 服务异常终止: {}", e);
             }
@@ -641,7 +684,23 @@ async fn handle_v1_chat(
                 "error": "too many messages"
             })).into_response();
         }
-        let session_id = format!("jan/{}", agent_id);
+        // PFAiX 强制上下文隔离：每个安装实例 + 每个对话独立 session。
+        // x-user-tag 是壳首次启动生成的随机 install_id；x-conversation-id
+        // 是壳内当前对话 id。两者缺省时向后兼容旧客户端。
+        let user_tag = headers
+            .get("x-user-tag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect::<String>())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "default".to_string());
+        let conversation_id = headers
+            .get("x-conversation-id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect::<String>())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "default".to_string());
+
+        let session_id = format!("jan/{}/{}/{}", agent_id, user_tag, conversation_id);
         if session_id.len() > 128 || !session_id.chars().all(|c| c.is_alphanumeric() || c == '/' || c == '-' || c == '_') {
             return axum::response::Json(serde_json::json!({
                 "error": "invalid session_id"
@@ -719,9 +778,11 @@ async fn handle_register(
     State(st): State<Arc<AppState>>,
     Json(req): Json<RegisterRequest>,
 ) -> Json<RegisterResponse> {
-    // 公司名为固定常量（部署时确定），禁止客户端篡改，避免命名空间 org/ 前缀漂移
-    // 须与 agent.toml 的 org/ 前缀、JAN lib.rs 的 COMPANY 保持一致
-    const COMPANY: &str = "常熟浦发第二热电能源有限公司";
+    // 公司名为固定常量（部署时确定），禁止客户端篡改，避免命名空间 org/ 前缀漂移。
+    // P0 修复：技术命名空间必须使用 ASCII（HTTP 头与 session_id 均不接受非 ASCII），
+    // 中文名「常熟浦发第二热电能源有限公司」仅作 Jan UI 展示（OnboardingScreen），不进入 agent_id/namespace。
+    // 须与 agent.toml 的 mcp_source namespace org/ 前缀保持一致。
+    const COMPANY: &str = "cs-pufa-2nd-thermal";
     // 命名空间分段做字符白名单清洗，避免 '/' 或特殊字符破坏层级路径（R5）
     let department = sanitize_ns_segment(&req.department);
     let div = sanitize_ns_segment(&req.div);
@@ -747,7 +808,8 @@ async fn handle_register(
     if !project.is_empty() {
         namespace = format!("{}/proj/{}", namespace, project);
     }
-    let badge_token = format!("sk-{:x}", rand::thread_rng().gen::<u128>());
+    // 先生成一个本地兜底 token；若 Memoria 注册成功，会用 Memoria 实际返回的 badge 覆盖（P0 修复：必须一致，否则客户端 key 与 Memoria 存值不符导致鉴权失败）
+    let mut badge_token = format!("sk-{:x}", rand::thread_rng().gen::<u128>());
 
     // 注册到 Memoria — 从环境变量或配置读取 admin_key
     let admin_key = match std::env::var("MEMORIA_ADMIN_KEY") {
@@ -755,12 +817,32 @@ async fn handle_register(
         _ => st.config.lock().await.memoria_admin_key.clone(),
     };
     let mcp = McpClient::new("http://127.0.0.1:9003", "admin", &admin_key);
-    let memoria_ok = !admin_key.is_empty() && mcp.call_json("register_agent", &serde_json::json!({
-        "agent_id": &agent_id,
-        "display_name": &req.name,
-        "admin_key": &admin_key,
-        "namespace": &namespace,
-    })).await.is_ok();
+    // P0 修复：Memoria 的 register_agent 会自行生成 badge 并在响应里返回；
+    // 必须用它作为后续鉴权 key，否则客户端拿本地随机 token 与 Memoria 存值对不上 → -32001。
+    let memoria_ok = if admin_key.is_empty() {
+        false
+    } else {
+        match mcp.call_json("register_agent", &serde_json::json!({
+            "agent_id": &agent_id,
+            "display_name": &req.name,
+            "admin_key": &admin_key,
+            "namespace": &namespace,
+        })).await {
+            Ok(text) => {
+                // Memoria register_agent 返回 {"status":"registered","badge":<AgentBadge对象 或 字符串>}
+                // 其中 badge.badge_token 才是后续鉴权用的 key 字符串；兼容 badge 直接是字符串的旧格式。
+                let badge_str = text.get("badge").and_then(|x| {
+                    if x.is_string() { x.as_str() }
+                    else { x.get("badge_token").and_then(|t| t.as_str()) }
+                });
+                if let Some(b) = badge_str {
+                    badge_token = b.to_string();
+                    true
+                } else { false }
+            }
+            Err(_) => false,
+        }
+    };
 
     // 缓存身份（使用 admin key 写入 Memoria 后，auth_cache 也存一份）
     // P2-10: 记录创建时间用于 TTL

@@ -150,6 +150,24 @@ impl AgentCore {
         }
     }
 
+    /// 从 session_id 解析调用者专属命名空间。
+    /// session_id 格式为 `jan/{agent_id}/{user_tag}/{conversation_id}`（PFAiX
+    /// 分发版注入 x-user-tag/x-conversation-id 后生成）。解析成功后返回
+    /// `agent/{agent_id}/user/{user_tag}`，确保不同安装实例、不同对话的
+    /// 长期记忆与历史完全隔离。旧格式或解析失败时回退到 agent 自身 ns，
+    /// 保持向后兼容。
+    fn caller_ns(&self, session_id: &str) -> String {
+        let parts: Vec<&str> = session_id.split('/').collect();
+        if parts.len() >= 4 && parts[0] == "jan" {
+            let agent_id = parts[1];
+            let user_tag = parts[2];
+            if !agent_id.is_empty() && !user_tag.is_empty() {
+                return format!("agent/{}/user/{}", agent_id, user_tag);
+            }
+        }
+        self.config.identity.ns()
+    }
+
     /// 入口：处理用户消息，返回回复
     ///
     /// 集成确认状态机（借鉴 task-workflow）：
@@ -166,7 +184,7 @@ impl AgentCore {
             match level {
                 ThreatLevel::High => {
                     tracing::warn!("[INJECTION-HIGH] session={}: {}", session_id, trimmed);
-                    let ns = self.config.identity.ns();
+                    let ns = self.caller_ns(session_id);
                     let db_path = self.harness.lock().await.db_path();
                     let reply = "⚠️ 检测到可疑指令，已拒绝执行。\n\n本次请求因安全风险被拦截。";
                     self.session_manager.save_to_history(session_id, &ns, &db_path, message, reply).await;
@@ -188,7 +206,7 @@ impl AgentCore {
         let timed_out = self.session_manager.check_confirm_timeouts(300).await;
         if timed_out.contains(&session_id.to_string()) {
             let reply = "⏰ 确认已超时，如需继续请重新发送指令。";
-            let ns = self.config.identity.ns();
+            let ns = self.caller_ns(session_id);
             let db_path = self.harness.lock().await.db_path();
             self.session_manager.save_to_history(session_id, &ns, &db_path, message, reply).await;
             return reply.to_string();
@@ -204,7 +222,7 @@ impl AgentCore {
                 let desc = action.description.chars().take(120).collect::<String>();
                 let result_short = result.chars().take(300).collect::<String>();
                 let reply = format!("✅ 操作已执行成功！\n\n操作内容：{}\n\n{}", desc, result_short);
-                let ns = self.config.identity.ns();
+                let ns = self.caller_ns(session_id);
                 let db_path = self.harness.lock().await.db_path();
                 self.session_manager.save_to_history(session_id, &ns, &db_path, message, &reply).await;
                 return reply;
@@ -303,14 +321,14 @@ impl AgentCore {
         // ── 2. 并行获取上下文 ──
         let (inbox_result, mem_result) = tokio::join!(
             self.check_inbox(),
-            self.search_memory(message),
+            self.search_memory(message, session_id, allowed_ns),
         );
 
         // P2-D: 检查审批响应
         self.check_approval_responses().await;
         // 如果有审批通过的请求，立即执行
         if let Some(reply) = self.execute_approved_request(session_id).await {
-            let ns = self.config.identity.ns();
+            let ns = self.caller_ns(session_id);
             let db_path = self.harness.lock().await.db_path();
             self.session_manager.save_to_history(session_id, &ns, &db_path, message, &reply).await;
             return reply;
@@ -340,7 +358,7 @@ impl AgentCore {
         }
 
         // ── 3. 加载历史对话 ──
-        let ns = self.config.identity.ns();
+        let ns = self.caller_ns(session_id);
         let db_path = self.harness.lock().await.db_path();
         let history = self.session_manager.load_history(session_id, &ns, &db_path).await;
 
@@ -370,7 +388,7 @@ impl AgentCore {
 
         // SAD 风格：并行获取上下文（记忆）和可用能力（工具列表）
         let (mem_result, tools) = tokio::join!(
-            self.search_memory(message),
+            self.search_memory(message, session_id, allowed_ns),
             self.fetch_tools_filtered(allowed_ns),
         );
 
@@ -572,17 +590,17 @@ impl AgentCore {
         )
     }
 
-    /// 从 SessionManager 加载历史对话
+    /// 从 SessionManager 加载历史对话（按调用者 namespace 隔离）
     #[allow(dead_code)]
     async fn load_history(&self, session_id: &str) -> Vec<Message> {
-        let ns = self.config.identity.ns();
+        let ns = self.caller_ns(session_id);
         let db_path = self.harness.lock().await.db_path();
         self.session_manager.load_history(session_id, &ns, &db_path).await
     }
 
-    /// 保存对话到 SessionManager（内存缓存 + SQLite 持久化）
+    /// 保存对话到 SessionManager（内存缓存 + SQLite 持久化，按调用者 namespace 隔离）
     async fn save_to_history(&self, session_id: &str, user_msg: &str, assistant_reply: &str) {
-        let ns = self.config.identity.ns();
+        let ns = self.caller_ns(session_id);
         let db_path = self.harness.lock().await.db_path();
         self.session_manager.save_to_history(session_id, &ns, &db_path, user_msg, assistant_reply).await;
     }
@@ -612,12 +630,12 @@ impl AgentCore {
                 let _ = self.mcp.call("memory_observe", &serde_json::json!({
                     "dialog": raw_message, "role": "user",
                     "source": format!("user:{}", user_id), "session_id": session_id,
-                    "namespace": self.config.identity.ns(),
+                    "namespace": self.caller_ns(session_id),
                 })).await;
                 let _ = self.mcp.call("memory_observe", &serde_json::json!({
                     "dialog": &reply, "role": "assistant",
                     "source": &self.config.identity.agent_id, "session_id": session_id,
-                    "namespace": self.config.identity.ns(),
+                    "namespace": self.caller_ns(session_id),
                 })).await;
                 // 保存到内存缓存
                 self.save_to_history(session_id, raw_message, &reply).await;
@@ -810,25 +828,56 @@ impl AgentCore {
         }
     }
 
-    /// 从 Memoria 搜索记忆
-    async fn search_memory(&self, query: &str) -> Result<Option<Vec<serde_json::Value>>, String> {
-        let result = self
-            .mcp
-            .call_json(
-                "memory_search_v2",
-                &serde_json::json!({
-                    "query": query,
-                    "namespace": self.config.identity.ns(),
-                    "max_results": 3,
-                    "intent": "WHAT",
-                }),
-            )
-            .await;
-
-        match result {
-            Ok(val) => Ok(val["results"].as_array().cloned()),
-            Err(_) => Ok(None),
+    /// 从 Memoria 搜索记忆。
+    /// PFAiX 强制隔离：同时搜索调用者私有 namespace（按 session_id 解析）
+    /// 与 allowed_ns 中的共享 namespace，合并后返回；既保证个人记忆隔离，
+    /// 又保留部门级共享知识库召回。
+    async fn search_memory(
+        &self,
+        query: &str,
+        session_id: &str,
+        allowed_ns: &[String],
+    ) -> Result<Option<Vec<serde_json::Value>>, String> {
+        let caller_ns = self.caller_ns(session_id);
+        let mut targets = vec![caller_ns];
+        for ns in allowed_ns {
+            if !targets.contains(ns) {
+                targets.push(ns.clone());
+            }
         }
+
+        let mut merged: Vec<serde_json::Value> = Vec::new();
+        for ns in &targets {
+            if merged.len() >= 6 {
+                break;
+            }
+            let result = self
+                .mcp
+                .call_json(
+                    "memory_search_v2",
+                    &serde_json::json!({
+                        "query": query,
+                        "namespace": ns,
+                        "max_results": 3,
+                        "intent": "WHAT",
+                    }),
+                )
+                .await;
+            if let Ok(val) = result {
+                if let Some(arr) = val["results"].as_array() {
+                    for item in arr.iter().cloned() {
+                        if !merged.contains(&item) {
+                            merged.push(item);
+                        }
+                        if merged.len() >= 6 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(if merged.is_empty() { None } else { Some(merged) })
     }
 
     /// 检查 A2A 收件箱中的审批响应
