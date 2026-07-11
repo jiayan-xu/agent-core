@@ -1427,6 +1427,202 @@ impl AgentCore {
         })).await;
         format!("洞见: {}", reply)
     }
+
+    /// 暗知识层 A2：通用夜间巩固编排器（泛化 run_insights）
+    ///
+    /// 流程（agent-core 出脑子，memoria 当哑存储）：
+    ///   1. dream_state_get 取游标 cursor_ts（该 ns 上次处理到的位置）
+    ///   2. memory_fetch_unconsolidated 拉取 cursor 之后的未巩固观察
+    ///   3. LLM 从观察中提炼 ≤5 条可复用模式（暗知识）
+    ///   4. 每条 pattern 经 memory_remember(category=pattern) 写回 memoria
+    ///   5. dream_state_update 推进游标（幂等：重跑不会重复处理同一批）
+    ///
+    /// 以 admin 身份调用 memoria（系统维护任务，合法跨命名空间读取观察原料）。
+    /// ns 隔离：每个 ns 独立游标、独立 pattern 库。
+    pub async fn consolidate(&self, ns: &str) -> String {
+        // 系统维护任务：用 admin 身份跨 ns 读取观察原料；无 admin_key 时退回自身身份（仅能处理自身 ns）
+        let admin_key = std::env::var("MEMORIA_ADMIN_KEY").unwrap_or_default();
+        let mem_client = if admin_key.is_empty() {
+            self.mcp.clone()
+        } else {
+            McpClient::new(&self.config.memoria_url, "admin", &admin_key)
+        };
+
+        // 1. 取游标
+        let ds_raw = mem_client.call("dream_state_get", &serde_json::json!({
+            "phase": "consolidate", "namespace": ns
+        })).await.unwrap_or_default();
+        let cursor_ts = serde_json::from_str::<serde_json::Value>(&ds_raw)
+            .ok()
+            .and_then(|v| v.get("cursor_ts").and_then(|c| c.as_str()).map(|s| s.to_string()))
+            .unwrap_or_else(|| "1970-01-01T00:00:00".to_string());
+
+        // 2. 拉原料
+        let raw = mem_client.call("memory_fetch_unconsolidated", &serde_json::json!({
+            "since": cursor_ts, "limit": 200, "namespace": ns
+        })).await.unwrap_or_default();
+        let items: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
+            .unwrap_or_default();
+        if items.is_empty() {
+            return format!("consolidate[{}]: 无新观察（cursor={}）", ns, cursor_ts);
+        }
+
+        // 3. LLM 提炼 ≤5 pattern
+        let mut obs_lines: Vec<String> = Vec::new();
+        let mut max_ts = cursor_ts.clone();
+        for it in &items {
+            if let Some(c) = it.get("content").and_then(|c| c.as_str()) {
+                let c = c.trim();
+                if !c.is_empty() {
+                    obs_lines.push(c.to_string());
+                }
+            }
+            if let Some(ts) = it.get("created_at").and_then(|t| t.as_str()) {
+                if ts > max_ts.as_str() {
+                    max_ts = ts.to_string();
+                }
+            }
+        }
+        let obs_text = obs_lines.join("\n- ");
+        let prompt = format!(
+            "你是知识巩固引擎。以下是一批\"观察\"记忆，请从中提炼可复用的高层模式（暗知识）：\
+             反复出现的规律、隐含业务约束、用户偏好、运营常识。每条模式用一句话陈述，最多 5 条。\
+             若观察里没有可提炼的模式，只输出\"无模式\"。\n\n## 待巩固观察（{} 条，命名空间 {}）\n- {}",
+            items.len(), ns, obs_text.chars().take(6000).collect::<String>()
+        );
+        let msg = crate::llm::Message { role: "system".to_string(), content: Some(prompt), tool_calls: None, tool_call_id: None };
+        let reply = match self.llm.chat(&[msg], &[]).await {
+            Ok(r) => r.text.trim().to_string(),
+            Err(e) => return format!("consolidate[{}] LLM 失败: {}", ns, e),
+        };
+        if reply.is_empty() || reply == "无模式" {
+            // 无模式也要推进游标，避免反复扫描同一批
+            let _ = mem_client.call("dream_state_update", &serde_json::json!({
+                "phase": "consolidate", "namespace": ns, "cursor_ts": max_ts, "items_out": 0
+            })).await;
+            return format!("consolidate[{}]: 无模式（已推进游标 {}）", ns, max_ts);
+        }
+
+        // 4. 写回 pattern（≤5）
+        let patterns: Vec<&str> = reply.lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .take(5)
+            .collect();
+        let mut written = 0u64;
+        for p in patterns {
+            // 去掉可能的序号/项目符号前缀（"1. "、"- "、"、 "）
+            let clean = p.trim_start_matches(|c: char| c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' ');
+            let _ = mem_client.call("memory_remember", &serde_json::json!({
+                "content": format!("[pattern] {} | ns={}", clean, ns),
+                "tags": ["pattern", "auto_consolidated"],
+                "category": "pattern",
+                "confidence": 70,
+                "namespace": ns
+            })).await;
+            written += 1;
+        }
+
+        // 5. 推进游标
+        let _ = mem_client.call("dream_state_update", &serde_json::json!({
+            "phase": "consolidate", "namespace": ns, "cursor_ts": max_ts, "items_out": written
+        })).await;
+
+        // 6. B 阶段：NER 实体提取（仅在提炼出 pattern 后才做，避免浪费 LLM 调用）
+        if written > 0 {
+            let entity_prompt = format!(
+                "你负责从以下观察和已提炼模式中识别实体（person/system/tool/concept/org/project/location/event）及关系。\
+                 仅输出纯 JSON，不要任何前缀后缀。\
+                 若没有实体，输出 {{\"entities\":[],\"edges\":[]}}\n\n## 观察（{} 条）\n- {}\n\n## 已提炼模式\n{}",
+                items.len(),
+                obs_text.chars().take(3000).collect::<String>(),
+                reply.chars().take(1000).collect::<String>(),
+            );
+            let msg2 = crate::llm::Message { role: "system".to_string(), content: Some(entity_prompt), tool_calls: None, tool_call_id: None };
+            if let Ok(ner_reply) = self.llm.chat(&[msg2], &[]).await {
+                let ner_text = ner_reply.text.trim().to_string();
+                // 解析 JSON（尝试直接解析，失败则查找最外层 {}）
+                let ner_json: Option<serde_json::Value> = serde_json::from_str(&ner_text).ok()
+                    .or_else(|| {
+                        let start = ner_text.find('{')?;
+                        let end = ner_text.rfind('}')?;
+                        serde_json::from_str(&ner_text[start..=end]).ok()
+                    });
+                if let Some(j) = ner_json {
+                    let entities = j.get("entities").and_then(|e| e.as_array()).cloned().unwrap_or_default();
+                    let edges = j.get("edges").and_then(|e| e.as_array()).cloned().unwrap_or_default();
+                    let mut entity_id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                    for ent in &entities {
+                        let name = ent.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                        let etype = ent.get("type").and_then(|t| t.as_str()).unwrap_or("other");
+                        let summary = ent.get("summary").and_then(|s| s.as_str()).unwrap_or("");
+                        // 确定性 ID = MD5 前缀 + ns + name
+                        // 确定性 ID = 命名空间名小写+实体名小写，去特殊字符
+                        let clean_id = |s: &str| -> String {
+                            s.to_lowercase().chars()
+                                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                                .take(40).collect::<String>()
+                        };
+                        let entity_id = format!("ent:{}_{}", clean_id(ns), clean_id(name));
+                        entity_id_map.insert(name.to_string(), entity_id.clone());
+                        let _ = mem_client.call("entity_upsert", &serde_json::json!({
+                            "entity_id": entity_id,
+                            "name": name,
+                            "entity_type": etype,
+                            "summary": summary,
+                            "namespace": ns
+                        })).await;
+                        // 为每条提及该实体的观察记录 mention
+                        for item in &items {
+                            let content = item.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                            let mem_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                            if content.contains(name) {
+                                let _ = mem_client.call("entity_add_mention", &serde_json::json!({
+                                    "entity_id": entity_id,
+                                    "memory_id": mem_id,
+                                    "context": content.chars().take(200).collect::<String>(),
+                                    "namespace": ns
+                                })).await;
+                            }
+                        }
+                        // 将实体摘要同时以 fact 记忆存入（便于搜索召回）
+                        if !summary.is_empty() {
+                            let _ = mem_client.call("memory_remember", &serde_json::json!({
+                                "content": format!("[entity:{}] {} — {}", etype, name, summary),
+                                "category": "fact",
+                                "tags": ["entity", etype],
+                                "namespace": ns
+                            })).await;
+                        }
+                    }
+                    let mut edge_count = 0u64;
+                    for edge in &edges {
+                        let src = edge.get("source").and_then(|s| s.as_str()).unwrap_or("");
+                        let tgt = edge.get("target").and_then(|t| t.as_str()).unwrap_or("");
+                        let rel = edge.get("relation").and_then(|r| r.as_str()).unwrap_or("related_to");
+                        let evidence = edge.get("evidence").and_then(|e| e.as_str()).unwrap_or("");
+                        if let (Some(src_id), Some(tgt_id)) = (entity_id_map.get(src), entity_id_map.get(tgt)) {
+                            let _ = mem_client.call("entity_add_edge", &serde_json::json!({
+                                "source_entity_id": src_id,
+                                "target_entity_id": tgt_id,
+                                "relation_type": rel,
+                                "evidence": evidence,
+                                "namespace": ns
+                            })).await;
+                            edge_count += 1;
+                        }
+                    }
+                    if !entities.is_empty() {
+                        tracing::info!("consolidate[{}] NER: {} entities, {} edges", ns, entities.len(), edge_count);
+                    }
+                }
+            }
+        }
+
+        format!("consolidate[{}]: 从 {} 条观察提炼 {} 条 pattern（cursor→{}）", ns, items.len(), written, max_ts)
+    }
 }
 
 fn now_secs() -> f64 {

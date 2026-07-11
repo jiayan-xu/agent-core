@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::convert::Infallible;
 use std::collections::HashMap;
+use chrono::{Local, Timelike};
 use axum::{
     Router, routing::{get, post, delete},
     Json, extract::State, response::{sse::{Sse, Event as SseEvent}, IntoResponse},
@@ -350,6 +351,16 @@ fn main() {
                         if insight_cycle % 4 == 0 {
                             let insight = agent.run_insights().await;
                             tracing::info!("{}", insight);
+                        }
+                        // 暗知识层 A2：低峰（02:00-05:00 本地时间）执行夜间巩固
+                        let hour = Local::now().hour();
+                        if (2..=4).contains(&hour) {
+                            let ns_list = std::env::var("CONSOLIDATE_NAMESPACES")
+                                .unwrap_or_else(|_| "agent/xujiayan".to_string());
+                            for ns in ns_list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                                let res = agent.consolidate(ns).await;
+                                tracing::info!("[consolidate] {}", res);
+                            }
                         }
                         // 每轮检查 dashboard agent_worker 健康（端口 8011）
                         let agent_ok = reqwest::get("http://127.0.0.1:8011/health")
