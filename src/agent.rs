@@ -60,6 +60,10 @@ pub struct AgentConfig {
     pub parent_permission: PermissionLevel,
     /// 启用组合路由（多 Skill 分解 + 按序执行）
     pub enable_compositional_routing: bool,
+    /// P1-2: 组合计划预览（HITL）。企业默认 true：多步计划先返回预览，用户确认后才执行。
+    pub compositional_preview: bool,
+    /// P1-4: 工具参数 JSON Schema 严格校验。true=校验失败直接报错；false=回灌 LLM 让其修正。
+    pub strict_schema: bool,
     /// P2-3: 自定义 system prompt 模板（可选）
     /// 如果为 None，使用内置默认模板
     pub system_prompt_template: Option<String>,
@@ -195,6 +199,10 @@ impl AgentCore {
         // 确认词用「包含匹配」而非精确相等：用户常回“对的”“好的，执行”“可以，查吧”
         // 等变体，精确匹配会漏掉导致确认状态机死循环（反复问“方向对吗？”）。
         let is_confirm = |m: &str| confirm_words.iter().any(|w| m.contains(*w));
+        let is_cancel = |m: &str| {
+            let kws = ["取消", "算了", "不执行", "放弃", "不要了", "不算了", "取消计划"];
+            kws.iter().any(|w| m.contains(w))
+        };
         let trimmed = message.trim();
 
         // ── P1-1: 崩溃恢复——先从 checkpoint 恢复控制面状态到内存 ──
@@ -257,11 +265,22 @@ impl AgentCore {
         match state {
             // ── 等待用户确认理解 ──
             SessionState::AwaitingConfirmation => {
+                // P1-2: 取消计划
+                if is_cancel(trimmed) {
+                    self.cancel_plan(session_id).await;
+                    return "✅ 已取消该计划。如需重新开始，请告诉我新的需求。".to_string();
+                }
                 if is_confirm(trimmed) {
                     let original = self.session_manager.take_original_message(session_id).await
                         .unwrap_or_else(|| message.to_string());
                     self.checkpoint_confirmed(session_id).await;
                     return self.execute_chat(&original, user_id, session_id, allowed_ns).await;
+                }
+                // P1-2: 计划编辑（当前支持「删除第N步」）
+                if let Some(new_plan) = self.try_apply_plan_edit(trimmed).await {
+                    *self.in_progress_plan.lock().await = Some(new_plan.clone());
+                    self.checkpoint_preview(session_id, &new_plan).await;
+                    return self.render_plan_preview(&new_plan).await;
                 }
                 // 修改/补充 → 保留 AwaitingConfirmation，重新复述
                 return self.rephrase_and_confirm(message, user_id, session_id, allowed_ns).await;
@@ -307,7 +326,16 @@ impl AgentCore {
                     }
                 };
                 if let Some(plan) = plan_opt {
-                    // 多步计划：记录进行中 + 执行（每步进度在 execute_plan 内落盘 checkpoint）
+                    // P1-2: 预览优先（非续跑、开启 preview、且多步）→ 先返回计划，不执行
+                    let is_resume = self.in_progress_plan.lock().await.is_some();
+                    if self.config.compositional_preview && !is_resume && plan.steps.len() > 1 {
+                        *self.in_progress_plan.lock().await = Some(plan.clone());
+                        self.checkpoint_preview(session_id, &plan).await;
+                        self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
+                        self.session_manager.set_original_message(session_id, message).await;
+                        return self.render_plan_preview(&plan).await;
+                    }
+                    // 执行路径（续跑 / 单步 / 关闭预览）：记录进行中 + 执行
                     *self.in_progress_plan.lock().await = Some(plan.clone());
                     self.checkpoint_executing(session_id, &plan, &self.in_progress_step_results.lock().await.clone()).await;
                     let result = self.execute_plan(&plan, session_id, allowed_ns).await
@@ -731,11 +759,99 @@ impl AgentCore {
                 // 恢复后下一次 execute_chat 会复用 in_progress_plan 续跑
                 self.session_manager.set_state(session_id, SessionState::Confirmed).await;
             }
+            CheckpointState::PlanPreview => {
+                // 恢复进行中的计划，等待用户「执行 / 取消 / 修改」
+                if let Some(plan_val) = cp.payload.get("plan") {
+                    if let Ok(plan) = serde_json::from_value::<crate::composer::ExecutionPlan>(plan_val.clone()) {
+                        *self.in_progress_plan.lock().await = Some(plan);
+                    }
+                }
+                self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
+                if let Some(msg) = cp.payload.get("original_message").and_then(|m| m.as_str()) {
+                    self.session_manager.set_original_message(session_id, msg).await;
+                }
+            }
             CheckpointState::Done | CheckpointState::Failed => {
                 // 终态：清空内存待确认（checkpoint 保留供审计）
                 self.session_manager.remove_state(session_id).await;
             }
             CheckpointState::New => {}
+        }
+    }
+
+    // ── P1-2 组合计划 HITL 辅助方法 ──
+
+    /// 进入计划预览态：记录 plan 但不执行（等待用户确认）
+    async fn checkpoint_preview(&self, session_id: &str, plan: &crate::composer::ExecutionPlan) {
+        let agent_id = self.config.identity.agent_id.clone();
+        let payload = serde_json::json!({
+            "plan": plan,
+            "original_message": self.session_manager.get_original_message(session_id).await.unwrap_or_default(),
+        });
+        let _ = self.checkpoint_store.lock().await.save(session_id, &agent_id, CheckpointState::PlanPreview, &payload);
+    }
+
+    /// 渲染计划预览（结构化摘要 + 机器可读 JSON）
+    async fn render_plan_preview(&self, plan: &crate::composer::ExecutionPlan) -> String {
+        let mut s = format!("📋 我规划了以下执行计划（共 {} 步）：\n\n", plan.steps.len());
+        for step in &plan.steps {
+            s.push_str(&format!("{}. {} — 工具 `{}`", step.step_id, step.description, step.tool));
+            if !step.depends_on.is_empty() {
+                s.push_str(&format!("（依赖步骤 {:?}）", step.depends_on));
+            }
+            s.push('\n');
+        }
+        s.push_str("\n回复「执行」开始；「取消」放弃；「删除第N步」可调整。\n\n```json\n");
+        s.push_str(&serde_json::to_string_pretty(plan).unwrap_or_default());
+        s.push_str("\n```");
+        s
+    }
+
+    /// 取消计划：清理进行中计划 + 审计 + 删除 checkpoint
+    async fn cancel_plan(&self, session_id: &str) {
+        *self.in_progress_plan.lock().await = None;
+        self.in_progress_step_results.lock().await.clear();
+        self.session_manager.remove_state(session_id).await;
+        let _ = self.audit_logger.log_decision(
+            &self.config.identity.agent_id, "plan_cancel", "用户取消组合计划", false,
+        ).await;
+        let _ = self.checkpoint_store.lock().await.delete(session_id);
+    }
+
+    /// 尝试应用计划编辑（当前支持「删除第N步」，并连带移除依赖它的步骤以防悬空）
+    async fn try_apply_plan_edit(&self, message: &str) -> Option<crate::composer::ExecutionPlan> {
+        let marker = message.find("删除第").or_else(|| message.find("去掉第"))?;
+        let rest = &message[marker..];
+        let num: u32 = rest.chars().skip_while(|c| !c.is_ascii_digit()).next()?.to_digit(10)?;
+        let mut plan = self.in_progress_plan.lock().await.clone()?;
+        plan.steps.retain(|s| s.step_id != num && !s.depends_on.contains(&num));
+        if plan.steps.is_empty() {
+            return None;
+        }
+        Some(plan)
+    }
+
+    /// P1-4: 轻量 JSON Schema 校验——检查 required 字段存在且非 null。
+    /// 不引入重依赖，覆盖「参数缺失导致 MCP 调用失败/错位」类问题。
+    fn validate_tool_args(args: &serde_json::Value, schema: &serde_json::Value) -> Result<(), String> {
+        let required = schema.get("required").and_then(|r| r.as_array());
+        match required {
+            Some(req) => {
+                let obj = args
+                    .as_object()
+                    .ok_or_else(|| "工具参数应为 JSON 对象".to_string())?;
+                for r in req {
+                    if let Some(name) = r.as_str() {
+                        match obj.get(name) {
+                            None => return Err(format!("缺少必填参数 '{}'", name)),
+                            Some(v) if v.is_null() => return Err(format!("必填参数 '{}' 为 null", name)),
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(())
+            }
+            None => Ok(()),
         }
     }
 
@@ -774,6 +890,11 @@ impl AgentCore {
     ) -> String {
         // 从 Memoria 取可用工具列表
         let tools = self.fetch_tools_filtered(allowed_ns).await;
+        // P1-4: 构建工具名 → JSON Schema 映射，用于参数校验
+        let tool_schemas: HashMap<String, serde_json::Value> = tools
+            .iter()
+            .map(|t| (t.function.name.clone(), t.function.parameters.clone()))
+            .collect();
 
         // P1 修复：把真实工具名动态注入 system prompt。
         // build_system_prompt 里写死的 query_sql/query_plate 与真实 MCP 工具
@@ -915,6 +1036,29 @@ impl AgentCore {
                                    tc.name, tc.name, check.reason);
                     self.save_to_history(session_id, raw_message, &reply).await;
                     return reply;
+                }
+
+                // P1-4: 工具参数 JSON Schema 校验（校验失败不调用 MCP）
+                if let Some(schema) = tool_schemas.get(&tc.name) {
+                    if let Err(e) = Self::validate_tool_args(&tc.arguments, schema) {
+                        if self.config.strict_schema {
+                            let reply = format!("工具「{}」参数校验失败: {}。请修正后重试。", tc.name, e);
+                            self.save_to_history(session_id, raw_message, &reply).await;
+                            return reply;
+                        }
+                        // 非严格模式：把错误回灌 LLM，让其修正参数后重试（受 max_tool_rounds 限制）
+                        tracing::info!(tool = %tc.name, error = %e, "工具参数 schema 校验失败，回灌 LLM 修正");
+                        messages.push(Message {
+                            role: "user".to_string(),
+                            content: Some(format!(
+                                "工具 {} 参数错误: {}。请严格按该工具的 JSON Schema（required 字段必填）修正参数后重试。",
+                                tc.name, e
+                            )),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
+                        continue;
+                    }
                 }
 
                 // 通过 MCP 调用工具（按名称路由到正确的源）
@@ -1531,18 +1675,14 @@ impl AgentCore {
 - 能修的直接调工具修，不能修的说明原因
 - 修改前向用户确认，确认后直接执行
 
-## 工具使用
-你有以下可用的工具（由系统自动提供）：
-- fuzzy_match_plate：按车牌/公司名模糊匹配企业信息
-- execute_sql：执行 SQL 查询（只允许 SELECT）
-- manage_whitelist：管理白名单
-- fill_excel_log：填写入厂日志
-- 以及其他系统提供的工具（实际可用工具名以对话中"当前真实可用工具"清单为准）
+        ## 工具使用
+        你可用的工具由系统按当前身份和命名空间动态提供，完整的真实工具名与描述见对话中
+        "当前真实可用工具"清单（每次请求都注入，以该清单为准）。
 
-调用工具时：
-1. 直接传递正确的参数，不要猜测参数名
-2. query_sql 的 SQL 必须是合法的 SQLite SELECT 语句
-3. 查询类工具不需要确认，修改类工具需要先确认
+        调用工具时：
+        1. 只能使用清单中列出的真实工具名，严禁臆造（如 query_sql / query_plate 等旧名已不存在）
+        2. 直接传递正确的参数，不要猜测参数名；参数必须符合工具的 JSON Schema（required 字段必填、类型正确）
+        3. 查询类工具不需要确认，修改/外发类工具需要先确认
 
 ## 边界
 - ❌ 不能执行 INSERT/UPDATE/DELETE SQL

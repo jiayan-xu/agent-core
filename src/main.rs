@@ -1237,6 +1237,8 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
         max_tool_rounds: 3,
         parent_permission: PermissionLevel::Write,
         enable_compositional_routing: true,
+        compositional_preview: true, // P1-2: 企业默认开启计划预览（HITL）
+        strict_schema: false, // P1-4: 默认回灌 LLM 修正参数（非严格报错）
         system_prompt_template: None, // P2-3: 使用内置默认模板
         approver_id: None, // P2-D: 无审批人（保持现有行为）
     };

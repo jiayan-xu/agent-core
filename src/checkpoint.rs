@@ -19,6 +19,7 @@ pub enum CheckpointState {
     Confirmed,
     PendingApproval,
     ExecutingPlan,
+    PlanPreview,
     Done,
     Failed,
 }
@@ -31,6 +32,7 @@ impl CheckpointState {
             CheckpointState::Confirmed => "Confirmed",
             CheckpointState::PendingApproval => "PendingApproval",
             CheckpointState::ExecutingPlan => "ExecutingPlan",
+            CheckpointState::PlanPreview => "PlanPreview",
             CheckpointState::Done => "Done",
             CheckpointState::Failed => "Failed",
         }
@@ -41,6 +43,7 @@ impl CheckpointState {
             "Confirmed" => CheckpointState::Confirmed,
             "PendingApproval" => CheckpointState::PendingApproval,
             "ExecutingPlan" => CheckpointState::ExecutingPlan,
+            "PlanPreview" => CheckpointState::PlanPreview,
             "Done" => CheckpointState::Done,
             "Failed" => CheckpointState::Failed,
             _ => CheckpointState::New,
