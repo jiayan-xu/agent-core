@@ -55,6 +55,7 @@ impl HttpMcpClient {
             "params": { "name": tool, "arguments": args }
         });
         let url = format!("{}/mcp", self.base_url);
+        let mut last_err = String::from("no response");
         for attempt in 0..3 {
             let result = self.client.post(&url).json(&body)
                 .header("X-Agent-Id", &self.agent_id)
@@ -63,19 +64,45 @@ impl HttpMcpClient {
             match result {
                 Ok(resp) => {
                     if !resp.status().is_success() {
+                        // HTTP 层错误（5xx / 网关）：视为可重试的传输错误
+                        last_err = format!("HTTP {}", resp.status());
                         if attempt < 2 { tokio::time::sleep(Duration::from_secs(attempt as u64)).await; continue; }
-                        return Err(format!("HTTP {}", resp.status()));
+                        return Err(last_err);
                     }
-                    let data: serde_json::Value = resp.json().await.map_err(|e| format!("json: {}", e))?;
-                    return Ok(data["result"]["content"][0]["text"].as_str().ok_or("empty MCP response")?.to_string());
+                    // HTTP 200 — 解析 JSON-RPC 信封
+                    let data: serde_json::Value = match resp.json().await {
+                        Ok(d) => d,
+                        Err(e) => {
+                            last_err = format!("json parse: {}", e);
+                            if attempt < 2 { tokio::time::sleep(Duration::from_secs(attempt as u64)).await; continue; }
+                            return Err(last_err);
+                        }
+                    };
+                    // JSON-RPC 业务错误（鉴权失败 / 参数错误等）：不重试，直接返回
+                    // 否则会把一次鉴权失败当成传输错误重试 3 次，放大对端的调用量（如 Memoria CPU 飙升）。
+                    if let Some(err) = data.get("error") {
+                        return Err(format!("MCP error: {}", err));
+                    }
+                    // 成功：抽取文本结果
+                    return match data.get("result")
+                        .and_then(|r| r.get("content"))
+                        .and_then(|c| c.get(0))
+                        .and_then(|c| c.get("text"))
+                        .and_then(|t| t.as_str())
+                    {
+                        Some(t) => Ok(t.to_string()),
+                        None => Err("empty MCP response".to_string()),
+                    };
                 }
                 Err(e) => {
+                    // 传输层错误（连接失败 / 超时）：可重试
+                    last_err = format!("MCP transport error: {}", e);
                     if attempt < 2 { tokio::time::sleep(Duration::from_secs(attempt as u64)).await; continue; }
-                    return Err(format!("MCP call failed after 3 retries: {}", e));
+                    return Err(last_err);
                 }
             }
         }
-        Err("unreachable".to_string())
+        Err(last_err)
     }
 
     pub async fn list_tools(&self) -> Result<Vec<(String, String, serde_json::Value)>, String> {
@@ -196,12 +223,19 @@ impl StdioMcpClient {
 }
 
 fn spawn_process(command: &str, args: &[String]) -> Child {
-    Command::new(command)
-        .args(args)
+    let mut cmd = Command::new(command);
+    cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
+        .stderr(Stdio::inherit());
+    // Windows: 防止 spawn 的 MCP 子进程（如 python）弹出控制台窗口
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.spawn()
         .expect("failed to spawn MCP server process")
 }
 

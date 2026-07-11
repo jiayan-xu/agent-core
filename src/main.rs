@@ -181,15 +181,28 @@ async fn authenticate(
         }
         // 安装实例首次使用：Memoria 中尚无该身份 → 以管理员身份自动注册为公司组织成员，
         // 使其获得基础命名空间（org 根），随后即可通过鉴权闸门。
-        if allowed_ns.is_empty() && !admin_key.is_empty() {
+        // 仅 legacy 模式（无 x-agent-id，仅 x-user-tag 的 PFAiX 自动开户）才用 admin key 自动注册。
+        // 登录模式（x-agent-id 已带 user_id）若身份不存在，必须走 Memoria `register_user`
+        // 建号（带口令），禁止此处用 admin key 无口令自动建号，否则口令形同虚设。
+        if allowed_ns.is_empty() && !admin_key.is_empty() && from_usertag {
+            // B2（选项2）：每个 PFAiX 安装实例分配独立 `agent/{install_id}` ns，
+            // 使安装间身份彼此隔离；同时保留组织级 ns `org/cs-pufa-2nd-thermal`，
+            // 以维持 dashboard 等共享工具的可见性（其 mcp_source 位于 org/… 子树，
+            // 工具门控依赖 allowed_ns 覆盖该子树，见 agent.toml）。两 ns 以逗号写入
+            // 同一 namespace 字段，Memoria `get_allowed_ns` 会按逗号拆分回传，从而
+            // 后续请求（缓存失效后重查）仍同时持有这两个 ns，不会因回读而丢失 dashboard。
+            let install_ns = format!("agent/{},org/cs-pufa-2nd-thermal", agent_id);
             let reg = McpClient::new(&server, "admin", &admin_key);
             let _ = reg.call_json("register_agent", &serde_json::json!({
                 "agent_id": &agent_id,
                 "display_name": &agent_id,
                 "admin_key": &admin_key,
-                "namespace": "org/cs-pufa-2nd-thermal"
+                "namespace": &install_ns
             })).await;
-            allowed_ns = vec!["org/cs-pufa-2nd-thermal".to_string()];
+            allowed_ns = vec![
+                format!("agent/{}", agent_id),
+                "org/cs-pufa-2nd-thermal".to_string(),
+            ];
         }
         if allowed_ns.is_empty() {
             // 不向外部暴露内部错误细节（R6）
@@ -386,6 +399,8 @@ fn main() {
                 .route("/api/sessions/{id}", delete(handle_session_delete))
                 .route("/v1/chat/completions", post(handle_v1_chat))
                 .route("/api/register", post(handle_register))
+                .route("/api/register_user", post(handle_register_user))
+                .route("/api/login", post(handle_login))
                 .layer(tower_http::cors::CorsLayer::permissive())
                 .with_state(state);
 
@@ -716,7 +731,7 @@ async fn handle_v1_chat(
         if user_text.is_empty() {
             "请输入消息".to_string()
         } else {
-            agent.chat(&user_text, &agent_id, &format!("jan/{}", agent_id), &allowed_ns).await
+            agent.chat(&user_text, &agent_id, &session_id, &allowed_ns).await
         }
     } else {
         "Agent 未就绪".to_string()
@@ -757,6 +772,40 @@ struct RegisterResponse {
     badge_token: String,
     namespace: String,
     error: Option<String>,
+}
+
+/// 个人账号注册（本地账密）—— user_id + password → 代理转发到 Memoria register_user。
+/// 财务机等分发端连不到内网 Memoria，注册/登录必须经 agent-core 代理。
+#[derive(Deserialize)]
+struct RegisterUserRequest {
+    user_id: String,
+    password: String,
+    #[serde(default)]
+    display_name: String,
+}
+#[derive(Deserialize)]
+struct LoginRequest {
+    user_id: String,
+    password: String,
+}
+#[derive(Serialize)]
+struct LoginResponse {
+    ok: bool,
+    user_id: String,
+    display_name: String,
+    badge_token: String,
+    namespace: String,
+    error: Option<String>,
+}
+
+/// user_id 严格清洗：作为 agent_id 会进入 HTTP 头与 session_id，必须 ASCII 安全。
+/// 仅保留字母/数字/下划线/连字符/点，避免破坏头部或命名空间层级。
+fn sanitize_user_id(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// 命名空间分段白名单清洗：仅保留字母/数字/中文/下划线/连字符，
@@ -864,6 +913,107 @@ async fn handle_register(
         namespace,
         error: if memoria_ok { None } else { Some("Memoria 暂时不可用，token 已生成".to_string()) },
     })
+}
+
+/// 个人账号注册代理：转发到 Memoria `register_user`（以 admin 身份）。
+/// 命名空间在此层追加部署级 org（cs-pufa-2nd-thermal），使登录用户获得 dashboard 等
+/// 共享工具可见性，同时保留 agent/{user_id} 作个人记忆隔离。
+async fn handle_register_user(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<RegisterUserRequest>,
+) -> Json<LoginResponse> {
+    let user_id = sanitize_user_id(&req.user_id);
+    if user_id.is_empty() || user_id != req.user_id.trim() {
+        return Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
+            badge_token: String::new(), namespace: String::new(),
+            error: Some("用户名仅允许字母/数字/下划线/连字符/点".to_string()) });
+    }
+    if req.password.len() < 6 {
+        return Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
+            badge_token: String::new(), namespace: String::new(),
+            error: Some("口令至少 6 位".to_string()) });
+    }
+    let display_name = if req.display_name.trim().is_empty() { user_id.clone() } else { req.display_name.trim().to_string() };
+    let admin_key = match std::env::var("MEMORIA_ADMIN_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => st.config.lock().await.memoria_admin_key.clone(),
+    };
+    if admin_key.is_empty() {
+        return Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
+            badge_token: String::new(), namespace: String::new(),
+            error: Some("服务未就绪，请稍后重试".to_string()) });
+    }
+    // 部署级组织命名空间：agent/{user_id}（个人记忆） + org/...（共享工具可见性）
+    let namespace = format!("agent/{},org/cs-pufa-2nd-thermal", user_id);
+    let mcp = McpClient::new("http://127.0.0.1:9003", "admin", &admin_key);
+    match mcp.call_json("register_user", &serde_json::json!({
+        "user_id": &user_id,
+        "display_name": &display_name,
+        "password": &req.password,
+        "namespace": &namespace,
+    })).await {
+        Ok(v) => {
+            let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            if status == "registered" {
+                Json(LoginResponse { ok: true, user_id, display_name,
+                    badge_token: String::new(), namespace, error: None })
+            } else {
+                let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("注册失败").to_string();
+                Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
+                    badge_token: String::new(), namespace: String::new(), error: Some(msg) })
+            }
+        }
+        Err(_) => Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
+            badge_token: String::new(), namespace: String::new(),
+            error: Some("Memoria 暂时不可用".to_string()) }),
+    }
+}
+
+/// 个人账号登录代理：转发到 Memoria `login_user`（以 admin 身份），
+/// 成功回传 badge_token，客户端存储后作为 x-agent-id / x-agent-key 用于聊天鉴权。
+async fn handle_login(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<LoginRequest>,
+) -> Json<LoginResponse> {
+    let user_id = sanitize_user_id(&req.user_id);
+    if user_id.is_empty() || req.password.is_empty() {
+        return Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
+            badge_token: String::new(), namespace: String::new(),
+            error: Some("用户名或口令错误".to_string()) });
+    }
+    let admin_key = match std::env::var("MEMORIA_ADMIN_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => st.config.lock().await.memoria_admin_key.clone(),
+    };
+    if admin_key.is_empty() {
+        return Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
+            badge_token: String::new(), namespace: String::new(),
+            error: Some("服务未就绪，请稍后重试".to_string()) });
+    }
+    let mcp = McpClient::new("http://127.0.0.1:9003", "admin", &admin_key);
+    match mcp.call_json("login_user", &serde_json::json!({
+        "user_id": &user_id,
+        "password": &req.password,
+    })).await {
+        Ok(v) => {
+            let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            if status == "ok" {
+                let badge_token = v.get("badge_token").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                let display_name = v.get("display_name").and_then(|s| s.as_str()).unwrap_or(&user_id).to_string();
+                let namespace = v.get("namespace").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                // 登录成功即写入 auth_cache，减少首条聊天的鉴权往返
+                st.auth_cache.lock().await.insert(user_id.clone(), (badge_token.clone(), std::time::Instant::now()));
+                Json(LoginResponse { ok: true, user_id, display_name, badge_token, namespace, error: None })
+            } else {
+                Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
+                    badge_token: String::new(), namespace: String::new(),
+                    error: Some("用户名或口令错误".to_string()) })
+            }
+        }
+        Err(_) => Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
+            badge_token: String::new(), namespace: String::new(),
+            error: Some("Memoria 暂时不可用".to_string()) }),
+    }
 }
 
 async fn build_agent(config: &Config) -> Result<AgentCore, String> {
