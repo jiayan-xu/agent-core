@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::convert::Infallible;
 use std::collections::HashMap;
+use agent_core::checkpoint::CheckpointStore;
 use chrono::{Local, Timelike};
 use axum::{
     Router, routing::{get, post, delete},
@@ -1242,7 +1243,9 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
     let cwd = std::env::current_dir().unwrap_or_default();
     let harness = HarnessStore::open(&cwd.join("harness.db").to_string_lossy())
         .map_err(|e| format!("创建 Harness 存储失败: {}", e))?;
-    let agent = AgentCore::new(agent_config, harness);
+    let checkpoint = CheckpointStore::open(&cwd.join("checkpoints.db").to_string_lossy())
+        .map_err(|e| format!("创建 Checkpoint 存储失败: {}", e))?;
+    let agent = AgentCore::new(agent_config, harness, checkpoint);
     // P2-C: 同步 Memoria 注册的 namespace 到本地 NamespaceRegistry
     agent.sync_namespace_from_identity();
     Ok(agent)

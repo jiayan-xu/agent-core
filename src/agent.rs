@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 
 use crate::audit::AuditLogger;
 use crate::boundary::{self, ComplianceBoundary, PermissionLevel, BlockLevel};
+use crate::checkpoint::{CheckpointState, CheckpointStore};
 use crate::boundary::prompt_injection::{PromptInjectionDetector, ThreatLevel};
 use crate::harness::{self, ExecutionLog, HarnessStore};
 use crate::llm::{LlmClient, LlmConfig, Message, ToolDef};
@@ -89,6 +90,12 @@ pub struct AgentCore {
     pub namespace_registry: std::sync::Mutex<NamespaceRegistry>,
     /// 审批管理器（P2-D）
     pub approval_manager: ApprovalManager,
+    /// P1-1: 控制面 checkpoint 持久化（会话 / 计划 / 审批可续跑）
+    pub checkpoint_store: Arc<tokio::sync::Mutex<CheckpointStore>>,
+    /// P1-1: 进行中的组合计划（崩溃续跑起点）
+    in_progress_plan: Arc<Mutex<Option<crate::composer::ExecutionPlan>>>,
+    /// P1-1: 已完成的步骤结果（崩溃后续跑起点）
+    in_progress_step_results: Arc<Mutex<HashMap<u32, String>>>,
 }
 
 struct InboxCache {
@@ -108,7 +115,7 @@ impl InboxCache {
 
 impl AgentCore {
     /// 创建 Agent 核心
-    pub fn new(config: AgentConfig, harness: HarnessStore) -> Self {
+    pub fn new(config: AgentConfig, harness: HarnessStore, checkpoint: CheckpointStore) -> Self {
         let mcp = McpClient::new(&config.memoria_url, &config.identity.agent_id, &config.identity.badge_token);
         // 构建 MCP 源列表（Memoria 始终为第一个源）
         let mut mcp_sources = vec![McpSource::memoria(mcp.clone())];
@@ -147,6 +154,9 @@ impl AgentCore {
             tool_route_cache: tokio::sync::Mutex::new(HashMap::new()),
             namespace_registry: std::sync::Mutex::new(NamespaceRegistry::new()),
             approval_manager: ApprovalManager::new(),
+            checkpoint_store: Arc::new(tokio::sync::Mutex::new(checkpoint)),
+            in_progress_plan: Arc::new(Mutex::new(None)),
+            in_progress_step_results: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -187,6 +197,9 @@ impl AgentCore {
         let is_confirm = |m: &str| confirm_words.iter().any(|w| m.contains(*w));
         let trimmed = message.trim();
 
+        // ── P1-1: 崩溃恢复——先从 checkpoint 恢复控制面状态到内存 ──
+        self.restore_checkpoint(session_id).await;
+
         // ── 提示词注入检测 ──
         let detector = PromptInjectionDetector::new();
         if let Some(level) = detector.quick_check(trimmed) {
@@ -201,7 +214,7 @@ impl AgentCore {
                 }
                 ThreatLevel::Medium => {
                     tracing::info!("[INJECTION-MED] session={}: {}", session_id, trimmed);
-                    self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
+                    self.checkpoint_awaiting(session_id, message).await;
                     let reply = "⚠️ 检测到不太常规的请求模式。\n\n您确定要执行这个操作吗？请回复\"确认\"继续，或修改您的请求。";
                     return reply.to_string();
                 }
@@ -247,7 +260,7 @@ impl AgentCore {
                 if is_confirm(trimmed) {
                     let original = self.session_manager.take_original_message(session_id).await
                         .unwrap_or_else(|| message.to_string());
-                    self.session_manager.set_state(session_id, SessionState::Confirmed).await;
+                    self.checkpoint_confirmed(session_id).await;
                     return self.execute_chat(&original, user_id, session_id, allowed_ns).await;
                 }
                 // 修改/补充 → 保留 AwaitingConfirmation，重新复述
@@ -268,7 +281,7 @@ impl AgentCore {
             // ── 新会话 ──
             SessionState::New => {
                 if boundary::TaskConfirmationGate::requires_confirmation(message) {
-                    self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
+                    self.checkpoint_awaiting(session_id, message).await;
                     return self.rephrase_and_confirm(message, user_id, session_id, allowed_ns).await;
                 }
                 // 简单查询 → 直接执行
@@ -284,41 +297,53 @@ impl AgentCore {
         if self.config.enable_compositional_routing {
             let tools = self.fetch_tools_filtered(allowed_ns).await;
             if !tools.is_empty() {
-                match crate::composer::decompose(&self.llm, message, &tools).await {
-                    Ok(plan) if plan.steps.len() > 1 => {
-                        let result = self.execute_plan(&plan, session_id, allowed_ns).await
-                            .unwrap_or_else(|e| format!("组合执行失败: {}", e));
-
-                        // 蒸馏闭环：记录组合执行的摘要日志，触发 Harness 蒸馏
-                        let is_success = result.starts_with("执行结果") && !result.contains("失败");
-                        {
-                            let mut log = self.execution_log.lock().await;
-                            // 用消息中的关键词作为 trigger_conditions（供后续 Harness 匹配）
-                            let query_preview: String = message.chars().take(80).collect();
-                            log.push(crate::harness::ExecutionLog {
-                                name: format!("composer_{}", message.chars().take(20).collect::<String>()),
-                                trigger_conditions: serde_json::json!({"query": query_preview}),
-                                steps: serde_json::json!(plan.steps.iter().map(|s| serde_json::json!({
-                                    "tool": s.tool,
-                                    "args": s.arguments,
-                                })).collect::<Vec<serde_json::Value>>()),
-                                verify_rule: String::new(),
-                                success: is_success,
-                            });
-                        }
-                        // 从积累的执行日志中蒸馏新模板
-                        {
-                            let logs = self.execution_log.lock().await;
-                            let mut harness = self.harness.lock().await;
-                            let _ = harness.distill_from_logs(&logs, 2);
-                        }
-
-                        return format!("[Step 2/3: 执行 → Step 3/3: 交付]\n\n{}", result);
+                // P1-1: 续跑优先——已有进行中计划则直接复用，不重新分解（崩溃恢复场景）
+                let plan_opt = if let Some(p) = self.in_progress_plan.lock().await.clone() {
+                    Some(p)
+                } else {
+                    match crate::composer::decompose(&self.llm, message, &tools).await {
+                        Ok(plan) if plan.steps.len() > 1 => Some(plan),
+                        _ => None,
                     }
-                    _ => {
-                        tracing::info!("合成路由降级到普通 LLM（单步或分解失败）");
-                    } // 单步或失败 → 降级到普通 LLM loop
+                };
+                if let Some(plan) = plan_opt {
+                    // 多步计划：记录进行中 + 执行（每步进度在 execute_plan 内落盘 checkpoint）
+                    *self.in_progress_plan.lock().await = Some(plan.clone());
+                    self.checkpoint_executing(session_id, &plan, &self.in_progress_step_results.lock().await.clone()).await;
+                    let result = self.execute_plan(&plan, session_id, allowed_ns).await
+                        .unwrap_or_else(|e| format!("组合执行失败: {}", e));
+
+                    // 蒸馏闭环：记录组合执行的摘要日志，触发 Harness 蒸馏
+                    let is_success = result.starts_with("执行结果") && !result.contains("失败");
+                    {
+                        let mut log = self.execution_log.lock().await;
+                        let query_preview: String = message.chars().take(80).collect();
+                        log.push(crate::harness::ExecutionLog {
+                            name: format!("composer_{}", message.chars().take(20).collect::<String>()),
+                            trigger_conditions: serde_json::json!({"query": query_preview}),
+                            steps: serde_json::json!(plan.steps.iter().map(|s| serde_json::json!({
+                                "tool": s.tool,
+                                "args": s.arguments,
+                            })).collect::<Vec<serde_json::Value>>()),
+                            verify_rule: String::new(),
+                            success: is_success,
+                        });
+                    }
+                    {
+                        let logs = self.execution_log.lock().await;
+                        let mut harness = self.harness.lock().await;
+                        let _ = harness.distill_from_logs(&logs, 2);
+                    }
+
+                    // P1-1: 组合执行完成 → 终态 checkpoint，清理进行中计划
+                    self.checkpoint_terminal(session_id, CheckpointState::Done).await;
+                    *self.in_progress_plan.lock().await = None;
+                    self.in_progress_step_results.lock().await.clear();
+
+                    return format!("[Step 2/3: 执行 → Step 3/3: 交付]\n\n{}", result);
                 }
+                // 单步或分解失败 → 降级到普通 LLM loop（fall through）
+                tracing::info!("合成路由降级到普通 LLM（单步或分解失败）");
             }
         }
 
@@ -449,14 +474,15 @@ impl AgentCore {
     async fn execute_plan(
         &self,
         plan: &crate::composer::ExecutionPlan,
-        _session_id: &str,
+        session_id: &str,
         allowed_ns: &[String],
     ) -> Result<String, String> {
         use std::collections::HashMap;
 
-        let mut step_results: HashMap<u32, String> = HashMap::new();
+        // P1-1: 续跑——从已完成的步骤结果起步（崩溃恢复后 in_progress_step_results 已填充）
+        let mut step_results: HashMap<u32, String> = self.in_progress_step_results.lock().await.clone();
         let mut step_errors: Vec<String> = Vec::new();
-        let mut executed: Vec<u32> = Vec::new();
+        let mut executed: Vec<u32> = step_results.keys().cloned().collect();
         let total = plan.steps.len();
 
         while executed.len() < total {
@@ -571,6 +597,8 @@ impl AgentCore {
                     }
                 }
                 executed.push(step_id);
+                // P1-1: 每步完成即落盘进度（崩溃可续跑）
+                self.persist_plan_progress(session_id).await;
             }
         }
 
@@ -594,6 +622,121 @@ impl AgentCore {
         }
 
         Ok(report)
+    }
+
+    // ── P1-1 Checkpoint 控制面辅助方法 ──
+
+    /// 进入待确认态：内存 + checkpoint 双写（含原始消息）
+    async fn checkpoint_awaiting(&self, session_id: &str, original_message: &str) {
+        self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
+        self.session_manager.set_original_message(session_id, original_message).await;
+        let payload = serde_json::json!({"original_message": original_message});
+        let agent_id = self.config.identity.agent_id.clone();
+        let _ = self.checkpoint_store.lock().await.save(session_id, &agent_id, CheckpointState::AwaitingConfirmation, &payload);
+    }
+
+    /// 进入已确认态
+    async fn checkpoint_confirmed(&self, session_id: &str) {
+        self.session_manager.set_state(session_id, SessionState::Confirmed).await;
+        let agent_id = self.config.identity.agent_id.clone();
+        let _ = self.checkpoint_store.lock().await.save(session_id, &agent_id, CheckpointState::Confirmed, &serde_json::json!({}));
+    }
+
+    /// 进入计划执行态：记录 plan + 已完成步骤
+    async fn checkpoint_executing(&self, session_id: &str, plan: &crate::composer::ExecutionPlan, step_results: &HashMap<u32, String>) {
+        let agent_id = self.config.identity.agent_id.clone();
+        let payload = serde_json::json!({
+            "plan": plan,
+            "step_results": step_results,
+        });
+        let _ = self.checkpoint_store.lock().await.save(session_id, &agent_id, CheckpointState::ExecutingPlan, &payload);
+    }
+
+    /// 记录待审批：含 approval_id 与工具意图
+    async fn checkpoint_pending_approval(&self, session_id: &str, approval_id: &str, action: &PendingAction) {
+        let agent_id = self.config.identity.agent_id.clone();
+        let payload = serde_json::json!({
+            "approval_id": approval_id,
+            "pending_action": {
+                "tool_name": action.tool_name,
+                "arguments": action.arguments,
+                "description": action.description,
+            }
+        });
+        let _ = self.checkpoint_store.lock().await.save(session_id, &agent_id, CheckpointState::PendingApproval, &payload);
+    }
+
+    /// 终态（Done / Failed）：保留 checkpoint 供审计关联
+    async fn checkpoint_terminal(&self, session_id: &str, state: CheckpointState) {
+        let agent_id = self.config.identity.agent_id.clone();
+        let _ = self.checkpoint_store.lock().await.save(session_id, &agent_id, state, &serde_json::json!({}));
+    }
+
+    /// 把当前进行中的计划进度（plan + 已完成步骤）落盘 checkpoint
+    async fn persist_plan_progress(&self, session_id: &str) {
+        let plan = self.in_progress_plan.lock().await.clone();
+        let sr = self.in_progress_step_results.lock().await.clone();
+        if let Some(p) = plan {
+            self.checkpoint_executing(session_id, &p, &sr).await;
+        }
+    }
+
+    /// 从持久化 checkpoint 恢复控制面状态到内存（chat 入口调用）
+    async fn restore_checkpoint(&self, session_id: &str) {
+        let cp = {
+            let store = self.checkpoint_store.lock().await;
+            store.load(session_id)
+        };
+        let cp = match cp {
+            Some(c) => c,
+            None => return,
+        };
+        match cp.state {
+            CheckpointState::AwaitingConfirmation => {
+                self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
+                if let Some(msg) = cp.payload.get("original_message").and_then(|m| m.as_str()) {
+                    self.session_manager.set_original_message(session_id, msg).await;
+                }
+            }
+            CheckpointState::Confirmed => {
+                self.session_manager.set_state(session_id, SessionState::Confirmed).await;
+            }
+            CheckpointState::PendingApproval => {
+                // 恢复待审批意图（审批结果需重新等待，但工具意图保留以便日志关联）
+                if let Some(pa) = cp.payload.get("pending_action") {
+                    let action = PendingAction {
+                        tool_name: pa.get("tool_name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        arguments: pa.get("arguments").cloned().unwrap_or(serde_json::json!({})),
+                        description: pa.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    };
+                    self.session_manager.set_pending_action(session_id, action).await;
+                }
+                self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
+            }
+            CheckpointState::ExecutingPlan => {
+                // 恢复进行中的计划与已完成步骤，供 execute_plan 续跑
+                if let Some(plan_val) = cp.payload.get("plan") {
+                    if let Ok(plan) = serde_json::from_value::<crate::composer::ExecutionPlan>(plan_val.clone()) {
+                        *self.in_progress_plan.lock().await = Some(plan);
+                    }
+                }
+                if let Some(sr) = cp.payload.get("step_results").and_then(|v| v.as_object()) {
+                    let mut map = self.in_progress_step_results.lock().await;
+                    for (k, v) in sr.iter() {
+                        if let (Ok(id), Some(s)) = (k.parse::<u32>(), v.as_str()) {
+                            map.insert(id, s.to_string());
+                        }
+                    }
+                }
+                // 恢复后下一次 execute_chat 会复用 in_progress_plan 续跑
+                self.session_manager.set_state(session_id, SessionState::Confirmed).await;
+            }
+            CheckpointState::Done | CheckpointState::Failed => {
+                // 终态：清空内存待确认（checkpoint 保留供审计）
+                self.session_manager.remove_state(session_id).await;
+            }
+            CheckpointState::New => {}
+        }
     }
 
     /// 话题切换检测：当前任务未完成，检测到话题切换
@@ -720,6 +863,13 @@ impl AgentCore {
                                 "content": msg.to_string(),
                                 "namespace": format!("agent/{}", approver_id),
                             })).await;
+                            // P1-1: 记录待审批到 checkpoint（崩溃恢复后审批意图仍可见）
+                            let pa = PendingAction {
+                                tool_name: tc.name.clone(),
+                                arguments: tc.arguments.clone(),
+                                description: check.reason.clone(),
+                            };
+                            self.checkpoint_pending_approval(session_id, &aid, &pa).await;
                             let reply = format!("AWAITING_APPROVAL:等待审批人「{}」审批工具「{}」，请稍后",
                                            approver_id, tc.name);
                             self.save_to_history(session_id, raw_message, &reply).await;
