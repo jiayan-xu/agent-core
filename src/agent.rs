@@ -6,7 +6,7 @@ use chrono::Datelike;
 use tokio::sync::Mutex;
 
 use crate::audit::AuditLogger;
-use crate::boundary::{self, ComplianceBoundary, PermissionLevel};
+use crate::boundary::{self, ComplianceBoundary, PermissionLevel, BlockLevel};
 use crate::boundary::prompt_injection::{PromptInjectionDetector, ThreatLevel};
 use crate::harness::{self, ExecutionLog, HarnessStore};
 use crate::llm::{LlmClient, LlmConfig, Message, ToolDef};
@@ -678,6 +678,7 @@ impl AgentCore {
                 // 边界检查
                 let boundary = self.boundary.lock().await;
                 let ns = self.current_ns_paths();
+                let tool_level = boundary.classifier.lock().unwrap().classify(&tc.name).to_string();
                 let check = boundary.check_tool(
                     &tc.name, &tc.arguments,
                     &self.config.identity.agent_id, "user",
@@ -691,9 +692,10 @@ impl AgentCore {
                         &self.config.identity.agent_id, &tc.name,
                         &check.reason, false
                     ).await;
-                    // REQUIRES_REVIEW：黄线 → 触发确认流程
-                    if check.level == Some(crate::boundary::BlockLevel::Yellow) {
-                        // P2-D: 如果有审批人，走外部审批流程
+
+                    // 危险/红线工具：无审批人时直接硬拒绝，不进入 LLM 下一轮
+                    let is_dangerous = tool_level == "dangerous";
+                    if check.level == Some(BlockLevel::Red) || is_dangerous {
                         if let Some(approver_id) = &self.config.approver_id {
                             let aid = self.approval_manager.create_request(
                                 &tc.name,
@@ -702,7 +704,6 @@ impl AgentCore {
                                 approver_id,
                                 &self.config.identity.agent_id,
                             ).await;
-                            // 通过 A2A 发送审批请求
                             let msg = serde_json::json!({
                                 "type": "approval_request",
                                 "approval_id": aid,
@@ -722,33 +723,46 @@ impl AgentCore {
                             self.save_to_history(session_id, raw_message, &reply).await;
                             return reply;
                         }
-                        // 无审批人：原有的 REQUIRES_REVIEW 流程
-                        let reply = format!("REQUIRES_REVIEW:{}:工具「{}」需要确认——{}",
-                                       tc.name, tc.name, check.reason);
+                        let reply = format!("硬拒绝: 工具「{}」触发{}，未配置审批人，无法执行",
+                            tc.name,
+                            if check.level == Some(BlockLevel::Red) { "红线" } else { "危险工具策略" }
+                        );
                         self.save_to_history(session_id, raw_message, &reply).await;
                         return reply;
                     }
-                    // 红线 → 直接拒绝
-                    messages.push(Message {
-                        role: "assistant".to_string(),
-                        content: None,
-                        tool_calls: Some(vec![crate::llm::ToolCallJson {
-                            id: tc.id.clone(),
-                            type_: "function".to_string(),
-                            function: crate::llm::ToolFunction {
-                                name: tc.name.clone(),
-                                arguments: tc.arguments.to_string(),
-                            },
-                        }]),
-                        tool_call_id: None,
-                    });
-                    messages.push(Message {
-                        role: "tool".to_string(),
-                        content: Some(format!("错误: {}", check.reason)),
-                        tool_calls: None,
-                        tool_call_id: Some(tc.id.clone()),
-                    });
-                    continue;
+
+                    // 黄线（未知工具、权限递减等）：走确认流程
+                    if let Some(approver_id) = &self.config.approver_id {
+                        let aid = self.approval_manager.create_request(
+                            &tc.name,
+                            &tc.arguments,
+                            &check.reason,
+                            approver_id,
+                            &self.config.identity.agent_id,
+                        ).await;
+                        let msg = serde_json::json!({
+                            "type": "approval_request",
+                            "approval_id": aid,
+                            "tool_name": tc.name,
+                            "description": check.reason,
+                            "arguments": tc.arguments,
+                            "requester_id": self.config.identity.agent_id,
+                            "requester_ns": self.config.identity.ns(),
+                        });
+                        let _ = self.mcp.call("a2a_send", &serde_json::json!({
+                            "to": approver_id,
+                            "content": msg.to_string(),
+                            "namespace": format!("agent/{}", approver_id),
+                        })).await;
+                        let reply = format!("AWAITING_APPROVAL:等待审批人「{}」审批工具「{}」，请稍后",
+                                       approver_id, tc.name);
+                        self.save_to_history(session_id, raw_message, &reply).await;
+                        return reply;
+                    }
+                    let reply = format!("REQUIRES_REVIEW:{}:工具「{}」需要确认——{}",
+                                   tc.name, tc.name, check.reason);
+                    self.save_to_history(session_id, raw_message, &reply).await;
+                    return reply;
                 }
 
                 // 通过 MCP 调用工具（按名称路由到正确的源）

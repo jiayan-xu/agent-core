@@ -16,8 +16,10 @@ use std::collections::HashMap;
 use chrono::{Local, Timelike};
 use axum::{
     Router, routing::{get, post, delete},
-    Json, extract::State, response::{sse::{Sse, Event as SseEvent}, IntoResponse},
+    Json, extract::{State, Extension, Request}, response::{sse::{Sse, Event as SseEvent}, IntoResponse},
+    middleware::{Next, from_fn_with_state},
 };
+use tower_http::cors::{CorsLayer, AllowOrigin, Any};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -47,6 +49,10 @@ struct Config {
     server: String,
     #[serde(default = "default_port")]
     port: u16,
+    #[serde(default = "default_host")]
+    host: String,
+    #[serde(default)]
+    cors_origins: Vec<String>,
     #[serde(default)]
     memoria_admin_key: String,
     #[serde(default)]
@@ -74,6 +80,7 @@ struct McpSourceConfig {
 
 fn default_server() -> String { "http://127.0.0.1:9003".to_string() }
 fn default_port() -> u16 { 9753 }
+fn default_host() -> String { "127.0.0.1".to_string() }
 
 impl Config {
     fn configured(&self) -> bool {
@@ -217,6 +224,40 @@ async fn authenticate(
     Ok((agent_id, allowed_ns))
 }
 
+#[derive(Clone)]
+struct AuthContext {
+    agent_id: String,
+    allowed_ns: Vec<String>,
+}
+
+/// 统一鉴权中间件。成功时把身份写入 extension；失败直接返回 401。
+/// 豁免路径：静态壳 / 健康检查 / 注册/登录 onboarding。
+async fn auth_middleware(
+    State(st): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> axum::response::Response {
+    let path = request.uri().path();
+    let exempt = path == "/"
+        || path == "/health"
+        || path == "/api/register"
+        || path == "/api/register_user"
+        || path == "/api/login"
+        || path == "/api/config"
+        || path == "/api/save-config";
+    if exempt {
+        return next.run(request).await;
+    }
+    match authenticate(request.headers(), &st).await {
+        Ok((agent_id, allowed_ns)) => {
+            let mut req = request;
+            req.extensions_mut().insert(AuthContext { agent_id, allowed_ns });
+            next.run(req).await
+        }
+        Err(resp) => resp,
+    }
+}
+
 fn config_path() -> String {
     std::env::current_dir()
         .unwrap_or_default()
@@ -248,6 +289,8 @@ fn load_or_create_config() -> Config {
         api_key: String::new(),
         server: default_server(),
         port: 9753,
+        host: default_host(),
+        cors_origins: Vec::new(),
         memoria_admin_key: String::new(),
         mcp_source: Vec::new(),
     };
@@ -260,6 +303,27 @@ fn save_config(cfg: &Config) {
     let _ = std::fs::write(&path, toml::to_string_pretty(cfg).unwrap_or_default());
 }
 
+fn build_cors_layer(host: &str, port: u16, configured: &[String]) -> CorsLayer {
+    let mut origins = Vec::new();
+    if configured.is_empty() {
+        origins.push(format!("http://127.0.0.1:{}", port));
+        origins.push(format!("http://localhost:{}", port));
+        if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+            origins.push(format!("http://{}:{}", host, port));
+        }
+    } else {
+        origins.extend(configured.iter().cloned());
+    }
+    let header_values: Vec<axum::http::HeaderValue> = origins
+        .into_iter()
+        .filter_map(|o| axum::http::HeaderValue::try_from(o).ok())
+        .collect();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(header_values))
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
 fn main() {
     // --service 模式：无窗口后台服务
     let is_service = std::env::args().any(|a| a == "--service");
@@ -267,8 +331,13 @@ fn main() {
     let config = load_or_create_config();
     let path = config_path();
     let port = config.port;
-    let addr = format!("0.0.0.0:{}", port);
+    let host = config.host.clone();
+    let addr = format!("{}:{}", host, port);
     let url = format!("http://{}/", addr);
+
+    if host != "127.0.0.1" && host != "::1" && host != "localhost" {
+        eprintln!("⚠️  服务监听地址 {} 不是本地回环，生产环境请确认防火墙/CORS 策略", host);
+    }
 
     // ── 启动 axum 后台服务 ──
     let server_ready = Arc::new(AtomicBool::new(false));
@@ -400,21 +469,28 @@ fn main() {
                 }
             });
 
-            let app = Router::new()
+            let public = Router::new()
                 .route("/", get(handle_index))
                 .route("/logo.png", get(handle_logo))
                 .route("/api/config", get(handle_config))
                 .route("/api/save-config", post(handle_save_config))
+                .route("/api/register", post(handle_register))
+                .route("/api/register_user", post(handle_register_user))
+                .route("/api/login", post(handle_login));
+
+            let protected = Router::new()
                 .route("/api/chat", post(handle_chat))
                 .route("/api/chat/stream", get(handle_chat_stream))
                 .route("/api/sessions", get(handle_sessions))
                 .route("/api/sessions/{id}", get(handle_session_load))
                 .route("/api/sessions/{id}", delete(handle_session_delete))
                 .route("/v1/chat/completions", post(handle_v1_chat))
-                .route("/api/register", post(handle_register))
-                .route("/api/register_user", post(handle_register_user))
-                .route("/api/login", post(handle_login))
-                .layer(tower_http::cors::CorsLayer::permissive())
+                .layer(from_fn_with_state(state.clone(), auth_middleware));
+
+            let cors = build_cors_layer(&host, port, &config.cors_origins);
+            let app = public
+                .merge(protected)
+                .layer(cors)
                 .with_state(state);
 
             if let Err(e) = axum::serve(listener, app).await {
@@ -522,17 +598,12 @@ async fn handle_save_config(
 
 async fn handle_chat(
     State(st): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    Extension(ctx): Extension<AuthContext>,
     Json(req): Json<ChatRequest>,
 ) -> axum::response::Response {
-    // P0-1 修复：统一鉴权（与 /v1/chat 一致），并传真实 allowed_ns 取代 ["*"] 绕过
-    let (agent_id, allowed_ns) = match authenticate(&headers, &st).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
     let agent_guard = st.agent.lock().await;
     if let Some(ref agent) = *agent_guard {
-        let reply = agent.chat(&req.message, &agent_id, &req.session_id, &allowed_ns).await;
+        let reply = agent.chat(&req.message, &ctx.agent_id, &req.session_id, &ctx.allowed_ns).await;
         Json(ChatResponse { reply, session_id: req.session_id }).into_response()
     } else {
         Json(ChatResponse { reply: "请先在设置页面配置 API 密钥。".to_string(), session_id: req.session_id }).into_response()
@@ -542,14 +613,9 @@ async fn handle_chat(
 /// SSE 流式聊天（包装 chat() 结果，分块推送）
 async fn handle_chat_stream(
     State(st): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    Extension(ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<ChatRequest>,
 ) -> axum::response::Response {
-    // P0-1 修复：统一鉴权 + 真实 allowed_ns（与 /api/chat 一致）
-    let (agent_id, allowed_ns) = match authenticate(&headers, &st).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
     let (tx, rx): (tokio::sync::mpsc::UnboundedSender<Result<SseEvent, Infallible>>,
                    tokio::sync::mpsc::UnboundedReceiver<Result<SseEvent, Infallible>>)
         = tokio::sync::mpsc::unbounded_channel();
@@ -562,6 +628,8 @@ async fn handle_chat_stream(
         let st_clone = st.clone();
         let msg = params.message.clone();
         let sid = params.session_id.clone();
+        let agent_id = ctx.agent_id.clone();
+        let allowed_ns = ctx.allowed_ns.clone();
         tokio::spawn(async move {
             let guard = st_clone.agent.lock().await;
             if let Some(ref agent) = *guard {
@@ -695,15 +763,10 @@ struct V1Message {
 
 async fn handle_v1_chat(
     State(st): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
     headers: axum::http::HeaderMap,
     Json(req): Json<V1ChatRequest>,
 ) -> axum::response::Response {
-    // 身份认证：复用 authenticate()（X-Agent-Id/Key → Memoria 反查 allowed_ns）
-    let (agent_id, allowed_ns) = match authenticate(&headers, &st).await {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-
     let agent_guard = st.agent.lock().await;
     let reply = if let Some(ref agent) = *agent_guard {
         // 输入校验：消息长度限制 32KB，消息数限制 100
@@ -728,7 +791,7 @@ async fn handle_v1_chat(
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "default".to_string());
 
-        let session_id = format!("jan/{}/{}/{}", agent_id, user_tag, conversation_id);
+        let session_id = format!("jan/{}/{}/{}", ctx.agent_id, user_tag, conversation_id);
         if session_id.len() > 128 || !session_id.chars().all(|c| c.is_alphanumeric() || c == '/' || c == '-' || c == '_') {
             return axum::response::Json(serde_json::json!({
                 "error": "invalid session_id"
@@ -744,7 +807,7 @@ async fn handle_v1_chat(
         if user_text.is_empty() {
             "请输入消息".to_string()
         } else {
-            agent.chat(&user_text, &agent_id, &session_id, &allowed_ns).await
+            agent.chat(&user_text, &ctx.agent_id, &session_id, &ctx.allowed_ns).await
         }
     } else {
         "Agent 未就绪".to_string()
