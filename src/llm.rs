@@ -120,6 +120,7 @@ impl LlmClient {
     }
 
     /// 发送聊天请求，返回响应（带重试 + failover）
+    #[tracing::instrument(skip_all, fields(model = %self.config.model, provider = %self.config.base_url, tool_count = tools.len()))]
     pub async fn chat(
         &self,
         messages: &[Message],
@@ -133,6 +134,7 @@ impl LlmClient {
         }
 
         let mut last_error = String::new();
+        tracing::info!("llm.complete start");
 
         for (idx, (base_url, model, api_key)) in providers.iter().enumerate() {
             let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
@@ -245,6 +247,7 @@ impl LlmClient {
         }
 
         let mut last_error = String::new();
+        tracing::info!("llm.complete start");
 
         for (idx, (base_url, model, api_key)) in providers.iter().enumerate() {
             match self.chat_stream_single(base_url, model, api_key, messages, tools, &sender).await {

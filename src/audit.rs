@@ -44,6 +44,7 @@ impl AuditLogger {
     /// 记录一条策略决策审计
     ///
     /// 在 check_tool 返回前调用，记录谁请求了什么工具、结果是允许还是拒绝。
+    #[tracing::instrument(skip_all, fields(event_type = "policy_decision", agent_id = %agent_id, tool = %tool, allowed))]
     pub async fn log_decision(&self, agent_id: &str, tool: &str, params: &str, allowed: bool) {
         let payload = serde_json::json!({
             "agent_id": agent_id,
@@ -59,6 +60,7 @@ impl AuditLogger {
     /// 记录身份变更审计
     ///
     /// 注册、调岗、角色变更时调用。
+    #[tracing::instrument(skip_all, fields(event_type = "identity_change", agent_id = %agent_id, action = %action))]
     pub async fn log_identity(&self, agent_id: &str, action: &str, detail: &str) {
         let payload = serde_json::json!({
             "agent_id": agent_id,
@@ -72,6 +74,7 @@ impl AuditLogger {
     /// 记录工具调用审计
     ///
     /// composer execute_plan 每步执行前后调用。
+    #[tracing::instrument(skip_all, fields(event_type = "tool_invocation", agent_id = %agent_id, tool = %tool, allowed))]
     pub async fn log_tool_call(&self, agent_id: &str, tool: &str, args: &serde_json::Value, allowed: bool) {
         // 只记录参数摘要，不传敏感字段
         let summary = summarize_args(args);

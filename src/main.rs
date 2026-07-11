@@ -20,11 +20,13 @@ use axum::{
     middleware::{Next, from_fn_with_state},
 };
 use tower_http::cors::{CorsLayer, AllowOrigin, Any};
+use tracing_subscriber::EnvFilter;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::interval;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tracing::Instrument;
 use tao::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
@@ -324,8 +326,31 @@ fn build_cors_layer(host: &str, port: u16, configured: &[String]) -> CorsLayer {
         .allow_headers(Any)
 }
 
+fn init_tracing() {
+    let filter = EnvFilter::try_from_env("AGENT_CORE_LOG")
+        .or_else(|_| EnvFilter::try_from_env("RUST_LOG"))
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .try_init();
+}
+
+async fn trace_middleware(request: Request, next: Next) -> axum::response::Response {
+    let trace_id = format!("{:x}", rand::thread_rng().gen::<u128>());
+    let path = request.uri().path().to_string();
+    let method = request.method().to_string();
+    let span = tracing::info_span!("http.request", trace_id = %trace_id, method = %method, path = %path);
+    let mut res = next.run(request).instrument(span).await;
+    if let Ok(v) = axum::http::HeaderValue::try_from(trace_id) {
+        res.headers_mut().insert("x-trace-id", v);
+    }
+    res
+}
+
 fn main() {
     // --service 模式：无窗口后台服务
+    init_tracing();
     let is_service = std::env::args().any(|a| a == "--service");
 
     let config = load_or_create_config();
@@ -491,6 +516,7 @@ fn main() {
             let app = public
                 .merge(protected)
                 .layer(cors)
+                .layer(axum::middleware::from_fn(trace_middleware))
                 .with_state(state);
 
             if let Err(e) = axum::serve(listener, app).await {

@@ -176,6 +176,7 @@ impl AgentCore {
     /// - 新任务 → 复述确认（Step 1）→ 执行（Step 2）→ 交付（Step 3）
     /// - 简单查询 → 直接执行
     /// - 已确认会话 → 话题切换检测
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, session_id = %session_id))]
     pub async fn chat(&self, message: &str, user_id: &str, session_id: &str, allowed_ns: &[String]) -> String {
         let confirm_words = [
             "确认", "确认添加", "确认执行", "添加", "是", "是的", "对", "执行", "确定", "可以",
@@ -444,6 +445,7 @@ impl AgentCore {
     }
 
     /// 按依赖序执行组合计划（支持并行执行无依赖步骤）
+    #[tracing::instrument(skip_all, fields(steps = plan.steps.len()))]
     async fn execute_plan(
         &self,
         plan: &crate::composer::ExecutionPlan,
@@ -1067,6 +1069,7 @@ impl AgentCore {
     /// 路由到正确的 MCP 源执行工具调用
     /// P0 修复：执行期再次按 allowed_ns 校验工具所属 MCP 源命名空间，
     /// 防止工具发现期被隐藏的工具在调用期被 LLM / prompt 注入点名执行。
+    #[tracing::instrument(skip_all, fields(tool_name = %tool_name))]
     pub async fn call_tool_routed(
         &self,
         tool_name: &str,
@@ -1301,6 +1304,7 @@ impl AgentCore {
     }
 
     /// 快速路径：Harness 模板匹配
+    #[tracing::instrument(skip_all, fields(message_len = message.len()))]
     async fn try_harness_match(&self, message: &str, allowed_ns: &[String]) -> Option<String> {
         let context = serde_json::json!({
             "query": message,

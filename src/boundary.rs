@@ -478,6 +478,7 @@ impl ComplianceBoundary {
     }
 
     /// 综合检查一次 tool 调用，按优先级顺序执行 7 条红线
+    #[tracing::instrument(skip(self, args, parent_permission), fields(tool_name = %tool_name, agent_id = %agent_id, user_role))]
     pub fn check_tool(
         &self,
         tool_name: &str,
