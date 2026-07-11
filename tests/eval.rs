@@ -96,6 +96,78 @@ async fn eval_e04_exfil_hard_deny() {
     assert!(!check.allow, "外发类工具（export_ 前缀）必须被硬拒绝");
 }
 
+// ── E07 / P1-5: 业务 MCP 宕机 → 降级收缩 ──
+#[tokio::test]
+async fn eval_e07_mcp_down_degrade() {
+    // 构造一个带「死亡业务 MCP 源」（127.0.0.1:1 立即拒绝连接）的 agent
+    let config = AgentConfig {
+        identity: AgentIdentity {
+            agent_id: "eval-agent".into(),
+            namespace: "agent/eval-agent".into(),
+            badge_token: String::new(),
+            ns_full_path: None,
+        },
+        llm: LlmConfig::default(),
+        memoria_url: String::new(),
+        // 业务源指向死亡端口：list_tools 必然失败
+        additional_mcp: vec![(
+            "dead".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            String::new(),
+            None,
+            None,
+        )],
+        skill_whitelist: None,
+        max_tool_rounds: 3,
+        parent_permission: PermissionLevel::Write,
+        enable_compositional_routing: true,
+        compositional_preview: true,
+        strict_schema: false,
+        system_prompt_template: None,
+        approver_id: None,
+    };
+    let harness = HarnessStore::open_memory().unwrap();
+    let cp = CheckpointStore::open_memory().unwrap();
+    let agent = AgentCore::new(config, harness, cp);
+
+    // 连续 3 次拉取工具（触发 UNHEALTHY_THRESHOLD）
+    for _ in 0..3 {
+        let _ = agent.fetch_tools().await;
+    }
+
+    let status = agent.degrade_status();
+    assert_eq!(
+        status["mode"].as_str(),
+        Some("memoria_readonly_chat"),
+        "全部业务源不可用 → 应进入 MemoriaReadonlyChat 降级模式"
+    );
+    let dead = status["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"].as_str() == Some("dead"))
+        .expect("status 应包含 dead 源");
+    assert!(
+        dead["unhealthy"].as_bool().unwrap(),
+        "dead 源连续失败应被标记为 unhealthy"
+    );
+    assert_eq!(
+        dead["consecutive_failures"].as_u64(),
+        Some(3),
+        "dead 源应累计 3 次连续失败"
+    );
+
+    // Kill switch 覆盖一切：开启后模式变 kill_switch，且工具调用被全局拒绝
+    agent.set_kill_switch(true);
+    let status2 = agent.degrade_status();
+    assert_eq!(status2["mode"].as_str(), Some("kill_switch"));
+    let res = agent
+        .call_tool_routed("any_tool", &serde_json::json!({}), &[])
+        .await;
+    assert!(res.is_err(), "Kill switch 开启时任何工具调用必须被拒绝");
+    agent.set_kill_switch(false);
+}
+
 // ── 以下为运行时依赖项，需真实服务 + Memoria 后跑 ──
 
 #[tokio::test]

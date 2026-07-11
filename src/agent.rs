@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use crate::audit::AuditLogger;
 use crate::boundary::{self, ComplianceBoundary, PermissionLevel, BlockLevel};
 use crate::checkpoint::{CheckpointState, CheckpointStore};
+use crate::degrade::{DegradeMode, DegradeMonitor, UNHEALTHY_THRESHOLD};
 use crate::boundary::prompt_injection::{PromptInjectionDetector, ThreatLevel};
 use crate::harness::{self, ExecutionLog, HarnessStore};
 use crate::llm::{LlmClient, LlmConfig, Message, ToolDef};
@@ -100,6 +101,8 @@ pub struct AgentCore {
     in_progress_plan: Arc<Mutex<Option<crate::composer::ExecutionPlan>>>,
     /// P1-1: 已完成的步骤结果（崩溃后续跑起点）
     in_progress_step_results: Arc<Mutex<HashMap<u32, String>>>,
+    /// P1-5: 降级收缩监视器（MCP 源健康 + Kill switch + 模式推导）
+    pub degrade: Arc<DegradeMonitor>,
 }
 
 struct InboxCache {
@@ -133,6 +136,19 @@ impl AgentCore {
                 mcp_sources.push(McpSource::new(name, client, src_ns.clone()));
             }
         }
+        // P1-5: 为每个 MCP 源注册健康槽位（memoria 也纳入，便于统一观测）
+        let degrade = Arc::new(DegradeMonitor::new());
+        for src in &mcp_sources {
+            degrade.register_source(&src.name);
+        }
+        // Kill switch 初始态：环境变量 AGENT_KILL_SWITCH=1/true 时启动即开
+        let kill_at_start = matches!(
+            std::env::var("AGENT_KILL_SWITCH").ok().as_deref(),
+            Some("1") | Some("true") | Some("on")
+        );
+        if kill_at_start {
+            degrade.set_kill_switch(true);
+        }
         let llm = LlmClient::new(config.llm.clone());
         let boundary = ComplianceBoundary::new(config.skill_whitelist.clone());
         // 注册 agent 自身到权限链（锁中毒时跳过）
@@ -161,6 +177,7 @@ impl AgentCore {
             checkpoint_store: Arc::new(tokio::sync::Mutex::new(checkpoint)),
             in_progress_plan: Arc::new(Mutex::new(None)),
             in_progress_step_results: Arc::new(Mutex::new(HashMap::new())),
+            degrade,
         }
     }
 
@@ -207,6 +224,9 @@ impl AgentCore {
 
         // ── P1-1: 崩溃恢复——先从 checkpoint 恢复控制面状态到内存 ──
         self.restore_checkpoint(session_id).await;
+
+        // ── P1-5: 降级模式 trace（故障可观测） ──
+        tracing::info!(degrade_mode = %self.current_degrade_mode().as_str(), "chat 入口降级模式");
 
         // ── 提示词注入检测 ──
         let detector = PromptInjectionDetector::new();
@@ -917,7 +937,11 @@ impl AgentCore {
         for _round in 0..self.config.max_tool_rounds {
             let response = match self.llm.chat(&messages, &tools).await {
                 Ok(r) => r,
-                Err(e) => return format!("LLM 调用失败: {}", e),
+                // P1-5：LLM 主/备 Provider 均失败 → 返回「可重试错误」，而非裸崩
+                Err(e) => {
+                    tracing::warn!("[DEGRADE] LLM 调用失败（已尝试主用+备用 Provider）: {}", e);
+                    return "⚠️ LLM 服务暂时不可用（已尝试主用与备用 Provider 均失败）。请稍后重试，或检查网络与 API 密钥配置。".to_string();
+                }
             };
 
             // 无工具调用 → LLM 直接回复
@@ -1370,6 +1394,62 @@ impl AgentCore {
         args: &serde_json::Value,
         allowed_ns: &[String],
     ) -> Result<String, String> {
+        // ── P1-5 降级收缩门控（全局 → 源级 → 模式级） ──
+        // 1) Kill switch：全局拒绝一切工具调用，仅系统状态查询可用
+        if self.degrade.kill_switch_on() {
+            tracing::warn!("[DEGRADE] Kill switch 启用，拒绝工具调用: {}", tool_name);
+            return Err(
+                "🛑 Kill switch 已启用，工具调用已全局禁用，仅系统状态查询可用。".to_string(),
+            );
+        }
+
+        // 解析工具所属 MCP 源
+        let idx = self.tool_route_cache.lock().await.get(tool_name).copied();
+        let mode = self.current_degrade_mode();
+        if let (Some(_idx), Some(source)) = (idx, idx.and_then(|i| self.mcp_sources.get(i))) {
+            // 2) 源不健康（连续失败达阈值）：直接拒绝，工具已剔除
+            if self.degrade.is_unhealthy(&source.name) {
+                tracing::warn!(
+                    "[DEGRADE] 源 {} 不健康，拒绝其工具调用: {}",
+                    source.name,
+                    tool_name
+                );
+                return Err(format!(
+                    "⚠️ 工具来源『{}』当前不可用（已标记 unhealthy），已降级剔除。",
+                    source.name
+                ));
+            }
+            // 3) 全部业务 MCP 不可用 → 仅 Memoria 只读 + 纯聊天
+            if mode == DegradeMode::MemoriaReadonlyChat && source.name != "memoria" {
+                tracing::warn!(
+                    "[DEGRADE] MemoriaReadonlyChat 模式，拒绝业务源工具: {} ({})",
+                    tool_name,
+                    source.name
+                );
+                return Err(
+                    "⚠️ 业务服务已降级（全部不可用），当前仅支持记忆检索与纯聊天，工具调用已暂停。".to_string(),
+                );
+            }
+            if mode == DegradeMode::MemoriaReadonlyChat && source.name == "memoria" {
+                // memoria 仅放行只读工具，避免降级期误写记忆
+                let cls = {
+                    let b = self.boundary.lock().await;
+                    b.classifier.lock().map(|c| c.classify(tool_name).to_string()).unwrap_or_else(|_| "unknown".to_string())
+                };
+                if cls != "read" {
+                    tracing::warn!(
+                        "[DEGRADE] MemoriaReadonlyChat 模式，拒绝非只读记忆工具: {} ({})",
+                        tool_name,
+                        cls
+                    );
+                    return Err(format!(
+                        "⚠️ 降级模式（仅记忆检索）：工具『{}』非只读，已暂停。",
+                        tool_name
+                    ));
+                }
+            }
+        }
+
         let client = self.find_mcp_for_tool_async(tool_name).await;
 
         // 执行期命名空间门控：根据 tool_route_cache 找到工具所属 MCP 源，
@@ -1480,42 +1560,149 @@ impl AgentCore {
         ]
     }
 
+    // ── P1-5 降级收缩：工具列表健康探测 ──
+
+    /// 业务 MCP 源名列表（除 memoria 外）。
+    /// 用于降级模式推导（全部业务源不健康 → MemoriaReadonlyChat）。
+    fn business_source_names(&self) -> Vec<String> {
+        self.mcp_sources
+            .iter()
+            .filter(|s| s.name != "memoria")
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
+    /// 当前降级模式（按需推导，不缓存）。
+    fn current_degrade_mode(&self) -> DegradeMode {
+        self.degrade.current_mode(&self.business_source_names())
+    }
+
+    /// 记录某 MCP 源宕机到审计（异步非阻塞）。
+    async fn audit_tool_source_down(&self, source: &str, err: &str) {
+        self.audit_logger
+            .log_identity(
+                &self.config.identity.agent_id,
+                "mcp_source_down",
+                &format!("source={} err={}", source, err),
+            )
+            .await;
+    }
+
+    /// P1-5：带健康探测的工具列表获取。
+    ///
+    /// - 已 `unhealthy` 的源：先探活一次，成功则恢复并重入，失败则维持剔除。
+    /// - 正常源：失败则记录，连续失败达 [`UNHEALTHY_THRESHOLD`] 标记 `unhealthy`
+    ///   并审计；无论哪种失败，本次都不并入其工具。
+    ///
+    /// 返回 `Some(tools)` 表示可用应并入；`None` 表示剔除（调用方 `continue`）。
+    async fn list_tools_healthy(
+        &self,
+        source: &McpSource,
+    ) -> Option<Vec<(String, String, serde_json::Value)>> {
+        if self.degrade.is_unhealthy(&source.name) {
+            // 探活检测恢复
+            match source.client.list_tools().await {
+                Ok(t) => {
+                    self.degrade.record_success(&source.name);
+                    tracing::info!("[DEGRADE] 源 {} 探活成功，已恢复并重新并入工具", source.name);
+                    Some(t)
+                }
+                Err(e) => {
+                    self.degrade.record_failure(&source.name, &e);
+                    tracing::warn!("[DEGRADE] 源 {} 仍不健康，剔除其工具: {}", source.name, e);
+                    None
+                }
+            }
+        } else {
+            match source.client.list_tools().await {
+                Ok(t) => {
+                    self.degrade.record_success(&source.name);
+                    Some(t)
+                }
+                Err(e) => {
+                    let became = self.degrade.record_failure(&source.name, &e);
+                    if became {
+                        tracing::warn!(
+                            "[DEGRADE] 源 {} 连续失败达阈值({})，标记 unhealthy 并剔除，审计",
+                            source.name,
+                            UNHEALTHY_THRESHOLD
+                        );
+                        self.audit_tool_source_down(&source.name, &e).await;
+                    } else {
+                        tracing::warn!(
+                            "[DEGRADE] 源 {} tools/list 失败(未达阈值 {}): {}",
+                            source.name,
+                            UNHEALTHY_THRESHOLD,
+                            e
+                        );
+                    }
+                    None
+                }
+            }
+        }
+    }
+
+    /// 暴露当前降级状态（供管理端点 / 健康检查）。
+    pub fn degrade_status(&self) -> serde_json::Value {
+        let mode = self.current_degrade_mode();
+        let sources: Vec<serde_json::Value> = self
+            .degrade
+            .health_snapshot()
+            .into_iter()
+            .map(|(name, unhealthy, failures, last_err)| {
+                serde_json::json!({
+                    "name": name,
+                    "unhealthy": unhealthy,
+                    "consecutive_failures": failures,
+                    "last_error": last_err,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "mode": mode.as_str(),
+            "kill_switch": self.degrade.kill_switch_on(),
+            "sources": sources,
+        })
+    }
+
+    /// P1-5：运行时切换 Kill switch（管理端点调用）。
+    pub fn set_kill_switch(&self, on: bool) {
+        self.degrade.set_kill_switch(on);
+    }
+
     pub async fn fetch_tools(&self) -> Vec<ToolDef> {
         let mut all_tools: Vec<ToolDef> = Vec::new();
         let mut seen_names = std::collections::HashSet::new();
 
         for (idx, source) in self.mcp_sources.iter().enumerate() {
-            match source.client.list_tools().await {
-                Ok(tools) => {
-                    // 更新路由缓存和分类器
-                    {
-                        let mut cache = self.tool_route_cache.lock().await;
-                        let boundary = self.boundary.lock().await;
-                        let tool_names_descs: Vec<(String, String)> = tools.iter().map(|(n, d, _)| (n.clone(), d.clone())).collect();
-                        for (name, _desc) in &tool_names_descs {
-                            cache.insert(name.clone(), idx);
-                        }
-                        boundary.learn_tools(&tool_names_descs);
-                    }
+            let tools = match self.list_tools_healthy(source).await {
+                Some(t) => t,
+                None => continue,
+            };
+            // 更新路由缓存和分类器
+            {
+                let mut cache = self.tool_route_cache.lock().await;
+                let boundary = self.boundary.lock().await;
+                let tool_names_descs: Vec<(String, String)> = tools.iter().map(|(n, d, _)| (n.clone(), d.clone())).collect();
+                for (name, _desc) in &tool_names_descs {
+                    cache.insert(name.clone(), idx);
+                }
+                boundary.learn_tools(&tool_names_descs);
+            }
 
-                    for (name, desc, params) in tools {
-                        if seen_names.contains(&name) {
-                            continue;
-                        }
-                        seen_names.insert(name.clone());
-                        all_tools.push(ToolDef {
-                            type_: "function".to_string(),
-                            function: crate::llm::ToolDefFunction {
-                                name,
-                                description: desc,
-                                parameters: params,
-                            },
-                        });
-                    }
+            for (name, desc, params) in tools {
+                if seen_names.contains(&name) {
+                    continue;
                 }
-                Err(e) => {
-                    tracing::warn!("{} tools/list 失败: {}", source.name, e);
-                }
+                seen_names.insert(name.clone());
+                all_tools.push(ToolDef {
+                    type_: "function".to_string(),
+                    function: crate::llm::ToolDefFunction {
+                        name,
+                        description: desc,
+                        parameters: params,
+                    },
+                });
             }
         }
 
@@ -1556,36 +1743,33 @@ impl AgentCore {
                     continue;
                 }
             }
-            match source.client.list_tools().await {
-                Ok(tools) => {
-                    {
-                        let mut cache = self.tool_route_cache.lock().await;
-                        let boundary = self.boundary.lock().await;
-                        let tool_names_descs: Vec<(String, String)> =
-                            tools.iter().map(|(n, d, _)| (n.clone(), d.clone())).collect();
-                        for (name, _desc) in &tool_names_descs {
-                            cache.insert(name.clone(), idx);
-                        }
-                        boundary.learn_tools(&tool_names_descs);
-                    }
-                    for (name, desc, params) in tools {
-                        if seen_names.contains(&name) {
-                            continue;
-                        }
-                        seen_names.insert(name.clone());
-                        all_tools.push(ToolDef {
-                            type_: "function".to_string(),
-                            function: crate::llm::ToolDefFunction {
-                                name,
-                                description: desc,
-                                parameters: params,
-                            },
-                        });
-                    }
+            let tools = match self.list_tools_healthy(source).await {
+                Some(t) => t,
+                None => continue,
+            };
+            {
+                let mut cache = self.tool_route_cache.lock().await;
+                let boundary = self.boundary.lock().await;
+                let tool_names_descs: Vec<(String, String)> =
+                    tools.iter().map(|(n, d, _)| (n.clone(), d.clone())).collect();
+                for (name, _desc) in &tool_names_descs {
+                    cache.insert(name.clone(), idx);
                 }
-                Err(e) => {
-                    tracing::warn!("{} tools/list 失败(过滤模式): {}", source.name, e);
+                boundary.learn_tools(&tool_names_descs);
+            }
+            for (name, desc, params) in tools {
+                if seen_names.contains(&name) {
+                    continue;
                 }
+                seen_names.insert(name.clone());
+                all_tools.push(ToolDef {
+                    type_: "function".to_string(),
+                    function: crate::llm::ToolDefFunction {
+                        name,
+                        description: desc,
+                        parameters: params,
+                    },
+                });
             }
         }
 

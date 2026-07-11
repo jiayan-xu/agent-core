@@ -510,6 +510,8 @@ fn main() {
                 .route("/api/sessions", get(handle_sessions))
                 .route("/api/sessions/{id}", get(handle_session_load))
                 .route("/api/sessions/{id}", delete(handle_session_delete))
+                .route("/api/admin/degrade", get(handle_admin_degrade))
+                .route("/api/admin/killswitch", post(handle_admin_killswitch))
                 .route("/v1/chat/completions", post(handle_v1_chat))
                 .layer(from_fn_with_state(state.clone(), auth_middleware));
 
@@ -771,6 +773,37 @@ async fn handle_session_delete(
     }).await.unwrap_or(0);
 
     Json(serde_json::json!({"deleted": deleted, "session_id": id}))
+}
+
+/// P1-5：查询当前降级收缩状态（Kill switch / 各 MCP 源健康 / 模式）
+async fn handle_admin_degrade(
+    State(st): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let guard = st.agent.lock().await;
+    if let Some(ref agent) = *guard {
+        Json(agent.degrade_status()).into_response()
+    } else {
+        Json(serde_json::json!({"error": "agent not ready"})).into_response()
+    }
+}
+
+/// P1-5：运行时切换 Kill switch（全局禁用/恢复工具调用）
+#[derive(Deserialize)]
+struct KillSwitchRequest {
+    enabled: bool,
+}
+
+async fn handle_admin_killswitch(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<KillSwitchRequest>,
+) -> axum::response::Response {
+    let guard = st.agent.lock().await;
+    if let Some(ref agent) = *guard {
+        agent.set_kill_switch(req.enabled);
+        Json(agent.degrade_status()).into_response()
+    } else {
+        Json(serde_json::json!({"error": "agent not ready"})).into_response()
+    }
 }
 
 /// OpenAI 兼容聊天补全端点（供 JAN / 第三方客户端调用）
