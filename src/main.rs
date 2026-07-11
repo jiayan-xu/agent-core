@@ -330,9 +330,11 @@ fn main() {
                     insight_cycle += 1;
                     let agent_guard = patrol_state.agent.lock().await;
                     if let Some(ref agent) = *agent_guard {
+                        // 系统巡检使用 Agent 自身命名空间作为 allowed_ns（无 namespace 的 MCP 源不受影响）
+                        let agent_ns = vec![agent.config.identity.ns()];
                         let tasks = [("system_ops", serde_json::json!({"action": "status"}))];
                         for (tool, args) in &tasks {
-                            match agent.call_tool_routed(tool, args).await {
+                            match agent.call_tool_routed(tool, args, &agent_ns).await {
                                 Ok(reply) => {
                                     fail_count = 0;
                                     tracing::info!("巡检 {}: {}", tool, &reply.chars().take(60).collect::<String>());
@@ -349,7 +351,7 @@ fn main() {
                         }
                     // 每 4 轮（约 2 小时）执行一次洞见发现
                         if insight_cycle % 4 == 0 {
-                            let insight = agent.run_insights().await;
+                            let insight = agent.run_insights(&agent_ns).await;
                             tracing::info!("{}", insight);
                         }
                         // 暗知识层 A2：低峰（02:00-05:00 本地时间）执行夜间巩固

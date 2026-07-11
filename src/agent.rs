@@ -223,7 +223,7 @@ impl AgentCore {
         // ── 0a. 工具级确认（现有）：pending_actions 中的操作等待确认 ──
         if is_confirm(trimmed) {
             if let Some(action) = self.session_manager.take_pending_action(session_id).await {
-                let result = match self.call_tool_routed(&action.tool_name, &action.arguments).await {
+                let result = match self.call_tool_routed(&action.tool_name, &action.arguments, allowed_ns).await {
                     Ok(text) => text,
                     Err(e) => format!("执行失败: {}", e),
                 };
@@ -285,7 +285,7 @@ impl AgentCore {
             if !tools.is_empty() {
                 match crate::composer::decompose(&self.llm, message, &tools).await {
                     Ok(plan) if plan.steps.len() > 1 => {
-                        let result = self.execute_plan(&plan, session_id).await
+                        let result = self.execute_plan(&plan, session_id, allowed_ns).await
                             .unwrap_or_else(|e| format!("组合执行失败: {}", e));
 
                         // 蒸馏闭环：记录组合执行的摘要日志，触发 Harness 蒸馏
@@ -322,7 +322,7 @@ impl AgentCore {
         }
 
         // ── 1. 快速路径（Harness 匹配）──
-        if let Some(reply) = self.try_harness_match(message).await {
+        if let Some(reply) = self.try_harness_match(message, allowed_ns).await {
             return reply;
         }
 
@@ -335,7 +335,7 @@ impl AgentCore {
         // P2-D: 检查审批响应
         self.check_approval_responses().await;
         // 如果有审批通过的请求，立即执行
-        if let Some(reply) = self.execute_approved_request(session_id).await {
+        if let Some(reply) = self.execute_approved_request(session_id, allowed_ns).await {
             let ns = self.caller_ns(session_id);
             let db_path = self.harness.lock().await.db_path();
             self.session_manager.save_to_history(session_id, &ns, &db_path, message, &reply).await;
@@ -444,7 +444,12 @@ impl AgentCore {
     }
 
     /// 按依赖序执行组合计划（支持并行执行无依赖步骤）
-    async fn execute_plan(&self, plan: &crate::composer::ExecutionPlan, _session_id: &str) -> Result<String, String> {
+    async fn execute_plan(
+        &self,
+        plan: &crate::composer::ExecutionPlan,
+        _session_id: &str,
+        allowed_ns: &[String],
+    ) -> Result<String, String> {
         use std::collections::HashMap;
 
         let mut step_results: HashMap<u32, String> = HashMap::new();
@@ -526,7 +531,7 @@ impl AgentCore {
                         }
                     }
 
-                    match this.call_tool_routed(&tool, &args).await {
+                    match this.call_tool_routed(&tool, &args, allowed_ns).await {
                         Ok(result) => {
                             this.audit_logger.log_tool_call(
                                 &this.config.identity.agent_id, &tool, &args, true
@@ -748,7 +753,7 @@ impl AgentCore {
 
                 // 通过 MCP 调用工具（按名称路由到正确的源）
                 let result = match self
-                    .call_tool_routed(&tc.name, &tc.arguments)
+                    .call_tool_routed(&tc.name, &tc.arguments, allowed_ns)
                     .await
                 {
                     Ok(text) => text,
@@ -934,12 +939,12 @@ impl AgentCore {
 
     /// 执行审批通过的请求
     /// 检查所有 pending 审批项，如果有已批准的，执行该工具并返回结果
-    async fn execute_approved_request(&self, _session_id: &str) -> Option<String> {
+    async fn execute_approved_request(&self, _session_id: &str, allowed_ns: &[String]) -> Option<String> {
         let pending_list = self.approval_manager.list_pending().await;
         for approval in &pending_list {
             if let Some(true) = self.approval_manager.is_approved(&approval.approval_id).await {
                 // 审批通过，执行工具
-                let result = match self.call_tool_routed(&approval.tool_name, &approval.arguments).await {
+                let result = match self.call_tool_routed(&approval.tool_name, &approval.arguments, allowed_ns).await {
                     Ok(text) => text,
                     Err(e) => format!("执行失败: {}", e),
                 };
@@ -1046,8 +1051,29 @@ impl AgentCore {
     }
 
     /// 路由到正确的 MCP 源执行工具调用
-    pub async fn call_tool_routed(&self, tool_name: &str, args: &serde_json::Value) -> Result<String, String> {
+    /// P0 修复：执行期再次按 allowed_ns 校验工具所属 MCP 源命名空间，
+    /// 防止工具发现期被隐藏的工具在调用期被 LLM / prompt 注入点名执行。
+    pub async fn call_tool_routed(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        allowed_ns: &[String],
+    ) -> Result<String, String> {
         let client = self.find_mcp_for_tool_async(tool_name).await;
+
+        // 执行期命名空间门控：根据 tool_route_cache 找到工具所属 MCP 源，
+        // 若该源声明了 namespace，则调用者 allowed_ns 必须与之存在包含关系。
+        if let Some(&idx) = self.tool_route_cache.lock().await.get(tool_name) {
+            if let Some(src_ns) = self.mcp_sources.get(idx).and_then(|s| s.namespace.as_deref()) {
+                if !allowed_ns.iter().any(|g| Self::ns_covers(g, src_ns)) {
+                    return Err(format!(
+                        "工具 {} 所属项目 '{}' 不在当前身份授权范围内",
+                        tool_name, src_ns
+                    ));
+                }
+            }
+        }
+
         client.call(tool_name, args).await
     }
 
@@ -1261,7 +1287,7 @@ impl AgentCore {
     }
 
     /// 快速路径：Harness 模板匹配
-    async fn try_harness_match(&self, message: &str) -> Option<String> {
+    async fn try_harness_match(&self, message: &str, allowed_ns: &[String]) -> Option<String> {
         let context = serde_json::json!({
             "query": message,
             "agent_id": self.config.identity.agent_id,
@@ -1297,7 +1323,7 @@ impl AgentCore {
                     all_ok = false;
                     break;
                 }
-                let result = self.call_tool_routed(tool_name, &args).await;
+                let result = self.call_tool_routed(tool_name, &args, allowed_ns).await;
                 if result.is_err() {
                     all_ok = false;
                     break;
@@ -1399,15 +1425,15 @@ impl AgentCore {
     }
 
     /// 洞见发现：拉取最近 7 天数据，LLM 分析模式，存入 Memoria
-    pub async fn run_insights(&self) -> String {
+    pub async fn run_insights(&self, allowed_ns: &[String]) -> String {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let week_ago = (chrono::Local::now() - chrono::Duration::days(7)).format("%Y-%m-%d").to_string();
         let data = self.call_tool_routed("query_entrance", &serde_json::json!({
             "date_from": week_ago, "date_to": today, "limit": 500,
-        })).await.unwrap_or_default();
+        }), allowed_ns).await.unwrap_or_default();
         let stats = self.call_tool_routed("query_monthly_stats", &serde_json::json!({
             "year": chrono::Local::now().year(), "month": chrono::Local::now().month(),
-        })).await.unwrap_or_default();
+        }), allowed_ns).await.unwrap_or_default();
 
         let prompt = format!(
             "你是固废运营数据分析师。分析最近7天入厂数据，找出有意义的模式或异常。\
