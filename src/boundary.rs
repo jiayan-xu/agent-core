@@ -44,6 +44,7 @@ where
 fn normalize_sql_for_check(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut in_single = false;
+    let mut in_double = false;
     let mut in_block = false;
     let chars: Vec<char> = sql.chars().collect();
     let mut i = 0;
@@ -65,6 +66,13 @@ fn normalize_sql_for_check(sql: &str) -> String {
             i += 1;
             continue;
         }
+        if in_double {
+            if c == '"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
         if c == '-' && i + 1 < chars.len() && chars[i + 1] == '-' {
             // 跳过整行注释
             while i < chars.len() && chars[i] != '\n' {
@@ -79,6 +87,11 @@ fn normalize_sql_for_check(sql: &str) -> String {
         }
         if c == '\'' {
             in_single = true;
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_double = true;
             i += 1;
             continue;
         }
@@ -102,6 +115,11 @@ fn contains_word(haystack: &str, word: &str) -> bool {
 
 /// 正向校验 SQL 为只读语句
 fn is_select_only(sql: &str) -> bool {
+    // 防御：只读查询不需要语句分隔符 `;`。直接拒绝含 `;` 的入参，
+    // 彻底阻断 `SELECT ...;DELETE ...` 拼接绕过（B1 修复）。
+    if sql.contains(';') {
+        return false;
+    }
     let norm = normalize_sql_for_check(sql);
     let first = norm.split_whitespace().next().unwrap_or("");
     let starts_ok = matches!(first, "select" | "with" | "explain" | "pragma");
@@ -611,6 +629,8 @@ impl ToolClassifier {
             "review_data", "diagnose_system", "archive_ocr",
             "query_archive_log", "system_ops", "code_reader",
             "summarize_url", "read_docx", "read_xlsx",
+            // 真实 MCP 工具名（dashboard stdio skills）兜底，避免首轮 learn 前被误判
+            "execute_sql", "fuzzy_match_plate", "fuzzy_match_indicator",
         ] { c.read_tools.insert(t.to_string()); }
         for t in [
             "fill_excel_log", "update_whitelist", "archive_manifest",
@@ -637,8 +657,20 @@ impl ToolClassifier {
     /// 批量注册（从 MCP tools/list 结果中自动学习分类）
     pub fn register_from_tools(&mut self, tools: &[(String, String)]) {
         for (name, _desc) in tools {
+            let lower = name.to_lowercase();
+            // SQL 查询类工具（execute_sql / query_* 等，仅 SELECT）一律按只读处理，
+            // 排除明显的写操作前缀（update_/insert_/delete_/create_）
+            let is_sql_read = lower.contains("sql")
+                && !lower.starts_with("update")
+                && !lower.starts_with("insert")
+                && !lower.starts_with("delete")
+                && !lower.starts_with("create");
             if name.starts_with("query_") || name.starts_with("search_") || name.starts_with("get_")
                 || name.starts_with("check_") || name.starts_with("read_") || name.starts_with("list_")
+                || name.starts_with("fuzzy_match_") || name.starts_with("match_")
+                || name.starts_with("review_") || name.starts_with("diagnose_")
+                || name.starts_with("explain_") || name.starts_with("validate_")
+                || name.starts_with("cross_") || is_sql_read
             {
                 self.read_tools.insert(name.clone());
             } else if name.starts_with("delete_") || name.starts_with("batch_delete") || name.starts_with("shutdown_") {
@@ -678,8 +710,19 @@ impl TaskConfirmationGate {
             return false;
         }
 
+        // 自然语言疑问句 / 查询意图 → 直接执行，不需要确认
+        // 覆盖「昨天进了多少车」「X 是多少」「查一下…」等不以“查/看/搜”开头的问法。
+        let query_signals = [
+            "多少", "几", "什么", "怎么", "如何", "为何", "何时", "哪些", "哪辆",
+            "吗", "？", "?", "查", "看", "搜", "统计", "查询", "列表", "明细",
+            "排行", "top", "TOP", "count", "Count", "有几", "是否", "有没有",
+        ];
+        if query_signals.iter().any(|s| trimmed.contains(s)) {
+            return false;
+        }
+
         // 以查询前缀开头 → 直接执行，不需要确认
-        let query_prefixes = ["查", "查一下", "查询", "看看", "搜一搜", "搜"];
+        let query_prefixes = ["查", "查一下", "查询", "看看", "搜一搜", "搜", "帮我看", "帮我查"];
         if query_prefixes.iter().any(|p| trimmed.starts_with(p)) {
             return false;
         }

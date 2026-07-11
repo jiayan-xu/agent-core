@@ -152,17 +152,19 @@ impl AgentCore {
 
     /// 从 session_id 解析调用者专属命名空间。
     /// session_id 格式为 `jan/{agent_id}/{user_tag}/{conversation_id}`（PFAiX
-    /// 分发版注入 x-user-tag/x-conversation-id 后生成）。解析成功后返回
-    /// `agent/{agent_id}/user/{user_tag}`，确保不同安装实例、不同对话的
-    /// 长期记忆与历史完全隔离。旧格式或解析失败时回退到 agent 自身 ns，
-    /// 保持向后兼容。
+    /// 分发版注入 x-user-id/x-user-tag/x-conversation-id 后生成）。
+    /// 解析成功后返回 `agent/{agent_id}/user/{agent_id}` —— **身份（agent_id）
+    /// 同时用于 user 段**，使记忆归属稳定的登录用户（agent_id=user_id），
+    /// 而非随设备变化的 user_tag（install_id）。这样：
+    ///   - 登录模式：agent_id=user_id → `agent/{user_id}/user/{user_id}`，记忆跨设备连续；
+    ///   - legacy 模式：agent_id=user_tag=install_id → `agent/{install_id}/user/{install_id}`，与原行为一致。
+    /// 旧格式或解析失败时回退到 agent 自身 ns，保持向后兼容。
     fn caller_ns(&self, session_id: &str) -> String {
         let parts: Vec<&str> = session_id.split('/').collect();
         if parts.len() >= 4 && parts[0] == "jan" {
             let agent_id = parts[1];
-            let user_tag = parts[2];
-            if !agent_id.is_empty() && !user_tag.is_empty() {
-                return format!("agent/{}/user/{}", agent_id, user_tag);
+            if !agent_id.is_empty() {
+                return format!("agent/{}/user/{}", agent_id, agent_id);
             }
         }
         self.config.identity.ns()
@@ -175,7 +177,13 @@ impl AgentCore {
     /// - 简单查询 → 直接执行
     /// - 已确认会话 → 话题切换检测
     pub async fn chat(&self, message: &str, user_id: &str, session_id: &str, allowed_ns: &[String]) -> String {
-        let confirm_words = ["确认", "确认添加", "确认执行", "添加", "是", "是的", "对", "执行", "确定", "可以"];
+        let confirm_words = [
+            "确认", "确认添加", "确认执行", "添加", "是", "是的", "对", "执行", "确定", "可以",
+            "好", "好的", "行", "没问题", "去吧", "查吧", "执行吧", "同意", "继续", "就按这个",
+        ];
+        // 确认词用「包含匹配」而非精确相等：用户常回“对的”“好的，执行”“可以，查吧”
+        // 等变体，精确匹配会漏掉导致确认状态机死循环（反复问“方向对吗？”）。
+        let is_confirm = |m: &str| confirm_words.iter().any(|w| m.contains(*w));
         let trimmed = message.trim();
 
         // ── 提示词注入检测 ──
@@ -213,7 +221,7 @@ impl AgentCore {
         }
 
         // ── 0a. 工具级确认（现有）：pending_actions 中的操作等待确认 ──
-        if confirm_words.contains(&trimmed) {
+        if is_confirm(trimmed) {
             if let Some(action) = self.session_manager.take_pending_action(session_id).await {
                 let result = match self.call_tool_routed(&action.tool_name, &action.arguments).await {
                     Ok(text) => text,
@@ -235,7 +243,7 @@ impl AgentCore {
         match state {
             // ── 等待用户确认理解 ──
             SessionState::AwaitingConfirmation => {
-                if confirm_words.contains(&trimmed) {
+                if is_confirm(trimmed) {
                     let original = self.session_manager.take_original_message(session_id).await
                         .unwrap_or_else(|| message.to_string());
                     self.session_manager.set_state(session_id, SessionState::Confirmed).await;
@@ -617,6 +625,24 @@ impl AgentCore {
         // 从 Memoria 取可用工具列表
         let tools = self.fetch_tools_filtered(allowed_ns).await;
 
+        // P1 修复：把真实工具名动态注入 system prompt。
+        // build_system_prompt 里写死的 query_sql/query_plate 与真实 MCP 工具
+        // (execute_sql/fuzzy_match_plate) 对不上，会导致 LLM 调错或调不存在的工具。
+        // 这里以"权威工具清单"覆盖，确保 LLM 使用真实存在的工具名。
+        if !tools.is_empty() {
+            if let Some(sys_msg) = messages.first_mut() {
+                if let Some(ref mut content) = sys_msg.content {
+                    let mut extra = String::from("\n\n## 当前真实可用工具（调用时务必使用以下名称）\n");
+                    for t in tools.iter().take(20) {
+                        let desc: String = t.function.description.chars().take(120).collect();
+                        extra.push_str(&format!("- `{}`: {}\n", t.function.name, desc));
+                    }
+                    extra.push_str("\n注意：以上为系统中真实存在的工具。严禁臆造工具名（如 query_sql/query_plate 并不存在），请直接选用上面列出的工具。\n");
+                    content.push_str(&extra);
+                }
+            }
+        }
+
         for _round in 0..self.config.max_tool_rounds {
             let response = match self.llm.chat(&messages, &tools).await {
                 Ok(r) => r,
@@ -948,10 +974,12 @@ impl AgentCore {
 
     /// 查找能处理该工具的 MCP 源
     /// P1-3 修复：优先从 tool_route_cache 精确查找，fallback 到 Memoria 特有工具列表
-    pub fn find_mcp_for_tool(&self, tool_name: &str) -> &McpClient {
-        // 1. 先查缓存
+    pub async fn find_mcp_for_tool(&self, tool_name: &str) -> &McpClient {
+        // 1. 先查缓存（关键修复：必须用异步锁 .lock().await，严禁 blocking_lock()，
+        //    否则在 tokio runtime 线程内调用会 panic 并直接 drop 请求连接，
+        //    表现为前端 "connection failed"）
         {
-            let cache = self.tool_route_cache.blocking_lock();
+            let cache = self.tool_route_cache.lock().await;
             if let Some(&idx) = cache.get(tool_name) {
                 if idx < self.mcp_sources.len() {
                     return &self.mcp_sources[idx].client;
@@ -1014,7 +1042,7 @@ impl AgentCore {
         }
 
         // 最终 fallback
-        self.find_mcp_for_tool(tool_name)
+        self.find_mcp_for_tool(tool_name).await
     }
 
     /// 路由到正确的 MCP 源执行工具调用
@@ -1311,11 +1339,11 @@ impl AgentCore {
 
 ## 工具使用
 你有以下可用的工具（由系统自动提供）：
-- query_plate：查车牌对应的企业信息
-- query_sql：执行 SQL 查询（只允许 SELECT）
+- fuzzy_match_plate：按车牌/公司名模糊匹配企业信息
+- execute_sql：执行 SQL 查询（只允许 SELECT）
 - manage_whitelist：管理白名单
 - fill_excel_log：填写入厂日志
-- 以及其他系统提供的工具
+- 以及其他系统提供的工具（实际可用工具名以对话中"当前真实可用工具"清单为准）
 
 调用工具时：
 1. 直接传递正确的参数，不要猜测参数名
