@@ -749,6 +749,56 @@ async fn handle_v1_chat(
     };
     drop(agent_guard);
 
+    // PFAiX SSE 兼容：stream=true 时返回 text/event-stream
+    if req.stream.unwrap_or(false) {
+        let model = req.model.unwrap_or_else(|| "agent-core".to_string());
+        let id = "chatcmpl-agent".to_string();
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let (tx, rx): (tokio::sync::mpsc::UnboundedSender<Result<SseEvent, Infallible>>,
+                       tokio::sync::mpsc::UnboundedReceiver<Result<SseEvent, Infallible>>)
+            = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            // role 起始事件
+            let _ = tx.send(Ok(SseEvent::default().data(serde_json::json!({
+                "id": &id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": &model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+            }).to_string())));
+            // 内容分块（与 /api/chat/stream 一致的 3 字/20ms 节奏）
+            let chars: Vec<char> = reply.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                let end = (i + 3).min(chars.len());
+                let chunk: String = chars[i..end].iter().collect();
+                let _ = tx.send(Ok(SseEvent::default().data(serde_json::json!({
+                    "id": &id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": &model,
+                    "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": null}]
+                }).to_string())));
+                i = end;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // finish_reason
+            let _ = tx.send(Ok(SseEvent::default().data(serde_json::json!({
+                "id": &id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": &model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            }).to_string())));
+            // [DONE]
+            let _ = tx.send(Ok(SseEvent::default().data("[DONE]")));
+        });
+        return Sse::new(UnboundedReceiverStream::new(rx)).into_response();
+    }
+
     axum::response::Json(serde_json::json!({
         "id": "chatcmpl-agent",
         "object": "chat.completion",
