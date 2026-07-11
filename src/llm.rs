@@ -211,7 +211,7 @@ impl LlmClient {
 
                         // 备用 Provider 调用成功时记录日志
                         if idx > 0 {
-                            tracing::warn!("LLM failover: 主 Provider 失败，切到 {} {}", base_url, model);
+                            tracing::info!(failover_to = %model, provider_index = idx, "LLM provider failover（主 Provider 失败）");
                         }
 
                         return Ok(LlmResponse { text, tool_calls });

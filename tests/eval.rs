@@ -27,6 +27,7 @@ fn test_agent() -> AgentCore {
         parent_permission: PermissionLevel::Write,
         enable_compositional_routing: true,
         compositional_preview: true,
+        strict_schema: false,
         system_prompt_template: None,
         approver_id: None,
     };
