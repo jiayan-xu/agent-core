@@ -312,9 +312,14 @@ impl DataExfiltrationGuard {
         "export_data", "send_email", "api_push", "webhook_send",
         "upload_file", "share_report",
     ];
+    const EXPORT_PREFIXES: &'static [&'static str] = &[
+        "export_", "send_", "upload_", "push_", "webhook_", "exfil", "share_",
+    ];
 
     pub fn check_export(tool_name: &str) -> ToolCheck {
-        if Self::EXPORT_TOOLS.contains(&tool_name) {
+        if Self::EXPORT_TOOLS.contains(&tool_name)
+            || Self::EXPORT_PREFIXES.iter().any(|p| tool_name.starts_with(p))
+        {
             return ToolCheck::red(&format!("{} 涉及数据外发，需要管理员审批", tool_name));
         }
         ToolCheck::allow()
@@ -613,6 +618,7 @@ pub struct ToolClassifier {
     read_tools: std::collections::HashSet<String>,
     write_tools: std::collections::HashSet<String>,
     dangerous_tools: std::collections::HashSet<String>,
+    unknown_tools: std::collections::HashSet<String>,
 }
 
 impl ToolClassifier {
@@ -621,6 +627,7 @@ impl ToolClassifier {
             read_tools: std::collections::HashSet::new(),
             write_tools: std::collections::HashSet::new(),
             dangerous_tools: std::collections::HashSet::new(),
+            unknown_tools: std::collections::HashSet::new(),
         };
         // 内置默认分类（保留原有列表）
         for t in [
@@ -651,7 +658,7 @@ impl ToolClassifier {
             "read" => { self.read_tools.insert(tool_name.to_string()); }
             "write" => { self.write_tools.insert(tool_name.to_string()); }
             "dangerous" => { self.dangerous_tools.insert(tool_name.to_string()); }
-            _ => {}
+            _ => { self.unknown_tools.insert(tool_name.to_string()); }
         }
     }
 
@@ -677,7 +684,8 @@ impl ToolClassifier {
             } else if name.starts_with("delete_") || name.starts_with("batch_delete") || name.starts_with("shutdown_") {
                 self.dangerous_tools.insert(name.clone());
             } else if !self.read_tools.contains(name) && !self.dangerous_tools.contains(name) {
-                self.write_tools.insert(name.clone());
+                // P0-4：未知工具不再默认当 write 放行，先标记为 unknown，由 check_tool 走黄线确认
+                self.unknown_tools.insert(name.clone());
             }
         }
     }
@@ -686,6 +694,7 @@ impl ToolClassifier {
         if self.read_tools.contains(tool_name) { return "read"; }
         if self.write_tools.contains(tool_name) { return "write"; }
         if self.dangerous_tools.contains(tool_name) { return "dangerous"; }
+        if self.unknown_tools.contains(tool_name) { return "unknown"; }
         "unknown"
     }
 }
