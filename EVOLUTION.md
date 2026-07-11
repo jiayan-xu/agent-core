@@ -146,3 +146,30 @@ PFAiX 桌面端聊天只发 `x-user-tag`（随机安装 ID），不发 `x-agent-
 
 ### 遗留/改进点
 - 源码未初始化 tracing subscriber，所有 `tracing::*` 为空操作 → 无法靠日志排障（后续可补 `tracing_subscriber::fmt().with_env_filter(...)`）。
+
+## 2026-07-11 (evening) — 暗知识层夜间巩固 + NER 真实体图谱（A2+B2）
+
+### 背景
+agent-core 已有 `run_insights` 洞见发现雏形，但只处理当前会话观察，无**跨会话模式提炼**和**实体图谱**。设计文档确定架构：agent-core 出脑子（self.llm.chat），memoria 当哑存储（纯 SQL）。夜间巩固填补了「观察→模式→可搜索暗知识」的空白；NER 实体提取替换了 graph.rs 的旧启发式假图谱。
+
+### 变更
+
+#### A2. 通用 consolidate(ns) 编排器（`src/agent.rs`）
+- 新增 `consolidate(ns)` 方法，复用 `run_insights` 的 McpClient 模式：
+  1. `dream_state_get` 取游标（首跑 → 1970-01-01，全量处理）
+  2. `memory_fetch_unconsolidated` 拉 200 条 observation（namespace+created_at 过滤空 content）
+  3. LLM 提炼 ≤5 条跨会话 pattern
+  4. `memory_remember(category=pattern)` 写回
+  5. `dream_state_update` 推进游标（cursor_ts + runs + items_out）
+- **追加 NER 第二阶段**：同一批原料通过第二轮 LLM 调用提取实体（9 类：person/system/tool/concept/org/project/location/event/other）和关系，调 `entity_upsert`（幂等 name+ns）/ `entity_add_edge`（去重）写入，同时 `memory_remember(category=fact)` 落库便于搜索。
+- **管理员身份**：以 `MEMORIA_ADMIN_KEY` 跨 ns 读 `agent/xujiayan` 的 11 万观察原料。
+
+#### B2. 低峰定时器（`src/main.rs`）
+- 导入 `chrono::Timelike`，30 分钟巡逻循环内加低峰闸 `02:00-05:00` 本地时间触发
+- 遍历 `CONSOLIDATE_NAMESPACES` 环境变量（默认 `agent/xujiayan`）
+- 关定时器即回退（零侵入）
+
+### 验证
+- **A3 联调**：手动模拟全链路 — dream_state_get → fetch_unconsolidated(200条多样观察) → 提炼 5 pattern → memory_remember(category=pattern) → dream_state_update → 幂等跳过已处理批次 ✅
+- **B4 联调**：entity_upsert(agent-core/memory_search/暗知识层) + entity_add_edge(calls/builds) + entity_search → memory_graph 返回 nodes=3 edges=2 ✅
+- 服务 :9753 运行中，凌晨 02:00 自动触发
