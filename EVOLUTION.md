@@ -111,3 +111,38 @@ PFAiX 桌面端聊天只发 `x-user-tag`（随机安装 ID），不发 `x-agent-
 ### 验证
 - 模拟 PFAiX 只发 `x-user-tag` 打 `/v1/chat/completions` → 200 且返回真实 AI 回复（不再 401）；裸请求无头仍 401（闸门保留）。
 - `agent.toml` 的 mcp_source namespace 前缀已对齐 `org/cs-pufa-2nd-thermal/...`，与 Memoria `check_ns_access` 祖先匹配一致。
+
+---
+
+## 2026-07-11 — 本地账密登录体系 + 工具调用断连根因修复
+
+### 背景
+两条线在同一批次落地：
+1. **登录身份**：PFAiX 需要真实员工账密（此前仅随机安装 ID 的 legacy 无登录模式）；财务机等分发端连不到内网 Memoria，注册/登录必须经 agent-core 代理。
+2. **聊天断连**：查库类问题（如「昨天进了几车」）在 ~8.5s 稳定报 `connection failed`，纯聊天正常 —— 定位为工具调用路径的 async 运行时 panic。
+
+### 变更
+
+#### A. 本地账密登录/注册代理（`src/main.rs`）
+- 新增路由 `/api/login` 与 `/api/register_user`，以 admin 身份代理转发 Memoria `login_user` / `register_user`（分发端免直连内网）。
+- `sanitize_user_id()`：user_id 作为 agent_id 会进 HTTP 头与 session_id，严格 ASCII 清洗（仅字母/数字/`_`/`-`/`.`）。
+- **legacy 与登录模式分流**：仅 legacy（无 `x-agent-id`、仅 `x-user-tag`）才用 admin key 无口令自动开户；登录模式身份不存在时必须走 `register_user`（带口令），否则口令形同虚设。
+- **按安装实例隔离 ns（B2）**：自动开户分配 `agent/{install_id}` + `org/cs-pufa-2nd-thermal` 双 ns（个人记忆隔离 + 保留 dashboard 共享工具可见性），逗号写入同一 namespace 字段，缓存失效回读时不丢 dashboard。
+- `handle_v1_chat` session_id 修复：用真实 `session_id` 取代写死的 `jan/{agent_id}`。
+
+#### B. MCP 传输健壮性（`src/mcp_client.rs`）
+- `HttpMcpClient.call` 错误分级：**传输层错误（连接失败/超时）可重试**；**JSON-RPC 业务错误（鉴权/参数错误）不重试直接返回** —— 避免把一次鉴权失败当传输错误重试 3 次，放大对端调用量（曾致 Memoria CPU 飙升）。
+- 结果抽取改为逐层 `get()` 安全解析，消除 index panic 隐患。
+- `spawn_process` 加 Windows `CREATE_NO_WINDOW`(0x08000000)：修复每次调 stdio MCP（python）弹出黑色控制台窗口。
+
+#### C. 工具调用断连根因修复（`src/agent.rs` + `src/boundary.rs`）— P0
+- **断连真根因**：`find_mcp_for_tool()` 同步函数内调 `tool_route_cache.blocking_lock()`（tokio Mutex），被 `find_mcp_for_tool_async()` 在 async 上下文调用 → 运行时线程内 `blocking_lock` **panic** → axum handler 任务崩溃 → TCP 连接被 drop → 前端三地址 failover 全废、报 `connection failed`。触发点是 LLM 去调一个**不存在的工具名**（缓存未命中 → 走 fallback → 命中 panic）。→ `find_mcp_for_tool` 改 async + `.lock().await`，调用处加 `.await`。
+- **工具名错位（P1）**：system prompt 写死 `query_sql`/`query_plate`，真实 MCP 工具实为 `execute_sql`/`fuzzy_match_plate`；普通 `llm_loop` 路径未动态注入真实工具清单（只有确认路径做了）→ LLM 调错工具或退化成问候。→ `llm_loop` 取得工具后动态注入真实工具清单，`build_system_prompt` 过期工具名改真名。
+- **权限归类（`boundary.rs`）**：`register_from_tools` 启发式把 `execute_sql`/`fuzzy_match_*` 因前缀不匹配错判为 WRITE；补充规则将 SQL 查询类与模糊匹配/审阅类归为 READ，并加入默认 READ 白名单兜底。
+
+### 验证
+- 用新二进制重启生产实例，登录后「昨天进了几车」**200 OK（7-8s，不再断连）**，返回真实进厂车次/车辆数/吨位汇总及企业分布明细，LLM 正确调用 `execute_sql` 查库（此前该路径稳定 panic 断连）。
+- 纯聊天路径不受影响；裸请求无身份头仍 401（闸门保留）。
+
+### 遗留/改进点
+- 源码未初始化 tracing subscriber，所有 `tracing::*` 为空操作 → 无法靠日志排障（后续可补 `tracing_subscriber::fmt().with_env_filter(...)`）。
