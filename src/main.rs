@@ -593,6 +593,7 @@ fn main() {
                 .route("/api/metrics", get(handle_metrics))
                 .route("/api/admin/quota", get(handle_admin_quota_get).put(handle_admin_quota_put))
                 .route("/api/admin/audit", get(handle_admin_audit))
+                .route("/api/admin/harness/activate", post(handle_admin_harness_activate))
                 .route("/v1/chat/completions", post(handle_v1_chat))
                 .layer(from_fn_with_state(state.clone(), auth_middleware));
 
@@ -978,6 +979,30 @@ async fn handle_admin_audit(
         Json(serde_json::json!({
             "count": events.len(),
             "events": events,
+        }))
+        .into_response()
+    } else {
+        Json(serde_json::json!({"error": "agent not ready"})).into_response()
+    }
+}
+
+/// P2-3：批准并激活待审批的 Harness 模板（含危险工具的蒸馏模板须经此人工 / admin 批准）
+#[derive(serde::Deserialize)]
+struct HarnessActivate {
+    id: i64,
+}
+
+async fn handle_admin_harness_activate(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<HarnessActivate>,
+) -> axum::response::Response {
+    let guard = st.agent.lock().await;
+    if let Some(ref agent) = *guard {
+        let ok = agent.harness.lock().await.activate(req.id);
+        Json(serde_json::json!({
+            "ok": ok,
+            "id": req.id,
+            "is_active": ok,
         }))
         .into_response()
     } else {

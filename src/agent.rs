@@ -421,7 +421,9 @@ impl AgentCore {
                     {
                         let logs = self.execution_log.lock().await;
                         let mut harness = self.harness.lock().await;
-                        let _ = harness.distill_from_logs(&logs, 2);
+                        // P2-3：蒸馏触发门槛 —— 需 N=3 次成功组合路由佐证（置信度门槛），
+                        // 避免偶发成功被过早蒸馏为模板。
+                        let _ = harness.distill_from_logs(&logs, 3);
                     }
 
                     // P1-1: 组合执行完成 → 终态 checkpoint，清理进行中计划
@@ -1069,6 +1071,15 @@ impl AgentCore {
                     &self.config.parent_permission, ns.as_deref(),
                 );
                 drop(boundary);
+
+                // P2-3：boundary 结果写入 span（allow / reason / level 可观测）
+                tracing::debug!(
+                    tool = %tc.name,
+                    allowed = check.allow,
+                    level = ?check.level,
+                    reason = %check.reason,
+                    "llm_tool_boundary"
+                );
 
                 if !check.allow {
                     // 审计日志：记录边界/红线拒绝（P2-2 统一事件，带 trace_id 串联）
@@ -1973,7 +1984,7 @@ impl AgentCore {
                 continue;
             }
 
-            tracing::info!("Harness 命中: {} (score={:.2})", m.harness.name, score);
+            tracing::info!(match_score = score, harness = %m.harness.name, "Harness 命中（快速路径）");
             // P2-2: Harness 命中事件
             self.audit_logger
                 .harness_hit(&self.config.identity.agent_id, "", &m.harness.name)
@@ -1988,8 +1999,10 @@ impl AgentCore {
                 let boundary = self.boundary.lock().await;
                 let check = boundary.check_tool(tool_name, &args, &self.config.identity.agent_id, "user", &PermissionLevel::Write, self.current_ns_paths().as_deref());
                 drop(boundary);
+                // P2-3：boundary 结果写入 span（allow / reason 可观测）
+                tracing::debug!(tool = %tool_name, allowed = check.allow, reason = %check.reason, "harness_step_boundary");
                 if !check.allow {
-                    tracing::warn!("Harness 步骤 {} 被 boundary 拒绝: {}", tool_name, check.reason);
+                    tracing::warn!(tool = %tool_name, reason = %check.reason, "Harness 步骤被 boundary 拒绝");
                     all_ok = false;
                     break;
                 }

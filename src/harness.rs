@@ -159,6 +159,15 @@ impl HarnessStore {
             .unwrap_or(false)
     }
 
+    /// 激活（P2-3：危险/待审批模板经人工 / admin 批准后激活）
+    pub fn activate(&mut self, harness_id: i64) -> bool {
+        self.conn
+            .execute("UPDATE harnesses SET is_active = 1 WHERE id = ?1", params![harness_id])
+            .ok()
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    }
+
     // ── 匹配算法 ───────────────────────────────────
 
     /// 根据 task_context 在所有激活的 Harness 中做模糊匹配
@@ -312,9 +321,25 @@ impl HarnessStore {
                 continue;
             }
 
-            let steps_val = serde_json::Value::Array(merged_steps);
+            let steps_val = serde_json::Value::Array(merged_steps.clone());
             let id = self.save(&best_name, &conditions, &steps_val, &best_rule, None)?;
             new_ids.push(id);
+
+            // P2-3：危险模板永不自动激活 —— 含危险工具的蒸馏模板置为待审批（is_active=0），
+            // 必须经人工 / admin 显式 activate 后方可参与匹配。
+            let has_dangerous = merged_steps.iter().any(|step| {
+                step.get("tool")
+                    .and_then(|t| t.as_str())
+                    .map(|t| crate::boundary::is_dangerous_tool(t))
+                    .unwrap_or(false)
+            });
+            if has_dangerous {
+                self.deactivate(id);
+                tracing::warn!(
+                    "蒸馏出的 Harness(id={}) 含危险工具，已置为待审批（不自动激活）",
+                    id
+                );
+            }
         }
 
         Ok(new_ids)
@@ -702,5 +727,65 @@ mod tests {
         }
         let h = store.get(id).unwrap();
         assert!(h.confidence >= 0.0, "confidence should not go below 0");
+    }
+
+    #[test]
+    fn test_distill_dangerous_template_not_auto_activated() {
+        let mut store = test_store();
+        // 3 次成功、相同触发、但步骤含危险工具 delete_entrance_record
+        let logs: Vec<ExecutionLog> = (0..3)
+            .map(|_| ExecutionLog {
+                name: "danger".to_string(),
+                trigger_conditions: serde_json::json!({"tool": "danger"}),
+                steps: serde_json::json!([
+                    {"tool": "delete_entrance_record", "args": {"id": 1}}
+                ]),
+                verify_rule: String::new(),
+                success: true,
+            })
+            .collect();
+
+        let new_ids = store.distill_from_logs(&logs, 3).unwrap();
+        assert_eq!(new_ids.len(), 1, "应蒸馏出 1 个模板");
+        let h = store.get(new_ids[0]).unwrap();
+        // P2-3：危险模板不得自动激活，必须待审批
+        assert!(!h.is_active, "危险模板不应自动激活（is_active 应为 false）");
+        // 确认其不在「已激活」列表中
+        let active = store.list_all(true).unwrap();
+        assert!(!active.iter().any(|x| x.id == h.id), "危险模板不应出现在激活列表");
+    }
+
+    #[test]
+    fn test_distill_safe_template_auto_activated() {
+        let mut store = test_store();
+        // 3 次成功、步骤仅含只读工具（安全）
+        let logs: Vec<ExecutionLog> = (0..3)
+            .map(|_| ExecutionLog {
+                name: "safe".to_string(),
+                trigger_conditions: serde_json::json!({"tool": "safe"}),
+                steps: serde_json::json!([
+                    {"tool": "query_plate", "args": {"plate": "沪A12345"}}
+                ]),
+                verify_rule: String::new(),
+                success: true,
+            })
+            .collect();
+
+        let new_ids = store.distill_from_logs(&logs, 3).unwrap();
+        assert_eq!(new_ids.len(), 1);
+        let h = store.get(new_ids[0]).unwrap();
+        assert!(h.is_active, "安全模板应自动激活");
+    }
+
+    #[test]
+    fn test_activate_toggles_is_active() {
+        let mut store = test_store();
+        let id = store
+            .save("test", &serde_json::json!({}), &serde_json::json!([]), "", None)
+            .unwrap();
+        store.deactivate(id);
+        assert!(!store.get(id).unwrap().is_active);
+        assert!(store.activate(id), "activate 应返回 true");
+        assert!(store.get(id).unwrap().is_active, "activate 后应为 active");
     }
 }

@@ -699,6 +699,22 @@ impl ToolClassifier {
     }
 }
 
+/// 判断工具是否「危险」（落入红线/高危前缀）。
+///
+/// 用于蒸馏质量门控（P2-3）：含危险工具的 Harness 模板绝不自动激活，
+/// 必须经人工 / admin 批准 `activate`。同时覆盖内置危险清单与
+/// `delete_` / `batch_delete` / `shutdown_` 高危前缀。
+pub fn is_dangerous_tool(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    if lower.starts_with("delete_")
+        || lower.starts_with("batch_delete")
+        || lower.starts_with("shutdown_")
+    {
+        return true;
+    }
+    ToolClassifier::new().classify(name) == "dangerous"
+}
+
 // ══════════════════════════════════════════════════════
 // 第八条：任务确认红线
 // ══════════════════════════════════════════════════════
