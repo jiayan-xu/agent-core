@@ -206,6 +206,10 @@ async fn authenticate(
     } else if !user_tag.is_empty() {
         (user_tag, true)
     } else {
+        // P2-2：鉴权失败审计（无身份）
+        if let Some(ref a) = *st.agent.lock().await {
+            a.audit_logger.auth_fail("", "缺少身份标识（x-agent-id / x-user-tag 均未提供）").await;
+        }
         return Err(unauthorized("请先通过 /api/register 注册身份"));
     };
 
@@ -271,6 +275,12 @@ async fn authenticate(
             ];
         }
         if allowed_ns.is_empty() {
+            // P2-2：鉴权失败审计（身份校验未通过）
+            if let Some(ref a) = *st.agent.lock().await {
+                a.audit_logger
+                    .auth_fail(&agent_id, "身份校验未通过（Memoria 未返回授权命名空间）")
+                    .await;
+            }
             // 不向外部暴露内部错误细节（R6）
             return Err(unauthorized("身份校验失败，请稍后重试"));
         }
@@ -497,7 +507,7 @@ fn main() {
                         let agent_ns = vec![agent.config.identity.ns()];
                         let tasks = [("system_ops", serde_json::json!({"action": "status"}))];
                         for (tool, args) in &tasks {
-                            match agent.call_tool_routed(tool, args, &agent_ns).await {
+                            match agent.call_tool_routed(tool, args, &agent_ns, "").await {
                                 Ok(reply) => {
                                     fail_count = 0;
                                     tracing::info!("巡检 {}: {}", tool, &reply.chars().take(60).collect::<String>());
@@ -582,6 +592,7 @@ fn main() {
                 .route("/api/admin/killswitch", post(handle_admin_killswitch))
                 .route("/api/metrics", get(handle_metrics))
                 .route("/api/admin/quota", get(handle_admin_quota_get).put(handle_admin_quota_put))
+                .route("/api/admin/audit", get(handle_admin_audit))
                 .route("/v1/chat/completions", post(handle_v1_chat))
                 .layer(from_fn_with_state(state.clone(), auth_middleware));
 
@@ -936,6 +947,37 @@ async fn handle_admin_quota_put(
                 "daily_token_budget": policy.daily_token_budget,
                 "max_concurrent_sessions": policy.max_concurrent_sessions,
             }
+        }))
+        .into_response()
+    } else {
+        Json(serde_json::json!({"error": "agent not ready"})).into_response()
+    }
+}
+
+/// P2-2：审计事件只读查询（本地有界环形缓冲即时返回，支持 trace_id / event_type 过滤）
+#[derive(serde::Deserialize)]
+struct AuditQuery {
+    #[serde(default)]
+    trace_id: Option<String>,
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn handle_admin_audit(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<AuditQuery>,
+) -> axum::response::Response {
+    let guard = st.agent.lock().await;
+    if let Some(ref agent) = *guard {
+        let limit = q.limit.unwrap_or(50).min(500);
+        let events = agent
+            .audit_logger
+            .recent_events(q.trace_id.as_deref(), q.event.as_deref(), limit);
+        Json(serde_json::json!({
+            "count": events.len(),
+            "events": events,
         }))
         .into_response()
     } else {

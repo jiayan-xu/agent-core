@@ -5,7 +5,7 @@ use chrono::Datelike;
 
 use tokio::sync::Mutex;
 
-use crate::audit::AuditLogger;
+use crate::audit::{AuditLogger, new_trace_id};
 use crate::boundary::{self, ComplianceBoundary, PermissionLevel, BlockLevel};
 use crate::checkpoint::{CheckpointState, CheckpointStore};
 use crate::degrade::{DegradeMode, DegradeMonitor, UNHEALTHY_THRESHOLD};
@@ -242,6 +242,9 @@ impl AgentCore {
         // ── P1-1: 崩溃恢复——先从 checkpoint 恢复控制面状态到内存 ──
         self.restore_checkpoint(session_id).await;
 
+        // ── P2-2: 生成本次请求的链路 trace_id（串联 LLM→边界→MCP→结果审计） ──
+        let trace_id = new_trace_id();
+
         // ── P1-5: 降级模式 trace（故障可观测） ──
         tracing::info!(degrade_mode = %self.current_degrade_mode().as_str(), "chat 入口降级模式");
 
@@ -303,7 +306,7 @@ impl AgentCore {
         // ── 0a. 工具级确认（现有）：pending_actions 中的操作等待确认 ──
         if is_confirm(trimmed) {
             if let Some(action) = self.session_manager.take_pending_action(session_id).await {
-                let result = match self.call_tool_routed(&action.tool_name, &action.arguments, allowed_ns).await {
+                let result = match self.call_tool_routed(&action.tool_name, &action.arguments, allowed_ns, &trace_id).await {
                     Ok(text) => text,
                     Err(e) => format!("执行失败: {}", e),
                 };
@@ -332,7 +335,7 @@ impl AgentCore {
                     let original = self.session_manager.take_original_message(session_id).await
                         .unwrap_or_else(|| message.to_string());
                     self.checkpoint_confirmed(session_id).await;
-                    return self.execute_chat(&original, user_id, session_id, allowed_ns).await;
+                    return self.execute_chat(&original, user_id, session_id, allowed_ns, &trace_id).await;
                 }
                 // P1-2: 计划编辑（当前支持「删除第N步」）
                 if let Some(new_plan) = self.try_apply_plan_edit(trimmed).await {
@@ -352,7 +355,7 @@ impl AgentCore {
                         return self.handle_topic_switch(message, session_id).await;
                     }
                 }
-                return self.execute_chat(message, user_id, session_id, allowed_ns).await;
+                return self.execute_chat(message, user_id, session_id, allowed_ns, &trace_id).await;
             }
 
             // ── 新会话 ──
@@ -363,13 +366,13 @@ impl AgentCore {
                 }
                 // 简单查询 → 直接执行
                 self.session_manager.set_state(session_id, SessionState::Confirmed).await;
-                return self.execute_chat(message, user_id, session_id, allowed_ns).await;
+                return self.execute_chat(message, user_id, session_id, allowed_ns, &trace_id).await;
             }
         }
     }
 
     /// 已确认会话的执行路径（原 chat() 主体 + Step 前缀）
-    async fn execute_chat(&self, message: &str, user_id: &str, session_id: &str, allowed_ns: &[String]) -> String {
+    async fn execute_chat(&self, message: &str, user_id: &str, session_id: &str, allowed_ns: &[String], trace_id: &str) -> String {
         // ── 0. 组合路由路径：多 Skill 分解 + 按序执行 ──
         if self.config.enable_compositional_routing {
             let tools = self.fetch_tools_filtered(allowed_ns).await;
@@ -492,7 +495,7 @@ impl AgentCore {
         messages.push(Message { role: "user".to_string(), content: Some(enriched_message), tool_calls: None, tool_call_id: None });
 
         // ── 5. LLM 调用循环 ──
-        let result = self.llm_loop(messages, session_id, message, user_id, allowed_ns).await;
+        let result = self.llm_loop(messages, session_id, message, user_id, allowed_ns, trace_id).await;
 
         // 给结果加 Step 前缀
         format!("[Step 2/3: 执行 → Step 3/3: 交付]\n\n{}", result)
@@ -645,7 +648,7 @@ impl AgentCore {
                         }
                     }
 
-                    match this.call_tool_routed(&tool, &args, allowed_ns).await {
+                    match this.call_tool_routed(&tool, &args, allowed_ns, "").await {
                         Ok(result) => {
                             this.audit_logger.log_tool_call(
                                 &this.config.identity.agent_id, &tool, &args, true
@@ -777,6 +780,20 @@ impl AgentCore {
             Some(c) => c,
             None => return,
         };
+        // P2-2: Checkpoint 恢复事件（崩溃续跑可观测）
+        let state_str = match cp.state {
+            CheckpointState::New => "New",
+            CheckpointState::AwaitingConfirmation => "AwaitingConfirmation",
+            CheckpointState::Confirmed => "Confirmed",
+            CheckpointState::PendingApproval => "PendingApproval",
+            CheckpointState::ExecutingPlan => "ExecutingPlan",
+            CheckpointState::PlanPreview => "PlanPreview",
+            CheckpointState::Done => "Done",
+            CheckpointState::Failed => "Failed",
+        };
+        self.audit_logger
+            .checkpoint_resume(&self.config.identity.agent_id, session_id, state_str, "")
+            .await;
         match cp.state {
             CheckpointState::AwaitingConfirmation => {
                 self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
@@ -945,6 +962,7 @@ impl AgentCore {
         raw_message: &str,
         user_id: &str,
         allowed_ns: &[String],
+        trace_id: &str,
     ) -> String {
         // 从 Memoria 取可用工具列表
         let tools = self.fetch_tools_filtered(allowed_ns).await;
@@ -1053,10 +1071,10 @@ impl AgentCore {
                 drop(boundary);
 
                 if !check.allow {
-                    // 审计日志：记录拒绝决策
-                    self.audit_logger.log_decision(
+                    // 审计日志：记录边界/红线拒绝（P2-2 统一事件，带 trace_id 串联）
+                    self.audit_logger.boundary_deny(
                         &self.config.identity.agent_id, &tc.name,
-                        &check.reason, false
+                        &check.reason, trace_id, Some(session_id),
                     ).await;
 
                     // 危险/红线工具：无审批人时直接硬拒绝，不进入 LLM 下一轮
@@ -1083,8 +1101,13 @@ impl AgentCore {
                                 "to": approver_id,
                                 "content": msg.to_string(),
                                 "namespace": format!("agent/{}", approver_id),
-                            })).await;
-                            // P1-1: 记录待审批到 checkpoint（崩溃恢复后审批意图仍可见）
+                        })).await;
+                        // P2-2: 审批创建事件（带 trace_id）
+                        self.audit_logger.approval_event(
+                            "created", &self.config.identity.agent_id, &tc.name,
+                            &check.reason, trace_id, Some(session_id),
+                        ).await;
+                        // P1-1: 记录待审批到 checkpoint（崩溃恢复后审批意图仍可见）
                             let pa = PendingAction {
                                 tool_name: tc.name.clone(),
                                 arguments: tc.arguments.clone(),
@@ -1163,7 +1186,7 @@ impl AgentCore {
 
                 // 通过 MCP 调用工具（按名称路由到正确的源）
                 let result = match self
-                    .call_tool_routed(&tc.name, &tc.arguments, allowed_ns)
+                    .call_tool_routed(&tc.name, &tc.arguments, allowed_ns, trace_id)
                     .await
                 {
                     Ok(text) => text,
@@ -1354,7 +1377,7 @@ impl AgentCore {
         for approval in &pending_list {
             if let Some(true) = self.approval_manager.is_approved(&approval.approval_id).await {
                 // 审批通过，执行工具
-                let result = match self.call_tool_routed(&approval.tool_name, &approval.arguments, allowed_ns).await {
+                let result = match self.call_tool_routed(&approval.tool_name, &approval.arguments, allowed_ns, "").await {
                     Ok(text) => text,
                     Err(e) => format!("执行失败: {}", e),
                 };
@@ -1469,6 +1492,7 @@ impl AgentCore {
         tool_name: &str,
         args: &serde_json::Value,
         allowed_ns: &[String],
+        trace_id: &str,
     ) -> Result<String, String> {
         // ── P1-5 降级收缩门控（全局 → 源级 → 模式级） ──
         // 1) Kill switch：全局拒绝一切工具调用，仅系统状态查询可用
@@ -1570,7 +1594,27 @@ impl AgentCore {
             }
         }
 
-        client.call(tool_name, args).await
+        // 实际执行；P2-2：记录 MCP 传输失败（便于按 trace_id 还原调用链）
+        let src_name = {
+            let c = self.tool_route_cache.lock().await;
+            c.get(tool_name)
+                .and_then(|&i| self.mcp_sources.get(i))
+                .map(|s| s.name.clone())
+        };
+        let result = client.call(tool_name, args).await;
+        if let Err(ref e) = result {
+            self.audit_logger
+                .mcp_retry(
+                    &self.config.identity.agent_id,
+                    &src_name.unwrap_or_else(|| "memoria".to_string()),
+                    tool_name,
+                    e,
+                    trace_id,
+                    None,
+                )
+                .await;
+        }
+        result
     }
 
     /// 获取当前 agent 的命名空间路径列表（用于 boundary check_tool 的 namespaces 参数）
@@ -1930,6 +1974,10 @@ impl AgentCore {
             }
 
             tracing::info!("Harness 命中: {} (score={:.2})", m.harness.name, score);
+            // P2-2: Harness 命中事件
+            self.audit_logger
+                .harness_hit(&self.config.identity.agent_id, "", &m.harness.name)
+                .await;
 
             // 执行每个步骤（含 boundary 检查）
             let mut all_ok = true;
@@ -1945,7 +1993,7 @@ impl AgentCore {
                     all_ok = false;
                     break;
                 }
-                let result = self.call_tool_routed(tool_name, &args, allowed_ns).await;
+                let result = self.call_tool_routed(tool_name, &args, allowed_ns, "").await;
                 if result.is_err() {
                     all_ok = false;
                     break;
@@ -2048,10 +2096,10 @@ impl AgentCore {
         let week_ago = (chrono::Local::now() - chrono::Duration::days(7)).format("%Y-%m-%d").to_string();
         let data = self.call_tool_routed("query_entrance", &serde_json::json!({
             "date_from": week_ago, "date_to": today, "limit": 500,
-        }), allowed_ns).await.unwrap_or_default();
+        }), allowed_ns, "").await.unwrap_or_default();
         let stats = self.call_tool_routed("query_monthly_stats", &serde_json::json!({
             "year": chrono::Local::now().year(), "month": chrono::Local::now().month(),
-        }), allowed_ns).await.unwrap_or_default();
+        }), allowed_ns, "").await.unwrap_or_default();
 
         let prompt = format!(
             "你是固废运营数据分析师。分析最近7天入厂数据，找出有意义的模式或异常。\
