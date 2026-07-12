@@ -7,6 +7,7 @@ use std::time::Duration;
 use std::process::{Child, Stdio, Command};
 use std::io::{BufRead, BufReader, Write};
 use std::sync::atomic::AtomicU64;
+use rand::Rng;
 use reqwest::Client as HttpClient;
 
 // ── 通用 MCP 结果 ──
@@ -57,9 +58,12 @@ impl HttpMcpClient {
         let url = format!("{}/mcp", self.base_url);
         let mut last_err = String::from("no response");
         for attempt in 0..3 {
+            // 联调：为每次 MCP 调用生成 x-trace-id（与 http.request trace_id 独立，携带跨服务 trace 链）。
+            let trace_id = format!("{:x}", rand::thread_rng().gen::<u128>());
             let result = self.client.post(&url).json(&body)
                 .header("X-Agent-Id", &self.agent_id)
                 .header("X-Agent-Key", &self.badge_token)
+                .header("x-trace-id", &trace_id)
                 .send().await;
             match result {
                 Ok(resp) => {
