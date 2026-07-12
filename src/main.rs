@@ -311,8 +311,7 @@ async fn auth_middleware(
         || path == "/api/register"
         || path == "/api/register_user"
         || path == "/api/login"
-        || path == "/api/config"
-        || path == "/api/save-config";
+        || path == "/api/config";
     if exempt {
         return next.run(request).await;
     }
@@ -577,7 +576,6 @@ fn main() {
                 .route("/", get(handle_index))
                 .route("/logo.png", get(handle_logo))
                 .route("/api/config", get(handle_config))
-                .route("/api/save-config", post(handle_save_config))
                 .route("/api/register", post(handle_register))
                 .route("/api/register_user", post(handle_register_user))
                 .route("/api/login", post(handle_login));
@@ -594,6 +592,7 @@ fn main() {
                 .route("/api/admin/quota", get(handle_admin_quota_get).put(handle_admin_quota_put))
                 .route("/api/admin/audit", get(handle_admin_audit))
                 .route("/api/admin/harness/activate", post(handle_admin_harness_activate))
+                .route("/api/save-config", post(handle_save_config))
                 .route("/v1/chat/completions", post(handle_v1_chat))
                 .layer(from_fn_with_state(state.clone(), auth_middleware));
 

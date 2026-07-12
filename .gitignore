@@ -24,3 +24,9 @@ FULL_REVIEW_*.md
 PLAN.md
 agent_core_*_review_*.md
 agent_core_*_audit_*.md
+
+# 临时/诊断文件（运行时产物，不公开）
+_diag/
+agent_core_run.err
+checkpoints.db
+tests/test_*.py

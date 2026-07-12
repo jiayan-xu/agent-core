@@ -113,9 +113,11 @@
 
 **验收**：
 
-- [ ] 无身份头访问 `/api/chat`、`/v1/chat/completions`、`/api/save-config` → 401。
-- [ ] 默认监听地址为 loopback；改 `0.0.0.0` 时日志有 WARN。
-- [ ] 跨域任意 Origin 默认被拒。
+- [x] 无身份头访问 `/api/chat`、`/v1/chat/completions`、`/api/save-config` → 401。
+- [x] 默认监听地址为 loopback；改 `0.0.0.0` 时日志有 WARN。
+- [x] 跨域任意 Origin 默认被拒。
+
+> 验收补丁（2026-07-12 打标签 v0.4.0 时）：发现 `/api/save-config` 原挂在 `public` 路由（无 auth 中间件），无身份返回 422 而非 401；已移至 `protected` 路由，现无身份→401，壳侧 `x-user-tag` 仍可正常落盘配置。
 
 **借鉴**：企业 Agent「默认最小暴露」；不借鉴云厂商 OAuth 全家桶（可后续可选）。
 
@@ -136,9 +138,9 @@
 
 **验收**：
 
-- [ ] 单测：无 approver 调 `export_*` / `send_email` / `delete_*` → Err，不调用 MCP。
-- [ ] 有 approver：进入 pending，未批准前 MCP 调用次数为 0。
-- [ ] Harness 命中路径同样被拦。
+- [x] 单测：无 approver 调 `export_*` / `send_email` / `delete_*` → Err，不调用 MCP。
+- [x] 有 approver：进入 pending，未批准前 MCP 调用次数为 0。
+- [x] Harness 命中路径同样被拦。
 
 **借鉴**：OpenAI Agents SDK hard guardrails；LangGraph interrupt（语义：暂停等人，不是换框架）。
 
@@ -165,9 +167,9 @@
 
 **验收**：
 
-- [ ] 一次「查昨天进了几车」日志树可见：鉴权 → LLM → 工具选择 → boundary → MCP → 汇总。
-- [ ] 故意错误工具名时，span 标出 cache miss / deny，无 async panic。
-- [ ] 默认不打明文 api_key / badge_token（脱敏）。
+- [x] 一次「查昨天进了几车」日志树可见：鉴权 → LLM → 工具选择 → boundary → MCP → 汇总。
+- [x] 故意错误工具名时，span 标出 cache miss / deny，无 async panic。
+- [x] 默认不打明文 api_key / badge_token（脱敏）。
 
 **借鉴**：Agents SDK / LangSmith 的「形态」；实现保持自研、零框架锁定。
 
@@ -186,8 +188,8 @@
 
 **验收**：
 
-- [ ] 单测覆盖：绕过命名、多语句 SQL、空白名单拒接不可信 MCP 工具。
-- [ ] 与现有 READ 白名单（`execute_sql` / `fuzzy_match_*`）不回归断连修复。
+- [x] 单测覆盖：绕过命名、多语句 SQL、空白名单拒接不可信 MCP 工具。
+- [x] 与现有 READ 白名单（`execute_sql` / `fuzzy_match_*`）不回归断连修复。
 
 ---
 
