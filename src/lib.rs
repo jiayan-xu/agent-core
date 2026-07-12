@@ -9,4 +9,5 @@ pub mod harness;
 pub mod llm;
 pub mod mcp_client;
 pub mod namespace;
+pub mod quota;
 pub mod session;

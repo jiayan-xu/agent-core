@@ -580,6 +580,8 @@ fn main() {
                 .route("/api/sessions/{id}", delete(handle_session_delete))
                 .route("/api/admin/degrade", get(handle_admin_degrade))
                 .route("/api/admin/killswitch", post(handle_admin_killswitch))
+                .route("/api/metrics", get(handle_metrics))
+                .route("/api/admin/quota", get(handle_admin_quota_get).put(handle_admin_quota_put))
                 .route("/v1/chat/completions", post(handle_v1_chat))
                 .layer(from_fn_with_state(state.clone(), auth_middleware));
 
@@ -869,6 +871,73 @@ async fn handle_admin_killswitch(
     if let Some(ref agent) = *guard {
         agent.set_kill_switch(req.enabled);
         Json(agent.degrade_status()).into_response()
+    } else {
+        Json(serde_json::json!({"error": "agent not ready"})).into_response()
+    }
+}
+
+/// P2-1：本机运行指标（命名空间配额用量 + 降级状态）
+async fn handle_metrics(State(st): State<Arc<AppState>>) -> axum::response::Response {
+    let guard = st.agent.lock().await;
+    if let Some(ref agent) = *guard {
+        Json(agent.quota_status()).into_response()
+    } else {
+        Json(serde_json::json!({"error": "agent not ready"})).into_response()
+    }
+}
+
+/// P2-1：查询配额（管理员视角，与 /api/metrics 的 quota 段一致）
+async fn handle_admin_quota_get(State(st): State<Arc<AppState>>) -> axum::response::Response {
+    let guard = st.agent.lock().await;
+    if let Some(ref agent) = *guard {
+        Json(agent.quota_status()).into_response()
+    } else {
+        Json(serde_json::json!({"error": "agent not ready"})).into_response()
+    }
+}
+
+/// P2-1：临时调整某命名空间配额策略（管理员）
+#[derive(Deserialize)]
+struct QuotaPolicyUpdate {
+    namespace: String,
+    #[serde(default)]
+    max_tool_rounds: Option<u32>,
+    #[serde(default)]
+    daily_token_budget: Option<u64>,
+    #[serde(default)]
+    max_concurrent_sessions: Option<u32>,
+}
+
+async fn handle_admin_quota_put(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<QuotaPolicyUpdate>,
+) -> axum::response::Response {
+    let guard = st.agent.lock().await;
+    if let Some(ref agent) = *guard {
+        let mut policy = {
+            let s = agent.quota.lock().unwrap_or_else(|p| p.into_inner());
+            s.get_policy(&req.namespace)
+        };
+        if let Some(v) = req.max_tool_rounds {
+            policy.max_tool_rounds = v;
+        }
+        if let Some(v) = req.daily_token_budget {
+            policy.daily_token_budget = v;
+        }
+        if let Some(v) = req.max_concurrent_sessions {
+            policy.max_concurrent_sessions = v;
+        }
+        agent.set_ns_quota(&req.namespace, policy.clone());
+        Json(serde_json::json!({
+            "ok": true,
+            "namespace": req.namespace,
+            "policy": {
+                "max_tool_rounds": policy.max_tool_rounds,
+                "daily_token_budget": policy.daily_token_budget,
+                "max_concurrent_sessions": policy.max_concurrent_sessions,
+            }
+        }))
+        .into_response()
     } else {
         Json(serde_json::json!({"error": "agent not ready"})).into_response()
     }

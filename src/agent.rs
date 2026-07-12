@@ -15,6 +15,7 @@ use crate::llm::{LlmClient, LlmConfig, Message, ToolDef};
 use crate::mcp_client::{McpClient, McpSource};
 use crate::session::{PendingAction, SessionManager, SessionState};
 use crate::namespace::NamespaceRegistry;
+use crate::quota::NsQuotaStore;
 use crate::approval::ApprovalManager;
 use std::collections::HashMap;
 
@@ -103,6 +104,21 @@ pub struct AgentCore {
     in_progress_step_results: Arc<Mutex<HashMap<u32, String>>>,
     /// P1-5: 降级收缩监视器（MCP 源健康 + Kill switch + 模式推导）
     pub degrade: Arc<DegradeMonitor>,
+    /// P2-1: 命名空间级配额与成本（tool 轮次 / 日 token 预算 / 并发会话）
+    pub quota: Arc<std::sync::Mutex<NsQuotaStore>>,
+}
+
+/// P2-1: 会话级配额守卫（RAII）。离开作用域自动 leave_session，避免并发计数泄漏。
+struct SessionQuotaGuard {
+    quota: Arc<std::sync::Mutex<NsQuotaStore>>,
+    ns: String,
+}
+impl Drop for SessionQuotaGuard {
+    fn drop(&mut self) {
+        if let Ok(mut s) = self.quota.lock() {
+            s.leave_session(&self.ns);
+        }
+    }
 }
 
 struct InboxCache {
@@ -178,6 +194,7 @@ impl AgentCore {
             in_progress_plan: Arc::new(Mutex::new(None)),
             in_progress_step_results: Arc::new(Mutex::new(HashMap::new())),
             degrade,
+            quota: Arc::new(std::sync::Mutex::new(NsQuotaStore::new())),
         }
     }
 
@@ -227,6 +244,27 @@ impl AgentCore {
 
         // ── P1-5: 降级模式 trace（故障可观测） ──
         tracing::info!(degrade_mode = %self.current_degrade_mode().as_str(), "chat 入口降级模式");
+
+        // ── P2-1: 并发会话配额（RAII 守卫，离开作用域自动 leave_session） ──
+        let caller_ns_quota = self.caller_ns(session_id);
+        let _quota_guard = match self
+            .quota
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .enter_session(&caller_ns_quota)
+        {
+            Ok(()) => Some(SessionQuotaGuard {
+                quota: self.quota.clone(),
+                ns: caller_ns_quota.clone(),
+            }),
+            Err(e) => {
+                tracing::warn!("[QUOTA] 命名空间『{}』并发会话超限: {}", caller_ns_quota, e);
+                return format!(
+                    "⚠️ 命名空间『{}』并发会话已达上限：{}。请稍后重试或合并请求。",
+                    caller_ns_quota, e
+                );
+            }
+        };
 
         // ── 提示词注入检测 ──
         let detector = PromptInjectionDetector::new();
@@ -934,7 +972,39 @@ impl AgentCore {
             }
         }
 
+        // P2-1: 配额命名空间（与 call_tool_routed 保持一致）
+        let quota_ns_llm = allowed_ns
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.caller_ns(session_id));
+
         for _round in 0..self.config.max_tool_rounds {
+            // P2-1: 日 token 预算预估（请求上下文体量），超限硬拒
+            let ctx_chars: usize = messages
+                .iter()
+                .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
+                .sum();
+            let req_est = ((raw_message.len() + ctx_chars) as u64) / 4;
+            let budget_check = self
+                .quota
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .check_token_budget(&quota_ns_llm, req_est);
+            if let Err(e) = budget_check {
+                tracing::warn!("[QUOTA] 命名空间『{}』token 预算不足: {}", quota_ns_llm, e);
+                self.audit_logger
+                    .log_decision(
+                        &self.config.identity.agent_id,
+                        "<llm>",
+                        &format!("QuotaExceeded(token_budget): {}", e),
+                        false,
+                    )
+                    .await;
+                return format!(
+                    "⚠️ 命名空间『{}』当日 token 预算已用尽：{}。请于次日或联系管理员提升配额。",
+                    quota_ns_llm, e
+                );
+            }
             let response = match self.llm.chat(&messages, &tools).await {
                 Ok(r) => r,
                 // P1-5：LLM 主/备 Provider 均失败 → 返回「可重试错误」，而非裸崩
@@ -943,6 +1013,12 @@ impl AgentCore {
                     return "⚠️ LLM 服务暂时不可用（已尝试主用与备用 Provider 均失败）。请稍后重试，或检查网络与 API 密钥配置。".to_string();
                 }
             };
+            // P2-1: 记录本次 token 消耗（请求 + 响应估算），跨天自动重置
+            let resp_est = (response.text.len() as u64) / 4;
+            self.quota
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .record_token(&quota_ns_llm, req_est + resp_est);
 
             // 无工具调用 → LLM 直接回复
             if response.tool_calls.is_empty() {
@@ -1403,6 +1479,35 @@ impl AgentCore {
             );
         }
 
+        // ── P2-1 配额门控（命名空间级工具轮次） ──
+        // 配额维度取调用者主命名空间（allowed_ns 首个；为空回退 agent 自身 ns）
+        let quota_ns = allowed_ns
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.config.identity.ns());
+        // 先把结果绑定到局部变量，确保 MutexGuard 临时量在此语句结束即释放
+        // （否则 guard 在 if let 块内跨 .await 存活，违反 Send 约束）
+        let quota_check = self
+            .quota
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .check_tool_round(&quota_ns);
+        if let Err(e) = quota_check {
+            tracing::warn!("[QUOTA] 命名空间『{}』工具轮次超限: {}", quota_ns, e);
+            self.audit_logger
+                .log_decision(
+                    &self.config.identity.agent_id,
+                    tool_name,
+                    &format!("QuotaExceeded(tool_rounds): {}", e),
+                    false,
+                )
+                .await;
+            return Err(format!(
+                "⚠️ 命名空间『{}』工具调用已达当日轮次上限：{}。请于次日或联系管理员提升配额。",
+                quota_ns, e
+            ));
+        }
+
         // 解析工具所属 MCP 源
         let idx = self.tool_route_cache.lock().await.get(tool_name).copied();
         let mode = self.current_degrade_mode();
@@ -1668,6 +1773,27 @@ impl AgentCore {
     /// P1-5：运行时切换 Kill switch（管理端点调用）。
     pub fn set_kill_switch(&self, on: bool) {
         self.degrade.set_kill_switch(on);
+    }
+
+    /// P2-1：配额 + 降级联合运行状态（供 `/api/metrics`）。
+    pub fn quota_status(&self) -> serde_json::Value {
+        let quota = self
+            .quota
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .status();
+        serde_json::json!({
+            "quota": quota,
+            "degrade": self.degrade_status(),
+        })
+    }
+
+    /// P2-1：管理员临时调整某命名空间配额策略（供 `/api/admin/quota` PUT）。
+    pub fn set_ns_quota(&self, ns: &str, policy: crate::quota::NsQuotaPolicy) {
+        self.quota
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_policy(ns, policy);
     }
 
     pub async fn fetch_tools(&self) -> Vec<ToolDef> {
