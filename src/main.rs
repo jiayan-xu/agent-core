@@ -85,6 +85,61 @@ fn default_server() -> String { "http://127.0.0.1:9003".to_string() }
 fn default_port() -> u16 { 9753 }
 fn default_host() -> String { "127.0.0.1".to_string() }
 
+/// P2-6：配置字符串脱敏——将 `${VAR}` / `$VAR` 替换为环境变量值。
+/// 用于让 `agent.toml` 不落盘明文密钥：写 `token = "${DEPT_MCP_TOKEN}"`，
+/// 运行时从环境注入。未设置的变量原样保留（便于发现配置缺失）。
+/// 仅作用于字符串字段，不影响数字/布尔。
+fn expand_env(value: &str) -> String {
+    if !value.contains('$') {
+        return value.to_string();
+    }
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            if chars.peek() == Some(&'{') {
+                chars.next(); // 消费 '{'
+                let mut name = String::new();
+                let mut closed = false;
+                while let Some(&nc) = chars.peek() {
+                    if nc == '}' { chars.next(); closed = true; break; }
+                    name.push(nc);
+                    chars.next();
+                }
+                if closed {
+                    if let Ok(v) = std::env::var(&name) {
+                        result.push_str(&v);
+                    }
+                    // 未设置：保留 ${NAME} 原样
+                } else {
+                    result.push_str("${");
+                    result.push_str(&name);
+                }
+            } else {
+                let mut name = String::new();
+                while let Some(&nc) = chars.peek() {
+                    if nc.is_alphanumeric() || nc == '_' {
+                        name.push(nc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if !name.is_empty() {
+                    if let Ok(v) = std::env::var(&name) {
+                        result.push_str(&v);
+                    }
+                } else {
+                    result.push('$');
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 impl Config {
     fn configured(&self) -> bool {
         !self.agent_id.is_empty() && !self.api_key.is_empty()
@@ -273,7 +328,20 @@ fn load_or_create_config() -> Config {
     let path = config_path();
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(mut cfg) = toml::from_str::<Config>(&text) {
-            // 环境变量覆盖（环境变量 > 配置文件）
+            // P2-6：先展开配置中的 ${ENV} 占位符，避免明文密钥落盘
+            cfg.api_key = expand_env(&cfg.api_key);
+            cfg.memoria_admin_key = expand_env(&cfg.memoria_admin_key);
+            cfg.server = expand_env(&cfg.server);
+            for src in &mut cfg.mcp_source {
+                src.url = expand_env(&src.url);
+                src.token = expand_env(&src.token);
+                src.command = expand_env(&src.command);
+                src.args = src.args.iter().map(|a| expand_env(a)).collect();
+                if let Some(ns) = src.namespace.as_mut() {
+                    *ns = expand_env(ns);
+                }
+            }
+            // 环境变量覆盖（环境变量 > 配置文件，仍生效）
             if let Ok(key) = std::env::var("AGENT_API_KEY") {
                 if !key.is_empty() {
                     cfg.api_key = key;

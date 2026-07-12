@@ -1,0 +1,67 @@
+# agent-core 配置示例模板（占位符版）
+#
+# 复制为 agent.toml 后按需修改。本文件不进入版本控制（已在 .gitignore）。
+# 安全约定（P2-6）：
+#   - 所有密钥一律通过环境变量注入，禁止在配置中写明文。
+#   - 支持 ${ENV_VAR} 语法，运行时自动替换为环境变量值。
+#   - agent_id / api_key / memoria_admin_key 也可由环境变量 AGENT_API_KEY / MEMORIA_ADMIN_KEY 直接覆盖。
+
+# 本 agent 的身份标识（用于向 Memoria 注册 / 审计）
+agent_id = "my-agent"
+
+# LLM API key —— 留空，从环境变量 AGENT_API_KEY 注入（不要写明文）
+api_key = "${AGENT_API_KEY}"
+
+# Memoria 地址（记忆 / 知识共享 / 身份鉴权后端）
+server = "http://127.0.0.1:9003"
+
+# HTTP 监听端口
+port = 9753
+
+# 监听地址（默认仅本机；公开部署请改用反向代理 + TLS）
+host = "127.0.0.1"
+
+# Memoria 管理员密钥 —— 留空，从环境变量 MEMORIA_ADMIN_KEY 注入
+memoria_admin_key = "${MEMORIA_ADMIN_KEY}"
+
+# 跨域白名单（留空 = 仅允许本机 127.0.0.1/localhost:<port>）
+# cors_origins = ["http://127.0.0.1:8000"]
+
+# ── 命名空间树（与 memoria agent_registry.namespace 对齐）────────────
+# org/<组织>
+# └── div/<业务线>
+#     └── dept/<部门>
+#         ├── proj/<项目A>
+#         └── proj/<项目B>
+# MCP 源的 namespace 决定「谁能调用该工具」（包含匹配，见 memoria auth.rs）：
+#   - 源省略 namespace      → 全局可见（人人可调用）
+#   - 源带 namespace         → 仅当调用者的 allowed_ns 与之存在祖先/后代/自身关系时可见
+
+# ── 示例 1：本地 stdio MCP（无登录要求，PFAiX 默认走它）──────────────
+# 直接接线仓库内 examples/skills/echo 示例（零机密、仅回显，用于验证链路）
+[[mcp_source]]
+name = "echo-demo"
+url = ""
+command = "python"
+args = ["examples/skills/echo/server.py"]
+# token 留空（示例服务不需要鉴权）；需要时可写 token = "${ECHO_MCP_TOKEN}"
+
+# ── 示例 2：公司级 MCP（全员可见）────────────────────────────────────
+# [[mcp_source]]
+# name = "company-hr"
+# url = "http://company-mcp.internal/hr/mcp"
+# token = "${COMPANY_MCP_TOKEN}"
+
+# ── 示例 3：部门级 MCP（仅该部门及其下级可见）────────────────────────
+# [[mcp_source]]
+# name = "finance-dept"
+# url = "http://dept-mcp.internal/finance/mcp"
+# token = "${FINANCE_MCP_TOKEN}"
+# namespace = "org/<组织>/div/<业务线>/dept/<部门>"
+
+# ── 示例 4：项目级 MCP（仅该项目及其上级可见）────────────────────────
+# [[mcp_source]]
+# name = "dashboard-p1"
+# url = "http://127.0.0.1:8001/mcp"
+# token = "${P1_MCP_TOKEN}"
+# namespace = "org/<组织>/div/<业务线>/dept/<部门>/proj/<项目A>"
