@@ -53,7 +53,7 @@ Company MCP (enterprise-wide skills: auth, HR policies, org data)
                      └───────────────┘
 ```
 
-**Desktop App** 是桌面壳 **Jan / PFAiX**（官方壳，基于 Tauri）——只做壳，不直接连内网 Memoria，所有请求经 agent-core 转发。任何 MCP 兼容客户端亦可接入。
+**Desktop App** 是桌面壳 **Jan / PFAiX**（官方壳，基于 Tauri）——只做壳，不直接连内网 Memoria，所有请求经 agent-core 转发。任何 MCP 兼容客户端亦可接入。壳与引擎的边界与序列图见 [`docs/SHELL_ENGINE_BOUNDARY.md`](docs/SHELL_ENGINE_BOUNDARY.md)。
 **Agent-Core** handles reasoning, tool routing, safety, and skill management.
 **Memoria** provides persistent memory and cross-agent knowledge sharing.
 **MCP Sources** define what each user/role can do — no more, no less.
