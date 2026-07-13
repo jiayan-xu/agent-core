@@ -58,6 +58,7 @@ async fn eval_e06_unknown_tool_no_panic() {
             "this_tool_does_not_exist_xyz",
             &serde_json::json!({}),
             &["agent/eval-agent".to_string()],
+            "eval-e06",
         )
         .await;
     assert!(res.is_err(), "未知工具应被拒绝（Err），而非 panic");
@@ -162,7 +163,7 @@ async fn eval_e07_mcp_down_degrade() {
     let status2 = agent.degrade_status();
     assert_eq!(status2["mode"].as_str(), Some("kill_switch"));
     let res = agent
-        .call_tool_routed("any_tool", &serde_json::json!({}), &[])
+        .call_tool_routed("any_tool", &serde_json::json!({}), &[], "eval-e07")
         .await;
     assert!(res.is_err(), "Kill switch 开启时任何工具调用必须被拒绝");
     agent.set_kill_switch(false);

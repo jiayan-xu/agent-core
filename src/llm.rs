@@ -315,7 +315,6 @@ impl LlmClient {
 
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
-        let _tool_call_buf: Option<String> = None;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result.map_err(|e| format!("stream read: {}", e))?;
