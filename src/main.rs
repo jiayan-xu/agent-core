@@ -6,33 +6,41 @@
 
 // P2-1 修复：仅 release 模式下隐藏控制台窗口，debug 模式保留
 // --service 模式仍需控制台输出用于调试，通过 Cargo features 控制
-#![cfg_attr(all(not(debug_assertions), not(feature = "service")), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), not(feature = "service")),
+    windows_subsystem = "windows"
+)]
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use std::convert::Infallible;
-use std::collections::HashMap;
 use agent_core::checkpoint::CheckpointStore;
-use chrono::{Local, Timelike};
 use axum::{
-    Router, routing::{get, post, delete},
-    Json, extract::{State, Extension, Request}, response::{sse::{Sse, Event as SseEvent}, IntoResponse},
-    middleware::{Next, from_fn_with_state},
+    extract::{Extension, Request, State},
+    middleware::{from_fn_with_state, Next},
+    response::{
+        sse::{Event as SseEvent, Sse},
+        IntoResponse,
+    },
+    routing::{delete, get, post},
+    Json, Router,
 };
-use tower_http::cors::{CorsLayer, AllowOrigin, Any};
-use tracing_subscriber::EnvFilter;
+use chrono::{Local, Timelike};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
-use tokio::time::interval;
-use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::Instrument;
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tao::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
     window::WindowBuilder,
 };
+use tokio::sync::Mutex;
+use tokio::time::interval;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tracing::Instrument;
+use tracing_subscriber::EnvFilter;
 use wry::WebViewBuilder;
 
 use agent_core::agent::{AgentConfig, AgentCore, AgentIdentity};
@@ -81,9 +89,15 @@ struct McpSourceConfig {
     namespace: Option<String>,
 }
 
-fn default_server() -> String { "http://127.0.0.1:9003".to_string() }
-fn default_port() -> u16 { 9753 }
-fn default_host() -> String { "127.0.0.1".to_string() }
+fn default_server() -> String {
+    "http://127.0.0.1:9003".to_string()
+}
+fn default_port() -> u16 {
+    9753
+}
+fn default_host() -> String {
+    "127.0.0.1".to_string()
+}
 
 /// P2-6：配置字符串脱敏——将 `${VAR}` / `$VAR` 替换为环境变量值。
 /// 用于让 `agent.toml` 不落盘明文密钥：写 `token = "${DEPT_MCP_TOKEN}"`，
@@ -102,7 +116,11 @@ fn expand_env(value: &str) -> String {
                 let mut name = String::new();
                 let mut closed = false;
                 while let Some(&nc) = chars.peek() {
-                    if nc == '}' { chars.next(); closed = true; break; }
+                    if nc == '}' {
+                        chars.next();
+                        closed = true;
+                        break;
+                    }
                     name.push(nc);
                     chars.next();
                 }
@@ -147,14 +165,46 @@ impl Config {
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatRequest { message: String, #[serde(default = "default_sid")] session_id: String }
-fn default_sid() -> String { "default".to_string() }
+struct ChatRequest {
+    message: String,
+    #[serde(default = "default_sid")]
+    session_id: String,
+}
+fn default_sid() -> String {
+    "default".to_string()
+}
 #[derive(Debug, Serialize)]
-struct ChatResponse { reply: String, session_id: String }
+struct ChatResponse {
+    reply: String,
+    session_id: String,
+}
 #[derive(Debug, Deserialize)]
-struct SetupRequest { agent_id: String, api_key: String, #[serde(default)] server: String }
+struct SetupRequest {
+    agent_id: String,
+    api_key: String,
+    #[serde(default)]
+    server: String,
+}
 #[derive(Debug, Serialize)]
-struct SetupResponse { ok: bool, error: Option<String> }
+struct SetupResponse {
+    ok: bool,
+    error: Option<String>,
+}
+
+/// 协作收件箱列表查询参数（GET /api/collab/inbox）
+#[derive(Debug, serde::Deserialize)]
+struct CollabInboxQuery {
+    /// 逗号分隔的 type 白名单：approval_request,approval_response,query,query_result,notify,message
+    types: Option<String>,
+    /// 逗号分隔的 scope 白名单：org,dept,proj,agent
+    scopes: Option<String>,
+    /// 页码（从 0 开始）
+    page: Option<usize>,
+    /// 每页大小（1..=200）
+    limit: Option<usize>,
+    /// 传 "1"/"true" 表示本次读取后标记已读（更新未读游标）
+    mark_seen: Option<String>,
+}
 
 struct AppState {
     config: Mutex<Config>,
@@ -168,6 +218,8 @@ struct AppState {
     /// 仅以 agent_id 为 key（token 已在 Memoria 端验证过，不在内存留存明文 key，P1-1）
     /// 短 TTL（60s）以在「每次请求反查 memoria」的性能与「权限即时生效」间取平衡（R1）
     ns_cache: tokio::sync::Mutex<HashMap<String, (Vec<String>, std::time::Instant)>>,
+    /// 协作收件箱「已读游标」：agent_id → 最近一次查看的 ISO 时间（用于未读计数）
+    collab_seen: tokio::sync::Mutex<HashMap<String, String>>,
 }
 
 /// 构造 401 未授权响应
@@ -175,7 +227,8 @@ fn unauthorized(message: &str) -> axum::response::Response {
     (
         axum::http::StatusCode::UNAUTHORIZED,
         axum::Json(serde_json::json!({"error": "unauthorized", "message": message})),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// 身份认证：从 header 取 X-Agent-Id + X-Agent-Key，向 Memoria 反查调用者命名空间授权。
@@ -208,7 +261,9 @@ async fn authenticate(
     } else {
         // P2-2：鉴权失败审计（无身份）
         if let Some(ref a) = *st.agent.lock().await {
-            a.audit_logger.auth_fail("", "缺少身份标识（x-agent-id / x-user-tag 均未提供）").await;
+            a.audit_logger
+                .auth_fail("", "缺少身份标识（x-agent-id / x-user-tag 均未提供）")
+                .await;
         }
         return Err(unauthorized("请先通过 /api/register 注册身份"));
     };
@@ -228,7 +283,10 @@ async fn authenticate(
     } else {
         admin_key.clone()
     };
-    let (server, actor) = { let cfg = st.config.lock().await; (cfg.server.clone(), cfg.agent_id.clone()) };
+    let (server, actor) = {
+        let cfg = st.config.lock().await;
+        (cfg.server.clone(), cfg.agent_id.clone())
+    };
     let mut allowed_ns: Vec<String> = {
         let cache = st.ns_cache.lock().await;
         cache
@@ -239,12 +297,19 @@ async fn authenticate(
     };
     if allowed_ns.is_empty() {
         let mcp = McpClient::new(&server, &agent_id, &agent_key);
-        match mcp.call_json("get_allowed_ns", &serde_json::json!({})).await {
+        match mcp
+            .call_json("get_allowed_ns", &serde_json::json!({}))
+            .await
+        {
             Ok(v) => {
                 allowed_ns = v
                     .get("allowed_ns")
                     .and_then(|a| a.as_array())
-                    .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
                     .unwrap_or_default();
             }
             Err(_) => {}
@@ -263,12 +328,17 @@ async fn authenticate(
             // 后续请求（缓存失效后重查）仍同时持有这两个 ns，不会因回读而丢失 dashboard。
             let install_ns = format!("agent/{},org/cs-pufa-2nd-thermal", agent_id);
             let reg = McpClient::new(&server, &actor, &admin_key);
-            let _ = reg.call_json("register_agent", &serde_json::json!({
-                "agent_id": &agent_id,
-                "display_name": &agent_id,
-                "admin_key": &admin_key,
-                "namespace": &install_ns
-            })).await;
+            let _ = reg
+                .call_json(
+                    "register_agent",
+                    &serde_json::json!({
+                        "agent_id": &agent_id,
+                        "display_name": &agent_id,
+                        "admin_key": &admin_key,
+                        "namespace": &install_ns
+                    }),
+                )
+                .await;
             allowed_ns = vec![
                 format!("agent/{}", agent_id),
                 "org/cs-pufa-2nd-thermal".to_string(),
@@ -284,10 +354,10 @@ async fn authenticate(
             // 不向外部暴露内部错误细节（R6）
             return Err(unauthorized("身份校验失败，请稍后重试"));
         }
-        st.ns_cache
-            .lock()
-            .await
-            .insert(agent_id.clone(), (allowed_ns.clone(), std::time::Instant::now()));
+        st.ns_cache.lock().await.insert(
+            agent_id.clone(),
+            (allowed_ns.clone(), std::time::Instant::now()),
+        );
     }
     Ok((agent_id, allowed_ns))
 }
@@ -318,7 +388,10 @@ async fn auth_middleware(
     match authenticate(request.headers(), &st).await {
         Ok((agent_id, allowed_ns)) => {
             let mut req = request;
-            req.extensions_mut().insert(AuthContext { agent_id, allowed_ns });
+            req.extensions_mut().insert(AuthContext {
+                agent_id,
+                allowed_ns,
+            });
             next.run(req).await
         }
         Err(resp) => resp,
@@ -418,7 +491,8 @@ async fn trace_middleware(request: Request, next: Next) -> axum::response::Respo
     let trace_id = format!("{:x}", rand::thread_rng().gen::<u128>());
     let path = request.uri().path().to_string();
     let method = request.method().to_string();
-    let span = tracing::info_span!("http.request", trace_id = %trace_id, method = %method, path = %path);
+    let span =
+        tracing::info_span!("http.request", trace_id = %trace_id, method = %method, path = %path);
     let mut res = next.run(request).instrument(span).await;
     if let Ok(v) = axum::http::HeaderValue::try_from(trace_id) {
         res.headers_mut().insert("x-trace-id", v);
@@ -439,7 +513,10 @@ fn main() {
     let url = format!("http://{}/", addr);
 
     if host != "127.0.0.1" && host != "::1" && host != "localhost" {
-        eprintln!("⚠️  服务监听地址 {} 不是本地回环，生产环境请确认防火墙/CORS 策略", host);
+        eprintln!(
+            "⚠️  服务监听地址 {} 不是本地回环，生产环境请确认防火墙/CORS 策略",
+            host
+        );
     }
 
     // ── 启动 axum 后台服务 ──
@@ -461,6 +538,7 @@ fn main() {
                 config_path: path,
                 auth_cache: tokio::sync::Mutex::new(HashMap::new()),
                 ns_cache: tokio::sync::Mutex::new(HashMap::new()),
+                collab_seen: tokio::sync::Mutex::new(HashMap::new()),
             });
 
             // 先绑定端口，确保服务立即可用（即使 Memoria 慢/未就绪也不阻塞启动）
@@ -480,7 +558,10 @@ fn main() {
                 tokio::spawn(async move {
                     match build_agent(&reg_config).await {
                         Ok(agent) => {
-                            println!("✓ Agent 已就绪（{}@{}）", reg_config.agent_id, reg_config.server);
+                            println!(
+                                "✓ Agent 已就绪（{}@{}）",
+                                reg_config.agent_id, reg_config.server
+                            );
                             *reg_state.agent.lock().await = Some(agent);
                         }
                         Err(e) => {
@@ -509,19 +590,32 @@ fn main() {
                             match agent.call_tool_routed(tool, args, &agent_ns, "").await {
                                 Ok(reply) => {
                                     fail_count = 0;
-                                    tracing::info!("巡检 {}: {}", tool, &reply.chars().take(60).collect::<String>());
+                                    tracing::info!(
+                                        "巡检 {}: {}",
+                                        tool,
+                                        &reply.chars().take(60).collect::<String>()
+                                    );
                                 }
                                 Err(e) => {
                                     fail_count = fail_count.saturating_add(1);
                                     if fail_count >= 3 {
-                                        tracing::error!("巡检连续失败 {} 次，工具 {}", fail_count, tool);
+                                        tracing::error!(
+                                            "巡检连续失败 {} 次，工具 {}",
+                                            fail_count,
+                                            tool
+                                        );
                                     } else {
-                                        tracing::warn!("巡检 {} 失败: {}（第 {} 次）", tool, e, fail_count);
+                                        tracing::warn!(
+                                            "巡检 {} 失败: {}（第 {} 次）",
+                                            tool,
+                                            e,
+                                            fail_count
+                                        );
                                     }
                                 }
                             }
                         }
-                    // 每 4 轮（约 2 小时）执行一次洞见发现
+                        // 每 4 轮（约 2 小时）执行一次洞见发现
                         if insight_cycle % 4 == 0 {
                             let insight = agent.run_insights(&agent_ns).await;
                             tracing::info!("{}", insight);
@@ -531,7 +625,11 @@ fn main() {
                         if (2..=4).contains(&hour) {
                             let ns_list = std::env::var("CONSOLIDATE_NAMESPACES")
                                 .unwrap_or_else(|_| "agent/xujiayan".to_string());
-                            for ns in ns_list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                            for ns in ns_list
+                                .split(',')
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                            {
                                 let res = agent.consolidate(ns).await;
                                 tracing::info!("[consolidate] {}", res);
                             }
@@ -544,25 +642,37 @@ fn main() {
                         if !agent_ok {
                             // P0-3 修复：dashboard 凭据移出源码，改读环境变量。
                             // DASHBOARD_USER 默认 admin；DASHBOARD_PASSWORD 未设置则跳过重启（不泄露/不崩溃）。
-                            let dash_user = std::env::var("DASHBOARD_USER").unwrap_or_else(|_| "admin".to_string());
+                            let dash_user = std::env::var("DASHBOARD_USER")
+                                .unwrap_or_else(|_| "admin".to_string());
                             let dash_pass = std::env::var("DASHBOARD_PASSWORD").unwrap_or_default();
                             if dash_pass.is_empty() {
-                                tracing::warn!("未设置 DASHBOARD_PASSWORD，跳过 dashboard agent worker 重启");
+                                tracing::warn!(
+                                    "未设置 DASHBOARD_PASSWORD，跳过 dashboard agent worker 重启"
+                                );
                             } else {
                                 tracing::warn!("Agent worker 无响应，通过 dashboard API 重启");
                                 let client = reqwest::Client::new();
-                                if let Ok(login) = client.post("http://127.0.0.1:8000/api/login")
-                                    .form(&[("username", dash_user.as_str()), ("password", dash_pass.as_str())])
-                                    .send().await
+                                if let Ok(login) = client
+                                    .post("http://127.0.0.1:8000/api/login")
+                                    .form(&[
+                                        ("username", dash_user.as_str()),
+                                        ("password", dash_pass.as_str()),
+                                    ])
+                                    .send()
+                                    .await
                                 {
-                                    let cookie = login.headers().get("set-cookie")
+                                    let cookie = login
+                                        .headers()
+                                        .get("set-cookie")
                                         .and_then(|v| v.to_str().ok())
                                         .unwrap_or("")
                                         .to_string();
                                     if !cookie.is_empty() {
-                                        let _ = client.post("http://127.0.0.1:8000/api/snmis/agent/start")
+                                        let _ = client
+                                            .post("http://127.0.0.1:8000/api/snmis/agent/start")
                                             .header("Cookie", &cookie)
-                                            .send().await;
+                                            .send()
+                                            .await;
                                     }
                                 }
                             }
@@ -590,10 +700,17 @@ fn main() {
                 .route("/api/admin/degrade", get(handle_admin_degrade))
                 .route("/api/admin/killswitch", post(handle_admin_killswitch))
                 .route("/api/metrics", get(handle_metrics))
-                .route("/api/admin/quota", get(handle_admin_quota_get).put(handle_admin_quota_put))
+                .route(
+                    "/api/admin/quota",
+                    get(handle_admin_quota_get).put(handle_admin_quota_put),
+                )
                 .route("/api/admin/audit", get(handle_admin_audit))
-                .route("/api/admin/harness/activate", post(handle_admin_harness_activate))
+                .route(
+                    "/api/admin/harness/activate",
+                    post(handle_admin_harness_activate),
+                )
                 .route("/api/save-config", post(handle_save_config))
+                .route("/api/collab/inbox", get(handle_collab_inbox))
                 .route("/v1/chat/completions", post(handle_v1_chat))
                 .layer(from_fn_with_state(state.clone(), auth_middleware));
 
@@ -617,7 +734,9 @@ fn main() {
     if is_service {
         // 服务模式：保持后台运行
         println!("[agent-core] 服务模式运行中 :{}", port);
-        loop { std::thread::sleep(Duration::from_secs(3600)); }
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
     }
 
     // ── tao 桌面窗口（无黑框） ──
@@ -630,15 +749,16 @@ fn main() {
         .build(&event_loop)
         .expect("创建窗口失败");
 
-    let _webview = WebViewBuilder::new()
-        .with_url(&url)
-        .build(&window);
+    let _webview = WebViewBuilder::new().with_url(&url).build(&window);
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
-            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => {
                 *control_flow = ControlFlow::Exit;
             }
             _ => (),
@@ -664,7 +784,10 @@ async fn handle_logo() -> impl axum::response::IntoResponse {
             return ([(axum::http::header::CONTENT_TYPE, "image/png")], data);
         }
     }
-    ([(axum::http::header::CONTENT_TYPE, "text/plain")], "logo not found".into())
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain")],
+        "logo not found".into(),
+    )
 }
 
 /// 公开健康检查（无鉴权）。供 PFAiX 状态条 / 诊断包探测。
@@ -710,9 +833,17 @@ async fn handle_save_config(
     match build_agent(&cfg).await {
         Ok(agent) => {
             *st.agent.lock().await = Some(agent);
-            Json(SetupResponse { ok: true, error: None }).into_response()
+            Json(SetupResponse {
+                ok: true,
+                error: None,
+            })
+            .into_response()
         }
-        Err(e) => Json(SetupResponse { ok: false, error: Some(e) }).into_response(),
+        Err(e) => Json(SetupResponse {
+            ok: false,
+            error: Some(e),
+        })
+        .into_response(),
     }
 }
 
@@ -723,10 +854,25 @@ async fn handle_chat(
 ) -> axum::response::Response {
     let agent_guard = st.agent.lock().await;
     if let Some(ref agent) = *agent_guard {
-        let reply = agent.chat(&req.message, &ctx.agent_id, &req.session_id, &ctx.allowed_ns).await;
-        Json(ChatResponse { reply, session_id: req.session_id }).into_response()
+        let reply = agent
+            .chat(
+                &req.message,
+                &ctx.agent_id,
+                &req.session_id,
+                &ctx.allowed_ns,
+            )
+            .await;
+        Json(ChatResponse {
+            reply,
+            session_id: req.session_id,
+        })
+        .into_response()
     } else {
-        Json(ChatResponse { reply: "请先在设置页面配置 API 密钥。".to_string(), session_id: req.session_id }).into_response()
+        Json(ChatResponse {
+            reply: "请先在设置页面配置 API 密钥。".to_string(),
+            session_id: req.session_id,
+        })
+        .into_response()
     }
 }
 
@@ -736,9 +882,10 @@ async fn handle_chat_stream(
     Extension(ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<ChatRequest>,
 ) -> axum::response::Response {
-    let (tx, rx): (tokio::sync::mpsc::UnboundedSender<Result<SseEvent, Infallible>>,
-                   tokio::sync::mpsc::UnboundedReceiver<Result<SseEvent, Infallible>>)
-        = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx): (
+        tokio::sync::mpsc::UnboundedSender<Result<SseEvent, Infallible>>,
+        tokio::sync::mpsc::UnboundedReceiver<Result<SseEvent, Infallible>>,
+    ) = tokio::sync::mpsc::unbounded_channel();
 
     let agent_guard = st.agent.lock().await;
     let has_agent = agent_guard.is_some();
@@ -767,7 +914,9 @@ async fn handle_chat_stream(
             let _ = tx.send(Ok(SseEvent::default().data("").event("done")));
         });
     } else {
-        let _ = tx.send(Ok(SseEvent::default().data("请先在设置页面配置 API 密钥。").event("text")));
+        let _ = tx.send(Ok(SseEvent::default()
+            .data("请先在设置页面配置 API 密钥。")
+            .event("text")));
         let _ = tx.send(Ok(SseEvent::default().data("").event("done")));
     }
 
@@ -776,7 +925,11 @@ async fn handle_chat_stream(
 
 /// 获取会话列表
 async fn handle_sessions(State(_st): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let db_path = std::env::current_dir().unwrap_or_default().join("harness.db").to_string_lossy().to_string();
+    let db_path = std::env::current_dir()
+        .unwrap_or_default()
+        .join("harness.db")
+        .to_string_lossy()
+        .to_string();
 
     let sessions = tokio::task::spawn_blocking(move || {
         let mut result = Vec::new();
@@ -784,7 +937,7 @@ async fn handle_sessions(State(_st): State<Arc<AppState>>) -> Json<serde_json::V
             if let Ok(mut stmt) = conn.prepare(
                 "SELECT session_id, role, content, created_at FROM chat_history WHERE id IN (
                     SELECT MIN(id) FROM chat_history GROUP BY session_id
-                ) AND role = 'user' ORDER BY id DESC LIMIT 50"
+                ) AND role = 'user' ORDER BY id DESC LIMIT 50",
             ) {
                 if let Ok(rows) = stmt.query_map([], |row| {
                     let sid: String = row.get(0)?;
@@ -804,9 +957,120 @@ async fn handle_sessions(State(_st): State<Arc<AppState>>) -> Json<serde_json::V
             }
         }
         result
-    }).await.unwrap_or_default();
+    })
+    .await
+    .unwrap_or_default();
 
     Json(serde_json::json!({"sessions": sessions}))
+}
+
+/// 协作收件箱（A2A）：拉取调用者身份下的规范化信封，支持 type/scope 过滤与未读计数。
+/// 读操作，沿用 authenticate 中间件（x-agent-id / x-agent-key）。
+async fn handle_collab_inbox(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<CollabInboxQuery>,
+) -> axum::response::Response {
+    let (agent_id, _allowed_ns) = match authenticate(&headers, &st).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let agent_key = headers
+        .get("x-agent-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // 拉取（持有 agent 锁的模式与 handle_chat 一致）
+    let raw = {
+        let agent_guard = st.agent.lock().await;
+        if let Some(ref agent) = *agent_guard {
+            let limit = q.limit.unwrap_or(50).clamp(1, 200) as u32;
+            match agent.collab_inbox_raw(&agent_id, &agent_key, limit).await {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        axum::Json(serde_json::json!({"error": e})),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::json!({"error": "agent 尚未就绪"})),
+            )
+                .into_response();
+        }
+    };
+
+    // type / scope 过滤
+    let types: Vec<&str> = q
+        .types
+        .as_deref()
+        .map(|s| s.split(',').filter(|x| !x.is_empty()).collect())
+        .unwrap_or_default();
+    let scopes: Vec<&str> = q
+        .scopes
+        .as_deref()
+        .map(|s| s.split(',').filter(|x| !x.is_empty()).collect())
+        .unwrap_or_default();
+    let filtered: Vec<serde_json::Value> = raw
+        .into_iter()
+        .filter(|m| {
+            let t = m["type"].as_str().unwrap_or("");
+            let sc = m["scope"].as_str().unwrap_or("agent");
+            (types.is_empty() || types.contains(&t)) && (scopes.is_empty() || scopes.contains(&sc))
+        })
+        .collect();
+
+    // 未读：与已读游标比较。信封 created_at 有两种常见格式
+    // （PFAiX 结构化信封为 ISO `2026-07-13T23:50:00Z`，Memoria 旧消息为
+    // `2026-07-13 23:50:00`），统一归一化为 `YYYY-MM-DD HH:MM:SS` 后再字典序比较，
+    // 避免格式不一致导致 mark_seen 永远不生效（未读角标无法清零）。
+    let norm_ts = |s: &str| -> String { s.replace('T', " ").replace('Z', "").replace('z', "") };
+    let seen = { st.collab_seen.lock().await.get(&agent_id).cloned() };
+    let seen_norm = seen.as_deref().map(|s| norm_ts(s));
+    let unread_count = filtered
+        .iter()
+        .filter(|m| {
+            let t = norm_ts(m["created_at"].as_str().unwrap_or(""));
+            match &seen_norm {
+                Some(s) => t > *s,
+                None => true,
+            }
+        })
+        .count();
+
+    if q.mark_seen.as_deref() == Some("1") || q.mark_seen.as_deref() == Some("true") {
+        // 游标推进到「当前返回信封中最大的 created_at」，而非服务器当前时间——
+        // 否则当信封时间晚于真实当前时间（如回放/测试数据）时 mark_seen 永远不生效。
+        let now_norm = norm_ts(&chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        let max_item = filtered
+            .iter()
+            .map(|m| norm_ts(m["created_at"].as_str().unwrap_or("")))
+            .max();
+        let cursor = max_item
+            .map(|x| if x > now_norm { x } else { now_norm.clone() })
+            .unwrap_or(now_norm);
+        st.collab_seen.lock().await.insert(agent_id.clone(), cursor);
+    }
+
+    let page = q.page.unwrap_or(0);
+    let page_size = q.limit.unwrap_or(50).clamp(1, 200);
+    let total = filtered.len();
+    let start = page * page_size;
+    let items: Vec<serde_json::Value> = filtered.into_iter().skip(start).take(page_size).collect();
+
+    axum::Json(serde_json::json!({
+        "items": items,
+        "unread_count": unread_count,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }))
+    .into_response()
 }
 
 /// 加载指定会话的历史
@@ -815,7 +1079,11 @@ async fn handle_session_load(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
     let db_path = {
-        std::env::current_dir().unwrap_or_default().join("harness.db").to_string_lossy().to_string()
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join("harness.db")
+            .to_string_lossy()
+            .to_string()
     };
 
     let sid = id.clone();
@@ -851,25 +1119,32 @@ async fn handle_session_load(
 async fn handle_session_delete(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
-    let db_path = std::env::current_dir().unwrap_or_default().join("harness.db").to_string_lossy().to_string();
+    let db_path = std::env::current_dir()
+        .unwrap_or_default()
+        .join("harness.db")
+        .to_string_lossy()
+        .to_string();
     let sid = id.clone();
 
     let deleted = tokio::task::spawn_blocking(move || {
         if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-            if let Ok(cnt) = conn.execute("DELETE FROM chat_history WHERE session_id=?1", rusqlite::params![sid]) {
+            if let Ok(cnt) = conn.execute(
+                "DELETE FROM chat_history WHERE session_id=?1",
+                rusqlite::params![sid],
+            ) {
                 return cnt;
             }
         }
         0
-    }).await.unwrap_or(0);
+    })
+    .await
+    .unwrap_or(0);
 
     Json(serde_json::json!({"deleted": deleted, "session_id": id}))
 }
 
 /// P1-5：查询当前降级收缩状态（Kill switch / 各 MCP 源健康 / 模式）
-async fn handle_admin_degrade(
-    State(st): State<Arc<AppState>>,
-) -> axum::response::Response {
+async fn handle_admin_degrade(State(st): State<Arc<AppState>>) -> axum::response::Response {
     let guard = st.agent.lock().await;
     if let Some(ref agent) = *guard {
         Json(agent.degrade_status()).into_response()
@@ -982,9 +1257,10 @@ async fn handle_admin_audit(
     let guard = st.agent.lock().await;
     if let Some(ref agent) = *guard {
         let limit = q.limit.unwrap_or(50).min(500);
-        let events = agent
-            .audit_logger
-            .recent_events(q.trace_id.as_deref(), q.event.as_deref(), limit);
+        let events =
+            agent
+                .audit_logger
+                .recent_events(q.trace_id.as_deref(), q.event.as_deref(), limit);
         Json(serde_json::json!({
             "count": events.len(),
             "events": events,
@@ -1046,7 +1322,8 @@ async fn handle_v1_chat(
         if req.messages.len() > 100 {
             return axum::response::Json(serde_json::json!({
                 "error": "too many messages"
-            })).into_response();
+            }))
+            .into_response();
         }
         // PFAiX 强制上下文隔离：每个安装实例 + 每个对话独立 session。
         // x-user-tag 是壳首次启动生成的随机 install_id；x-conversation-id
@@ -1054,21 +1331,34 @@ async fn handle_v1_chat(
         let user_tag = headers
             .get("x-user-tag")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect::<String>())
+            .map(|s| {
+                s.chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                    .collect::<String>()
+            })
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "default".to_string());
         let conversation_id = headers
             .get("x-conversation-id")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect::<String>())
+            .map(|s| {
+                s.chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                    .collect::<String>()
+            })
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "default".to_string());
 
         let session_id = format!("jan/{}/{}/{}", ctx.agent_id, user_tag, conversation_id);
-        if session_id.len() > 128 || !session_id.chars().all(|c| c.is_alphanumeric() || c == '/' || c == '-' || c == '_') {
+        if session_id.len() > 128
+            || !session_id
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '/' || c == '-' || c == '_')
+        {
             return axum::response::Json(serde_json::json!({
                 "error": "invalid session_id"
-            })).into_response();
+            }))
+            .into_response();
         }
         // 只取最后一条 user 消息。Jan 会带上完整 history；若把 assistant 自我介绍也 join
         // 进 user_text，模型容易反复只回身份介绍、不调工具。
@@ -1085,7 +1375,9 @@ async fn handle_v1_chat(
         if user_text.trim().is_empty() {
             "请输入消息".to_string()
         } else {
-            agent.chat(&user_text, &ctx.agent_id, &session_id, &ctx.allowed_ns).await
+            agent
+                .chat(&user_text, &ctx.agent_id, &session_id, &ctx.allowed_ns)
+                .await
         }
     } else {
         "Agent 未就绪".to_string()
@@ -1100,18 +1392,22 @@ async fn handle_v1_chat(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let (tx, rx): (tokio::sync::mpsc::UnboundedSender<Result<SseEvent, Infallible>>,
-                       tokio::sync::mpsc::UnboundedReceiver<Result<SseEvent, Infallible>>)
-            = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx): (
+            tokio::sync::mpsc::UnboundedSender<Result<SseEvent, Infallible>>,
+            tokio::sync::mpsc::UnboundedReceiver<Result<SseEvent, Infallible>>,
+        ) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             // role 起始事件
-            let _ = tx.send(Ok(SseEvent::default().data(serde_json::json!({
-                "id": &id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": &model,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
-            }).to_string())));
+            let _ = tx.send(Ok(SseEvent::default().data(
+                serde_json::json!({
+                    "id": &id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": &model,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+                })
+                .to_string(),
+            )));
             // 内容分块（与 /api/chat/stream 一致的 3 字/20ms 节奏）
             let chars: Vec<char> = reply.chars().collect();
             let mut i = 0;
@@ -1129,13 +1425,16 @@ async fn handle_v1_chat(
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             // finish_reason
-            let _ = tx.send(Ok(SseEvent::default().data(serde_json::json!({
-                "id": &id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": &model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-            }).to_string())));
+            let _ = tx.send(Ok(SseEvent::default().data(
+                serde_json::json!({
+                    "id": &id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": &model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                })
+                .to_string(),
+            )));
             // [DONE]
             let _ = tx.send(Ok(SseEvent::default().data("[DONE]")));
         });
@@ -1277,30 +1576,44 @@ async fn handle_register(
     };
     // P0 修复：以 dashboard-agent 身份（其 badge 持有固定 admin key）代理注册，
     // 而非字面 "admin"（DB 中持有过期 key，会导致 Memoria require_admin 401）。
-    let (actor, server) = { let cfg = st.config.lock().await; (cfg.agent_id.clone(), cfg.server.clone()) };
+    let (actor, server) = {
+        let cfg = st.config.lock().await;
+        (cfg.agent_id.clone(), cfg.server.clone())
+    };
     let mcp = McpClient::new(&server, &actor, &admin_key);
     // P0 修复：Memoria 的 register_agent 会自行生成 badge 并在响应里返回；
     // 必须用它作为后续鉴权 key，否则客户端拿本地随机 token 与 Memoria 存值对不上 → -32001。
     let memoria_ok = if admin_key.is_empty() {
         false
     } else {
-        match mcp.call_json("register_agent", &serde_json::json!({
-            "agent_id": &agent_id,
-            "display_name": &req.name,
-            "admin_key": &admin_key,
-            "namespace": &namespace,
-        })).await {
+        match mcp
+            .call_json(
+                "register_agent",
+                &serde_json::json!({
+                    "agent_id": &agent_id,
+                    "display_name": &req.name,
+                    "admin_key": &admin_key,
+                    "namespace": &namespace,
+                }),
+            )
+            .await
+        {
             Ok(text) => {
                 // Memoria register_agent 返回 {"status":"registered","badge":<AgentBadge对象 或 字符串>}
                 // 其中 badge.badge_token 才是后续鉴权用的 key 字符串；兼容 badge 直接是字符串的旧格式。
                 let badge_str = text.get("badge").and_then(|x| {
-                    if x.is_string() { x.as_str() }
-                    else { x.get("badge_token").and_then(|t| t.as_str()) }
+                    if x.is_string() {
+                        x.as_str()
+                    } else {
+                        x.get("badge_token").and_then(|t| t.as_str())
+                    }
                 });
                 if let Some(b) = badge_str {
                     badge_token = b.to_string();
                     true
-                } else { false }
+                } else {
+                    false
+                }
             }
             Err(_) => false,
         }
@@ -1309,15 +1622,24 @@ async fn handle_register(
     // 缓存身份（使用 admin key 写入 Memoria 后，auth_cache 也存一份）
     // P2-10: 记录创建时间用于 TTL
     if memoria_ok {
-        st.auth_cache.lock().await.insert(agent_id.clone(), (badge_token.clone(), std::time::Instant::now()));
+        st.auth_cache.lock().await.insert(
+            agent_id.clone(),
+            (badge_token.clone(), std::time::Instant::now()),
+        );
     }
 
     // 审计日志：记录身份注册
     let audit = AuditLogger::new(McpClient::new(&server, &actor, &admin_key));
-    audit.log_identity(&agent_id, "register",
-        &format!("name={}, department={}, company={}, div={}, project={}",
-            req.name, req.department, req.company, req.div, req.project)
-    ).await;
+    audit
+        .log_identity(
+            &agent_id,
+            "register",
+            &format!(
+                "name={}, department={}, company={}, div={}, project={}",
+                req.name, req.department, req.company, req.div, req.project
+            ),
+        )
+        .await;
 
     if !memoria_ok {
         return Json(RegisterResponse {
@@ -1350,24 +1672,43 @@ async fn handle_register_user(
 ) -> Json<LoginResponse> {
     let user_id = sanitize_user_id(&req.user_id);
     if user_id.is_empty() || user_id != req.user_id.trim() {
-        return Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
-            badge_token: String::new(), namespace: String::new(),
-            error: Some("用户名仅允许字母/数字/下划线/连字符/点".to_string()) });
+        return Json(LoginResponse {
+            ok: false,
+            user_id: String::new(),
+            display_name: String::new(),
+            badge_token: String::new(),
+            namespace: String::new(),
+            error: Some("用户名仅允许字母/数字/下划线/连字符/点".to_string()),
+        });
     }
     if req.password.len() < 6 {
-        return Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
-            badge_token: String::new(), namespace: String::new(),
-            error: Some("口令至少 6 位".to_string()) });
+        return Json(LoginResponse {
+            ok: false,
+            user_id: String::new(),
+            display_name: String::new(),
+            badge_token: String::new(),
+            namespace: String::new(),
+            error: Some("口令至少 6 位".to_string()),
+        });
     }
-    let display_name = if req.display_name.trim().is_empty() { user_id.clone() } else { req.display_name.trim().to_string() };
+    let display_name = if req.display_name.trim().is_empty() {
+        user_id.clone()
+    } else {
+        req.display_name.trim().to_string()
+    };
     let admin_key = match std::env::var("MEMORIA_ADMIN_KEY") {
         Ok(k) if !k.is_empty() => k,
         _ => st.config.lock().await.memoria_admin_key.clone(),
     };
     if admin_key.is_empty() {
-        return Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
-            badge_token: String::new(), namespace: String::new(),
-            error: Some("服务未就绪，请稍后重试".to_string()) });
+        return Json(LoginResponse {
+            ok: false,
+            user_id: String::new(),
+            display_name: String::new(),
+            badge_token: String::new(),
+            namespace: String::new(),
+            error: Some("服务未就绪，请稍后重试".to_string()),
+        });
     }
     // 默认命名空间：个人 agent + 组织根（可见 org 下全部共享工具）。
     // HR/管理员（持 admin_key）可预置部门/项目命名空间；否则回退默认（个人 agent + 组织根）。
@@ -1390,26 +1731,53 @@ async fn handle_register_user(
         (cfg.agent_id.clone(), cfg.server.clone())
     };
     let mcp = McpClient::new(&server, &actor, &admin_key);
-    match mcp.call_json("register_user", &serde_json::json!({
-        "user_id": &user_id,
-        "display_name": &display_name,
-        "password": &req.password,
-        "namespace": effective_ns.clone(),
-    })).await {
+    match mcp
+        .call_json(
+            "register_user",
+            &serde_json::json!({
+                "user_id": &user_id,
+                "display_name": &display_name,
+                "password": &req.password,
+                "namespace": effective_ns.clone(),
+            }),
+        )
+        .await
+    {
         Ok(v) => {
             let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
             if status == "registered" {
-                Json(LoginResponse { ok: true, user_id, display_name,
-                    badge_token: String::new(), namespace: effective_ns, error: None })
+                Json(LoginResponse {
+                    ok: true,
+                    user_id,
+                    display_name,
+                    badge_token: String::new(),
+                    namespace: effective_ns,
+                    error: None,
+                })
             } else {
-                let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("注册失败").to_string();
-                Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
-                    badge_token: String::new(), namespace: String::new(), error: Some(msg) })
+                let msg = v
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("注册失败")
+                    .to_string();
+                Json(LoginResponse {
+                    ok: false,
+                    user_id: String::new(),
+                    display_name: String::new(),
+                    badge_token: String::new(),
+                    namespace: String::new(),
+                    error: Some(msg),
+                })
             }
         }
-        Err(_) => Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
-            badge_token: String::new(), namespace: String::new(),
-            error: Some("Memoria 暂时不可用".to_string()) }),
+        Err(_) => Json(LoginResponse {
+            ok: false,
+            user_id: String::new(),
+            display_name: String::new(),
+            badge_token: String::new(),
+            namespace: String::new(),
+            error: Some("Memoria 暂时不可用".to_string()),
+        }),
     }
 }
 
@@ -1421,45 +1789,96 @@ async fn handle_login(
 ) -> Json<LoginResponse> {
     let user_id = sanitize_user_id(&req.user_id);
     if user_id.is_empty() || req.password.is_empty() {
-        return Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
-            badge_token: String::new(), namespace: String::new(),
-            error: Some("用户名或口令错误".to_string()) });
+        return Json(LoginResponse {
+            ok: false,
+            user_id: String::new(),
+            display_name: String::new(),
+            badge_token: String::new(),
+            namespace: String::new(),
+            error: Some("用户名或口令错误".to_string()),
+        });
     }
     let admin_key = match std::env::var("MEMORIA_ADMIN_KEY") {
         Ok(k) if !k.is_empty() => k,
         _ => st.config.lock().await.memoria_admin_key.clone(),
     };
     if admin_key.is_empty() {
-        return Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
-            badge_token: String::new(), namespace: String::new(),
-            error: Some("服务未就绪，请稍后重试".to_string()) });
+        return Json(LoginResponse {
+            ok: false,
+            user_id: String::new(),
+            display_name: String::new(),
+            badge_token: String::new(),
+            namespace: String::new(),
+            error: Some("服务未就绪，请稍后重试".to_string()),
+        });
     }
     // P0 修复：以 dashboard-agent 身份代理登录（其 badge 持有固定 admin key），
     // 而非字面 "admin"（DB 中过期 key 会导致 require_admin 401）。
-    let (actor, server) = { let cfg = st.config.lock().await; (cfg.agent_id.clone(), cfg.server.clone()) };
+    let (actor, server) = {
+        let cfg = st.config.lock().await;
+        (cfg.agent_id.clone(), cfg.server.clone())
+    };
     let mcp = McpClient::new(&server, &actor, &admin_key);
-    match mcp.call_json("login_user", &serde_json::json!({
-        "user_id": &user_id,
-        "password": &req.password,
-    })).await {
+    match mcp
+        .call_json(
+            "login_user",
+            &serde_json::json!({
+                "user_id": &user_id,
+                "password": &req.password,
+            }),
+        )
+        .await
+    {
         Ok(v) => {
             let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
             if status == "ok" {
-                let badge_token = v.get("badge_token").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                let display_name = v.get("display_name").and_then(|s| s.as_str()).unwrap_or(&user_id).to_string();
-                let namespace = v.get("namespace").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                let badge_token = v
+                    .get("badge_token")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let display_name = v
+                    .get("display_name")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or(&user_id)
+                    .to_string();
+                let namespace = v
+                    .get("namespace")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 // 登录成功即写入 auth_cache，减少首条聊天的鉴权往返
-                st.auth_cache.lock().await.insert(user_id.clone(), (badge_token.clone(), std::time::Instant::now()));
-                Json(LoginResponse { ok: true, user_id, display_name, badge_token, namespace, error: None })
+                st.auth_cache.lock().await.insert(
+                    user_id.clone(),
+                    (badge_token.clone(), std::time::Instant::now()),
+                );
+                Json(LoginResponse {
+                    ok: true,
+                    user_id,
+                    display_name,
+                    badge_token,
+                    namespace,
+                    error: None,
+                })
             } else {
-                Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
-                    badge_token: String::new(), namespace: String::new(),
-                    error: Some("用户名或口令错误".to_string()) })
+                Json(LoginResponse {
+                    ok: false,
+                    user_id: String::new(),
+                    display_name: String::new(),
+                    badge_token: String::new(),
+                    namespace: String::new(),
+                    error: Some("用户名或口令错误".to_string()),
+                })
             }
         }
-        Err(_) => Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
-            badge_token: String::new(), namespace: String::new(),
-            error: Some("Memoria 暂时不可用".to_string()) }),
+        Err(_) => Json(LoginResponse {
+            ok: false,
+            user_id: String::new(),
+            display_name: String::new(),
+            badge_token: String::new(),
+            namespace: String::new(),
+            error: Some("Memoria 暂时不可用".to_string()),
+        }),
     }
 }
 
@@ -1475,18 +1894,26 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
     };
 
     let mcp = McpClient::new(&config.server, &config.agent_id, &badge_token);
-    let _ = mcp.call_json("register_agent", &serde_json::json!({
-        "agent_id": &config.agent_id,
-        "display_name": &config.agent_id,
-        "admin_key": &admin_key,
-        "namespace": format!("agent/{}", config.agent_id),
-    })).await;
+    let _ = mcp
+        .call_json(
+            "register_agent",
+            &serde_json::json!({
+                "agent_id": &config.agent_id,
+                "display_name": &config.agent_id,
+                "admin_key": &admin_key,
+                "namespace": format!("agent/{}", config.agent_id),
+            }),
+        )
+        .await;
 
     // P2-C: 从 agent_id 解析多租户命名空间（handle_register 格式：{company}_{department}_{name}）
     let ns_full_path = {
         let parts: Vec<&str> = config.agent_id.splitn(3, '_').collect();
         if parts.len() == 3 {
-            Some(format!("/dept/{}/project/{}/user/{}", parts[0], parts[1], parts[2]))
+            Some(format!(
+                "/dept/{}/project/{}/user/{}",
+                parts[0], parts[1], parts[2]
+            ))
         } else {
             None
         }
@@ -1501,11 +1928,11 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
     // P0-1: 设置 failover fallbacks
     let doubao_key = std::env::var("DOUBAO_API_KEY").unwrap_or_default();
     let fallbacks = if !doubao_key.is_empty() {
-        vec![
-            ("https://ark.cn-beijing.volces.com/api/v3".to_string(),
-             "doubao-lite-32k".to_string(),
-             doubao_key),
-        ]
+        vec![(
+            "https://ark.cn-beijing.volces.com/api/v3".to_string(),
+            "doubao-lite-32k".to_string(),
+            doubao_key,
+        )]
     } else {
         Vec::new()
     };
@@ -1517,9 +1944,21 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
     let mut additional_mcp = Vec::new();
     for src in &config.mcp_source {
         if !src.command.is_empty() {
-            additional_mcp.push((src.name.clone(), src.url.clone(), src.token.clone(), Some((src.command.clone(), src.args.clone())), src.namespace.clone()));
+            additional_mcp.push((
+                src.name.clone(),
+                src.url.clone(),
+                src.token.clone(),
+                Some((src.command.clone(), src.args.clone())),
+                src.namespace.clone(),
+            ));
         } else {
-            additional_mcp.push((src.name.clone(), src.url.clone(), src.token.clone(), None, src.namespace.clone()));
+            additional_mcp.push((
+                src.name.clone(),
+                src.url.clone(),
+                src.token.clone(),
+                None,
+                src.namespace.clone(),
+            ));
         }
     }
     let agent_config = AgentConfig {
@@ -1532,9 +1971,9 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
         parent_permission: PermissionLevel::Write,
         enable_compositional_routing: true,
         compositional_preview: true, // P1-2: 企业默认开启计划预览（HITL）
-        strict_schema: false, // P1-4: 默认回灌 LLM 修正参数（非严格报错）
+        strict_schema: false,        // P1-4: 默认回灌 LLM 修正参数（非严格报错）
         system_prompt_template: None, // P2-3: 使用内置默认模板
-        approver_id: None, // P2-D: 无审批人（保持现有行为）
+        approver_id: None,           // P2-D: 无审批人（保持现有行为）
     };
     let cwd = std::env::current_dir().unwrap_or_default();
     let harness = HarnessStore::open(&cwd.join("harness.db").to_string_lossy())
@@ -1548,7 +1987,9 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
 }
 
 fn whoami() -> Option<String> {
-    std::env::var("USERNAME").or_else(|_| std::env::var("USER")).ok()
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .ok()
 }
 
 /// 加载窗口图标（从 logo.png 解码，保留 2:1 比例）

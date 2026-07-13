@@ -41,7 +41,11 @@ fn eval_cases_json_valid() {
     let raw = include_str!("../eval/cases.json");
     let v: serde_json::Value = serde_json::from_str(raw).expect("cases.json 必须合法 JSON");
     let cases = v["cases"].as_array().expect("cases 应为数组");
-    assert!(cases.len() >= 10, "应至少覆盖 E01–E10，实际 {}", cases.len());
+    assert!(
+        cases.len() >= 10,
+        "应至少覆盖 E01–E10，实际 {}",
+        cases.len()
+    );
     for c in cases {
         assert!(c["id"].is_string(), "每个 case 需有 id");
         assert!(c["scenario"].is_string(), "{} 缺 scenario", c["id"]);

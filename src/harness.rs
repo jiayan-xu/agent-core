@@ -47,7 +47,10 @@ impl HarnessStore {
     /// 内存模式（用于测试）
     pub fn open_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| format!("open memory: {}", e))?;
-        let mut store = HarnessStore { conn, db_path: String::new() };
+        let mut store = HarnessStore {
+            conn,
+            db_path: String::new(),
+        };
         store.init_schema()?;
         Ok(store)
     }
@@ -141,7 +144,10 @@ impl HarnessStore {
         } else {
             "SELECT * FROM harnesses ORDER BY confidence DESC"
         };
-        let mut stmt = self.conn.prepare(sql).map_err(|e| format!("prepare: {}", e))?;
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(|e| format!("prepare: {}", e))?;
         let rows = stmt
             .query_map([], map_row)
             .map_err(|e| format!("query: {}", e))?
@@ -153,7 +159,10 @@ impl HarnessStore {
     /// 软删除
     pub fn deactivate(&mut self, harness_id: i64) -> bool {
         self.conn
-            .execute("UPDATE harnesses SET is_active = 0 WHERE id = ?1", params![harness_id])
+            .execute(
+                "UPDATE harnesses SET is_active = 0 WHERE id = ?1",
+                params![harness_id],
+            )
             .ok()
             .map(|n| n > 0)
             .unwrap_or(false)
@@ -162,7 +171,10 @@ impl HarnessStore {
     /// 激活（P2-3：危险/待审批模板经人工 / admin 批准后激活）
     pub fn activate(&mut self, harness_id: i64) -> bool {
         self.conn
-            .execute("UPDATE harnesses SET is_active = 1 WHERE id = ?1", params![harness_id])
+            .execute(
+                "UPDATE harnesses SET is_active = 1 WHERE id = ?1",
+                params![harness_id],
+            )
             .ok()
             .map(|n| n > 0)
             .unwrap_or(false)
@@ -210,7 +222,11 @@ impl HarnessStore {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(top_k);
         Ok(scored)
     }
@@ -244,7 +260,14 @@ impl HarnessStore {
             .execute(
                 "UPDATE harnesses SET confidence=?1, usage_count=?2, success_count=?3,
                  consecutive_success=?4, last_used=?5, updated_at=?5 WHERE id=?6",
-                params![new_confidence, new_usage, new_success, new_consecutive, now, harness_id],
+                params![
+                    new_confidence,
+                    new_usage,
+                    new_success,
+                    new_consecutive,
+                    now,
+                    harness_id
+                ],
             )
             .map_err(|e| format!("update usage: {}", e))?;
 
@@ -381,8 +404,7 @@ fn map_row(row: &rusqlite::Row) -> rusqlite::Result<Harness> {
         name: row.get(1)?,
         trigger_conditions: serde_json::from_str(&row.get::<_, String>(2)?)
             .unwrap_or(serde_json::Value::Null),
-        steps: serde_json::from_str(&row.get::<_, String>(3)?)
-            .unwrap_or(serde_json::Value::Null),
+        steps: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or(serde_json::Value::Null),
         verify_rule: row.get(4)?,
         confidence: row.get(5)?,
         usage_count: row.get(6)?,
@@ -404,7 +426,7 @@ pub use now_secs as current_timestamp;
 
 /// 计算 trigger_conditions 与 context 的模糊匹配分数
 #[allow(unused_assignments, unused_variables)]
-    fn compute_match_score(
+fn compute_match_score(
     conditions: &serde_json::Map<String, serde_json::Value>,
     context: &serde_json::Map<String, serde_json::Value>,
 ) -> f64 {
@@ -515,7 +537,9 @@ mod tests {
         let conditions = serde_json::json!({"tool": "query_plate"});
         let steps = serde_json::json!([{"tool": "query_plate", "args": {"plate": "test"}}]);
 
-        let id = store.save("test_harness", &conditions, &steps, "", None).unwrap();
+        let id = store
+            .save("test_harness", &conditions, &steps, "", None)
+            .unwrap();
         assert!(id > 0);
 
         let h = store.get(id).unwrap();
@@ -541,7 +565,13 @@ mod tests {
     fn test_deactivate() {
         let mut store = test_store();
         let id = store
-            .save("test", &serde_json::json!({}), &serde_json::json!([]), "", None)
+            .save(
+                "test",
+                &serde_json::json!({}),
+                &serde_json::json!([]),
+                "",
+                None,
+            )
             .unwrap();
         assert!(store.deactivate(id));
         assert!(!store.get(id).unwrap().is_active);
@@ -555,11 +585,7 @@ mod tests {
         let c_obj = conditions.as_object().unwrap();
         let ctx_obj = context.as_object().unwrap();
         let score = compute_match_score(c_obj, ctx_obj);
-        assert!(
-            score > 0.9,
-            "exact match should score high: {}",
-            score
-        );
+        assert!(score > 0.9, "exact match should score high: {}", score);
     }
 
     #[test]
@@ -618,7 +644,13 @@ mod tests {
     fn test_record_usage_success() {
         let mut store = test_store();
         let id = store
-            .save("test", &serde_json::json!({}), &serde_json::json!([]), "", None)
+            .save(
+                "test",
+                &serde_json::json!({}),
+                &serde_json::json!([]),
+                "",
+                None,
+            )
             .unwrap();
 
         let r = store.record_usage(id, true).unwrap();
@@ -631,7 +663,13 @@ mod tests {
     fn test_record_usage_failure() {
         let mut store = test_store();
         let id = store
-            .save("test", &serde_json::json!({}), &serde_json::json!([]), "", None)
+            .save(
+                "test",
+                &serde_json::json!({}),
+                &serde_json::json!([]),
+                "",
+                None,
+            )
             .unwrap();
 
         let r = store.record_usage(id, false).unwrap();
@@ -643,7 +681,13 @@ mod tests {
     fn test_record_usage_consecutive_bonus() {
         let mut store = test_store();
         let id = store
-            .save("test", &serde_json::json!({}), &serde_json::json!([]), "", None)
+            .save(
+                "test",
+                &serde_json::json!({}),
+                &serde_json::json!([]),
+                "",
+                None,
+            )
             .unwrap();
 
         // 5 次连续成功 → 额外 +0.1
@@ -674,7 +718,10 @@ mod tests {
         assert_eq!(new_ids.len(), 1, "should distill 1 new harness");
 
         let h = store.get(new_ids[0]).unwrap();
-        assert!(h.name.contains("check_plate"), "name should be derived from logs");
+        assert!(
+            h.name.contains("check_plate"),
+            "name should be derived from logs"
+        );
     }
 
     #[test]
@@ -718,7 +765,13 @@ mod tests {
     fn test_confidence_clamping() {
         let mut store = test_store();
         let id = store
-            .save("test", &serde_json::json!({}), &serde_json::json!([]), "", None)
+            .save(
+                "test",
+                &serde_json::json!({}),
+                &serde_json::json!([]),
+                "",
+                None,
+            )
             .unwrap();
 
         // 连续失败 → 不应低于 0
@@ -752,7 +805,10 @@ mod tests {
         assert!(!h.is_active, "危险模板不应自动激活（is_active 应为 false）");
         // 确认其不在「已激活」列表中
         let active = store.list_all(true).unwrap();
-        assert!(!active.iter().any(|x| x.id == h.id), "危险模板不应出现在激活列表");
+        assert!(
+            !active.iter().any(|x| x.id == h.id),
+            "危险模板不应出现在激活列表"
+        );
     }
 
     #[test]
@@ -781,7 +837,13 @@ mod tests {
     fn test_activate_toggles_is_active() {
         let mut store = test_store();
         let id = store
-            .save("test", &serde_json::json!({}), &serde_json::json!([]), "", None)
+            .save(
+                "test",
+                &serde_json::json!({}),
+                &serde_json::json!([]),
+                "",
+                None,
+            )
             .unwrap();
         store.deactivate(id);
         assert!(!store.get(id).unwrap().is_active);

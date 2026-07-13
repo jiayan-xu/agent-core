@@ -105,7 +105,10 @@ fn normalize_sql_for_check(sql: &str) -> String {
 fn contains_word(haystack: &str, word: &str) -> bool {
     for w in haystack.split_whitespace() {
         // 去掉尾随标点后再比较（如 "delete;" / "delete"）
-        let cleaned: String = w.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+        let cleaned: String = w
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
         if cleaned == word {
             return true;
         }
@@ -124,8 +127,8 @@ fn is_select_only(sql: &str) -> bool {
     let first = norm.split_whitespace().next().unwrap_or("");
     let starts_ok = matches!(first, "select" | "with" | "explain" | "pragma");
     let forbidden = [
-        "insert", "update", "delete", "drop", "alter", "create", "truncate",
-        "attach", "replace", "merge", "grant", "revoke", "vacuum",
+        "insert", "update", "delete", "drop", "alter", "create", "truncate", "attach", "replace",
+        "merge", "grant", "revoke", "vacuum",
     ];
     let no_write = !forbidden.iter().any(|kw| contains_word(&norm, kw));
     starts_ok && no_write
@@ -134,9 +137,8 @@ fn is_select_only(sql: &str) -> bool {
 /// 是否为 SQL 执行类工具的查询参数（需要 SELECT-only 校验）
 fn is_sql_query_param(tool_name: &str, key: &str) -> bool {
     let key = key.to_lowercase();
-    let is_sql_tool = tool_name == "query_sql"
-        || tool_name.starts_with("query_")
-        || tool_name.contains("sql");
+    let is_sql_tool =
+        tool_name == "query_sql" || tool_name.starts_with("query_") || tool_name.contains("sql");
     let is_sql_arg = matches!(key.as_str(), "query" | "sql" | "statement" | "sql_text");
     is_sql_tool && is_sql_arg
 }
@@ -201,13 +203,25 @@ pub struct ToolCheck {
 
 impl ToolCheck {
     pub fn allow() -> Self {
-        ToolCheck { allow: true, level: None, reason: String::new() }
+        ToolCheck {
+            allow: true,
+            level: None,
+            reason: String::new(),
+        }
     }
     pub fn red(reason: &str) -> Self {
-        ToolCheck { allow: false, level: Some(BlockLevel::Red), reason: reason.to_string() }
+        ToolCheck {
+            allow: false,
+            level: Some(BlockLevel::Red),
+            reason: reason.to_string(),
+        }
     }
     pub fn yellow(reason: &str) -> Self {
-        ToolCheck { allow: false, level: Some(BlockLevel::Yellow), reason: reason.to_string() }
+        ToolCheck {
+            allow: false,
+            level: Some(BlockLevel::Yellow),
+            reason: reason.to_string(),
+        }
     }
 }
 
@@ -222,7 +236,9 @@ pub struct PermissionChain {
 
 impl PermissionChain {
     pub fn new() -> Self {
-        PermissionChain { chain: HashMap::new() }
+        PermissionChain {
+            chain: HashMap::new(),
+        }
     }
 
     /// 注册 Agent 权限，返回最终权限等级
@@ -257,11 +273,13 @@ pub struct ExecutionSandbox;
 
 impl ExecutionSandbox {
     const REQUIRES_SANDBOX: &'static [&'static str] = &[
-        "exec_code", "exec_shell", "exec_sql_raw", "exec_python", "run_script",
+        "exec_code",
+        "exec_shell",
+        "exec_sql_raw",
+        "exec_python",
+        "run_script",
     ];
-    const REQUIRES_REVIEW: &'static [&'static str] = &[
-        "delete_", "batch_", "shutdown_",
-    ];
+    const REQUIRES_REVIEW: &'static [&'static str] = &["delete_", "batch_", "shutdown_"];
 
     pub fn check(tool_name: &str) -> ToolCheck {
         for pattern in Self::REQUIRES_SANDBOX {
@@ -286,11 +304,16 @@ pub struct GovernanceGuard;
 
 impl GovernanceGuard {
     const GOVERNANCE_TOOLS: &'static [&'static str] = &[
-        "modify_router_rules", "modify_permission_logic",
-        "modify_kill_switch", "modify_alert_rules",
-        "modify_audit_module", "modify_agent_key",
-        "modify_boundary_config", "modify_red_lines",
-        "disable_safety_check", "bypass_approval",
+        "modify_router_rules",
+        "modify_permission_logic",
+        "modify_kill_switch",
+        "modify_alert_rules",
+        "modify_audit_module",
+        "modify_agent_key",
+        "modify_boundary_config",
+        "modify_red_lines",
+        "disable_safety_check",
+        "bypass_approval",
     ];
 
     pub fn is_governance(tool_name: &str) -> bool {
@@ -309,8 +332,12 @@ pub struct DataExfiltrationGuard;
 
 impl DataExfiltrationGuard {
     const EXPORT_TOOLS: &'static [&'static str] = &[
-        "export_data", "send_email", "api_push", "webhook_send",
-        "upload_file", "share_report",
+        "export_data",
+        "send_email",
+        "api_push",
+        "webhook_send",
+        "upload_file",
+        "share_report",
     ];
     const EXPORT_PREFIXES: &'static [&'static str] = &[
         "export_", "send_", "upload_", "push_", "webhook_", "exfil", "share_",
@@ -318,7 +345,9 @@ impl DataExfiltrationGuard {
 
     pub fn check_export(tool_name: &str) -> ToolCheck {
         if Self::EXPORT_TOOLS.contains(&tool_name)
-            || Self::EXPORT_PREFIXES.iter().any(|p| tool_name.starts_with(p))
+            || Self::EXPORT_PREFIXES
+                .iter()
+                .any(|p| tool_name.starts_with(p))
         {
             return ToolCheck::red(&format!("{} 涉及数据外发，需要管理员审批", tool_name));
         }
@@ -331,7 +360,10 @@ impl DataExfiltrationGuard {
         unique.sort();
         unique.dedup();
         if unique.len() > 1 {
-            return ToolCheck::red(&format!("跨 {} 个 namespace 聚合数据需要审批", unique.len()));
+            return ToolCheck::red(&format!(
+                "跨 {} 个 namespace 聚合数据需要审批",
+                unique.len()
+            ));
         }
         ToolCheck::allow()
     }
@@ -344,9 +376,9 @@ impl DataExfiltrationGuard {
 #[derive(Debug, Clone, PartialEq)]
 pub enum KillState {
     Running,
-    SoftStop,   // L1：可恢复
-    HardStop,   // L2：需人工恢复
-    Killed,     // L3：物理终止
+    SoftStop, // L1：可恢复
+    HardStop, // L2：需人工恢复
+    Killed,   // L3：物理终止
 }
 
 /// KillSwitch 熔断器（带 hook 回调）
@@ -381,8 +413,12 @@ impl KillSwitch {
             _ => KillState::SoftStop,
         };
         match self.state.lock() {
-            Ok(mut state) => { *state = new_state; }
-            Err(_) => { tracing::error!("KillState Mutex 中毒，跳过状态更新"); }
+            Ok(mut state) => {
+                *state = new_state;
+            }
+            Err(_) => {
+                tracing::error!("KillState Mutex 中毒，跳过状态更新");
+            }
         }
         tracing::warn!("[KILL] L{} 熔断触发: {}", level, reason);
         // 执行所有注册的 hook 回调
@@ -495,12 +531,16 @@ impl ComplianceBoundary {
     ) -> ToolCheck {
         // ── ⑤ 全局终止：最优先 ──
         if !self.kill_switch.is_alive() {
-            return ToolCheck::red(&format!("系统已终止（{:?}），拒绝所有操作", self.kill_switch.state()));
+            return ToolCheck::red(&format!(
+                "系统已终止（{:?}），拒绝所有操作",
+                self.kill_switch.state()
+            ));
         }
 
         // ── ③ 进化边界：不可修改治理层 ──
         if GovernanceGuard::is_governance(tool_name) {
-            self.kill_switch.trigger(2, &format!("试图修改治理层: {}", tool_name));
+            self.kill_switch
+                .trigger(2, &format!("试图修改治理层: {}", tool_name));
             return ToolCheck::red(&format!("红线：{} 属于治理层，Agent 不可修改", tool_name));
         }
 
@@ -531,7 +571,9 @@ impl ComplianceBoundary {
 
         // ── ⑨ 审批检查：dangerous 级别工具需要审批（P2-D 接入）──
         if !crate::approval::has_pending_approval_sync(&self.approval_manager, tool_name) {
-            let tool_level = with_classifier(&self.classifier, "read".to_string(), |c| c.classify(tool_name).to_string());
+            let tool_level = with_classifier(&self.classifier, "read".to_string(), |c| {
+                c.classify(tool_name).to_string()
+            });
             if tool_level == "dangerous" {
                 return ToolCheck::yellow(&format!("{} 需要审批，请等待审批人确认", tool_name));
             }
@@ -551,9 +593,7 @@ impl ComplianceBoundary {
         let level = with_classifier(&self.classifier, "unknown", |c| c.classify(tool_name));
         if level == "unknown" {
             // P1-7 修复：unknown 工具不再直接放行，改为黄线需确认
-            return ToolCheck::yellow(&format!(
-                "工具 {} 未分类，需要确认后执行", tool_name
-            ));
+            return ToolCheck::yellow(&format!("工具 {} 未分类，需要确认后执行", tool_name));
         }
 
         let requested = PermissionLevel::from_str(level);
@@ -565,10 +605,15 @@ impl ComplianceBoundary {
                     let s = val.as_str().unwrap_or("");
                     // SQL 注入检测（P2-7 增强）
                     let s_upper = s.to_uppercase();
-                    if s.contains("' --") || s.contains("';") || s_upper.contains(" UNION ")
-                        || s_upper.contains(" OR 1=1") || s_upper.contains(" AND 1=1")
-                        || s_upper.contains("DROP TABLE") || s_upper.contains("INSERT INTO")
-                        || s_upper.contains("DELETE FROM") || s_upper.contains("UPDATE ") && s_upper.contains("SET ")
+                    if s.contains("' --")
+                        || s.contains("';")
+                        || s_upper.contains(" UNION ")
+                        || s_upper.contains(" OR 1=1")
+                        || s_upper.contains(" AND 1=1")
+                        || s_upper.contains("DROP TABLE")
+                        || s_upper.contains("INSERT INTO")
+                        || s_upper.contains("DELETE FROM")
+                        || s_upper.contains("UPDATE ") && s_upper.contains("SET ")
                     {
                         return ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key));
                     }
@@ -588,16 +633,23 @@ impl ComplianceBoundary {
         }
 
         // 权限逐级检查：当前授予权限 >= 角色基础 >= 工具要求
-        if !with_perm_chain(&self.perm_chain, false, |c| c.check_escalation(agent_id, &requested)) {
+        if !with_perm_chain(&self.perm_chain, false, |c| {
+            c.check_escalation(agent_id, &requested)
+        }) {
             return ToolCheck::yellow(&format!(
-                "权限递减：{} 需要 {}，但当前 Agent 权限不足", tool_name, requested.as_str()
+                "权限递减：{} 需要 {}，但当前 Agent 权限不足",
+                tool_name,
+                requested.as_str()
             ));
         }
 
         if &requested > &effective_max {
             return ToolCheck::yellow(&format!(
                 "权限递减：{} 需要 {}，但用户角色 {} 最高 {}",
-                tool_name, requested.as_str(), user_role, effective_max.as_str()
+                tool_name,
+                requested.as_str(),
+                user_role,
+                effective_max.as_str()
             ));
         }
 
@@ -631,34 +683,69 @@ impl ToolClassifier {
         };
         // 内置默认分类（保留原有列表）
         for t in [
-            "query_plate", "query_sql", "search_memory",
-            "check_status", "get_statistics", "validate_data",
-            "detect_anomaly", "get_context", "check_media",
-            "review_data", "diagnose_system", "archive_ocr",
-            "query_archive_log", "system_ops", "code_reader",
-            "summarize_url", "read_docx", "read_xlsx",
+            "query_plate",
+            "query_sql",
+            "search_memory",
+            "check_status",
+            "get_statistics",
+            "validate_data",
+            "detect_anomaly",
+            "get_context",
+            "check_media",
+            "review_data",
+            "diagnose_system",
+            "archive_ocr",
+            "query_archive_log",
+            "system_ops",
+            "code_reader",
+            "summarize_url",
+            "read_docx",
+            "read_xlsx",
             // 真实 MCP 工具名（dashboard stdio skills）兜底，避免首轮 learn 前被误判
-            "execute_sql", "fuzzy_match_plate", "fuzzy_match_indicator",
-        ] { c.read_tools.insert(t.to_string()); }
+            "execute_sql",
+            "fuzzy_match_plate",
+            "fuzzy_match_indicator",
+        ] {
+            c.read_tools.insert(t.to_string());
+        }
         for t in [
-            "fill_excel_log", "update_whitelist", "archive_manifest",
-            "manage_whitelist", "manage_holiday", "generate_month_log",
-            "archive_operate", "organize_folders",
-        ] { c.write_tools.insert(t.to_string()); }
+            "fill_excel_log",
+            "update_whitelist",
+            "archive_manifest",
+            "manage_whitelist",
+            "manage_holiday",
+            "generate_month_log",
+            "archive_operate",
+            "organize_folders",
+        ] {
+            c.write_tools.insert(t.to_string());
+        }
         for t in [
-            "delete_entrance_record", "batch_update_whitelist",
-            "shutdown_agent", "batch_delete_memories",
-        ] { c.dangerous_tools.insert(t.to_string()); }
+            "delete_entrance_record",
+            "batch_update_whitelist",
+            "shutdown_agent",
+            "batch_delete_memories",
+        ] {
+            c.dangerous_tools.insert(t.to_string());
+        }
         c
     }
 
     /// 注册工具到指定权限级别
     pub fn register(&mut self, tool_name: &str, level: &str) {
         match level {
-            "read" => { self.read_tools.insert(tool_name.to_string()); }
-            "write" => { self.write_tools.insert(tool_name.to_string()); }
-            "dangerous" => { self.dangerous_tools.insert(tool_name.to_string()); }
-            _ => { self.unknown_tools.insert(tool_name.to_string()); }
+            "read" => {
+                self.read_tools.insert(tool_name.to_string());
+            }
+            "write" => {
+                self.write_tools.insert(tool_name.to_string());
+            }
+            "dangerous" => {
+                self.dangerous_tools.insert(tool_name.to_string());
+            }
+            _ => {
+                self.unknown_tools.insert(tool_name.to_string());
+            }
         }
     }
 
@@ -673,15 +760,26 @@ impl ToolClassifier {
                 && !lower.starts_with("insert")
                 && !lower.starts_with("delete")
                 && !lower.starts_with("create");
-            if name.starts_with("query_") || name.starts_with("search_") || name.starts_with("get_")
-                || name.starts_with("check_") || name.starts_with("read_") || name.starts_with("list_")
-                || name.starts_with("fuzzy_match_") || name.starts_with("match_")
-                || name.starts_with("review_") || name.starts_with("diagnose_")
-                || name.starts_with("explain_") || name.starts_with("validate_")
-                || name.starts_with("cross_") || is_sql_read
+            if name.starts_with("query_")
+                || name.starts_with("search_")
+                || name.starts_with("get_")
+                || name.starts_with("check_")
+                || name.starts_with("read_")
+                || name.starts_with("list_")
+                || name.starts_with("fuzzy_match_")
+                || name.starts_with("match_")
+                || name.starts_with("review_")
+                || name.starts_with("diagnose_")
+                || name.starts_with("explain_")
+                || name.starts_with("validate_")
+                || name.starts_with("cross_")
+                || is_sql_read
             {
                 self.read_tools.insert(name.clone());
-            } else if name.starts_with("delete_") || name.starts_with("batch_delete") || name.starts_with("shutdown_") {
+            } else if name.starts_with("delete_")
+                || name.starts_with("batch_delete")
+                || name.starts_with("shutdown_")
+            {
                 self.dangerous_tools.insert(name.clone());
             } else if !self.read_tools.contains(name) && !self.dangerous_tools.contains(name) {
                 // P0-4：未知工具不再默认当 write 放行，先标记为 unknown，由 check_tool 走黄线确认
@@ -691,10 +789,18 @@ impl ToolClassifier {
     }
 
     pub fn classify(&self, tool_name: &str) -> &'static str {
-        if self.read_tools.contains(tool_name) { return "read"; }
-        if self.write_tools.contains(tool_name) { return "write"; }
-        if self.dangerous_tools.contains(tool_name) { return "dangerous"; }
-        if self.unknown_tools.contains(tool_name) { return "unknown"; }
+        if self.read_tools.contains(tool_name) {
+            return "read";
+        }
+        if self.write_tools.contains(tool_name) {
+            return "write";
+        }
+        if self.dangerous_tools.contains(tool_name) {
+            return "dangerous";
+        }
+        if self.unknown_tools.contains(tool_name) {
+            return "unknown";
+        }
         "unknown"
     }
 }
@@ -731,7 +837,9 @@ impl TaskConfirmationGate {
         let trimmed = message.trim();
 
         // 确认/否定/元词 → 不是新任务
-        let meta_words = ["对", "是", "确认", "行", "好", "可以", "不对", "改", "补充", "继续", "停", "结束"];
+        let meta_words = [
+            "对", "是", "确认", "行", "好", "可以", "不对", "改", "补充", "继续", "停", "结束",
+        ];
         if meta_words.contains(&trimmed) {
             return false;
         }
@@ -739,16 +847,49 @@ impl TaskConfirmationGate {
         // 自然语言疑问句 / 查询意图 → 直接执行，不需要确认
         // 覆盖「昨天进了多少车」「X 是多少」「查一下…」等不以“查/看/搜”开头的问法。
         let query_signals = [
-            "多少", "几", "什么", "怎么", "如何", "为何", "何时", "哪些", "哪辆",
-            "吗", "？", "?", "查", "看", "搜", "统计", "查询", "列表", "明细",
-            "排行", "top", "TOP", "count", "Count", "有几", "是否", "有没有",
+            "多少",
+            "几",
+            "什么",
+            "怎么",
+            "如何",
+            "为何",
+            "何时",
+            "哪些",
+            "哪辆",
+            "吗",
+            "？",
+            "?",
+            "查",
+            "看",
+            "搜",
+            "统计",
+            "查询",
+            "列表",
+            "明细",
+            "排行",
+            "top",
+            "TOP",
+            "count",
+            "Count",
+            "有几",
+            "是否",
+            "有没有",
         ];
         if query_signals.iter().any(|s| trimmed.contains(s)) {
             return false;
         }
 
         // 以查询前缀开头 → 直接执行，不需要确认
-        let query_prefixes = ["查", "查一下", "查询", "看看", "搜一搜", "搜", "帮我看", "帮我查"];
+        let query_prefixes = [
+            "查",
+            "查一下",
+            "查询",
+            "看看",
+            "搜一搜",
+            "搜",
+            "帮我看",
+            "帮我查",
+        ];
         if query_prefixes.iter().any(|p| trimmed.starts_with(p)) {
             return false;
         }
@@ -760,10 +901,29 @@ impl TaskConfirmationGate {
 
         // 任务类关键词 → 需要确认
         let task_keywords = [
-            "帮我", "写", "做", "分析", "整理", "设计", "方案",
-            "报告", "文档", "总结", "规划", "开发", "实现",
-            "创建", "生成", "修改", "更新", "重构", "调整",
-            "给我", "出一份", "做一个", "搞一个",
+            "帮我",
+            "写",
+            "做",
+            "分析",
+            "整理",
+            "设计",
+            "方案",
+            "报告",
+            "文档",
+            "总结",
+            "规划",
+            "开发",
+            "实现",
+            "创建",
+            "生成",
+            "修改",
+            "更新",
+            "重构",
+            "调整",
+            "给我",
+            "出一份",
+            "做一个",
+            "搞一个",
         ];
         task_keywords.iter().any(|k| trimmed.contains(k))
     }
@@ -775,7 +935,18 @@ impl TaskConfirmationGate {
     pub fn detect_topic_switch(message: &str, current_task: &str) -> bool {
         let msg = message.trim();
         // 元命令 → 不是切换
-        let meta = ["对", "是", "确认", "行", "好", "可以", "继续", "停", "结束", "先这样"];
+        let meta = [
+            "对",
+            "是",
+            "确认",
+            "行",
+            "好",
+            "可以",
+            "继续",
+            "停",
+            "结束",
+            "先这样",
+        ];
         if meta.contains(&msg) {
             return false;
         }
@@ -793,7 +964,10 @@ impl TaskConfirmationGate {
             }
         }
         // 也处理英文/混合文本的分词
-        for w in current_task.split_whitespace().filter(|w| w.chars().count() >= 2) {
+        for w in current_task
+            .split_whitespace()
+            .filter(|w| w.chars().count() >= 2)
+        {
             if !task_tokens.contains(&w.to_string()) {
                 task_tokens.push(w.to_string());
             }
@@ -892,17 +1066,32 @@ mod tests {
         let mut boundary = ComplianceBoundary::new(None);
 
         // 注册 test-agent 的权限
-        boundary.perm_chain.lock().unwrap()
+        boundary
+            .perm_chain
+            .lock()
+            .unwrap()
             .register("test-agent", None, PermissionLevel::Write);
 
         // 正常工具应该放行
-        let r = boundary.check_tool("query_plate", &serde_json::json!({}),
-                                    "test-agent", "user", &PermissionLevel::Write, None);
+        let r = boundary.check_tool(
+            "query_plate",
+            &serde_json::json!({}),
+            "test-agent",
+            "user",
+            &PermissionLevel::Write,
+            None,
+        );
         assert!(r.allow, "query_plate 应放行: {:?}", r);
 
         // 治理工具应拦截
-        let r = boundary.check_tool("modify_red_lines", &serde_json::json!({}),
-                                    "test-agent", "user", &PermissionLevel::Write, None);
+        let r = boundary.check_tool(
+            "modify_red_lines",
+            &serde_json::json!({}),
+            "test-agent",
+            "user",
+            &PermissionLevel::Write,
+            None,
+        );
         assert!(!r.allow);
         assert_eq!(r.level, Some(BlockLevel::Red));
     }
@@ -912,26 +1101,47 @@ mod tests {
         let mut boundary = ComplianceBoundary::new(Some(vec!["query_sql".to_string()]));
 
         // 注册权限
-        boundary.perm_chain.lock().unwrap()
+        boundary
+            .perm_chain
+            .lock()
+            .unwrap()
             .register("test-agent", None, PermissionLevel::Write);
 
         // 在白名单中
-        let r = boundary.check_tool("query_sql", &serde_json::json!({}),
-                                    "test-agent", "user", &PermissionLevel::Write, None);
+        let r = boundary.check_tool(
+            "query_sql",
+            &serde_json::json!({}),
+            "test-agent",
+            "user",
+            &PermissionLevel::Write,
+            None,
+        );
         assert!(r.allow, "query_sql 应在白名单中: {:?}", r);
 
         // 不在白名单中
-        let r = boundary.check_tool("query_plate", &serde_json::json!({}),
-                                    "test-agent", "user", &PermissionLevel::Write, None);
+        let r = boundary.check_tool(
+            "query_plate",
+            &serde_json::json!({}),
+            "test-agent",
+            "user",
+            &PermissionLevel::Write,
+            None,
+        );
         assert!(!r.allow, "query_plate 应被白名单拦截: {:?}", r);
     }
 
     #[test]
     fn test_task_confirmation_simple_query() {
         // 简单查询 → 不需要确认
-        assert!(!TaskConfirmationGate::requires_confirmation("查一下京A12345"));
-        assert!(!TaskConfirmationGate::requires_confirmation("查询昨天的车辆数据"));
-        assert!(!TaskConfirmationGate::requires_confirmation("看看白名单有没有这个企业"));
+        assert!(!TaskConfirmationGate::requires_confirmation(
+            "查一下京A12345"
+        ));
+        assert!(!TaskConfirmationGate::requires_confirmation(
+            "查询昨天的车辆数据"
+        ));
+        assert!(!TaskConfirmationGate::requires_confirmation(
+            "看看白名单有没有这个企业"
+        ));
     }
 
     #[test]
@@ -945,19 +1155,34 @@ mod tests {
     #[test]
     fn test_task_confirmation_task_request() {
         // 任务类请求 → 需要确认
-        assert!(TaskConfirmationGate::requires_confirmation("帮我分析上个月的车辆数据"));
-        assert!(TaskConfirmationGate::requires_confirmation("写一份固废分析报告"));
-        assert!(TaskConfirmationGate::requires_confirmation("整理一下这个月的入厂记录"));
+        assert!(TaskConfirmationGate::requires_confirmation(
+            "帮我分析上个月的车辆数据"
+        ));
+        assert!(TaskConfirmationGate::requires_confirmation(
+            "写一份固废分析报告"
+        ));
+        assert!(TaskConfirmationGate::requires_confirmation(
+            "整理一下这个月的入厂记录"
+        ));
     }
 
     #[test]
     fn test_topic_switch_detection() {
         // 相关输入 → 非切换
-        assert!(!TaskConfirmationGate::detect_topic_switch("看看车辆数据的趋势", "分析上个月车辆入厂数据"));
+        assert!(!TaskConfirmationGate::detect_topic_switch(
+            "看看车辆数据的趋势",
+            "分析上个月车辆入厂数据"
+        ));
         // 无关输入 → 切换
-        assert!(TaskConfirmationGate::detect_topic_switch("今天天气怎么样", "分析上个月车辆入厂数据"));
+        assert!(TaskConfirmationGate::detect_topic_switch(
+            "今天天气怎么样",
+            "分析上个月车辆入厂数据"
+        ));
         // 元命令 → 非切换
-        assert!(!TaskConfirmationGate::detect_topic_switch("继续", "分析数据"));
+        assert!(!TaskConfirmationGate::detect_topic_switch(
+            "继续",
+            "分析数据"
+        ));
         // 太短 → 可能是切换
         assert!(TaskConfirmationGate::detect_topic_switch("哦", "分析数据"));
     }
@@ -965,12 +1190,21 @@ mod tests {
     #[test]
     fn test_kill_switch_blocks_all() {
         let mut boundary = ComplianceBoundary::new(None);
-        boundary.perm_chain.lock().unwrap()
+        boundary
+            .perm_chain
+            .lock()
+            .unwrap()
             .register("test-agent", None, PermissionLevel::Write);
         boundary.kill_switch().trigger(3, "emergency");
 
-        let r = boundary.check_tool("query_plate", &serde_json::json!({}),
-                                    "test-agent", "user", &PermissionLevel::Write, None);
+        let r = boundary.check_tool(
+            "query_plate",
+            &serde_json::json!({}),
+            "test-agent",
+            "user",
+            &PermissionLevel::Write,
+            None,
+        );
         assert!(!r.allow);
         assert_eq!(r.level, Some(BlockLevel::Red));
     }

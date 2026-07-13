@@ -40,18 +40,27 @@ impl PromptInjectionDetector {
                 // ── 角色扮演注入 ──
                 PatternGroup {
                     keywords: &[
-                        "忽略之前的指令", "忽略上面的内容", "忽略所有指令",
-                        "ignore all previous", "ignore previous instructions",
-                        "ignore all prior", "disregard previous",
+                        "忽略之前的指令",
+                        "忽略上面的内容",
+                        "忽略所有指令",
+                        "ignore all previous",
+                        "ignore previous instructions",
+                        "ignore all prior",
+                        "disregard previous",
                     ],
                     severity: ThreatLevel::High,
                     description: "角色扮演注入 — 试图覆盖系统指令",
                 },
                 PatternGroup {
                     keywords: &[
-                        "从现在开始你是一个", "你现在是", "你不再是",
-                        "忘记你之前", "从现在起你是",
-                        "act as if", "you are now", "pretend to be",
+                        "从现在开始你是一个",
+                        "你现在是",
+                        "你不再是",
+                        "忘记你之前",
+                        "从现在起你是",
+                        "act as if",
+                        "you are now",
+                        "pretend to be",
                         "roleplay as",
                     ],
                     severity: ThreatLevel::Medium,
@@ -59,8 +68,12 @@ impl PromptInjectionDetector {
                 },
                 PatternGroup {
                     keywords: &[
-                        "system prompt", "system指令", "system_message",
-                        "系统提示词", "显示你的提示", "show me your prompt",
+                        "system prompt",
+                        "system指令",
+                        "system_message",
+                        "系统提示词",
+                        "显示你的提示",
+                        "show me your prompt",
                         "reveal your instructions",
                     ],
                     severity: ThreatLevel::High,
@@ -69,18 +82,29 @@ impl PromptInjectionDetector {
                 // ── 权限提升 ──
                 PatternGroup {
                     keywords: &[
-                        "以管理员身份", "用admin权限", "bypass security",
-                        "escalate privilege", "as root", "with admin rights",
-                        "超级管理员", "root权限",
+                        "以管理员身份",
+                        "用admin权限",
+                        "bypass security",
+                        "escalate privilege",
+                        "as root",
+                        "with admin rights",
+                        "超级管理员",
+                        "root权限",
                     ],
                     severity: ThreatLevel::High,
                     description: "权限提升请求",
                 },
                 PatternGroup {
                     keywords: &[
-                        "不需要确认", "不要问直接执行", "不要审批",
-                        "无需人工", "不用问我", "跳过确认",
-                        "skip approval", "don't ask", "no confirmation",
+                        "不需要确认",
+                        "不要问直接执行",
+                        "不要审批",
+                        "无需人工",
+                        "不用问我",
+                        "跳过确认",
+                        "skip approval",
+                        "don't ask",
+                        "no confirmation",
                     ],
                     severity: ThreatLevel::Medium,
                     description: "绕过确认机制",
@@ -88,9 +112,13 @@ impl PromptInjectionDetector {
                 // ── 工具绕过 ──
                 PatternGroup {
                     keywords: &[
-                        "直接调用api", "直接调用工具", "直接执行函数",
-                        "call_tool directly", "invoke_tool",
-                        "raw tool call", "绕过agent",
+                        "直接调用api",
+                        "直接调用工具",
+                        "直接执行函数",
+                        "call_tool directly",
+                        "invoke_tool",
+                        "raw tool call",
+                        "绕过agent",
                     ],
                     severity: ThreatLevel::High,
                     description: "工具绕过请求",
@@ -98,8 +126,11 @@ impl PromptInjectionDetector {
                 // ── 数据外泄 ──
                 PatternGroup {
                     keywords: &[
-                        "把数据库的全部", "所有数据导出", "全部内容发到",
-                        "把这里的全部", "export all data",
+                        "把数据库的全部",
+                        "所有数据导出",
+                        "全部内容发到",
+                        "把这里的全部",
+                        "export all data",
                         "dump database",
                     ],
                     severity: ThreatLevel::Medium,
@@ -107,9 +138,13 @@ impl PromptInjectionDetector {
                 },
                 PatternGroup {
                     keywords: &[
-                        "发到我邮箱", "发送到外部", "发到我的邮箱",
-                        "转发到外部", "上传到服务器",
-                        "send to my email", "forward externally",
+                        "发到我邮箱",
+                        "发送到外部",
+                        "发到我的邮箱",
+                        "转发到外部",
+                        "上传到服务器",
+                        "send to my email",
+                        "forward externally",
                     ],
                     severity: ThreatLevel::Medium,
                     description: "数据外泄指令",

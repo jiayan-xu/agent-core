@@ -3,12 +3,12 @@
 //! - `McpClient::Http(HttpMcpClient)` — HTTP(S) 连接远程 MCP 服务器
 //! - `McpClient::Stdio(StdioMcpClient)` — 子进程 stdin/stdout MCP 通信
 
-use std::time::Duration;
-use std::process::{Child, Stdio, Command};
-use std::io::{BufRead, BufReader, Write};
-use std::sync::atomic::AtomicU64;
 use rand::Rng;
 use reqwest::Client as HttpClient;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 // ── 通用 MCP 结果 ──
 
@@ -35,7 +35,12 @@ impl HttpMcpClient {
         Self::with_timeout(base_url, agent_id, badge_token, 30)
     }
 
-    pub fn with_timeout(base_url: &str, agent_id: &str, badge_token: &str, timeout_secs: u64) -> Self {
+    pub fn with_timeout(
+        base_url: &str,
+        agent_id: &str,
+        badge_token: &str,
+        timeout_secs: u64,
+    ) -> Self {
         let client = HttpClient::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(4)
@@ -60,17 +65,24 @@ impl HttpMcpClient {
         for attempt in 0..3 {
             // 联调：为每次 MCP 调用生成 x-trace-id（与 http.request trace_id 独立，携带跨服务 trace 链）。
             let trace_id = format!("{:x}", rand::thread_rng().gen::<u128>());
-            let result = self.client.post(&url).json(&body)
+            let result = self
+                .client
+                .post(&url)
+                .json(&body)
                 .header("X-Agent-Id", &self.agent_id)
                 .header("X-Agent-Key", &self.badge_token)
                 .header("x-trace-id", &trace_id)
-                .send().await;
+                .send()
+                .await;
             match result {
                 Ok(resp) => {
                     if !resp.status().is_success() {
                         // HTTP 层错误（5xx / 网关）：视为可重试的传输错误
                         last_err = format!("HTTP {}", resp.status());
-                        if attempt < 2 { tokio::time::sleep(Duration::from_secs(attempt as u64)).await; continue; }
+                        if attempt < 2 {
+                            tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
+                            continue;
+                        }
                         return Err(last_err);
                     }
                     // HTTP 200 — 解析 JSON-RPC 信封
@@ -78,7 +90,10 @@ impl HttpMcpClient {
                         Ok(d) => d,
                         Err(e) => {
                             last_err = format!("json parse: {}", e);
-                            if attempt < 2 { tokio::time::sleep(Duration::from_secs(attempt as u64)).await; continue; }
+                            if attempt < 2 {
+                                tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
+                                continue;
+                            }
                             return Err(last_err);
                         }
                     };
@@ -88,7 +103,8 @@ impl HttpMcpClient {
                         return Err(format!("MCP error: {}", err));
                     }
                     // 成功：抽取文本结果
-                    return match data.get("result")
+                    return match data
+                        .get("result")
                         .and_then(|r| r.get("content"))
                         .and_then(|c| c.get(0))
                         .and_then(|c| c.get("text"))
@@ -101,7 +117,10 @@ impl HttpMcpClient {
                 Err(e) => {
                     // 传输层错误（连接失败 / 超时）：可重试
                     last_err = format!("MCP transport error: {}", e);
-                    if attempt < 2 { tokio::time::sleep(Duration::from_secs(attempt as u64)).await; continue; }
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
+                        continue;
+                    }
                     return Err(last_err);
                 }
             }
@@ -114,15 +133,27 @@ impl HttpMcpClient {
             "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
         });
         let url = format!("{}/mcp", self.base_url);
-        let resp = self.client.post(&url).json(&body)
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
             .header("X-Agent-Id", &self.agent_id)
             .header("X-Agent-Key", &self.badge_token)
-            .send().await.map_err(|e| format!("tools/list: {}", e))?;
-        let data: serde_json::Value = resp.json().await.map_err(|e| format!("tools/list JSON: {}", e))?;
+            .send()
+            .await
+            .map_err(|e| format!("tools/list: {}", e))?;
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("tools/list JSON: {}", e))?;
         Ok(extract_tools(&data))
     }
 
-    pub async fn call_json(&self, tool: &str, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+    pub async fn call_json(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let text = self.call(tool, args).await?;
         serde_json::from_str(&text).map_err(|e| format!("parse result: {}", e))
     }
@@ -160,7 +191,10 @@ fn read_line_flexible(reader: &mut impl BufRead) -> Result<String, String> {
 impl StdioMcpClient {
     pub fn new(command: &str, args: &[String]) -> Self {
         StdioMcpClient {
-            child: tokio::sync::Mutex::new(ChildProcess { inner: spawn_process(command, args), ready: false }),
+            child: tokio::sync::Mutex::new(ChildProcess {
+                inner: spawn_process(command, args),
+                ready: false,
+            }),
             command: command.to_string(),
             args: args.to_vec(),
             next_id: AtomicU64::new(1),
@@ -190,7 +224,9 @@ impl StdioMcpClient {
         let stdin = guard.inner.stdin.as_mut().unwrap();
         let mut line = serde_json::to_string(request).map_err(|e| format!("serialize: {}", e))?;
         line.push('\n');
-        stdin.write_all(line.as_bytes()).map_err(|e| format!("write stdin: {}", e))?;
+        stdin
+            .write_all(line.as_bytes())
+            .map_err(|e| format!("write stdin: {}", e))?;
         stdin.flush().map_err(|e| format!("flush stdin: {}", e))?;
 
         // 读取响应
@@ -204,14 +240,19 @@ impl StdioMcpClient {
     }
 
     pub async fn call(&self, tool: &str, args: &serde_json::Value) -> Result<String, String> {
-        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let request = serde_json::json!({
             "jsonrpc": "2.0", "id": id, "method": "tools/call",
             "params": { "name": tool, "arguments": args }
         });
         let response = self.communicate(&request).await?;
         if let Some(err) = response.get("error") {
-            return Err(err["message"].as_str().unwrap_or("unknown error").to_string());
+            return Err(err["message"]
+                .as_str()
+                .unwrap_or("unknown error")
+                .to_string());
         }
         Ok(response["result"]["content"][0]["text"]
             .as_str()
@@ -220,18 +261,27 @@ impl StdioMcpClient {
     }
 
     pub async fn list_tools(&self) -> Result<Vec<(String, String, serde_json::Value)>, String> {
-        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let request = serde_json::json!({
             "jsonrpc": "2.0", "id": id, "method": "tools/list", "params": {}
         });
         let response = self.communicate(&request).await?;
         if let Some(err) = response.get("error") {
-            return Err(err["message"].as_str().unwrap_or("unknown error").to_string());
+            return Err(err["message"]
+                .as_str()
+                .unwrap_or("unknown error")
+                .to_string());
         }
         Ok(extract_tools(&response))
     }
 
-    pub async fn call_json(&self, tool: &str, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+    pub async fn call_json(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let text = self.call(tool, args).await?;
         serde_json::from_str(&text).map_err(|e| format!("parse result: {}", e))
     }
@@ -253,8 +303,7 @@ fn spawn_process(command: &str, args: &[String]) -> Child {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd.spawn()
-        .expect("failed to spawn MCP server process")
+    cmd.spawn().expect("failed to spawn MCP server process")
 }
 
 // ── 统一 McpClient 枚举 ──
@@ -263,7 +312,7 @@ fn spawn_process(command: &str, args: &[String]) -> Child {
 #[derive(Clone)]
 pub enum McpClient {
     Http(HttpMcpClient),
-    Stdio(std::sync::Arc<StdioMcpClient>),  // Arc because StdioMcpClient isn't Clone
+    Stdio(std::sync::Arc<StdioMcpClient>), // Arc because StdioMcpClient isn't Clone
 }
 
 impl McpClient {
@@ -272,8 +321,18 @@ impl McpClient {
         McpClient::Http(HttpMcpClient::new(base_url, agent_id, badge_token))
     }
 
-    pub fn with_timeout(base_url: &str, agent_id: &str, badge_token: &str, timeout_secs: u64) -> Self {
-        McpClient::Http(HttpMcpClient::with_timeout(base_url, agent_id, badge_token, timeout_secs))
+    pub fn with_timeout(
+        base_url: &str,
+        agent_id: &str,
+        badge_token: &str,
+        timeout_secs: u64,
+    ) -> Self {
+        McpClient::Http(HttpMcpClient::with_timeout(
+            base_url,
+            agent_id,
+            badge_token,
+            timeout_secs,
+        ))
     }
 
     pub fn new_stdio(command: &str, args: &[String]) -> Self {
@@ -294,7 +353,11 @@ impl McpClient {
         }
     }
 
-    pub async fn call_json(&self, tool: &str, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+    pub async fn call_json(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         match self {
             McpClient::Http(c) => c.call_json(tool, args).await,
             McpClient::Stdio(c) => c.call_json(tool, args).await,
@@ -321,11 +384,19 @@ pub struct McpSource {
 
 impl McpSource {
     pub fn new(name: &str, client: McpClient, namespace: Option<String>) -> Self {
-        McpSource { name: name.to_string(), client, namespace }
+        McpSource {
+            name: name.to_string(),
+            client,
+            namespace,
+        }
     }
 
     pub fn memoria(client: McpClient) -> Self {
-        McpSource { name: "memoria".to_string(), client, namespace: None }
+        McpSource {
+            name: "memoria".to_string(),
+            client,
+            namespace: None,
+        }
     }
 }
 
@@ -336,9 +407,19 @@ fn extract_tools(data: &serde_json::Value) -> Vec<(String, String, serde_json::V
     if let Some(tools) = data["result"]["tools"].as_array() {
         for t in tools {
             if let Some(func) = t.get("function") {
-                let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("?").to_string();
-                let desc = func.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
-                let params = func.get("parameters").cloned()
+                let name = func
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let desc = func
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let params = func
+                    .get("parameters")
+                    .cloned()
                     .unwrap_or(serde_json::json!({"type": "object", "properties": {}}));
                 result.push((name, desc, params));
             }
@@ -361,7 +442,8 @@ mod tests {
 
     #[test]
     fn test_stdio_client_creation() {
-        let client = McpClient::new_stdio("python", &["-c".to_string(), "print('test')".to_string()]);
+        let client =
+            McpClient::new_stdio("python", &["-c".to_string(), "print('test')".to_string()]);
         assert!(matches!(client, McpClient::Stdio(_)));
     }
 

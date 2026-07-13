@@ -30,7 +30,11 @@ pub struct ExecutionPlan {
 ///
 /// 返回 ExecutionPlan，如果请求很简单只需一步也返回单步 plan。
 /// 解析失败时返回 Err，调用方应降级到普通 LLM loop。
-pub async fn decompose(llm: &LlmClient, query: &str, tools: &[ToolDef]) -> Result<ExecutionPlan, String> {
+pub async fn decompose(
+    llm: &LlmClient,
+    query: &str,
+    tools: &[ToolDef],
+) -> Result<ExecutionPlan, String> {
     // 构建工具摘要（名称 + 简短描述）
     let mut tools_summary = String::new();
     for t in tools.iter().take(30) {
@@ -56,8 +60,18 @@ pub async fn decompose(llm: &LlmClient, query: &str, tools: &[ToolDef]) -> Resul
     );
 
     let msgs = vec![
-        Message { role: "system".to_string(), content: Some(system_prompt), tool_calls: None, tool_call_id: None },
-        Message { role: "user".to_string(), content: Some(query.to_string()), tool_calls: None, tool_call_id: None },
+        Message {
+            role: "system".to_string(),
+            content: Some(system_prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Some(query.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        },
     ];
 
     let response = llm.chat(&msgs, &[]).await?;
@@ -65,7 +79,11 @@ pub async fn decompose(llm: &LlmClient, query: &str, tools: &[ToolDef]) -> Resul
 
     // 多策略解析，从宽松到严格
     let plan = try_parse_plan(&raw_text).map_err(|e| {
-        format!("解析计划失败: {} (原始: {})", e, raw_text.chars().take(160).collect::<String>())
+        format!(
+            "解析计划失败: {} (原始: {})",
+            e,
+            raw_text.chars().take(160).collect::<String>()
+        )
     })?;
 
     if plan.steps.is_empty() {
@@ -73,10 +91,14 @@ pub async fn decompose(llm: &LlmClient, query: &str, tools: &[ToolDef]) -> Resul
     }
 
     // 校验：所有工具名必须在 tools 列表中
-    let tool_names: std::collections::HashSet<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
+    let tool_names: std::collections::HashSet<&str> =
+        tools.iter().map(|t| t.function.name.as_str()).collect();
     for step in &plan.steps {
         if !tool_names.contains(step.tool.as_str()) {
-            return Err(format!("Step {} 使用了未知工具: {}", step.step_id, step.tool));
+            return Err(format!(
+                "Step {} 使用了未知工具: {}",
+                step.step_id, step.tool
+            ));
         }
     }
 
@@ -270,7 +292,10 @@ mod tests {
 
     #[test]
     fn test_extra_text_before() {
-        let text = format!("好的，我来帮你分解任务：\n\n{}\n\n确认这个方案吗？", sample_plan_json());
+        let text = format!(
+            "好的，我来帮你分解任务：\n\n{}\n\n确认这个方案吗？",
+            sample_plan_json()
+        );
         let plan = try_parse_plan(&text).unwrap();
         assert_eq!(plan, sample_plan());
     }
@@ -288,7 +313,6 @@ mod tests {
         let plan = try_parse_plan(text).unwrap();
         assert_eq!(plan, sample_plan());
     }
-
 
     #[test]
     fn test_extract_first_json_with_prefix() {

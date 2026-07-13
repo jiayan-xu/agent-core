@@ -65,12 +65,21 @@ pub struct Namespace {
 
 impl Namespace {
     pub fn new(level: NsLevel, id: &str) -> Self {
-        Namespace { level, id: id.to_string() }
+        Namespace {
+            level,
+            id: id.to_string(),
+        }
     }
 
-    pub fn dept(id: &str) -> Self { Namespace::new(NsLevel::Dept, id) }
-    pub fn project(id: &str) -> Self { Namespace::new(NsLevel::Project, id) }
-    pub fn user(id: &str) -> Self { Namespace::new(NsLevel::User, id) }
+    pub fn dept(id: &str) -> Self {
+        Namespace::new(NsLevel::Dept, id)
+    }
+    pub fn project(id: &str) -> Self {
+        Namespace::new(NsLevel::Project, id)
+    }
+    pub fn user(id: &str) -> Self {
+        Namespace::new(NsLevel::User, id)
+    }
 
     /// 本地路径：/dept/{id}、/project/{id}、/user/{id}
     pub fn to_path(&self) -> String {
@@ -87,7 +96,10 @@ impl Namespace {
                 "user" => NsLevel::User,
                 _ => return None,
             };
-            Some(Namespace { level, id: parts[parts.len() - 1].to_string() })
+            Some(Namespace {
+                level,
+                id: parts[parts.len() - 1].to_string(),
+            })
         } else {
             None
         }
@@ -99,7 +111,13 @@ impl Namespace {
         if parent_full_path.is_empty() {
             local
         } else {
-            format!("{}/{}", parent_full_path.trim_start_matches('/').trim_end_matches('/'), local)
+            format!(
+                "{}/{}",
+                parent_full_path
+                    .trim_start_matches('/')
+                    .trim_end_matches('/'),
+                local
+            )
         }
     }
 }
@@ -133,11 +151,17 @@ impl NamespaceRegistry {
     /// 由之前的 register() 返回。父节点必须已存在。
     ///
     /// 返回新节点的完整路径（如 `/dept/运营部/project/固废平台`）。
-    pub fn register(&mut self, ns: Namespace, parent_full_path: Option<&str>) -> Result<String, String> {
+    pub fn register(
+        &mut self,
+        ns: Namespace,
+        parent_full_path: Option<&str>,
+    ) -> Result<String, String> {
         // 计算完整路径
         let full_path = match parent_full_path {
             Some(pp) => {
-                let parent = self.namespaces.get(pp)
+                let parent = self
+                    .namespaces
+                    .get(pp)
                     .ok_or_else(|| format!("父 namespace 不存在: {}", pp))?;
 
                 // 校验层级关系
@@ -161,7 +185,10 @@ impl NamespaceRegistry {
             }
             None => {
                 if ns.level != NsLevel::Dept {
-                    return Err(format!("只有 Dept 级别可以不指定父 namespace，{} 需要父 namespace", ns.level));
+                    return Err(format!(
+                        "只有 Dept 级别可以不指定父 namespace，{} 需要父 namespace",
+                        ns.level
+                    ));
                 }
                 ns.to_path()
             }
@@ -173,13 +200,17 @@ impl NamespaceRegistry {
 
         let parent_owned = parent_full_path.map(|s| s.trim_end_matches('/').to_string());
 
-        self.namespaces.insert(full_path.clone(), NsEntry {
-            ns: ns.clone(),
-            parent_full_path: parent_owned.clone(),
-        });
+        self.namespaces.insert(
+            full_path.clone(),
+            NsEntry {
+                ns: ns.clone(),
+                parent_full_path: parent_owned.clone(),
+            },
+        );
 
         if let Some(ref pp) = parent_owned {
-            self.children_index.entry(pp.clone())
+            self.children_index
+                .entry(pp.clone())
                 .or_default()
                 .push(full_path.clone());
         }
@@ -188,7 +219,10 @@ impl NamespaceRegistry {
     }
 
     /// 批量注册（方便测试和启动时初始化）
-    pub fn register_batch(&mut self, entries: Vec<(Namespace, Option<String>)>) -> Result<Vec<String>, String> {
+    pub fn register_batch(
+        &mut self,
+        entries: Vec<(Namespace, Option<String>)>,
+    ) -> Result<Vec<String>, String> {
         let mut results = Vec::new();
         for (ns, parent) in entries {
             results.push(self.register(ns, parent.as_deref())?);
@@ -232,7 +266,10 @@ impl NamespaceRegistry {
 
     /// 获取指定完整路径的直接子级
     pub fn children(&self, full_path: &str) -> Vec<String> {
-        self.children_index.get(full_path).cloned().unwrap_or_default()
+        self.children_index
+            .get(full_path)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// 获取指定完整路径的所有后代（递归）
@@ -264,7 +301,8 @@ impl NamespaceRegistry {
 
     /// 按层级过滤
     pub fn list_by_level(&self, level: &NsLevel) -> Vec<String> {
-        self.namespaces.iter()
+        self.namespaces
+            .iter()
             .filter(|(_, entry)| entry.ns.level == *level)
             .map(|(path, _)| path.clone())
             .collect()
@@ -272,9 +310,11 @@ impl NamespaceRegistry {
 
     /// 获取某个节点下所有指定层级的后代路径
     pub fn descendants_by_level(&self, root: &str, level: &NsLevel) -> Vec<String> {
-        self.descendants(root).into_iter()
+        self.descendants(root)
+            .into_iter()
             .filter(|path| {
-                self.namespaces.get(path)
+                self.namespaces
+                    .get(path)
                     .map(|e| e.ns.level == *level)
                     .unwrap_or(false)
             })
@@ -334,7 +374,10 @@ mod tests {
     #[test]
     fn test_namespace_to_path() {
         assert_eq!(Namespace::dept("运营部").to_path(), "/dept/运营部");
-        assert_eq!(Namespace::project("固废平台").to_path(), "/project/固废平台");
+        assert_eq!(
+            Namespace::project("固废平台").to_path(),
+            "/project/固废平台"
+        );
         assert_eq!(Namespace::user("张三").to_path(), "/user/张三");
     }
 
@@ -375,7 +418,9 @@ mod tests {
     #[test]
     fn test_dept_must_be_root() {
         let mut reg = NamespaceRegistry::new();
-        let err = reg.register(Namespace::project("固废平台"), None).unwrap_err();
+        let err = reg
+            .register(Namespace::project("固废平台"), None)
+            .unwrap_err();
         assert!(err.contains("需要父 namespace"));
     }
 
@@ -384,9 +429,12 @@ mod tests {
         let mut reg = NamespaceRegistry::new();
         reg.register(Namespace::dept("运营部"), None).unwrap();
 
-        reg.register(Namespace::project("固废平台"), Some("/dept/运营部")).unwrap();
+        reg.register(Namespace::project("固废平台"), Some("/dept/运营部"))
+            .unwrap();
 
-        let err = reg.register(Namespace::user("张三"), Some("/dept/运营部")).unwrap_err();
+        let err = reg
+            .register(Namespace::user("张三"), Some("/dept/运营部"))
+            .unwrap_err();
         assert!(err.contains("Dept 下只能注册 Project"));
     }
 
@@ -394,7 +442,9 @@ mod tests {
     fn test_full_hierarchy() {
         let mut reg = NamespaceRegistry::new();
         let dept = reg.register(Namespace::dept("运营部"), None).unwrap();
-        let proj = reg.register(Namespace::project("固废平台"), Some(&dept)).unwrap();
+        let proj = reg
+            .register(Namespace::project("固废平台"), Some(&dept))
+            .unwrap();
         reg.register(Namespace::user("张三"), Some(&proj)).unwrap();
 
         assert_eq!(reg.count(), 3);
@@ -412,7 +462,9 @@ mod tests {
     #[test]
     fn test_missing_parent() {
         let mut reg = NamespaceRegistry::new();
-        let err = reg.register(Namespace::project("固废平台"), Some("/dept/不存在")).unwrap_err();
+        let err = reg
+            .register(Namespace::project("固废平台"), Some("/dept/不存在"))
+            .unwrap_err();
         assert!(err.contains("父 namespace 不存在"));
     }
 
@@ -420,7 +472,9 @@ mod tests {
     fn test_contains() {
         let mut reg = NamespaceRegistry::new();
         let d = reg.register(Namespace::dept("运营部"), None).unwrap();
-        let p = reg.register(Namespace::project("固废平台"), Some(&d)).unwrap();
+        let p = reg
+            .register(Namespace::project("固废平台"), Some(&d))
+            .unwrap();
         let u = reg.register(Namespace::user("张三"), Some(&p)).unwrap();
 
         assert!(reg.contains(&d, &p));
@@ -435,7 +489,9 @@ mod tests {
     fn test_ancestors() {
         let mut reg = NamespaceRegistry::new();
         let d = reg.register(Namespace::dept("运营部"), None).unwrap();
-        let p = reg.register(Namespace::project("固废平台"), Some(&d)).unwrap();
+        let p = reg
+            .register(Namespace::project("固废平台"), Some(&d))
+            .unwrap();
         let u = reg.register(Namespace::user("张三"), Some(&p)).unwrap();
 
         let ancestors = reg.ancestors(&u);
@@ -448,8 +504,12 @@ mod tests {
     fn test_children_and_descendants() {
         let mut reg = NamespaceRegistry::new();
         let d = reg.register(Namespace::dept("运营部"), None).unwrap();
-        let p1 = reg.register(Namespace::project("固废平台"), Some(&d)).unwrap();
-        let p2 = reg.register(Namespace::project("智慧交通"), Some(&d)).unwrap();
+        let p1 = reg
+            .register(Namespace::project("固废平台"), Some(&d))
+            .unwrap();
+        let p2 = reg
+            .register(Namespace::project("智慧交通"), Some(&d))
+            .unwrap();
         reg.register(Namespace::user("张三"), Some(&p1)).unwrap();
         reg.register(Namespace::user("李四"), Some(&p1)).unwrap();
 
@@ -468,7 +528,8 @@ mod tests {
         reg.register(Namespace::dept("运营部"), None).unwrap();
         reg.register(Namespace::dept("技术部"), None).unwrap();
         let d = reg.list_all().first().unwrap().clone();
-        reg.register(Namespace::project("固废平台"), Some(&d)).unwrap();
+        reg.register(Namespace::project("固废平台"), Some(&d))
+            .unwrap();
 
         assert_eq!(reg.list_by_level(&NsLevel::Dept).len(), 2);
         assert_eq!(reg.list_by_level(&NsLevel::Project).len(), 1);
@@ -479,7 +540,9 @@ mod tests {
     fn test_descendants_by_level() {
         let mut reg = NamespaceRegistry::new();
         let d = reg.register(Namespace::dept("运营部"), None).unwrap();
-        let p = reg.register(Namespace::project("固废平台"), Some(&d)).unwrap();
+        let p = reg
+            .register(Namespace::project("固废平台"), Some(&d))
+            .unwrap();
         reg.register(Namespace::user("张三"), Some(&p)).unwrap();
         reg.register(Namespace::user("李四"), Some(&p)).unwrap();
 
@@ -498,8 +561,14 @@ mod tests {
         let mut reg = NamespaceRegistry::new();
         let result = reg.register_batch(vec![
             (Namespace::dept("运营部"), None),
-            (Namespace::project("固废平台"), Some("/dept/运营部".to_string())),
-            (Namespace::user("张三"), Some("/dept/运营部/project/固废平台".to_string())),
+            (
+                Namespace::project("固废平台"),
+                Some("/dept/运营部".to_string()),
+            ),
+            (
+                Namespace::user("张三"),
+                Some("/dept/运营部/project/固废平台".to_string()),
+            ),
         ]);
         assert!(result.is_ok());
         assert_eq!(reg.count(), 3);

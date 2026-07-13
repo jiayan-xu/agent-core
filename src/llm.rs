@@ -14,7 +14,11 @@ pub enum SseEvent {
     #[serde(rename = "text")]
     TextEvt { content: String },
     #[serde(rename = "tool_call")]
-    ToolCallEvt { name: String, arguments: serde_json::Value, id: String },
+    ToolCallEvt {
+        name: String,
+        arguments: serde_json::Value,
+        id: String,
+    },
     #[serde(rename = "tool_result")]
     ToolResultEvt { name: String, result: String },
     #[serde(rename = "done")]
@@ -128,7 +132,11 @@ impl LlmClient {
     ) -> Result<LlmResponse, String> {
         // 主 Provider + 备用 Provider 列表
         let mut providers = Vec::new();
-        providers.push((self.config.base_url.clone(), self.config.model.clone(), self.config.api_key.clone()));
+        providers.push((
+            self.config.base_url.clone(),
+            self.config.model.clone(),
+            self.config.api_key.clone(),
+        ));
         for fb in &self.config.fallbacks {
             providers.push(fb.clone());
         }
@@ -147,7 +155,8 @@ impl LlmClient {
             });
 
             if !tools.is_empty() {
-                body["tools"] = serde_json::to_value(tools).map_err(|e| format!("tools json: {}", e))?;
+                body["tools"] =
+                    serde_json::to_value(tools).map_err(|e| format!("tools json: {}", e))?;
             }
 
             // 3 次重试：0s, 1s, 2s 退避
@@ -166,7 +175,11 @@ impl LlmClient {
                         let status = resp.status();
                         if !status.is_success() {
                             let err_body = resp.text().await.unwrap_or_default();
-                            let msg = format!("HTTP {}: {}", status.as_u16(), err_body.chars().take(200).collect::<String>());
+                            let msg = format!(
+                                "HTTP {}: {}",
+                                status.as_u16(),
+                                err_body.chars().take(200).collect::<String>()
+                            );
                             if attempt < max_retries - 1 {
                                 tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
                                 continue;
@@ -175,7 +188,8 @@ impl LlmClient {
                             break;
                         }
 
-                        let data: serde_json::Value = resp.json().await.map_err(|e| format!("LLM json: {}", e))?;
+                        let data: serde_json::Value =
+                            resp.json().await.map_err(|e| format!("LLM json: {}", e))?;
 
                         let choice = data["choices"][0]
                             .as_object()
@@ -203,7 +217,11 @@ impl LlmClient {
                                         let args_str = tc["function"]["arguments"].as_str()?;
                                         let arguments: serde_json::Value =
                                             serde_json::from_str(args_str).ok()?;
-                                        Some(ToolCall { id, name, arguments })
+                                        Some(ToolCall {
+                                            id,
+                                            name,
+                                            arguments,
+                                        })
                                     })
                                     .collect::<Vec<_>>()
                             })
@@ -228,7 +246,10 @@ impl LlmClient {
             }
         }
 
-        Err(format!("LLM 所有 Provider 均失败，最后错误: {}", last_error))
+        Err(format!(
+            "LLM 所有 Provider 均失败，最后错误: {}",
+            last_error
+        ))
     }
 
     /// 流式聊天（SSE 事件通过 sender 发送）
@@ -241,7 +262,11 @@ impl LlmClient {
     ) -> Result<(), String> {
         // P2-6: 主 Provider 失败时尝试备用 Provider
         let mut providers = Vec::new();
-        providers.push((self.config.base_url.clone(), self.config.model.clone(), self.config.api_key.clone()));
+        providers.push((
+            self.config.base_url.clone(),
+            self.config.model.clone(),
+            self.config.api_key.clone(),
+        ));
         for fb in &self.config.fallbacks {
             providers.push(fb.clone());
         }
@@ -250,7 +275,10 @@ impl LlmClient {
         tracing::info!("llm.complete start");
 
         for (idx, (base_url, model, api_key)) in providers.iter().enumerate() {
-            match self.chat_stream_single(base_url, model, api_key, messages, tools, &sender).await {
+            match self
+                .chat_stream_single(base_url, model, api_key, messages, tools, &sender)
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     if idx == 0 {
@@ -267,7 +295,9 @@ impl LlmClient {
             }
         }
 
-        let _ = sender.send(SseEvent::ErrorEvt { message: last_error.clone() });
+        let _ = sender.send(SseEvent::ErrorEvt {
+            message: last_error.clone(),
+        });
         Err(last_error)
     }
 
@@ -292,7 +322,8 @@ impl LlmClient {
         });
 
         if !tools.is_empty() {
-            body["tools"] = serde_json::to_value(tools).map_err(|e| format!("tools json: {}", e))?;
+            body["tools"] =
+                serde_json::to_value(tools).map_err(|e| format!("tools json: {}", e))?;
         }
 
         // DeepSeek 专用：禁用 thinking 输出（避免中文乱码）
@@ -310,7 +341,11 @@ impl LlmClient {
         let status = resp.status();
         if !status.is_success() {
             let err_body = resp.text().await.unwrap_or_default();
-            return Err(format!("HTTP {}: {}", status.as_u16(), err_body.chars().take(200).collect::<String>()));
+            return Err(format!(
+                "HTTP {}: {}",
+                status.as_u16(),
+                err_body.chars().take(200).collect::<String>()
+            ));
         }
 
         use futures::StreamExt;
@@ -332,20 +367,26 @@ impl LlmClient {
 
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
                     if let Some(choices) = val["choices"].as_array() {
-                        if choices.is_empty() { continue; }
+                        if choices.is_empty() {
+                            continue;
+                        }
                         let delta = &choices[0]["delta"];
 
                         // thinking
                         if let Some(tc) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
                             if !tc.is_empty() {
-                                let _ = sender.send(SseEvent::ThinkingEvt { content: tc.to_string() });
+                                let _ = sender.send(SseEvent::ThinkingEvt {
+                                    content: tc.to_string(),
+                                });
                             }
                         }
 
                         // text
                         if let Some(tc) = delta.get("content").and_then(|c| c.as_str()) {
                             if !tc.is_empty() {
-                                let _ = sender.send(SseEvent::TextEvt { content: tc.to_string() });
+                                let _ = sender.send(SseEvent::TextEvt {
+                                    content: tc.to_string(),
+                                });
                             }
                         }
 
@@ -353,11 +394,14 @@ impl LlmClient {
                         if let Some(tcs) = delta.get("tool_calls").and_then(|tc| tc.as_array()) {
                             for tc in tcs {
                                 let id = tc["id"].as_str().unwrap_or("").to_string();
-                                let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                                let name =
+                                    tc["function"]["name"].as_str().unwrap_or("").to_string();
                                 let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
                                 if let Ok(args) = serde_json::from_str(args_str) {
                                     let _ = sender.send(SseEvent::ToolCallEvt {
-                                        name, arguments: args, id,
+                                        name,
+                                        arguments: args,
+                                        id,
                                     });
                                 }
                             }

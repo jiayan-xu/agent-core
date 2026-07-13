@@ -1,22 +1,22 @@
 //! Agent 核心 — chat 循环 + 工具执行
 
-use std::sync::Arc;
 use chrono::Datelike;
+use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::audit::{AuditLogger, new_trace_id};
-use crate::boundary::{self, ComplianceBoundary, PermissionLevel, BlockLevel};
+use crate::approval::ApprovalManager;
+use crate::audit::{new_trace_id, AuditLogger};
+use crate::boundary::prompt_injection::{PromptInjectionDetector, ThreatLevel};
+use crate::boundary::{self, BlockLevel, ComplianceBoundary, PermissionLevel};
 use crate::checkpoint::{CheckpointState, CheckpointStore};
 use crate::degrade::{DegradeMode, DegradeMonitor, UNHEALTHY_THRESHOLD};
-use crate::boundary::prompt_injection::{PromptInjectionDetector, ThreatLevel};
 use crate::harness::{self, ExecutionLog, HarnessStore};
 use crate::llm::{LlmClient, LlmConfig, Message, ToolDef};
 use crate::mcp_client::{McpClient, McpSource};
-use crate::session::{PendingAction, SessionManager, SessionState};
 use crate::namespace::NamespaceRegistry;
 use crate::quota::NsQuotaStore;
-use crate::approval::ApprovalManager;
+use crate::session::{PendingAction, SessionManager, SessionState};
 use std::collections::HashMap;
 
 /// Agent 身份
@@ -56,7 +56,13 @@ pub struct AgentConfig {
     /// 可选 MCP 源（名称 + URL + 令牌 + 可选的 stdio (命令, 参数) + 可选的命名空间），
     /// 例 HTTP:  [("dashboard", "http://127.0.0.1:8000", "", None, Some("dept/工程部/proj/P1".into()))]
     /// 例 stdio: [("dashboard", "", "", Some(("python".into(), ["-m","mcp_server"].map(String::from).to_vec())), None)]
-    pub additional_mcp: Vec<(String, String, String, Option<(String, Vec<String>)>, Option<String>)>,
+    pub additional_mcp: Vec<(
+        String,
+        String,
+        String,
+        Option<(String, Vec<String>)>,
+        Option<String>,
+    )>,
     pub skill_whitelist: Option<Vec<String>>,
     pub max_tool_rounds: u32,
     pub parent_permission: PermissionLevel,
@@ -76,8 +82,8 @@ pub struct AgentConfig {
 /// Agent 核心
 pub struct AgentCore {
     pub config: AgentConfig,
-    pub mcp: McpClient,  // Memoria MCP（主）
-    pub mcp_sources: Vec<McpSource>,  // 全部 MCP 源（含 Memoria）
+    pub mcp: McpClient,              // Memoria MCP（主）
+    pub mcp_sources: Vec<McpSource>, // 全部 MCP 源（含 Memoria）
     pub llm: LlmClient,
     pub boundary: Arc<Mutex<ComplianceBoundary>>,
     pub harness: Arc<Mutex<HarnessStore>>,
@@ -128,7 +134,10 @@ struct InboxCache {
 
 impl InboxCache {
     fn new() -> Self {
-        InboxCache { data: None, expires_at: 0.0 }
+        InboxCache {
+            data: None,
+            expires_at: 0.0,
+        }
     }
     fn is_fresh(&self) -> bool {
         let now = now_secs();
@@ -139,7 +148,11 @@ impl InboxCache {
 impl AgentCore {
     /// 创建 Agent 核心
     pub fn new(config: AgentConfig, harness: HarnessStore, checkpoint: CheckpointStore) -> Self {
-        let mcp = McpClient::new(&config.memoria_url, &config.identity.agent_id, &config.identity.badge_token);
+        let mcp = McpClient::new(
+            &config.memoria_url,
+            &config.identity.agent_id,
+            &config.identity.badge_token,
+        );
         // 构建 MCP 源列表（Memoria 始终为第一个源）
         let mut mcp_sources = vec![McpSource::memoria(mcp.clone())];
         for (name, url, token, stdio_opt, src_ns) in &config.additional_mcp {
@@ -147,7 +160,11 @@ impl AgentCore {
                 let client = McpClient::new_stdio(cmd, args);
                 mcp_sources.push(McpSource::new(name, client, src_ns.clone()));
             } else {
-                let badge = if token.is_empty() { &config.identity.badge_token } else { token };
+                let badge = if token.is_empty() {
+                    &config.identity.badge_token
+                } else {
+                    token
+                };
                 let client = McpClient::new(url, &config.identity.agent_id, badge);
                 mcp_sources.push(McpSource::new(name, client, src_ns.clone()));
             }
@@ -225,16 +242,48 @@ impl AgentCore {
     /// - 简单查询 → 直接执行
     /// - 已确认会话 → 话题切换检测
     #[tracing::instrument(skip_all, fields(user_id = %user_id, session_id = %session_id))]
-    pub async fn chat(&self, message: &str, user_id: &str, session_id: &str, allowed_ns: &[String]) -> String {
+    pub async fn chat(
+        &self,
+        message: &str,
+        user_id: &str,
+        session_id: &str,
+        allowed_ns: &[String],
+    ) -> String {
         let confirm_words = [
-            "确认", "确认添加", "确认执行", "添加", "是", "是的", "对", "执行", "确定", "可以",
-            "好", "好的", "行", "没问题", "去吧", "查吧", "执行吧", "同意", "继续", "就按这个",
+            "确认",
+            "确认添加",
+            "确认执行",
+            "添加",
+            "是",
+            "是的",
+            "对",
+            "执行",
+            "确定",
+            "可以",
+            "好",
+            "好的",
+            "行",
+            "没问题",
+            "去吧",
+            "查吧",
+            "执行吧",
+            "同意",
+            "继续",
+            "就按这个",
         ];
         // 确认词用「包含匹配」而非精确相等：用户常回“对的”“好的，执行”“可以，查吧”
         // 等变体，精确匹配会漏掉导致确认状态机死循环（反复问“方向对吗？”）。
         let is_confirm = |m: &str| confirm_words.iter().any(|w| m.contains(*w));
         let is_cancel = |m: &str| {
-            let kws = ["取消", "算了", "不执行", "放弃", "不要了", "不算了", "取消计划"];
+            let kws = [
+                "取消",
+                "算了",
+                "不执行",
+                "放弃",
+                "不要了",
+                "不算了",
+                "取消计划",
+            ];
             kws.iter().any(|w| m.contains(w))
         };
         let trimmed = message.trim();
@@ -278,7 +327,9 @@ impl AgentCore {
                     let ns = self.caller_ns(session_id);
                     let db_path = self.harness.lock().await.db_path();
                     let reply = "⚠️ 检测到可疑指令，已拒绝执行。\n\n本次请求因安全风险被拦截。";
-                    self.session_manager.save_to_history(session_id, &ns, &db_path, message, reply).await;
+                    self.session_manager
+                        .save_to_history(session_id, &ns, &db_path, message, reply)
+                        .await;
                     return reply.to_string();
                 }
                 ThreatLevel::Medium => {
@@ -299,23 +350,33 @@ impl AgentCore {
             let reply = "⏰ 确认已超时，如需继续请重新发送指令。";
             let ns = self.caller_ns(session_id);
             let db_path = self.harness.lock().await.db_path();
-            self.session_manager.save_to_history(session_id, &ns, &db_path, message, reply).await;
+            self.session_manager
+                .save_to_history(session_id, &ns, &db_path, message, reply)
+                .await;
             return reply.to_string();
         }
 
         // ── 0a. 工具级确认（现有）：pending_actions 中的操作等待确认 ──
         if is_confirm(trimmed) {
             if let Some(action) = self.session_manager.take_pending_action(session_id).await {
-                let result = match self.call_tool_routed(&action.tool_name, &action.arguments, allowed_ns, &trace_id).await {
+                let result = match self
+                    .call_tool_routed(&action.tool_name, &action.arguments, allowed_ns, &trace_id)
+                    .await
+                {
                     Ok(text) => text,
                     Err(e) => format!("执行失败: {}", e),
                 };
                 let desc = action.description.chars().take(120).collect::<String>();
                 let result_short = result.chars().take(300).collect::<String>();
-                let reply = format!("✅ 操作已执行成功！\n\n操作内容：{}\n\n{}", desc, result_short);
+                let reply = format!(
+                    "✅ 操作已执行成功！\n\n操作内容：{}\n\n{}",
+                    desc, result_short
+                );
                 let ns = self.caller_ns(session_id);
                 let db_path = self.harness.lock().await.db_path();
-                self.session_manager.save_to_history(session_id, &ns, &db_path, message, &reply).await;
+                self.session_manager
+                    .save_to_history(session_id, &ns, &db_path, message, &reply)
+                    .await;
                 return reply;
             }
         }
@@ -332,10 +393,15 @@ impl AgentCore {
                     return "✅ 已取消该计划。如需重新开始，请告诉我新的需求。".to_string();
                 }
                 if is_confirm(trimmed) {
-                    let original = self.session_manager.take_original_message(session_id).await
+                    let original = self
+                        .session_manager
+                        .take_original_message(session_id)
+                        .await
                         .unwrap_or_else(|| message.to_string());
                     self.checkpoint_confirmed(session_id).await;
-                    return self.execute_chat(&original, user_id, session_id, allowed_ns, &trace_id).await;
+                    return self
+                        .execute_chat(&original, user_id, session_id, allowed_ns, &trace_id)
+                        .await;
                 }
                 // P1-2: 计划编辑（当前支持「删除第N步」）
                 if let Some(new_plan) = self.try_apply_plan_edit(trimmed).await {
@@ -344,7 +410,9 @@ impl AgentCore {
                     return self.render_plan_preview(&new_plan).await;
                 }
                 // 修改/补充 → 保留 AwaitingConfirmation，重新复述
-                return self.rephrase_and_confirm(message, user_id, session_id, allowed_ns).await;
+                return self
+                    .rephrase_and_confirm(message, user_id, session_id, allowed_ns)
+                    .await;
             }
 
             // ── 已确认，正常执行 ──
@@ -355,24 +423,39 @@ impl AgentCore {
                         return self.handle_topic_switch(message, session_id).await;
                     }
                 }
-                return self.execute_chat(message, user_id, session_id, allowed_ns, &trace_id).await;
+                return self
+                    .execute_chat(message, user_id, session_id, allowed_ns, &trace_id)
+                    .await;
             }
 
             // ── 新会话 ──
             SessionState::New => {
                 if boundary::TaskConfirmationGate::requires_confirmation(message) {
                     self.checkpoint_awaiting(session_id, message).await;
-                    return self.rephrase_and_confirm(message, user_id, session_id, allowed_ns).await;
+                    return self
+                        .rephrase_and_confirm(message, user_id, session_id, allowed_ns)
+                        .await;
                 }
                 // 简单查询 → 直接执行
-                self.session_manager.set_state(session_id, SessionState::Confirmed).await;
-                return self.execute_chat(message, user_id, session_id, allowed_ns, &trace_id).await;
+                self.session_manager
+                    .set_state(session_id, SessionState::Confirmed)
+                    .await;
+                return self
+                    .execute_chat(message, user_id, session_id, allowed_ns, &trace_id)
+                    .await;
             }
         }
     }
 
     /// 已确认会话的执行路径（原 chat() 主体 + Step 前缀）
-    async fn execute_chat(&self, message: &str, user_id: &str, session_id: &str, allowed_ns: &[String], trace_id: &str) -> String {
+    async fn execute_chat(
+        &self,
+        message: &str,
+        user_id: &str,
+        session_id: &str,
+        allowed_ns: &[String],
+        trace_id: &str,
+    ) -> String {
         // ── 0. 组合路由路径：多 Skill 分解 + 按序执行 ──
         if self.config.enable_compositional_routing {
             let tools = self.fetch_tools_filtered(allowed_ns).await;
@@ -392,14 +475,25 @@ impl AgentCore {
                     if self.config.compositional_preview && !is_resume && plan.steps.len() > 1 {
                         *self.in_progress_plan.lock().await = Some(plan.clone());
                         self.checkpoint_preview(session_id, &plan).await;
-                        self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
-                        self.session_manager.set_original_message(session_id, message).await;
+                        self.session_manager
+                            .set_state(session_id, SessionState::AwaitingConfirmation)
+                            .await;
+                        self.session_manager
+                            .set_original_message(session_id, message)
+                            .await;
                         return self.render_plan_preview(&plan).await;
                     }
                     // 执行路径（续跑 / 单步 / 关闭预览）：记录进行中 + 执行
                     *self.in_progress_plan.lock().await = Some(plan.clone());
-                    self.checkpoint_executing(session_id, &plan, &self.in_progress_step_results.lock().await.clone()).await;
-                    let result = self.execute_plan(&plan, session_id, allowed_ns).await
+                    self.checkpoint_executing(
+                        session_id,
+                        &plan,
+                        &self.in_progress_step_results.lock().await.clone(),
+                    )
+                    .await;
+                    let result = self
+                        .execute_plan(&plan, session_id, allowed_ns)
+                        .await
                         .unwrap_or_else(|e| format!("组合执行失败: {}", e));
 
                     // 蒸馏闭环：记录组合执行的摘要日志，触发 Harness 蒸馏
@@ -408,12 +502,19 @@ impl AgentCore {
                         let mut log = self.execution_log.lock().await;
                         let query_preview: String = message.chars().take(80).collect();
                         log.push(crate::harness::ExecutionLog {
-                            name: format!("composer_{}", message.chars().take(20).collect::<String>()),
+                            name: format!(
+                                "composer_{}",
+                                message.chars().take(20).collect::<String>()
+                            ),
                             trigger_conditions: serde_json::json!({"query": query_preview}),
-                            steps: serde_json::json!(plan.steps.iter().map(|s| serde_json::json!({
-                                "tool": s.tool,
-                                "args": s.arguments,
-                            })).collect::<Vec<serde_json::Value>>()),
+                            steps: serde_json::json!(plan
+                                .steps
+                                .iter()
+                                .map(|s| serde_json::json!({
+                                    "tool": s.tool,
+                                    "args": s.arguments,
+                                }))
+                                .collect::<Vec<serde_json::Value>>()),
                             verify_rule: String::new(),
                             success: is_success,
                         });
@@ -427,7 +528,8 @@ impl AgentCore {
                     }
 
                     // P1-1: 组合执行完成 → 终态 checkpoint，清理进行中计划
-                    self.checkpoint_terminal(session_id, CheckpointState::Done).await;
+                    self.checkpoint_terminal(session_id, CheckpointState::Done)
+                        .await;
                     *self.in_progress_plan.lock().await = None;
                     self.in_progress_step_results.lock().await.clear();
 
@@ -455,7 +557,9 @@ impl AgentCore {
         if let Some(reply) = self.execute_approved_request(session_id, allowed_ns).await {
             let ns = self.caller_ns(session_id);
             let db_path = self.harness.lock().await.db_path();
-            self.session_manager.save_to_history(session_id, &ns, &db_path, message, &reply).await;
+            self.session_manager
+                .save_to_history(session_id, &ns, &db_path, message, &reply)
+                .await;
             return reply;
         }
 
@@ -467,7 +571,11 @@ impl AgentCore {
             for m in inbox_msgs.iter().take(3) {
                 let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 let from = m.get("from").and_then(|f| f.as_str()).unwrap_or("?");
-                prefix.push_str(&format!("- [{}] {}\n", from, &content[..content.len().min(200)]));
+                prefix.push_str(&format!(
+                    "- [{}] {}\n",
+                    from,
+                    &content[..content.len().min(200)]
+                ));
             }
             enriched_message = format!("{}\n---\n{}", prefix, message);
         }
@@ -485,19 +593,34 @@ impl AgentCore {
         // ── 3. 加载历史对话 ──
         let ns = self.caller_ns(session_id);
         let db_path = self.harness.lock().await.db_path();
-        let history = self.session_manager.load_history(session_id, &ns, &db_path).await;
+        let history = self
+            .session_manager
+            .load_history(session_id, &ns, &db_path)
+            .await;
 
         // ── 4. 构建消息列表 ──
         let system_prompt = self.build_system_prompt(&knowledge);
         let mut messages = Vec::new();
-        messages.push(Message { role: "system".to_string(), content: Some(system_prompt), tool_calls: None, tool_call_id: None });
+        messages.push(Message {
+            role: "system".to_string(),
+            content: Some(system_prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        });
         for h in history.iter().rev().take(20) {
             messages.push(h.clone());
         }
-        messages.push(Message { role: "user".to_string(), content: Some(enriched_message), tool_calls: None, tool_call_id: None });
+        messages.push(Message {
+            role: "user".to_string(),
+            content: Some(enriched_message),
+            tool_calls: None,
+            tool_call_id: None,
+        });
 
         // ── 5. LLM 调用循环 ──
-        let result = self.llm_loop(messages, session_id, message, user_id, allowed_ns, trace_id).await;
+        let result = self
+            .llm_loop(messages, session_id, message, user_id, allowed_ns, trace_id)
+            .await;
 
         // 给结果加 Step 前缀
         format!("[Step 2/3: 执行 → Step 3/3: 交付]\n\n{}", result)
@@ -508,8 +631,16 @@ impl AgentCore {
     /// SAD（Skill-Aware Decomposition）风格增强：
     /// 并行获取记忆 + 可用工具列表，注入到 system prompt 中，
     /// 让 LLM 在复述时就能感知可用能力，对齐措辞。
-    async fn rephrase_and_confirm(&self, message: &str, _user_id: &str, session_id: &str, allowed_ns: &[String]) -> String {
-        self.session_manager.set_original_message(session_id, message).await;
+    async fn rephrase_and_confirm(
+        &self,
+        message: &str,
+        _user_id: &str,
+        session_id: &str,
+        allowed_ns: &[String],
+    ) -> String {
+        self.session_manager
+            .set_original_message(session_id, message)
+            .await;
 
         // SAD 风格：并行获取上下文（记忆）和可用能力（工具列表）
         let (mem_result, tools) = tokio::join!(
@@ -538,12 +669,24 @@ impl AgentCore {
                 let desc: String = t.function.description.chars().take(100).collect();
                 system_prompt.push_str(&format!("- `{}`: {}\n", t.function.name, desc));
             }
-            system_prompt.push_str("\n在复述中列出你的执行计划（需要几步、用什么工具），让用户确认方案后再执行。\n");
+            system_prompt.push_str(
+                "\n在复述中列出你的执行计划（需要几步、用什么工具），让用户确认方案后再执行。\n",
+            );
         }
 
         let msgs = vec![
-            Message { role: "system".to_string(), content: Some(system_prompt), tool_calls: None, tool_call_id: None },
-            Message { role: "user".to_string(), content: Some(message.to_string()), tool_calls: None, tool_call_id: None },
+            Message {
+                role: "system".to_string(),
+                content: Some(system_prompt),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Some(message.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
         ];
 
         // 无工具 LLM 调用 — 只复述，不执行
@@ -556,7 +699,11 @@ impl AgentCore {
         format!(
             "[Step 1/3: 确认理解]\n\n{}，我理解你的需求是：\n\n{}\n\n方向对吗？",
             self.config.identity.agent_id,
-            if rephrase.is_empty() { message } else { &rephrase },
+            if rephrase.is_empty() {
+                message
+            } else {
+                &rephrase
+            },
         )
     }
 
@@ -571,14 +718,17 @@ impl AgentCore {
         use std::collections::HashMap;
 
         // P1-1: 续跑——从已完成的步骤结果起步（崩溃恢复后 in_progress_step_results 已填充）
-        let mut step_results: HashMap<u32, String> = self.in_progress_step_results.lock().await.clone();
+        let mut step_results: HashMap<u32, String> =
+            self.in_progress_step_results.lock().await.clone();
         let mut step_errors: Vec<String> = Vec::new();
         let mut executed: Vec<u32> = step_results.keys().cloned().collect();
         let total = plan.steps.len();
 
         while executed.len() < total {
             // 找出本轮可执行的步骤（所有依赖已就绪）
-            let ready: Vec<&crate::composer::StepPlan> = plan.steps.iter()
+            let ready: Vec<&crate::composer::StepPlan> = plan
+                .steps
+                .iter()
                 .filter(|s| !executed.contains(&s.step_id))
                 .filter(|s| s.depends_on.iter().all(|d| executed.contains(d)))
                 .collect();
@@ -594,36 +744,39 @@ impl AgentCore {
             }
 
             // 并行执行所有就绪步骤
-            let futures: Vec<_> = ready.iter().map(|step| {
-                // 解析参数中的依赖占位符（step_N → 第 N 步的实际结果）
-                let mut args = step.arguments.clone();
-                if let Some(obj) = args.as_object_mut() {
-                    for val in obj.values_mut() {
-                        if let Some(s) = val.as_str() {
-                            if let Some(rest) = s.strip_prefix("step_") {
-                                // 解析 step_N[_result] 中的 N
-                                let step_num: u32 = rest.split(['_', ' ']).next()
-                                    .and_then(|n| n.parse().ok())
-                                    .unwrap_or(0);
-                                if step_num > 0 {
-                                    if let Some(prev) = step_results.get(&step_num) {
-                                        *val = serde_json::Value::String(prev.clone());
+            let futures: Vec<_> = ready
+                .iter()
+                .map(|step| {
+                    // 解析参数中的依赖占位符（step_N → 第 N 步的实际结果）
+                    let mut args = step.arguments.clone();
+                    if let Some(obj) = args.as_object_mut() {
+                        for val in obj.values_mut() {
+                            if let Some(s) = val.as_str() {
+                                if let Some(rest) = s.strip_prefix("step_") {
+                                    // 解析 step_N[_result] 中的 N
+                                    let step_num: u32 = rest
+                                        .split(['_', ' '])
+                                        .next()
+                                        .and_then(|n| n.parse().ok())
+                                        .unwrap_or(0);
+                                    if step_num > 0 {
+                                        if let Some(prev) = step_results.get(&step_num) {
+                                            *val = serde_json::Value::String(prev.clone());
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                // 捕获所需引用
-                let step_id = step.step_id;
-                let tool = step.tool.clone();
-                let desc = step.description.clone();
+                    // 捕获所需引用
+                    let step_id = step.step_id;
+                    let tool = step.tool.clone();
+                    let desc = step.description.clone();
 
-                async move {
-                    (step_id, tool, desc, args)
-                }
-            }).collect();
+                    async move { (step_id, tool, desc, args) }
+                })
+                .collect();
 
             // 先解析完参数再逐个执行
             let parsed: Vec<_> = futures::future::join_all(futures).await;
@@ -719,32 +872,63 @@ impl AgentCore {
 
     /// 进入待确认态：内存 + checkpoint 双写（含原始消息）
     async fn checkpoint_awaiting(&self, session_id: &str, original_message: &str) {
-        self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
-        self.session_manager.set_original_message(session_id, original_message).await;
+        self.session_manager
+            .set_state(session_id, SessionState::AwaitingConfirmation)
+            .await;
+        self.session_manager
+            .set_original_message(session_id, original_message)
+            .await;
         let payload = serde_json::json!({"original_message": original_message});
         let agent_id = self.config.identity.agent_id.clone();
-        let _ = self.checkpoint_store.lock().await.save(session_id, &agent_id, CheckpointState::AwaitingConfirmation, &payload);
+        let _ = self.checkpoint_store.lock().await.save(
+            session_id,
+            &agent_id,
+            CheckpointState::AwaitingConfirmation,
+            &payload,
+        );
     }
 
     /// 进入已确认态
     async fn checkpoint_confirmed(&self, session_id: &str) {
-        self.session_manager.set_state(session_id, SessionState::Confirmed).await;
+        self.session_manager
+            .set_state(session_id, SessionState::Confirmed)
+            .await;
         let agent_id = self.config.identity.agent_id.clone();
-        let _ = self.checkpoint_store.lock().await.save(session_id, &agent_id, CheckpointState::Confirmed, &serde_json::json!({}));
+        let _ = self.checkpoint_store.lock().await.save(
+            session_id,
+            &agent_id,
+            CheckpointState::Confirmed,
+            &serde_json::json!({}),
+        );
     }
 
     /// 进入计划执行态：记录 plan + 已完成步骤
-    async fn checkpoint_executing(&self, session_id: &str, plan: &crate::composer::ExecutionPlan, step_results: &HashMap<u32, String>) {
+    async fn checkpoint_executing(
+        &self,
+        session_id: &str,
+        plan: &crate::composer::ExecutionPlan,
+        step_results: &HashMap<u32, String>,
+    ) {
         let agent_id = self.config.identity.agent_id.clone();
         let payload = serde_json::json!({
             "plan": plan,
             "step_results": step_results,
         });
-        let _ = self.checkpoint_store.lock().await.save(session_id, &agent_id, CheckpointState::ExecutingPlan, &payload);
+        let _ = self.checkpoint_store.lock().await.save(
+            session_id,
+            &agent_id,
+            CheckpointState::ExecutingPlan,
+            &payload,
+        );
     }
 
     /// 记录待审批：含 approval_id 与工具意图
-    async fn checkpoint_pending_approval(&self, session_id: &str, approval_id: &str, action: &PendingAction) {
+    async fn checkpoint_pending_approval(
+        &self,
+        session_id: &str,
+        approval_id: &str,
+        action: &PendingAction,
+    ) {
         let agent_id = self.config.identity.agent_id.clone();
         let payload = serde_json::json!({
             "approval_id": approval_id,
@@ -754,13 +938,23 @@ impl AgentCore {
                 "description": action.description,
             }
         });
-        let _ = self.checkpoint_store.lock().await.save(session_id, &agent_id, CheckpointState::PendingApproval, &payload);
+        let _ = self.checkpoint_store.lock().await.save(
+            session_id,
+            &agent_id,
+            CheckpointState::PendingApproval,
+            &payload,
+        );
     }
 
     /// 终态（Done / Failed）：保留 checkpoint 供审计关联
     async fn checkpoint_terminal(&self, session_id: &str, state: CheckpointState) {
         let agent_id = self.config.identity.agent_id.clone();
-        let _ = self.checkpoint_store.lock().await.save(session_id, &agent_id, state, &serde_json::json!({}));
+        let _ = self.checkpoint_store.lock().await.save(
+            session_id,
+            &agent_id,
+            state,
+            &serde_json::json!({}),
+        );
     }
 
     /// 把当前进行中的计划进度（plan + 已完成步骤）落盘 checkpoint
@@ -798,30 +992,53 @@ impl AgentCore {
             .await;
         match cp.state {
             CheckpointState::AwaitingConfirmation => {
-                self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
+                self.session_manager
+                    .set_state(session_id, SessionState::AwaitingConfirmation)
+                    .await;
                 if let Some(msg) = cp.payload.get("original_message").and_then(|m| m.as_str()) {
-                    self.session_manager.set_original_message(session_id, msg).await;
+                    self.session_manager
+                        .set_original_message(session_id, msg)
+                        .await;
                 }
             }
             CheckpointState::Confirmed => {
-                self.session_manager.set_state(session_id, SessionState::Confirmed).await;
+                self.session_manager
+                    .set_state(session_id, SessionState::Confirmed)
+                    .await;
             }
             CheckpointState::PendingApproval => {
                 // 恢复待审批意图（审批结果需重新等待，但工具意图保留以便日志关联）
                 if let Some(pa) = cp.payload.get("pending_action") {
                     let action = PendingAction {
-                        tool_name: pa.get("tool_name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                        arguments: pa.get("arguments").cloned().unwrap_or(serde_json::json!({})),
-                        description: pa.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        tool_name: pa
+                            .get("tool_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        arguments: pa
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or(serde_json::json!({})),
+                        description: pa
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                     };
-                    self.session_manager.set_pending_action(session_id, action).await;
+                    self.session_manager
+                        .set_pending_action(session_id, action)
+                        .await;
                 }
-                self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
+                self.session_manager
+                    .set_state(session_id, SessionState::AwaitingConfirmation)
+                    .await;
             }
             CheckpointState::ExecutingPlan => {
                 // 恢复进行中的计划与已完成步骤，供 execute_plan 续跑
                 if let Some(plan_val) = cp.payload.get("plan") {
-                    if let Ok(plan) = serde_json::from_value::<crate::composer::ExecutionPlan>(plan_val.clone()) {
+                    if let Ok(plan) =
+                        serde_json::from_value::<crate::composer::ExecutionPlan>(plan_val.clone())
+                    {
                         *self.in_progress_plan.lock().await = Some(plan);
                     }
                 }
@@ -834,18 +1051,26 @@ impl AgentCore {
                     }
                 }
                 // 恢复后下一次 execute_chat 会复用 in_progress_plan 续跑
-                self.session_manager.set_state(session_id, SessionState::Confirmed).await;
+                self.session_manager
+                    .set_state(session_id, SessionState::Confirmed)
+                    .await;
             }
             CheckpointState::PlanPreview => {
                 // 恢复进行中的计划，等待用户「执行 / 取消 / 修改」
                 if let Some(plan_val) = cp.payload.get("plan") {
-                    if let Ok(plan) = serde_json::from_value::<crate::composer::ExecutionPlan>(plan_val.clone()) {
+                    if let Ok(plan) =
+                        serde_json::from_value::<crate::composer::ExecutionPlan>(plan_val.clone())
+                    {
                         *self.in_progress_plan.lock().await = Some(plan);
                     }
                 }
-                self.session_manager.set_state(session_id, SessionState::AwaitingConfirmation).await;
+                self.session_manager
+                    .set_state(session_id, SessionState::AwaitingConfirmation)
+                    .await;
                 if let Some(msg) = cp.payload.get("original_message").and_then(|m| m.as_str()) {
-                    self.session_manager.set_original_message(session_id, msg).await;
+                    self.session_manager
+                        .set_original_message(session_id, msg)
+                        .await;
                 }
             }
             CheckpointState::Done | CheckpointState::Failed => {
@@ -865,14 +1090,25 @@ impl AgentCore {
             "plan": plan,
             "original_message": self.session_manager.get_original_message(session_id).await.unwrap_or_default(),
         });
-        let _ = self.checkpoint_store.lock().await.save(session_id, &agent_id, CheckpointState::PlanPreview, &payload);
+        let _ = self.checkpoint_store.lock().await.save(
+            session_id,
+            &agent_id,
+            CheckpointState::PlanPreview,
+            &payload,
+        );
     }
 
     /// 渲染计划预览（结构化摘要 + 机器可读 JSON）
     async fn render_plan_preview(&self, plan: &crate::composer::ExecutionPlan) -> String {
-        let mut s = format!("📋 我规划了以下执行计划（共 {} 步）：\n\n", plan.steps.len());
+        let mut s = format!(
+            "📋 我规划了以下执行计划（共 {} 步）：\n\n",
+            plan.steps.len()
+        );
         for step in &plan.steps {
-            s.push_str(&format!("{}. {} — 工具 `{}`", step.step_id, step.description, step.tool));
+            s.push_str(&format!(
+                "{}. {} — 工具 `{}`",
+                step.step_id, step.description, step.tool
+            ));
             if !step.depends_on.is_empty() {
                 s.push_str(&format!("（依赖步骤 {:?}）", step.depends_on));
             }
@@ -889,9 +1125,15 @@ impl AgentCore {
         *self.in_progress_plan.lock().await = None;
         self.in_progress_step_results.lock().await.clear();
         self.session_manager.remove_state(session_id).await;
-        let _ = self.audit_logger.log_decision(
-            &self.config.identity.agent_id, "plan_cancel", "用户取消组合计划", false,
-        ).await;
+        let _ = self
+            .audit_logger
+            .log_decision(
+                &self.config.identity.agent_id,
+                "plan_cancel",
+                "用户取消组合计划",
+                false,
+            )
+            .await;
         let _ = self.checkpoint_store.lock().await.delete(session_id);
     }
 
@@ -899,9 +1141,14 @@ impl AgentCore {
     async fn try_apply_plan_edit(&self, message: &str) -> Option<crate::composer::ExecutionPlan> {
         let marker = message.find("删除第").or_else(|| message.find("去掉第"))?;
         let rest = &message[marker..];
-        let num: u32 = rest.chars().skip_while(|c| !c.is_ascii_digit()).next()?.to_digit(10)?;
+        let num: u32 = rest
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .next()?
+            .to_digit(10)?;
         let mut plan = self.in_progress_plan.lock().await.clone()?;
-        plan.steps.retain(|s| s.step_id != num && !s.depends_on.contains(&num));
+        plan.steps
+            .retain(|s| s.step_id != num && !s.depends_on.contains(&num));
         if plan.steps.is_empty() {
             return None;
         }
@@ -910,7 +1157,10 @@ impl AgentCore {
 
     /// P1-4: 轻量 JSON Schema 校验——检查 required 字段存在且非 null。
     /// 不引入重依赖，覆盖「参数缺失导致 MCP 调用失败/错位」类问题。
-    fn validate_tool_args(args: &serde_json::Value, schema: &serde_json::Value) -> Result<(), String> {
+    fn validate_tool_args(
+        args: &serde_json::Value,
+        schema: &serde_json::Value,
+    ) -> Result<(), String> {
         let required = schema.get("required").and_then(|r| r.as_array());
         match required {
             Some(req) => {
@@ -921,7 +1171,9 @@ impl AgentCore {
                     if let Some(name) = r.as_str() {
                         match obj.get(name) {
                             None => return Err(format!("缺少必填参数 '{}'", name)),
-                            Some(v) if v.is_null() => return Err(format!("必填参数 '{}' 为 null", name)),
+                            Some(v) if v.is_null() => {
+                                return Err(format!("必填参数 '{}' 为 null", name))
+                            }
                             _ => {}
                         }
                     }
@@ -934,7 +1186,11 @@ impl AgentCore {
 
     /// 话题切换检测：当前任务未完成，检测到话题切换
     async fn handle_topic_switch(&self, _message: &str, session_id: &str) -> String {
-        let task = self.session_manager.get_original_message(session_id).await.unwrap_or_default();
+        let task = self
+            .session_manager
+            .get_original_message(session_id)
+            .await
+            .unwrap_or_default();
         let task_preview: String = task.chars().take(80).collect();
         format!(
             "[Task 管理]\n\n检测到您可能换了话题。当前任务还在处理：{task_preview}\n\n请选择：\n- \"继续\" → 继续当前任务\n- \"暂停\" → 暂停当前任务\n- \"结束\" → 结束当前任务"
@@ -946,14 +1202,18 @@ impl AgentCore {
     async fn load_history(&self, session_id: &str) -> Vec<Message> {
         let ns = self.caller_ns(session_id);
         let db_path = self.harness.lock().await.db_path();
-        self.session_manager.load_history(session_id, &ns, &db_path).await
+        self.session_manager
+            .load_history(session_id, &ns, &db_path)
+            .await
     }
 
     /// 保存对话到 SessionManager（内存缓存 + SQLite 持久化，按调用者 namespace 隔离）
     async fn save_to_history(&self, session_id: &str, user_msg: &str, assistant_reply: &str) {
         let ns = self.caller_ns(session_id);
         let db_path = self.harness.lock().await.db_path();
-        self.session_manager.save_to_history(session_id, &ns, &db_path, user_msg, assistant_reply).await;
+        self.session_manager
+            .save_to_history(session_id, &ns, &db_path, user_msg, assistant_reply)
+            .await;
     }
 
     /// LLM 调用循环（支持多轮 tool calling）
@@ -981,7 +1241,8 @@ impl AgentCore {
         if !tools.is_empty() {
             if let Some(sys_msg) = messages.first_mut() {
                 if let Some(ref mut content) = sys_msg.content {
-                    let mut extra = String::from("\n\n## 当前真实可用工具（调用时务必使用以下名称）\n");
+                    let mut extra =
+                        String::from("\n\n## 当前真实可用工具（调用时务必使用以下名称）\n");
                     for t in tools.iter().take(20) {
                         let desc: String = t.function.description.chars().take(120).collect();
                         extra.push_str(&format!("- `{}`: {}\n", t.function.name, desc));
@@ -1044,16 +1305,28 @@ impl AgentCore {
             if response.tool_calls.is_empty() {
                 let reply = response.text;
                 // 保存对话
-                let _ = self.mcp.call("memory_observe", &serde_json::json!({
-                    "dialog": raw_message, "role": "user",
-                    "source": format!("user:{}", user_id), "session_id": session_id,
-                    "namespace": self.caller_ns(session_id),
-                })).await;
-                let _ = self.mcp.call("memory_observe", &serde_json::json!({
-                    "dialog": &reply, "role": "assistant",
-                    "source": &self.config.identity.agent_id, "session_id": session_id,
-                    "namespace": self.caller_ns(session_id),
-                })).await;
+                let _ = self
+                    .mcp
+                    .call(
+                        "memory_observe",
+                        &serde_json::json!({
+                            "dialog": raw_message, "role": "user",
+                            "source": format!("user:{}", user_id), "session_id": session_id,
+                            "namespace": self.caller_ns(session_id),
+                        }),
+                    )
+                    .await;
+                let _ = self
+                    .mcp
+                    .call(
+                        "memory_observe",
+                        &serde_json::json!({
+                            "dialog": &reply, "role": "assistant",
+                            "source": &self.config.identity.agent_id, "session_id": session_id,
+                            "namespace": self.caller_ns(session_id),
+                        }),
+                    )
+                    .await;
                 // 保存到内存缓存
                 self.save_to_history(session_id, raw_message, &reply).await;
                 return reply;
@@ -1064,11 +1337,19 @@ impl AgentCore {
                 // 边界检查
                 let boundary = self.boundary.lock().await;
                 let ns = self.current_ns_paths();
-                let tool_level = boundary.classifier.lock().unwrap().classify(&tc.name).to_string();
+                let tool_level = boundary
+                    .classifier
+                    .lock()
+                    .unwrap()
+                    .classify(&tc.name)
+                    .to_string();
                 let check = boundary.check_tool(
-                    &tc.name, &tc.arguments,
-                    &self.config.identity.agent_id, "user",
-                    &self.config.parent_permission, ns.as_deref(),
+                    &tc.name,
+                    &tc.arguments,
+                    &self.config.identity.agent_id,
+                    "user",
+                    &self.config.parent_permission,
+                    ns.as_deref(),
                 );
                 drop(boundary);
 
@@ -1083,22 +1364,30 @@ impl AgentCore {
 
                 if !check.allow {
                     // 审计日志：记录边界/红线拒绝（P2-2 统一事件，带 trace_id 串联）
-                    self.audit_logger.boundary_deny(
-                        &self.config.identity.agent_id, &tc.name,
-                        &check.reason, trace_id, Some(session_id),
-                    ).await;
+                    self.audit_logger
+                        .boundary_deny(
+                            &self.config.identity.agent_id,
+                            &tc.name,
+                            &check.reason,
+                            trace_id,
+                            Some(session_id),
+                        )
+                        .await;
 
                     // 危险/红线工具：无审批人时直接硬拒绝，不进入 LLM 下一轮
                     let is_dangerous = tool_level == "dangerous";
                     if check.level == Some(BlockLevel::Red) || is_dangerous {
                         if let Some(approver_id) = &self.config.approver_id {
-                            let aid = self.approval_manager.create_request(
-                                &tc.name,
-                                &tc.arguments,
-                                &check.reason,
-                                approver_id,
-                                &self.config.identity.agent_id,
-                            ).await;
+                            let aid = self
+                                .approval_manager
+                                .create_request(
+                                    &tc.name,
+                                    &tc.arguments,
+                                    &check.reason,
+                                    approver_id,
+                                    &self.config.identity.agent_id,
+                                )
+                                .await;
                             let msg = serde_json::json!({
                                 "type": "approval_request",
                                 "approval_id": aid,
@@ -1108,31 +1397,51 @@ impl AgentCore {
                                 "requester_id": self.config.identity.agent_id,
                                 "requester_ns": self.config.identity.ns(),
                             });
-                            let _ = self.mcp.call("a2a_send", &serde_json::json!({
-                                "to": approver_id,
-                                "content": msg.to_string(),
-                                "namespace": format!("agent/{}", approver_id),
-                        })).await;
-                        // P2-2: 审批创建事件（带 trace_id）
-                        self.audit_logger.approval_event(
-                            "created", &self.config.identity.agent_id, &tc.name,
-                            &check.reason, trace_id, Some(session_id),
-                        ).await;
-                        // P1-1: 记录待审批到 checkpoint（崩溃恢复后审批意图仍可见）
+                            let _ = self
+                                .mcp
+                                .call(
+                                    "a2a_send",
+                                    &serde_json::json!({
+                                            "to": approver_id,
+                                            "content": msg.to_string(),
+                                            "namespace": format!("agent/{}", approver_id),
+                                    }),
+                                )
+                                .await;
+                            // P2-2: 审批创建事件（带 trace_id）
+                            self.audit_logger
+                                .approval_event(
+                                    "created",
+                                    &self.config.identity.agent_id,
+                                    &tc.name,
+                                    &check.reason,
+                                    trace_id,
+                                    Some(session_id),
+                                )
+                                .await;
+                            // P1-1: 记录待审批到 checkpoint（崩溃恢复后审批意图仍可见）
                             let pa = PendingAction {
                                 tool_name: tc.name.clone(),
                                 arguments: tc.arguments.clone(),
                                 description: check.reason.clone(),
                             };
-                            self.checkpoint_pending_approval(session_id, &aid, &pa).await;
-                            let reply = format!("AWAITING_APPROVAL:等待审批人「{}」审批工具「{}」，请稍后",
-                                           approver_id, tc.name);
+                            self.checkpoint_pending_approval(session_id, &aid, &pa)
+                                .await;
+                            let reply = format!(
+                                "AWAITING_APPROVAL:等待审批人「{}」审批工具「{}」，请稍后",
+                                approver_id, tc.name
+                            );
                             self.save_to_history(session_id, raw_message, &reply).await;
                             return reply;
                         }
-                        let reply = format!("硬拒绝: 工具「{}」触发{}，未配置审批人，无法执行",
+                        let reply = format!(
+                            "硬拒绝: 工具「{}」触发{}，未配置审批人，无法执行",
                             tc.name,
-                            if check.level == Some(BlockLevel::Red) { "红线" } else { "危险工具策略" }
+                            if check.level == Some(BlockLevel::Red) {
+                                "红线"
+                            } else {
+                                "危险工具策略"
+                            }
                         );
                         self.save_to_history(session_id, raw_message, &reply).await;
                         return reply;
@@ -1140,13 +1449,16 @@ impl AgentCore {
 
                     // 黄线（未知工具、权限递减等）：走确认流程
                     if let Some(approver_id) = &self.config.approver_id {
-                        let aid = self.approval_manager.create_request(
-                            &tc.name,
-                            &tc.arguments,
-                            &check.reason,
-                            approver_id,
-                            &self.config.identity.agent_id,
-                        ).await;
+                        let aid = self
+                            .approval_manager
+                            .create_request(
+                                &tc.name,
+                                &tc.arguments,
+                                &check.reason,
+                                approver_id,
+                                &self.config.identity.agent_id,
+                            )
+                            .await;
                         let msg = serde_json::json!({
                             "type": "approval_request",
                             "approval_id": aid,
@@ -1156,18 +1468,28 @@ impl AgentCore {
                             "requester_id": self.config.identity.agent_id,
                             "requester_ns": self.config.identity.ns(),
                         });
-                        let _ = self.mcp.call("a2a_send", &serde_json::json!({
-                            "to": approver_id,
-                            "content": msg.to_string(),
-                            "namespace": format!("agent/{}", approver_id),
-                        })).await;
-                        let reply = format!("AWAITING_APPROVAL:等待审批人「{}」审批工具「{}」，请稍后",
-                                       approver_id, tc.name);
+                        let _ = self
+                            .mcp
+                            .call(
+                                "a2a_send",
+                                &serde_json::json!({
+                                    "to": approver_id,
+                                    "content": msg.to_string(),
+                                    "namespace": format!("agent/{}", approver_id),
+                                }),
+                            )
+                            .await;
+                        let reply = format!(
+                            "AWAITING_APPROVAL:等待审批人「{}」审批工具「{}」，请稍后",
+                            approver_id, tc.name
+                        );
                         self.save_to_history(session_id, raw_message, &reply).await;
                         return reply;
                     }
-                    let reply = format!("REQUIRES_REVIEW:{}:工具「{}」需要确认——{}",
-                                   tc.name, tc.name, check.reason);
+                    let reply = format!(
+                        "REQUIRES_REVIEW:{}:工具「{}」需要确认——{}",
+                        tc.name, tc.name, check.reason
+                    );
                     self.save_to_history(session_id, raw_message, &reply).await;
                     return reply;
                 }
@@ -1176,7 +1498,8 @@ impl AgentCore {
                 if let Some(schema) = tool_schemas.get(&tc.name) {
                     if let Err(e) = Self::validate_tool_args(&tc.arguments, schema) {
                         if self.config.strict_schema {
-                            let reply = format!("工具「{}」参数校验失败: {}。请修正后重试。", tc.name, e);
+                            let reply =
+                                format!("工具「{}」参数校验失败: {}。请修正后重试。", tc.name, e);
                             self.save_to_history(session_id, raw_message, &reply).await;
                             return reply;
                         }
@@ -1232,7 +1555,9 @@ impl AgentCore {
                         },
                         description: format!("{} ({})", tc.name, tc.arguments),
                     };
-                    self.session_manager.set_pending_action(session_id, action).await;
+                    self.session_manager
+                        .set_pending_action(session_id, action)
+                        .await;
                 }
 
                 // 将工具调用 + 结果加入消息列表
@@ -1303,6 +1628,199 @@ impl AgentCore {
         }
     }
 
+    /// 拉取并规范化调用者的 A2A 协作收件箱（按调用者身份，而非服务端自身身份）。
+    ///
+    /// 与 `check_inbox`（内部审批轮询，固定读服务端身份 ns）不同，本方法以
+    /// `caller_agent_id` 为收件人向 Memoria `a2a_recv` 查询 `agent/{caller_agent_id}`
+    /// 命名空间下的消息，契合 PFAiX「人各自收件箱」模型。Memoria `a2a_recv` 采用
+    /// SelfOnly 策略，调用方只能读自己的收件箱，天然安全。
+    ///
+    /// 返回已规范化的信封数组（兼容结构化 JSON 信封与旧版 `[subject] body` 文本）。
+    pub async fn collab_inbox_raw(
+        &self,
+        caller_agent_id: &str,
+        caller_agent_key: &str,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let mcp = McpClient::new(&self.config.memoria_url, caller_agent_id, caller_agent_key);
+        let val = mcp
+            .call_json(
+                "a2a_recv",
+                &serde_json::json!({
+                    "limit": limit,
+                    "namespace": format!("agent/{}", caller_agent_id),
+                }),
+            )
+            .await
+            .map_err(|e| format!("a2a_recv 失败: {}", e))?;
+        let msgs = val["messages"].as_array().cloned().unwrap_or_default();
+        let mut out = Vec::with_capacity(msgs.len());
+        for m in &msgs {
+            out.push(Self::map_a2a_message(m));
+        }
+        Ok(out)
+    }
+
+    /// 将 Memoria 原始 A2A 消息规范化为协作信封。
+    /// - 结构化信封：content 为 JSON 且含 `type` 字段，直接取字段。
+    /// - 旧版文本：content 形如 `[subject] body`，解析后 type 降级为 `message`。
+    fn map_a2a_message(m: &serde_json::Value) -> serde_json::Value {
+        let id = m
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let from = m.get("from").and_then(|v| v.as_str()).unwrap_or("");
+        let time = m
+            .get("time")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let content = m.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+        let (
+            etype,
+            subject,
+            body,
+            from_agent,
+            from_ns,
+            to_agent,
+            scope,
+            scope_id,
+            workspace_id,
+            thread_id,
+            payload,
+            created_at,
+        ) = if let Ok(env) = serde_json::from_str::<serde_json::Value>(content) {
+            if env.get("type").is_some() {
+                (
+                    env.get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("message")
+                        .to_string(),
+                    env.get("subject")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    env.get("body")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    env.get("from_agent")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| Self::strip_agent_prefix(from)),
+                    env.get("from_ns")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(from)
+                        .to_string(),
+                    env.get("to_agent")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    env.get("scope")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("agent")
+                        .to_string(),
+                    env.get("scope_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    env.get("workspace_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    env.get("thread_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    env.get("payload")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    env.get("created_at")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| time.clone()),
+                )
+            } else {
+                Self::legacy_parts(content, from, &time)
+            }
+        } else {
+            Self::legacy_parts(content, from, &time)
+        };
+
+        serde_json::json!({
+            "id": id,
+            "type": etype,
+            "subject": subject,
+            "body": body,
+            "from_agent": from_agent,
+            "from_ns": from_ns,
+            "to_agent": to_agent,
+            "scope": scope,
+            "scope_id": scope_id,
+            "workspace_id": workspace_id,
+            "thread_id": thread_id,
+            "payload": payload,
+            "created_at": created_at,
+        })
+    }
+
+    /// 解析旧版 `[subject] body` 文本消息为信封各部分（type 降级为 `message`）。
+    fn legacy_parts(
+        content: &str,
+        from: &str,
+        time: &str,
+    ) -> (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        serde_json::Value,
+        String,
+    ) {
+        let (subject, body) = if let Some(rest) = content.strip_prefix('[') {
+            if let Some(end) = rest.find(']') {
+                (
+                    rest[..end].to_string(),
+                    rest[end + 1..].trim_start().to_string(),
+                )
+            } else {
+                ("".to_string(), content.to_string())
+            }
+        } else {
+            ("".to_string(), content.to_string())
+        };
+        (
+            "message".to_string(),
+            subject,
+            body,
+            Self::strip_agent_prefix(from),
+            from.to_string(),
+            "".to_string(),
+            "agent".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "".to_string(),
+            serde_json::Value::Null,
+            time.to_string(),
+        )
+    }
+
+    /// 把 `agent:xxx` / `agent/xxx` 形式的来源归一为 agent id。
+    fn strip_agent_prefix(from: &str) -> String {
+        from.strip_prefix("agent:")
+            .or_else(|| from.strip_prefix("agent/"))
+            .unwrap_or(from)
+            .to_string()
+    }
+
     /// 从 Memoria 搜索记忆。
     /// PFAiX 强制隔离：同时搜索调用者私有 namespace（按 session_id 解析）
     /// 与 allowed_ns 中的共享 namespace，合并后返回；既保证个人记忆隔离，
@@ -1352,16 +1870,27 @@ impl AgentCore {
             }
         }
 
-        Ok(if merged.is_empty() { None } else { Some(merged) })
+        Ok(if merged.is_empty() {
+            None
+        } else {
+            Some(merged)
+        })
     }
 
     /// 检查 A2A 收件箱中的审批响应
     /// 扫描收件箱消息，识别 approval_response 类型，记录到 ApprovalManager
     async fn check_approval_responses(&self) {
-        let inbox = match self.mcp.call_json("a2a_recv", &serde_json::json!({
-            "limit": 10,
-            "namespace": self.config.identity.ns(),
-        })).await {
+        let inbox = match self
+            .mcp
+            .call_json(
+                "a2a_recv",
+                &serde_json::json!({
+                    "limit": 10,
+                    "namespace": self.config.identity.ns(),
+                }),
+            )
+            .await
+        {
             Ok(val) => val["messages"].as_array().cloned().unwrap_or_default(),
             Err(_) => return,
         };
@@ -1383,12 +1912,23 @@ impl AgentCore {
 
     /// 执行审批通过的请求
     /// 检查所有 pending 审批项，如果有已批准的，执行该工具并返回结果
-    async fn execute_approved_request(&self, _session_id: &str, allowed_ns: &[String]) -> Option<String> {
+    async fn execute_approved_request(
+        &self,
+        _session_id: &str,
+        allowed_ns: &[String],
+    ) -> Option<String> {
         let pending_list = self.approval_manager.list_pending().await;
         for approval in &pending_list {
-            if let Some(true) = self.approval_manager.is_approved(&approval.approval_id).await {
+            if let Some(true) = self
+                .approval_manager
+                .is_approved(&approval.approval_id)
+                .await
+            {
                 // 审批通过，执行工具
-                let result = match self.call_tool_routed(&approval.tool_name, &approval.arguments, allowed_ns, "").await {
+                let result = match self
+                    .call_tool_routed(&approval.tool_name, &approval.arguments, allowed_ns, "")
+                    .await
+                {
                     Ok(text) => text,
                     Err(e) => format!("执行失败: {}", e),
                 };
@@ -1399,15 +1939,21 @@ impl AgentCore {
                     desc, approval.approver_id, result_short
                 );
                 // 审计日志
-                self.audit_logger.log_tool_call(
-                    &self.config.identity.agent_id,
-                    &approval.tool_name,
-                    &approval.arguments,
-                    true,
-                ).await;
+                self.audit_logger
+                    .log_tool_call(
+                        &self.config.identity.agent_id,
+                        &approval.tool_name,
+                        &approval.arguments,
+                        true,
+                    )
+                    .await;
                 self.approval_manager.remove(&approval.approval_id).await;
                 return Some(reply);
-            } else if let Some(false) = self.approval_manager.is_approved(&approval.approval_id).await {
+            } else if let Some(false) = self
+                .approval_manager
+                .is_approved(&approval.approval_id)
+                .await
+            {
                 // 审批被拒绝
                 let desc = approval.description.chars().take(120).collect::<String>();
                 let reply = format!(
@@ -1438,10 +1984,19 @@ impl AgentCore {
 
         // 2. Memoria 特有工具走第一个源
         let memoria_tools = [
-            "memory_search", "memory_search_v2", "memory_remember",
-            "memory_observe", "a2a_send", "a2a_recv", "register_agent",
-            "audit_query", "db_stats", "skill_market_list_installed",
-            "skill_market_search", "agent_list", "agent_revoke",
+            "memory_search",
+            "memory_search_v2",
+            "memory_remember",
+            "memory_observe",
+            "a2a_send",
+            "a2a_recv",
+            "register_agent",
+            "audit_query",
+            "db_stats",
+            "skill_market_list_installed",
+            "skill_market_search",
+            "agent_list",
+            "agent_revoke",
         ];
         if memoria_tools.contains(&tool_name) {
             return &self.mcp;
@@ -1479,7 +2034,10 @@ impl AgentCore {
                 }
                 // 同时学习工具分类
                 let boundary = self.boundary.lock().await;
-                let tool_names_descs: Vec<(String, String)> = tools.iter().map(|(n, d, _)| (n.clone(), d.clone())).collect();
+                let tool_names_descs: Vec<(String, String)> = tools
+                    .iter()
+                    .map(|(n, d, _)| (n.clone(), d.clone()))
+                    .collect();
                 boundary.learn_tools(&tool_names_descs);
                 drop(boundary);
 
@@ -1567,14 +2125,18 @@ impl AgentCore {
                     source.name
                 );
                 return Err(
-                    "⚠️ 业务服务已降级（全部不可用），当前仅支持记忆检索与纯聊天，工具调用已暂停。".to_string(),
+                    "⚠️ 业务服务已降级（全部不可用），当前仅支持记忆检索与纯聊天，工具调用已暂停。"
+                        .to_string(),
                 );
             }
             if mode == DegradeMode::MemoriaReadonlyChat && source.name == "memoria" {
                 // memoria 仅放行只读工具，避免降级期误写记忆
                 let cls = {
                     let b = self.boundary.lock().await;
-                    b.classifier.lock().map(|c| c.classify(tool_name).to_string()).unwrap_or_else(|_| "unknown".to_string())
+                    b.classifier
+                        .lock()
+                        .map(|c| c.classify(tool_name).to_string())
+                        .unwrap_or_else(|_| "unknown".to_string())
                 };
                 if cls != "read" {
                     tracing::warn!(
@@ -1595,7 +2157,11 @@ impl AgentCore {
         // 执行期命名空间门控：根据 tool_route_cache 找到工具所属 MCP 源，
         // 若该源声明了 namespace，则调用者 allowed_ns 必须与之存在包含关系。
         if let Some(&idx) = self.tool_route_cache.lock().await.get(tool_name) {
-            if let Some(src_ns) = self.mcp_sources.get(idx).and_then(|s| s.namespace.as_deref()) {
+            if let Some(src_ns) = self
+                .mcp_sources
+                .get(idx)
+                .and_then(|s| s.namespace.as_deref())
+            {
                 if !allowed_ns.iter().any(|g| Self::ns_covers(g, src_ns)) {
                     return Err(format!(
                         "工具 {} 所属项目 '{}' 不在当前身份授权范围内",
@@ -1671,10 +2237,7 @@ impl AgentCore {
             // parts 格式：["dept", "公司名", "project", "部门名", "user", "用户名"]
             if parts.len() >= 2 && parts[0] == "dept" {
                 let dept_name = parts[1];
-                let _ = reg.register(
-                    crate::namespace::Namespace::dept(dept_name),
-                    None,
-                );
+                let _ = reg.register(crate::namespace::Namespace::dept(dept_name), None);
                 if parts.len() >= 4 && parts[2] == "project" {
                     let proj_name = parts[3];
                     let dept_path = format!("/dept/{}", dept_name);
@@ -1764,7 +2327,10 @@ impl AgentCore {
             match source.client.list_tools().await {
                 Ok(t) => {
                     self.degrade.record_success(&source.name);
-                    tracing::info!("[DEGRADE] 源 {} 探活成功，已恢复并重新并入工具", source.name);
+                    tracing::info!(
+                        "[DEGRADE] 源 {} 探活成功，已恢复并重新并入工具",
+                        source.name
+                    );
                     Some(t)
                 }
                 Err(e) => {
@@ -1864,7 +2430,10 @@ impl AgentCore {
             {
                 let mut cache = self.tool_route_cache.lock().await;
                 let boundary = self.boundary.lock().await;
-                let tool_names_descs: Vec<(String, String)> = tools.iter().map(|(n, d, _)| (n.clone(), d.clone())).collect();
+                let tool_names_descs: Vec<(String, String)> = tools
+                    .iter()
+                    .map(|(n, d, _)| (n.clone(), d.clone()))
+                    .collect();
                 for (name, _desc) in &tool_names_descs {
                     cache.insert(name.clone(), idx);
                 }
@@ -1931,8 +2500,10 @@ impl AgentCore {
             {
                 let mut cache = self.tool_route_cache.lock().await;
                 let boundary = self.boundary.lock().await;
-                let tool_names_descs: Vec<(String, String)> =
-                    tools.iter().map(|(n, d, _)| (n.clone(), d.clone())).collect();
+                let tool_names_descs: Vec<(String, String)> = tools
+                    .iter()
+                    .map(|(n, d, _)| (n.clone(), d.clone()))
+                    .collect();
                 for (name, _desc) in &tool_names_descs {
                     cache.insert(name.clone(), idx);
                 }
@@ -2001,7 +2572,14 @@ impl AgentCore {
                 let args = step.get("args").cloned().unwrap_or(serde_json::Value::Null);
                 // P2-9: 执行前经过 boundary 检查
                 let boundary = self.boundary.lock().await;
-                let check = boundary.check_tool(tool_name, &args, &self.config.identity.agent_id, "user", &PermissionLevel::Write, self.current_ns_paths().as_deref());
+                let check = boundary.check_tool(
+                    tool_name,
+                    &args,
+                    &self.config.identity.agent_id,
+                    "user",
+                    &PermissionLevel::Write,
+                    self.current_ns_paths().as_deref(),
+                );
                 drop(boundary);
                 // P2-3：boundary 结果写入 span（allow / reason 可观测）
                 tracing::debug!(tool = %tool_name, allowed = check.allow, reason = %check.reason, "harness_step_boundary");
@@ -2010,7 +2588,9 @@ impl AgentCore {
                     all_ok = false;
                     break;
                 }
-                let result = self.call_tool_routed(tool_name, &args, allowed_ns, "").await;
+                let result = self
+                    .call_tool_routed(tool_name, &args, allowed_ns, "")
+                    .await;
                 if result.is_err() {
                     all_ok = false;
                     break;
@@ -2022,7 +2602,11 @@ impl AgentCore {
             let _ = h.record_usage(m.harness.id, all_ok);
             drop(h);
 
-            return Some(format!("已执行 {}：{}", m.harness.name, if all_ok { "成功" } else { "部分失败" }));
+            return Some(format!(
+                "已执行 {}：{}",
+                m.harness.name,
+                if all_ok { "成功" } else { "部分失败" }
+            ));
         }
 
         None
@@ -2101,7 +2685,7 @@ impl AgentCore {
              其他核心表：\n\
              - vehicle_whitelist（白名单）: license_plate, company_name, waste_type\n\
              - indicator_history（指标）: indicator_name, indicator_value, data_date\n\
-             - sample_records（取样）: serial_no, license_plate, sample_weight, sample_time\n"
+             - sample_records（取样）: serial_no, license_plate, sample_weight, sample_time\n",
         );
 
         prompt
@@ -2110,13 +2694,31 @@ impl AgentCore {
     /// 洞见发现：拉取最近 7 天数据，LLM 分析模式，存入 Memoria
     pub async fn run_insights(&self, allowed_ns: &[String]) -> String {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let week_ago = (chrono::Local::now() - chrono::Duration::days(7)).format("%Y-%m-%d").to_string();
-        let data = self.call_tool_routed("query_entrance", &serde_json::json!({
-            "date_from": week_ago, "date_to": today, "limit": 500,
-        }), allowed_ns, "").await.unwrap_or_default();
-        let stats = self.call_tool_routed("query_monthly_stats", &serde_json::json!({
-            "year": chrono::Local::now().year(), "month": chrono::Local::now().month(),
-        }), allowed_ns, "").await.unwrap_or_default();
+        let week_ago = (chrono::Local::now() - chrono::Duration::days(7))
+            .format("%Y-%m-%d")
+            .to_string();
+        let data = self
+            .call_tool_routed(
+                "query_entrance",
+                &serde_json::json!({
+                    "date_from": week_ago, "date_to": today, "limit": 500,
+                }),
+                allowed_ns,
+                "",
+            )
+            .await
+            .unwrap_or_default();
+        let stats = self
+            .call_tool_routed(
+                "query_monthly_stats",
+                &serde_json::json!({
+                    "year": chrono::Local::now().year(), "month": chrono::Local::now().month(),
+                }),
+                allowed_ns,
+                "",
+            )
+            .await
+            .unwrap_or_default();
 
         let prompt = format!(
             "你是固废运营数据分析师。分析最近7天入厂数据，找出有意义的模式或异常。\
@@ -2124,16 +2726,29 @@ impl AgentCore {
             data.chars().take(3000).collect::<String>(),
             stats.chars().take(1000).collect::<String>(),
         );
-        let msg = crate::llm::Message { role: "system".to_string(), content: Some(prompt), tool_calls: None, tool_call_id: None };
+        let msg = crate::llm::Message {
+            role: "system".to_string(),
+            content: Some(prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        };
         let reply = match self.llm.chat(&[msg], &[]).await {
             Ok(r) => r.text.trim().to_string(),
             Err(e) => return format!("洞见失败: {}", e),
         };
-        if reply.is_empty() || reply == "无异常" { return "洞见: 无异常".to_string(); }
-        let _ = self.mcp.call("memory_remember", &serde_json::json!({
-            "content": format!("[洞见] {} | {}~{}", reply, week_ago, today),
-            "tags": ["insight", "auto_discovered"], "confidence": 70,
-        })).await;
+        if reply.is_empty() || reply == "无异常" {
+            return "洞见: 无异常".to_string();
+        }
+        let _ = self
+            .mcp
+            .call(
+                "memory_remember",
+                &serde_json::json!({
+                    "content": format!("[洞见] {} | {}~{}", reply, week_ago, today),
+                    "tags": ["insight", "auto_discovered"], "confidence": 70,
+                }),
+            )
+            .await;
         format!("洞见: {}", reply)
     }
 
@@ -2158,18 +2773,34 @@ impl AgentCore {
         };
 
         // 1. 取游标
-        let ds_raw = mem_client.call("dream_state_get", &serde_json::json!({
-            "phase": "consolidate", "namespace": ns
-        })).await.unwrap_or_default();
+        let ds_raw = mem_client
+            .call(
+                "dream_state_get",
+                &serde_json::json!({
+                    "phase": "consolidate", "namespace": ns
+                }),
+            )
+            .await
+            .unwrap_or_default();
         let cursor_ts = serde_json::from_str::<serde_json::Value>(&ds_raw)
             .ok()
-            .and_then(|v| v.get("cursor_ts").and_then(|c| c.as_str()).map(|s| s.to_string()))
+            .and_then(|v| {
+                v.get("cursor_ts")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_else(|| "1970-01-01T00:00:00".to_string());
 
         // 2. 拉原料
-        let raw = mem_client.call("memory_fetch_unconsolidated", &serde_json::json!({
-            "since": cursor_ts, "limit": 200, "namespace": ns
-        })).await.unwrap_or_default();
+        let raw = mem_client
+            .call(
+                "memory_fetch_unconsolidated",
+                &serde_json::json!({
+                    "since": cursor_ts, "limit": 200, "namespace": ns
+                }),
+            )
+            .await
+            .unwrap_or_default();
         let items: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&raw)
             .ok()
             .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
@@ -2201,21 +2832,32 @@ impl AgentCore {
              若观察里没有可提炼的模式，只输出\"无模式\"。\n\n## 待巩固观察（{} 条，命名空间 {}）\n- {}",
             items.len(), ns, obs_text.chars().take(6000).collect::<String>()
         );
-        let msg = crate::llm::Message { role: "system".to_string(), content: Some(prompt), tool_calls: None, tool_call_id: None };
+        let msg = crate::llm::Message {
+            role: "system".to_string(),
+            content: Some(prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        };
         let reply = match self.llm.chat(&[msg], &[]).await {
             Ok(r) => r.text.trim().to_string(),
             Err(e) => return format!("consolidate[{}] LLM 失败: {}", ns, e),
         };
         if reply.is_empty() || reply == "无模式" {
             // 无模式也要推进游标，避免反复扫描同一批
-            let _ = mem_client.call("dream_state_update", &serde_json::json!({
-                "phase": "consolidate", "namespace": ns, "cursor_ts": max_ts, "items_out": 0
-            })).await;
+            let _ = mem_client
+                .call(
+                    "dream_state_update",
+                    &serde_json::json!({
+                        "phase": "consolidate", "namespace": ns, "cursor_ts": max_ts, "items_out": 0
+                    }),
+                )
+                .await;
             return format!("consolidate[{}]: 无模式（已推进游标 {}）", ns, max_ts);
         }
 
         // 4. 写回 pattern（≤5）
-        let patterns: Vec<&str> = reply.lines()
+        let patterns: Vec<&str> = reply
+            .lines()
             .map(|l| l.trim())
             .filter(|l| !l.is_empty())
             .take(5)
@@ -2223,14 +2865,21 @@ impl AgentCore {
         let mut written = 0u64;
         for p in patterns {
             // 去掉可能的序号/项目符号前缀（"1. "、"- "、"、 "）
-            let clean = p.trim_start_matches(|c: char| c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' ');
-            let _ = mem_client.call("memory_remember", &serde_json::json!({
-                "content": format!("[pattern] {} | ns={}", clean, ns),
-                "tags": ["pattern", "auto_consolidated"],
-                "category": "pattern",
-                "confidence": 70,
-                "namespace": ns
-            })).await;
+            let clean = p.trim_start_matches(|c: char| {
+                c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' '
+            });
+            let _ = mem_client
+                .call(
+                    "memory_remember",
+                    &serde_json::json!({
+                        "content": format!("[pattern] {} | ns={}", clean, ns),
+                        "tags": ["pattern", "auto_consolidated"],
+                        "category": "pattern",
+                        "confidence": 70,
+                        "namespace": ns
+                    }),
+                )
+                .await;
             written += 1;
         }
 
@@ -2249,20 +2898,34 @@ impl AgentCore {
                 obs_text.chars().take(3000).collect::<String>(),
                 reply.chars().take(1000).collect::<String>(),
             );
-            let msg2 = crate::llm::Message { role: "system".to_string(), content: Some(entity_prompt), tool_calls: None, tool_call_id: None };
+            let msg2 = crate::llm::Message {
+                role: "system".to_string(),
+                content: Some(entity_prompt),
+                tool_calls: None,
+                tool_call_id: None,
+            };
             if let Ok(ner_reply) = self.llm.chat(&[msg2], &[]).await {
                 let ner_text = ner_reply.text.trim().to_string();
                 // 解析 JSON（尝试直接解析，失败则查找最外层 {}）
-                let ner_json: Option<serde_json::Value> = serde_json::from_str(&ner_text).ok()
-                    .or_else(|| {
+                let ner_json: Option<serde_json::Value> =
+                    serde_json::from_str(&ner_text).ok().or_else(|| {
                         let start = ner_text.find('{')?;
                         let end = ner_text.rfind('}')?;
                         serde_json::from_str(&ner_text[start..=end]).ok()
                     });
                 if let Some(j) = ner_json {
-                    let entities = j.get("entities").and_then(|e| e.as_array()).cloned().unwrap_or_default();
-                    let edges = j.get("edges").and_then(|e| e.as_array()).cloned().unwrap_or_default();
-                    let mut entity_id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                    let entities = j
+                        .get("entities")
+                        .and_then(|e| e.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let edges = j
+                        .get("edges")
+                        .and_then(|e| e.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut entity_id_map: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
                     for ent in &entities {
                         let name = ent.get("name").and_then(|n| n.as_str()).unwrap_or("");
                         let etype = ent.get("type").and_then(|t| t.as_str()).unwrap_or("other");
@@ -2270,22 +2933,30 @@ impl AgentCore {
                         // 确定性 ID = MD5 前缀 + ns + name
                         // 确定性 ID = 命名空间名小写+实体名小写，去特殊字符
                         let clean_id = |s: &str| -> String {
-                            s.to_lowercase().chars()
+                            s.to_lowercase()
+                                .chars()
                                 .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-                                .take(40).collect::<String>()
+                                .take(40)
+                                .collect::<String>()
                         };
                         let entity_id = format!("ent:{}_{}", clean_id(ns), clean_id(name));
                         entity_id_map.insert(name.to_string(), entity_id.clone());
-                        let _ = mem_client.call("entity_upsert", &serde_json::json!({
-                            "entity_id": entity_id,
-                            "name": name,
-                            "entity_type": etype,
-                            "summary": summary,
-                            "namespace": ns
-                        })).await;
+                        let _ = mem_client
+                            .call(
+                                "entity_upsert",
+                                &serde_json::json!({
+                                    "entity_id": entity_id,
+                                    "name": name,
+                                    "entity_type": etype,
+                                    "summary": summary,
+                                    "namespace": ns
+                                }),
+                            )
+                            .await;
                         // 为每条提及该实体的观察记录 mention
                         for item in &items {
-                            let content = item.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                            let content =
+                                item.get("content").and_then(|c| c.as_str()).unwrap_or("");
                             let mem_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("");
                             if content.contains(name) {
                                 let _ = mem_client.call("entity_add_mention", &serde_json::json!({
@@ -2310,27 +2981,48 @@ impl AgentCore {
                     for edge in &edges {
                         let src = edge.get("source").and_then(|s| s.as_str()).unwrap_or("");
                         let tgt = edge.get("target").and_then(|t| t.as_str()).unwrap_or("");
-                        let rel = edge.get("relation").and_then(|r| r.as_str()).unwrap_or("related_to");
+                        let rel = edge
+                            .get("relation")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("related_to");
                         let evidence = edge.get("evidence").and_then(|e| e.as_str()).unwrap_or("");
-                        if let (Some(src_id), Some(tgt_id)) = (entity_id_map.get(src), entity_id_map.get(tgt)) {
-                            let _ = mem_client.call("entity_add_edge", &serde_json::json!({
-                                "source_entity_id": src_id,
-                                "target_entity_id": tgt_id,
-                                "relation_type": rel,
-                                "evidence": evidence,
-                                "namespace": ns
-                            })).await;
+                        if let (Some(src_id), Some(tgt_id)) =
+                            (entity_id_map.get(src), entity_id_map.get(tgt))
+                        {
+                            let _ = mem_client
+                                .call(
+                                    "entity_add_edge",
+                                    &serde_json::json!({
+                                        "source_entity_id": src_id,
+                                        "target_entity_id": tgt_id,
+                                        "relation_type": rel,
+                                        "evidence": evidence,
+                                        "namespace": ns
+                                    }),
+                                )
+                                .await;
                             edge_count += 1;
                         }
                     }
                     if !entities.is_empty() {
-                        tracing::info!("consolidate[{}] NER: {} entities, {} edges", ns, entities.len(), edge_count);
+                        tracing::info!(
+                            "consolidate[{}] NER: {} entities, {} edges",
+                            ns,
+                            entities.len(),
+                            edge_count
+                        );
                     }
                 }
             }
         }
 
-        format!("consolidate[{}]: 从 {} 条观察提炼 {} 条 pattern（cursor→{}）", ns, items.len(), written, max_ts)
+        format!(
+            "consolidate[{}]: 从 {} 条观察提炼 {} 条 pattern（cursor→{}）",
+            ns,
+            items.len(),
+            written,
+            max_ts
+        )
     }
 }
 

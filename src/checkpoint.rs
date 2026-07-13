@@ -157,7 +157,10 @@ impl CheckpointStore {
     /// 删除（会话清理时调用）
     pub fn delete(&self, session_id: &str) -> Result<(), String> {
         self.conn
-            .execute("DELETE FROM checkpoints WHERE session_id=?1", params![session_id])
+            .execute(
+                "DELETE FROM checkpoints WHERE session_id=?1",
+                params![session_id],
+            )
             .map_err(|e| format!("delete checkpoint: {}", e))?;
         Ok(())
     }
@@ -166,9 +169,10 @@ impl CheckpointStore {
     pub fn list_stale(&self, ttl_secs: u64) -> Vec<String> {
         let delta = format!("-{} seconds", ttl_secs);
         let mut out = Vec::new();
-        if let Ok(mut stmt) = self.conn.prepare(
-            "SELECT session_id FROM checkpoints WHERE updated_at <= datetime('now', ?1)",
-        ) {
+        if let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT session_id FROM checkpoints WHERE updated_at <= datetime('now', ?1)")
+        {
             if let Ok(mut rows) = stmt.query(params![delta]) {
                 while let Ok(Some(row)) = rows.next() {
                     if let Ok(sid) = row.get::<_, String>(0) {
@@ -183,13 +187,10 @@ impl CheckpointStore {
     /// 清理过期 checkpoint（默认 24h 语义由调用方传入 ttl）
     pub fn purge_stale(&self, ttl_secs: u64) -> usize {
         let delta = format!("-{} seconds", ttl_secs);
-        match self
-            .conn
-            .execute(
-                "DELETE FROM checkpoints WHERE updated_at <= datetime('now', ?1)",
-                params![delta],
-            )
-        {
+        match self.conn.execute(
+            "DELETE FROM checkpoints WHERE updated_at <= datetime('now', ?1)",
+            params![delta],
+        ) {
             Ok(n) => n as usize,
             Err(_) => 0,
         }
@@ -222,14 +223,16 @@ mod tests {
         let store = CheckpointStore::open_memory().unwrap();
         let payload = serde_json::json!({"original_message": "帮我查数据"});
         store
-            .save("s1", "agent1", CheckpointState::AwaitingConfirmation, &payload)
+            .save(
+                "s1",
+                "agent1",
+                CheckpointState::AwaitingConfirmation,
+                &payload,
+            )
             .unwrap();
         let cp = store.load("s1").unwrap();
         assert_eq!(cp.state, CheckpointState::AwaitingConfirmation);
-        assert_eq!(
-            cp.payload["original_message"].as_str(),
-            Some("帮我查数据")
-        );
+        assert_eq!(cp.payload["original_message"].as_str(), Some("帮我查数据"));
 
         // 覆盖
         let payload2 = serde_json::json!({"original_message": "改了"});
@@ -256,10 +259,7 @@ mod tests {
             .unwrap();
         let cp = store.load("p1").unwrap();
         assert_eq!(cp.payload["step_results"]["1"].as_str(), Some("ok"));
-        assert_eq!(
-            cp.payload["plan"]["steps"][0]["tool"].as_str(),
-            Some("t")
-        );
+        assert_eq!(cp.payload["plan"]["steps"][0]["tool"].as_str(), Some("t"));
     }
 
     #[test]

@@ -124,7 +124,9 @@ impl DegradeMonitor {
 
     /// 记录源失败，返回是否「刚刚变 unhealthy」
     pub fn record_failure(&self, name: &str, err: &str) -> bool {
-        self.get_health(name).map(|h| h.record_failure(err)).unwrap_or(false)
+        self.get_health(name)
+            .map(|h| h.record_failure(err))
+            .unwrap_or(false)
     }
 
     pub fn record_success(&self, name: &str) {
@@ -134,7 +136,9 @@ impl DegradeMonitor {
     }
 
     pub fn is_unhealthy(&self, name: &str) -> bool {
-        self.get_health(name).map(|h| h.is_unhealthy()).unwrap_or(false)
+        self.get_health(name)
+            .map(|h| h.is_unhealthy())
+            .unwrap_or(false)
     }
 
     pub fn health_snapshot(&self) -> Vec<(String, bool, u32, Option<String>)> {

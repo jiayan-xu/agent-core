@@ -322,7 +322,13 @@ impl AuditLogger {
     }
 
     #[tracing::instrument(skip_all, fields(event_type = "tool_invocation", agent_id = %agent_id, tool = %tool, allowed))]
-    pub async fn log_tool_call(&self, agent_id: &str, tool: &str, args: &serde_json::Value, allowed: bool) {
+    pub async fn log_tool_call(
+        &self,
+        agent_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+        allowed: bool,
+    ) {
         let summary = summarize_args(args);
         self.record_event(AuditEvent {
             ts: now_ts(),
@@ -383,7 +389,14 @@ pub fn redact(text: &str) -> String {
 /// 参数摘要：限制长度 + 排除敏感字段
 fn summarize_args(args: &serde_json::Value) -> String {
     const MAX_LEN: usize = 200;
-    const SENSITIVE_KEYS: &[&str] = &["admin_key", "api_key", "badge_token", "token", "password", "secret"];
+    const SENSITIVE_KEYS: &[&str] = &[
+        "admin_key",
+        "api_key",
+        "badge_token",
+        "token",
+        "password",
+        "secret",
+    ];
 
     match args {
         serde_json::Value::Object(map) => {
@@ -430,7 +443,10 @@ mod tests {
     fn event_type_strings_stable() {
         assert_eq!(AuditEventType::AuthFail.as_str(), "auth_fail");
         assert_eq!(AuditEventType::BoundaryDeny.as_str(), "boundary_deny");
-        assert_eq!(AuditEventType::CheckpointResume.as_str(), "checkpoint_resume");
+        assert_eq!(
+            AuditEventType::CheckpointResume.as_str(),
+            "checkpoint_resume"
+        );
     }
 
     #[test]

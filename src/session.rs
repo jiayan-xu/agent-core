@@ -77,13 +77,17 @@ impl SessionManager {
     pub async fn set_state(&self, session_id: &str, state: SessionState) {
         // 进入 AwaitingConfirmation 时记录开始时间
         if state == SessionState::AwaitingConfirmation {
-            self.confirm_started_at.lock().await
+            self.confirm_started_at
+                .lock()
+                .await
                 .insert(session_id.to_string(), Instant::now());
         } else {
             // 离开确认状态时清除时间戳
             self.confirm_started_at.lock().await.remove(session_id);
         }
-        self.session_state.lock().await
+        self.session_state
+            .lock()
+            .await
             .insert(session_id.to_string(), state);
     }
 
@@ -101,7 +105,9 @@ impl SessionManager {
 
     /// 设置待确认操作
     pub async fn set_pending_action(&self, session_id: &str, action: PendingAction) {
-        self.pending_actions.lock().await
+        self.pending_actions
+            .lock()
+            .await
             .insert(session_id.to_string(), action);
     }
 
@@ -114,18 +120,26 @@ impl SessionManager {
 
     /// 获取并移除待确认的原始消息
     pub async fn take_original_message(&self, session_id: &str) -> Option<String> {
-        self.pending_original_message.lock().await.remove(session_id)
+        self.pending_original_message
+            .lock()
+            .await
+            .remove(session_id)
     }
 
     /// 获取待确认的原始消息（不移除）
     pub async fn get_original_message(&self, session_id: &str) -> Option<String> {
-        self.pending_original_message.lock().await
-            .get(session_id).cloned()
+        self.pending_original_message
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
     }
 
     /// 设置待确认的原始消息
     pub async fn set_original_message(&self, session_id: &str, message: &str) {
-        self.pending_original_message.lock().await
+        self.pending_original_message
+            .lock()
+            .await
             .insert(session_id.to_string(), message.to_string());
     }
 
@@ -273,7 +287,10 @@ impl SessionManager {
         self.session_history.lock().await.remove(session_id);
         self.pending_actions.lock().await.remove(session_id);
         self.session_state.lock().await.remove(session_id);
-        self.pending_original_message.lock().await.remove(session_id);
+        self.pending_original_message
+            .lock()
+            .await
+            .remove(session_id);
         self.confirm_started_at.lock().await.remove(session_id);
         self.session_lru.lock().await.retain(|s| s != session_id);
     }
@@ -427,11 +444,15 @@ mod tests {
         assert!(history.is_empty());
 
         // 保存对话
-        sm.save_to_history("s1", ns, db_path, "你好", "你好！有什么可以帮你的？").await;
+        sm.save_to_history("s1", ns, db_path, "你好", "你好！有什么可以帮你的？")
+            .await;
         let history = sm.load_history("s1", ns, db_path).await;
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].content.as_deref(), Some("你好"));
-        assert_eq!(history[1].content.as_deref(), Some("你好！有什么可以帮你的？"));
+        assert_eq!(
+            history[1].content.as_deref(),
+            Some("你好！有什么可以帮你的？")
+        );
 
         assert_eq!(sm.cached_count().await, 1);
         assert_eq!(sm.lru_len().await, 1);
@@ -445,7 +466,14 @@ mod tests {
 
         // 写 15 轮（30 条消息），先推后截，最终保留最近 10 轮（20 条）
         for i in 0..15 {
-            sm.save_to_history("s1", ns, db_path, &format!("msg{}", i), &format!("reply{}", i)).await;
+            sm.save_to_history(
+                "s1",
+                ns,
+                db_path,
+                &format!("msg{}", i),
+                &format!("reply{}", i),
+            )
+            .await;
         }
 
         let history = sm.load_history("s1", ns, db_path).await;

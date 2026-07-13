@@ -48,7 +48,10 @@ pub struct NsQuotaUsage {
 
 impl NsQuotaUsage {
     fn new(day: String) -> Self {
-        NsQuotaUsage { day, ..Default::default() }
+        NsQuotaUsage {
+            day,
+            ..Default::default()
+        }
     }
 
     fn reset(&mut self, day: String) {
@@ -91,12 +94,18 @@ impl NsQuotaStore {
 
     /// 读取某命名空间配额策略（无则回默认）
     pub fn get_policy(&self, ns: &str) -> NsQuotaPolicy {
-        self.policies.get(ns).cloned().unwrap_or_else(|| self.default_policy.clone())
+        self.policies
+            .get(ns)
+            .cloned()
+            .unwrap_or_else(|| self.default_policy.clone())
     }
 
     fn usage_mut(&mut self, ns: &str) -> &mut NsQuotaUsage {
         let today = Self::today();
-        let u = self.usage.entry(ns.to_string()).or_insert_with(|| NsQuotaUsage::new(today.clone()));
+        let u = self
+            .usage
+            .entry(ns.to_string())
+            .or_insert_with(|| NsQuotaUsage::new(today.clone()));
         if u.day != today {
             u.reset(today);
         }
@@ -250,7 +259,13 @@ mod tests {
     #[test]
     fn policy_override_applies() {
         let mut s = NsQuotaStore::new();
-        s.set_policy("ns/d", NsQuotaPolicy { max_tool_rounds: 2, ..Default::default() });
+        s.set_policy(
+            "ns/d",
+            NsQuotaPolicy {
+                max_tool_rounds: 2,
+                ..Default::default()
+            },
+        );
         assert!(s.check_tool_round("ns/d").is_ok());
         assert!(s.check_tool_round("ns/d").is_ok());
         assert!(s.check_tool_round("ns/d").is_err());

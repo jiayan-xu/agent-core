@@ -79,20 +79,27 @@ impl ApprovalManager {
         approver_id: &str,
         requester_id: &str,
     ) -> String {
-        let approval_id = format!("apr_{}_{}", chrono::Utc::now().timestamp_millis(), tool_name);
+        let approval_id = format!(
+            "apr_{}_{}",
+            chrono::Utc::now().timestamp_millis(),
+            tool_name
+        );
         let now = now_secs();
 
         let mut outgoing = self.outgoing.lock().await;
-        outgoing.insert(approval_id.clone(), PendingApproval {
-            approval_id: approval_id.clone(),
-            tool_name: tool_name.to_string(),
-            arguments: arguments.clone(),
-            description: description.to_string(),
-            approver_id: approver_id.to_string(),
-            requester_id: requester_id.to_string(),
-            status: ApprovalStatus::Pending,
-            created_at: now,
-        });
+        outgoing.insert(
+            approval_id.clone(),
+            PendingApproval {
+                approval_id: approval_id.clone(),
+                tool_name: tool_name.to_string(),
+                arguments: arguments.clone(),
+                description: description.to_string(),
+                approver_id: approver_id.to_string(),
+                requester_id: requester_id.to_string(),
+                status: ApprovalStatus::Pending,
+                created_at: now,
+            },
+        );
 
         approval_id
     }
@@ -124,7 +131,8 @@ impl ApprovalManager {
     /// 获取所有 pending 的审批项
     pub async fn list_pending(&self) -> Vec<PendingApproval> {
         let outgoing = self.outgoing.lock().await;
-        outgoing.values()
+        outgoing
+            .values()
             .filter(|a| a.status == ApprovalStatus::Pending)
             .cloned()
             .collect()
@@ -142,7 +150,11 @@ impl ApprovalManager {
     }
 
     /// 构建 A2A 审批请求消息
-    pub fn build_a2a_request(&self, approval: &PendingApproval, requester_ns: &str) -> serde_json::Value {
+    pub fn build_a2a_request(
+        &self,
+        approval: &PendingApproval,
+        requester_ns: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
             "type": "approval_request",
             "approval_id": approval.approval_id,
@@ -179,7 +191,10 @@ impl ApprovalManager {
             r#type: "approval_response".to_string(),
             approval_id: msg["approval_id"].as_str()?.to_string(),
             approved: msg["approved"].as_bool()?,
-            reason: msg.get("reason").and_then(|r| r.as_str()).map(|s| s.to_string()),
+            reason: msg
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .map(|s| s.to_string()),
             approver_id: msg["approver_id"].as_str()?.to_string(),
         })
     }
@@ -203,7 +218,10 @@ pub fn has_pending_approval_sync(_manager: &ApprovalManager, _tool_name: &str) -
 
 fn now_secs() -> f64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 #[cfg(test)]
@@ -225,13 +243,15 @@ mod tests {
     #[tokio::test]
     async fn test_create_and_get_pending() {
         let am = ApprovalManager::new();
-        let aid = am.create_request(
-            "delete_record",
-            &serde_json::json!({"id": 42}),
-            "删除记录 42",
-            "approver-01",
-            "agent-001",
-        ).await;
+        let aid = am
+            .create_request(
+                "delete_record",
+                &serde_json::json!({"id": 42}),
+                "删除记录 42",
+                "approver-01",
+                "agent-001",
+            )
+            .await;
 
         let pending = am.get_pending(&aid).await;
         assert!(pending.is_some());
@@ -242,7 +262,15 @@ mod tests {
     #[tokio::test]
     async fn test_record_and_check_response() {
         let am = ApprovalManager::new();
-        let aid = am.create_request("delete_record", &serde_json::json!({}), "del", "approver-01", "agent-001").await;
+        let aid = am
+            .create_request(
+                "delete_record",
+                &serde_json::json!({}),
+                "del",
+                "approver-01",
+                "agent-001",
+            )
+            .await;
 
         // 审批人批准
         let resp = ApprovalResponse {
@@ -260,7 +288,15 @@ mod tests {
     #[tokio::test]
     async fn test_deny_response() {
         let am = ApprovalManager::new();
-        let aid = am.create_request("shutdown_server", &serde_json::json!({}), "关停", "admin", "agent-001").await;
+        let aid = am
+            .create_request(
+                "shutdown_server",
+                &serde_json::json!({}),
+                "关停",
+                "admin",
+                "agent-001",
+            )
+            .await;
 
         let resp = ApprovalResponse {
             r#type: "approval_response".to_string(),
@@ -326,8 +362,22 @@ mod tests {
     #[tokio::test]
     async fn test_list_pending() {
         let am = ApprovalManager::new();
-        am.create_request("tool_a", &serde_json::json!({}), "A", "approver-01", "agent-001").await;
-        am.create_request("tool_b", &serde_json::json!({}), "B", "approver-01", "agent-001").await;
+        am.create_request(
+            "tool_a",
+            &serde_json::json!({}),
+            "A",
+            "approver-01",
+            "agent-001",
+        )
+        .await;
+        am.create_request(
+            "tool_b",
+            &serde_json::json!({}),
+            "B",
+            "approver-01",
+            "agent-001",
+        )
+        .await;
 
         assert_eq!(am.list_pending().await.len(), 2);
     }
@@ -335,7 +385,15 @@ mod tests {
     #[tokio::test]
     async fn test_remove() {
         let am = ApprovalManager::new();
-        let aid = am.create_request("tool", &serde_json::json!({}), "test", "approver-01", "agent-001").await;
+        let aid = am
+            .create_request(
+                "tool",
+                &serde_json::json!({}),
+                "test",
+                "approver-01",
+                "agent-001",
+            )
+            .await;
 
         let resp = ApprovalResponse {
             r#type: "approval_response".to_string(),
