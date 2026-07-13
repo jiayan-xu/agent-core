@@ -1954,6 +1954,10 @@ impl AgentCore {
             }
         }
 
+        // [E2E-DEBUG] 端到端验证：打印 allowed_ns 与最终可见工具集
+        let visible: Vec<&str> = all_tools.iter().map(|t| t.function.name.as_str()).collect();
+        tracing::info!(allowed_ns = ?allowed_ns, visible_tools = ?visible, "e2e_fetch_tools_filtered");
+
         if all_tools.is_empty() {
             tracing::warn!("命名空间过滤后无可用 MCP 工具，使用 fallback");
             return Self::fallback_tools();

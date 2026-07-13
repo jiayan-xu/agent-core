@@ -228,7 +228,7 @@ async fn authenticate(
     } else {
         admin_key.clone()
     };
-    let server = { let cfg = st.config.lock().await; cfg.server.clone() };
+    let (server, actor) = { let cfg = st.config.lock().await; (cfg.server.clone(), cfg.agent_id.clone()) };
     let mut allowed_ns: Vec<String> = {
         let cache = st.ns_cache.lock().await;
         cache
@@ -262,7 +262,7 @@ async fn authenticate(
             // 同一 namespace 字段，Memoria `get_allowed_ns` 会按逗号拆分回传，从而
             // 后续请求（缓存失效后重查）仍同时持有这两个 ns，不会因回读而丢失 dashboard。
             let install_ns = format!("agent/{},org/cs-pufa-2nd-thermal", agent_id);
-            let reg = McpClient::new(&server, "admin", &admin_key);
+            let reg = McpClient::new(&server, &actor, &admin_key);
             let _ = reg.call_json("register_agent", &serde_json::json!({
                 "agent_id": &agent_id,
                 "display_name": &agent_id,
@@ -384,18 +384,18 @@ fn save_config(cfg: &Config) {
 }
 
 fn build_cors_layer(host: &str, port: u16, configured: &[String]) -> CorsLayer {
-    let mut origins = Vec::new();
+    // 未配置 cors_origins 时：本地壳（Tauri / vite）任意 Origin 可探测/聊天；
+    // 生产若收紧，在 config.toml 显式填写 cors_origins 白名单。
     if configured.is_empty() {
-        origins.push(format!("http://127.0.0.1:{}", port));
-        origins.push(format!("http://localhost:{}", port));
-        if host != "127.0.0.1" && host != "localhost" && host != "::1" {
-            origins.push(format!("http://{}:{}", host, port));
-        }
-    } else {
-        origins.extend(configured.iter().cloned());
+        let _ = (host, port);
+        return CorsLayer::new()
+            .allow_origin(AllowOrigin::mirror_request())
+            .allow_methods(Any)
+            .allow_headers(Any);
     }
-    let header_values: Vec<axum::http::HeaderValue> = origins
-        .into_iter()
+    let header_values: Vec<axum::http::HeaderValue> = configured
+        .iter()
+        .cloned()
         .filter_map(|o| axum::http::HeaderValue::try_from(o).ok())
         .collect();
     CorsLayer::new()
@@ -575,6 +575,7 @@ fn main() {
             let public = Router::new()
                 .route("/", get(handle_index))
                 .route("/logo.png", get(handle_logo))
+                .route("/health", get(handle_health))
                 .route("/api/config", get(handle_config))
                 .route("/api/register", post(handle_register))
                 .route("/api/register_user", post(handle_register_user))
@@ -664,6 +665,15 @@ async fn handle_logo() -> impl axum::response::IntoResponse {
         }
     }
     ([(axum::http::header::CONTENT_TYPE, "text/plain")], "logo not found".into())
+}
+
+/// 公开健康检查（无鉴权）。供 PFAiX 状态条 / 诊断包探测。
+async fn handle_health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "service": "agent-core",
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 async fn handle_config(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -1060,14 +1070,19 @@ async fn handle_v1_chat(
                 "error": "invalid session_id"
             })).into_response();
         }
-        let user_text: String = req.messages.iter()
-            .filter_map(|m| m.content.as_deref())
-            .collect::<Vec<_>>()
-            .join("\n")
+        // 只取最后一条 user 消息。Jan 会带上完整 history；若把 assistant 自我介绍也 join
+        // 进 user_text，模型容易反复只回身份介绍、不调工具。
+        let user_text: String = req
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role.eq_ignore_ascii_case("user"))
+            .and_then(|m| m.content.clone())
+            .unwrap_or_default()
             .chars()
             .take(32768)
             .collect();
-        if user_text.is_empty() {
+        if user_text.trim().is_empty() {
             "请输入消息".to_string()
         } else {
             agent.chat(&user_text, &ctx.agent_id, &session_id, &ctx.allowed_ns).await
@@ -1171,6 +1186,12 @@ struct RegisterUserRequest {
     password: String,
     #[serde(default)]
     display_name: String,
+    /// 管理/HR 预置的命名空间（部门/项目级）。仅当携带合法 admin_key 时才生效，
+    /// 否则忽略并回退到默认 org 根——防止普通自助注册自我提权到任意部门/项目。
+    #[serde(default)]
+    namespace: String,
+    #[serde(default)]
+    admin_key: String,
 }
 #[derive(Deserialize)]
 struct LoginRequest {
@@ -1254,7 +1275,10 @@ async fn handle_register(
         Ok(k) if !k.is_empty() => k,
         _ => st.config.lock().await.memoria_admin_key.clone(),
     };
-    let mcp = McpClient::new("http://127.0.0.1:9003", "admin", &admin_key);
+    // P0 修复：以 dashboard-agent 身份（其 badge 持有固定 admin key）代理注册，
+    // 而非字面 "admin"（DB 中持有过期 key，会导致 Memoria require_admin 401）。
+    let (actor, server) = { let cfg = st.config.lock().await; (cfg.agent_id.clone(), cfg.server.clone()) };
+    let mcp = McpClient::new(&server, &actor, &admin_key);
     // P0 修复：Memoria 的 register_agent 会自行生成 badge 并在响应里返回；
     // 必须用它作为后续鉴权 key，否则客户端拿本地随机 token 与 Memoria 存值对不上 → -32001。
     let memoria_ok = if admin_key.is_empty() {
@@ -1289,18 +1313,31 @@ async fn handle_register(
     }
 
     // 审计日志：记录身份注册
-    let audit = AuditLogger::new(McpClient::new("http://127.0.0.1:9003", "admin", &admin_key));
+    let audit = AuditLogger::new(McpClient::new(&server, &actor, &admin_key));
     audit.log_identity(&agent_id, "register",
         &format!("name={}, department={}, company={}, div={}, project={}",
             req.name, req.department, req.company, req.div, req.project)
     ).await;
+
+    if !memoria_ok {
+        return Json(RegisterResponse {
+            ok: false,
+            agent_id: String::new(),
+            badge_token: String::new(),
+            namespace: String::new(),
+            error: Some(
+                "Memoria 注册失败：请确认 agent-core 已加载 MEMORIA_ADMIN_KEY，且 Memoria(:9003) 可用"
+                    .into(),
+            ),
+        });
+    }
 
     Json(RegisterResponse {
         ok: true,
         agent_id,
         badge_token,
         namespace,
-        error: if memoria_ok { None } else { Some("Memoria 暂时不可用，token 已生成".to_string()) },
+        error: None,
     })
 }
 
@@ -1332,20 +1369,38 @@ async fn handle_register_user(
             badge_token: String::new(), namespace: String::new(),
             error: Some("服务未就绪，请稍后重试".to_string()) });
     }
-    // 部署级组织命名空间：agent/{user_id}（个人记忆） + org/...（共享工具可见性）
-    let namespace = format!("agent/{},org/cs-pufa-2nd-thermal", user_id);
-    let mcp = McpClient::new("http://127.0.0.1:9003", "admin", &admin_key);
+    // 默认命名空间：个人 agent + 组织根（可见 org 下全部共享工具）。
+    // HR/管理员（持 admin_key）可预置部门/项目命名空间；否则回退默认（个人 agent + 组织根）。
+    // 始终携带 effective_ns 作为 register_user 的 `namespace` 参数（与 Memoria dispatch 读取的
+    // 键名一致；此前误用 namespace_override 导致覆盖被静默丢弃），使自助注册员工也能获得
+    // org 根可见性；权限提升仅限持合法 admin_key 者，杜绝普通用户越权指定命名空间。
+    let default_ns = format!("agent/{},org/cs-pufa-2nd-thermal", user_id);
+    let effective_ns = if !req.admin_key.is_empty()
+        && req.admin_key == admin_key
+        && !req.namespace.trim().is_empty()
+    {
+        req.namespace.trim().to_string()
+    } else {
+        default_ns.clone()
+    };
+    // 以 agent-core 自身身份（dashboard-agent，已在 Memoria 持固定 admin key）调 Memoria，
+    // 其 badge == MEMORIA_ADMIN_KEY → 角色 admin，可代理 register_user/login_user。
+    let (actor, server) = {
+        let cfg = st.config.lock().await;
+        (cfg.agent_id.clone(), cfg.server.clone())
+    };
+    let mcp = McpClient::new(&server, &actor, &admin_key);
     match mcp.call_json("register_user", &serde_json::json!({
         "user_id": &user_id,
         "display_name": &display_name,
         "password": &req.password,
-        "namespace": &namespace,
+        "namespace": effective_ns.clone(),
     })).await {
         Ok(v) => {
             let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
             if status == "registered" {
                 Json(LoginResponse { ok: true, user_id, display_name,
-                    badge_token: String::new(), namespace, error: None })
+                    badge_token: String::new(), namespace: effective_ns, error: None })
             } else {
                 let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("注册失败").to_string();
                 Json(LoginResponse { ok: false, user_id: String::new(), display_name: String::new(),
@@ -1379,7 +1434,10 @@ async fn handle_login(
             badge_token: String::new(), namespace: String::new(),
             error: Some("服务未就绪，请稍后重试".to_string()) });
     }
-    let mcp = McpClient::new("http://127.0.0.1:9003", "admin", &admin_key);
+    // P0 修复：以 dashboard-agent 身份代理登录（其 badge 持有固定 admin key），
+    // 而非字面 "admin"（DB 中过期 key 会导致 require_admin 401）。
+    let (actor, server) = { let cfg = st.config.lock().await; (cfg.agent_id.clone(), cfg.server.clone()) };
+    let mcp = McpClient::new(&server, &actor, &admin_key);
     match mcp.call_json("login_user", &serde_json::json!({
         "user_id": &user_id,
         "password": &req.password,

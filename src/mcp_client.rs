@@ -145,6 +145,18 @@ struct ChildProcess {
     ready: bool,
 }
 
+/// 读 stdout 一行：容忍非严格 UTF-8（Windows 子进程偶发）
+fn read_line_flexible(reader: &mut impl BufRead) -> Result<String, String> {
+    let mut buf = Vec::new();
+    reader
+        .read_until(b'\n', &mut buf)
+        .map_err(|e| format!("read stdout: {}", e))?;
+    if buf.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 impl StdioMcpClient {
     pub fn new(command: &str, args: &[String]) -> Self {
         StdioMcpClient {
@@ -168,8 +180,8 @@ impl StdioMcpClient {
         // 读取就绪信号（首次启动时）
         if !guard.ready {
             let mut reader = BufReader::new(guard.inner.stdout.as_mut().unwrap());
-            let mut ready_line = String::new();
-            reader.read_line(&mut ready_line).map_err(|e| format!("read ready signal: {}", e))?;
+            let ready_line = read_line_flexible(&mut reader)?;
+            let _ = ready_line;
             guard.ready = true;
             // 把 reader 丢回去 — 用完后 drop
         }
@@ -184,12 +196,11 @@ impl StdioMcpClient {
         // 读取响应
         let stdout = guard.inner.stdout.as_mut().unwrap();
         let mut reader = BufReader::new(stdout);
-        let mut resp_line = String::new();
-        reader.read_line(&mut resp_line).map_err(|e| format!("read stdout: {}", e))?;
+        let resp_line = read_line_flexible(&mut reader)?;
         if resp_line.is_empty() {
             return Err("MCP server closed stdout".to_string());
         }
-        serde_json::from_str(&resp_line).map_err(|e| format!("parse JSON: {}", e))
+        serde_json::from_str(resp_line.trim()).map_err(|e| format!("parse JSON: {}", e))
     }
 
     pub async fn call(&self, tool: &str, args: &serde_json::Value) -> Result<String, String> {
@@ -231,7 +242,10 @@ fn spawn_process(command: &str, args: &[String]) -> Child {
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::inherit())
+        // 强制子进程 stdout UTF-8，避免 Windows 本地代码页导致 JSON-RPC 行非法
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8");
     // Windows: 防止 spawn 的 MCP 子进程（如 python）弹出控制台窗口
     #[cfg(windows)]
     {
