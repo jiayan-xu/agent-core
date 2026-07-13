@@ -48,7 +48,11 @@ use agent_core::audit::AuditLogger;
 use agent_core::boundary::PermissionLevel;
 use agent_core::harness::HarnessStore;
 use agent_core::llm::LlmConfig;
+use agent_core::approval::ApprovalResponse;
 use agent_core::mcp_client::McpClient;
+
+/// 公司根命名空间（与 agent.toml 的 mcp_source namespace org/ 前缀、Memoria 注册一致）
+const ORG_COMPANY: &str = "cs-pufa-2nd-thermal";
 
 /// 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +208,56 @@ struct CollabInboxQuery {
     limit: Option<usize>,
     /// 传 "1"/"true" 表示本次读取后标记已读（更新未读游标）
     mark_seen: Option<String>,
+}
+
+/// 协作发送请求体（POST /api/collab/send）
+#[derive(Debug, serde::Deserialize)]
+struct CollabSendBody {
+    /// 单点收件人 agent_id（scope=agent 必填）
+    to_agent: Option<String>,
+    /// 广播范围：org | dept | proj | agent
+    scope: String,
+    /// 范围 id：org 公司根 / dept 部门名 / proj 项目名
+    scope_id: Option<String>,
+    /// 信封类型白名单：query | query_result | notify | approval_request | message
+    #[serde(rename = "type")]
+    r#type: String,
+    subject: String,
+    body: String,
+    /// 结构化载荷（审批请求的工具名/参数等），可选
+    payload: Option<serde_json::Value>,
+    /// 关联线程 id，可选
+    thread_id: Option<String>,
+}
+
+/// 协作审批响应请求体（POST /api/collab/approval）
+#[derive(Debug, serde::Deserialize)]
+struct CollabApprovalBody {
+    /// 待响应的 approval_request 消息 id（调用者收件箱中的）
+    id: String,
+    /// 决策：approve | reject
+    decision: String,
+    /// 拒绝/备注理由，可选
+    reason: Option<String>,
+}
+
+/// 协作可达策略（§3.3）：校验「调用者能否以某类型发往某范围」。
+/// 仅做粗粒度可达性；跨租户/跨公司的实际隔离由 Memoria NS 门控兜底。
+fn collab_reachability(caller_ns: &[String], scope: &str, etype: &str) -> bool {
+    let in_org = caller_ns
+        .iter()
+        .any(|n| n == &format!("org/{}", ORG_COMPANY) || n.starts_with(&format!("org/{}/", ORG_COMPANY)) || n == "*");
+    match scope {
+        // 公司级广播：仅通知/制度类；须公司级角色（持有 org 根 ns）
+        "org" => in_org && matches!(etype, "notify" | "announcement"),
+        // 部门级：通知 / 问询 / 审批请求
+        "dept" => matches!(etype, "notify" | "query" | "approval_request"),
+        // 项目级：默认更窄（通知 / 问询）
+        "proj" => matches!(etype, "notify" | "query"),
+        // 单点：审批请求 / 问询 / 通知 / 普通消息（同组织内；跨公司由 NS 门控拒绝）
+        "agent" => matches!(etype, "approval_request" | "query" | "notify" | "message"),
+        _ => false,
+    }
 }
 
 struct AppState {
@@ -711,6 +765,9 @@ fn main() {
                 )
                 .route("/api/save-config", post(handle_save_config))
                 .route("/api/collab/inbox", get(handle_collab_inbox))
+                .route("/api/collab/send", post(handle_collab_send))
+                .route("/api/collab/approval", post(handle_collab_approval))
+                .route("/api/collab/peers", get(handle_collab_peers))
                 .route("/v1/chat/completions", post(handle_v1_chat))
                 .layer(from_fn_with_state(state.clone(), auth_middleware));
 
@@ -1071,6 +1128,347 @@ async fn handle_collab_inbox(
         "page_size": page_size,
     }))
     .into_response()
+}
+
+/// 协作发送（POST /api/collab/send）
+///
+/// 校验 type 白名单 + 可达策略（§3.3）后，按 scope 构建信封并投递：
+/// - scope=agent → 点对点 a2a_send 到 `agent/{to_agent}`
+/// - scope=org/dept/proj → 经 `agent_list` 展开 NS 树为多收件人，逐一 a2a_send（fan-out）
+/// 实际送达经服务端受信身份（admin 中继）完成；Memoria NS 门控仅作纵深防御。
+async fn handle_collab_send(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<CollabSendBody>,
+) -> axum::response::Response {
+    let (agent_id, allowed_ns) = match authenticate(&headers, &st).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+
+    // 1) type 白名单
+    let etype = body.r#type.trim();
+    let allowed_types = ["query", "query_result", "notify", "approval_request", "message"];
+    if !allowed_types.contains(&etype) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": format!("不支持的信封类型: {}", etype)})),
+        )
+            .into_response();
+    }
+
+    // 2) 可达策略（§3.3）
+    let scope = body.scope.trim();
+    if !collab_reachability(&allowed_ns, scope, etype) {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!(
+                {"error": format!("可达策略拒绝：scope={} 不允许 type={}", scope, etype)}
+            )),
+        )
+            .into_response();
+    }
+
+    // 3) 构建信封（§3.1）
+    let from_ns = allowed_ns
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("agent/{}", agent_id));
+    let now = chrono::Utc::now().to_rfc3339();
+    let msg_id = format!("col_{}_{}", chrono::Utc::now().timestamp_millis(), etype);
+    let scope_id = body.scope_id.clone().unwrap_or_default();
+
+    // 4) 投递
+    let agent_guard = st.agent.lock().await;
+    let sent = if let Some(ref agent) = *agent_guard {
+        if scope == "agent" {
+            // 点对点：必须指定收件人
+            let to = match &body.to_agent {
+                Some(t) if !t.is_empty() => t.clone(),
+                _ => {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({"error": "scope=agent 须指定 to_agent"})),
+                    )
+                        .into_response();
+                }
+            };
+            let envelope = build_collab_envelope(
+                &msg_id, etype, &body.subject, &body.body, &agent_id, &from_ns,
+                &to, scope, &scope_id, body.thread_id.as_deref(),
+                body.payload.as_ref(), &now,
+            );
+            match agent.collab_send_raw(&to, &envelope).await {
+                Ok(s) => serde_json::json!({"sent": 1, "targets": [to], "detail": s}),
+                Err(e) => {
+                    return (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        axum::Json(serde_json::json!({"error": e})),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            // fan-out：展开 NS 树为多个点对点收件人
+            match agent.collab_list_peers().await {
+                Ok(peers) => {
+                    let targets: Vec<String> = peers
+                        .iter()
+                        .filter_map(|p| p["agent_id"].as_str().map(|s| s.to_string()))
+                        .filter(|id| id != &agent_id) // 不自发
+                        .filter(|id| {
+                            // 按 scope 过滤同组织/同部门/同项目成员
+                            let ns = peers_ns_of(&peers, id);
+                            match scope {
+                                "org" => ns.contains(&format!("org/{}", ORG_COMPANY)),
+                                "dept" => scope_id.is_empty()
+                                    || ns.contains(&format!("dept/{}", scope_id)),
+                                "proj" => scope_id.is_empty()
+                                    || ns.contains(&format!("proj/{}", scope_id)),
+                                _ => false,
+                            }
+                        })
+                        .collect();
+                    if targets.is_empty() {
+                        serde_json::json!({"sent": 0, "targets": Vec::<String>::new(), "detail": "无可投递的同组织收件人"})
+                    } else {
+                        let mut count = 0usize;
+                        let mut failed = Vec::new();
+                        for t in &targets {
+                            let envelope = build_collab_envelope(
+                                &msg_id, etype, &body.subject, &body.body, &agent_id,
+                                &from_ns, t, scope, &scope_id,
+                                body.thread_id.as_deref(), body.payload.as_ref(), &now,
+                            );
+                            match agent.collab_send_raw(t, &envelope).await {
+                                Ok(_) => count += 1,
+                                Err(e) => failed.push(serde_json::json!({"to": t, "error": e})),
+                            }
+                        }
+                        serde_json::json!({"sent": count, "targets": targets, "failed": failed})
+                    }
+                }
+                Err(e) => {
+                    return (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        axum::Json(serde_json::json!({"error": e})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    } else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "agent 尚未就绪"})),
+        )
+            .into_response();
+    };
+    drop(agent_guard);
+    axum::Json(sent).into_response()
+}
+
+/// 从 agent_list 结果中取某 agent 的 namespace 字段（用于 fan-out 范围匹配）。
+fn peers_ns_of(peers: &[serde_json::Value], id: &str) -> String {
+    peers
+        .iter()
+        .find(|p| p["agent_id"].as_str() == Some(id))
+        .and_then(|p| p["namespace"].as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 构建标准协作信封（§3.1）。`to` 为单个收件人 agent_id（fan-out 时逐封改写）。
+fn build_collab_envelope(
+    id: &str,
+    etype: &str,
+    subject: &str,
+    body: &str,
+    from_agent: &str,
+    from_ns: &str,
+    to_agent: &str,
+    scope: &str,
+    scope_id: &str,
+    thread_id: Option<&str>,
+    payload: Option<&serde_json::Value>,
+    created_at: &str,
+) -> serde_json::Value {
+    let mut env = serde_json::json!({
+        "type": etype,
+        "id": id,
+        "subject": subject,
+        "body": body,
+        "from_agent": from_agent,
+        "from_ns": from_ns,
+        "to_agent": to_agent,
+        "scope": scope,
+        "scope_id": scope_id,
+        "created_at": created_at,
+    });
+    if let Some(tid) = thread_id {
+        env["thread_id"] = serde_json::Value::String(tid.to_string());
+    }
+    if let Some(p) = payload {
+        env["payload"] = p.clone();
+    }
+    env
+}
+
+/// 协作审批响应（POST /api/collab/approval）
+///
+/// 在调用者收件箱中找到对应 approval_request，向 requester 回写 approval_response 信封，
+/// 并记入本地 ApprovalManager（若本实例恰好是等待方，可即时解阻塞）。
+async fn handle_collab_approval(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<CollabApprovalBody>,
+) -> axum::response::Response {
+    let (agent_id, _allowed_ns) = match authenticate(&headers, &st).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let agent_key = headers
+        .get("x-agent-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // 在调用者收件箱中定位该 approval_request
+    let agent_guard = st.agent.lock().await;
+    let (requester, approval_id) = if let Some(ref agent) = *agent_guard {
+        match agent
+            .collab_find_message(&agent_id, &agent_key, &body.id)
+            .await
+        {
+            Ok(Some(m)) => {
+                if m["type"].as_str() != Some("approval_request") {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!(
+                            {"error": "该消息不是 approval_request，无法审批"}
+                        )),
+                    )
+                        .into_response();
+                }
+                let req = m["from_agent"].as_str().unwrap_or("").to_string();
+                let aid = m["payload"]["approval_id"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| body.id.clone());
+                (req, aid)
+            }
+            Ok(None) => {
+                return (
+                    axum::http::StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({"error": "收件箱中找不到该审批请求"})),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    axum::Json(serde_json::json!({"error": e})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "agent 尚未就绪"})),
+        )
+            .into_response();
+    };
+
+    let decision_ok = matches!(body.decision.trim(), "approve" | "yes" | "通过" | "批准");
+    let resp_env = serde_json::json!({
+        "type": "approval_response",
+        "approval_id": approval_id,
+        "approved": decision_ok,
+        "reason": body.reason.clone(),
+        "approver_id": agent_id,
+    });
+
+    // 回写 requester 收件箱
+    let send_res = if let Some(ref agent) = *agent_guard {
+        agent.collab_send_raw(&requester, &resp_env).await
+    } else {
+        Err("agent 尚未就绪".to_string())
+    };
+    drop(agent_guard);
+
+    match send_res {
+        Ok(_) => {
+            // 记录本地 ApprovalManager（解阻塞本实例等待中的审批）
+            let agent_guard = st.agent.lock().await;
+            if let Some(ref agent) = *agent_guard {
+                let _ = agent.approval_manager.record_response(
+                    ApprovalResponse {
+                        r#type: "approval_response".to_string(),
+                        approval_id: approval_id.clone(),
+                        approved: decision_ok,
+                        reason: body.reason.clone(),
+                        approver_id: agent_id.clone(),
+                    },
+                ).await;
+            }
+            drop(agent_guard);
+            axum::Json(serde_json::json!({
+                "ok": true,
+                "decision": if decision_ok { "approve" } else { "reject" },
+                "to": requester,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// 协作通讯录（GET /api/collab/peers）
+///
+/// 返回同组织已注册 Agent 列表（经 admin 中继调 Memoria `agent_list`）。
+async fn handle_collab_peers(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let (_agent_id, _allowed_ns) = match authenticate(&headers, &st).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let agent_guard = st.agent.lock().await;
+    let res = if let Some(ref agent) = *agent_guard {
+        agent.collab_list_peers().await
+    } else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "agent 尚未就绪"})),
+        )
+            .into_response();
+    };
+    drop(agent_guard);
+    match res {
+        Ok(agents) => axum::Json(serde_json::json!({
+            "agents": agents
+                .iter()
+                .map(|a| serde_json::json!({
+                    "agent_id": a["agent_id"],
+                    "display_name": a["display_name"],
+                    "namespace": a["namespace"],
+                    "permission": a["permission"],
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
 }
 
 /// 加载指定会话的历史

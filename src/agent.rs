@@ -1766,6 +1766,60 @@ impl AgentCore {
         })
     }
 
+    /// 代调用者向 `agent/{to_agent}` 收件箱投递一封协作信封。
+    ///
+    /// 经服务端受信身份 `self.mcp`（即 `dashboard-agent`，在 Memoria 注册为 admin/`*`，
+    /// 与现有审批流一致）中继投递。Memoria 的 `a2a_send` NS 门控
+    /// 仅放行 admin 角色，故由 agent-core（可信后端）统一中继；真正的可达性策略在
+    /// `handle_collab_send` 中按 §3.3 校验，NS 门控仅作纵深防御。
+    /// 信封的 `from_agent` / `from_ns` 已填真实调用者，收件人据此识别发送方。
+    pub async fn collab_send_raw(
+        &self,
+        to_agent: &str,
+        envelope: &serde_json::Value,
+    ) -> Result<String, String> {
+        self.mcp
+            .call(
+                "a2a_send",
+                &serde_json::json!({
+                    "to": to_agent,
+                    "content": envelope.to_string(),
+                    "namespace": format!("agent/{}", to_agent),
+                }),
+            )
+            .await
+            .map_err(|e| format!("a2a_send 失败: {}", e))
+    }
+
+    /// 取同组织已注册 Agent 通讯录（Memoria `agent_list`，需 admin）。
+    pub async fn collab_list_peers(&self) -> Result<Vec<serde_json::Value>, String> {
+        let admin_key = std::env::var("MEMORIA_ADMIN_KEY").unwrap_or_default();
+        let val = self
+            .mcp
+            .call_json(
+                "agent_list",
+                &serde_json::json!({ "admin_key": admin_key }),
+            )
+            .await
+            .map_err(|e| format!("agent_list 失败: {}", e))?;
+        Ok(val["agents"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// 在调用者收件箱中按消息 id 查找一封规范化信封（用于审批响应回写）。
+    pub async fn collab_find_message(
+        &self,
+        caller_agent_id: &str,
+        caller_agent_key: &str,
+        msg_id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let inbox = self
+            .collab_inbox_raw(caller_agent_id, caller_agent_key, 200)
+            .await?;
+        Ok(inbox
+            .into_iter()
+            .find(|m| m["id"].as_str() == Some(msg_id)))
+    }
+
     /// 解析旧版 `[subject] body` 文本消息为信封各部分（type 降级为 `message`）。
     fn legacy_parts(
         content: &str,
