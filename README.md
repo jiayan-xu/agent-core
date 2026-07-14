@@ -108,10 +108,13 @@ cargo build --release
 cp agent.toml.example agent.toml
 # 编辑 agent.toml；密钥请用环境变量注入（见下），不要写明文
 
-# 以服务模式启动（默认监听 127.0.0.1:9753）
-./target/release/agent-core --service
-# Windows: target\release\agent-core.exe --service
+# 默认即无窗服务（监听 127.0.0.1:9753）；勿裸启 GUI，「AI 助手」窗需显式 --gui
+./target/release/agent-core
+# 等价：./target/release/agent-core --service
+# Windows: target\release\agent-core.exe
+# 调试桌面窗（一般不要）：target\release\agent-core.exe --gui
 ```
+
 
 ### 密钥不落盘（P2-6）
 

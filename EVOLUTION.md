@@ -189,3 +189,24 @@ PFAiX 聊天弹窗 + 回复空白的根因之一是 agent-core 对 `stream:true`
 - 非流式：`Content-Type: application/json`，返回 `chat.completion` 对象 ✅
 - 流式：`Content-Type: text/event-stream`，解析得到完整回复，`[DONE]` 结束 ✅
 - 服务 :9753 运行正常，PFAiX 聊天不再依赖前端转写
+
+## 2026-07-14 — Dream 巩固闭环 + health 聚合 embed + 默认无窗
+
+### 背景
+夜间巩固此前会硬编码默认 ns、低峰窗口内可能重复跑；`/health` 只报自身 ok，托盘/壳无法判断嵌入通道；裸启 `agent-core` 默认弹出「AI 助手」WebView，运维重启时易误开 GUI。
+
+### 变更
+- **Dream 闭环**（`src/main.rs` / `src/agent.rs`）
+  - 低峰 **02–04 点本地、每日最多一轮**；默认 ns=`agent/{agent_id}`，可用 `CONSOLIDATE_NAMESPACES` 覆盖
+  - `POST /api/admin/consolidate` 手动触发（鉴权：`x-agent-id` + `x-agent-key`）
+  - consolidate 以本 Agent + `MEMORIA_ADMIN_KEY` 调 Memoria（不用字面 `"admin"`）
+- **health**：公开 `/health` 聚合 Memoria `/health.embed` + 最近 `dream` 摘要；整体 `ok|degraded|fail`
+- **默认无窗**：默认 / `--service` 均不弹桌面窗；仅 `--gui` / `--desktop` 开「AI 助手」；README 同步
+
+### 验证
+- Memoria embed `pass` 时 agent-core `/health` → `status=ok`，含 `memoria.embed` / `dream`
+- 手动 consolidate → `trigger=manual`，`dream` 从 `never` 更新；空观察时推进游标属正常
+- 裸启不再弹窗；托盘/`--service` 常驻
+
+### 同批已实现待推送（协作）
+- A2A collab M2–M4 写路径 + 公司广播白名单/scope 收紧 + E2E（见近期 collab 提交）

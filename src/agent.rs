@@ -2838,12 +2838,17 @@ impl AgentCore {
     /// 以 admin 身份调用 memoria（系统维护任务，合法跨命名空间读取观察原料）。
     /// ns 隔离：每个 ns 独立游标、独立 pattern 库。
     pub async fn consolidate(&self, ns: &str) -> String {
-        // 系统维护任务：用 admin 身份跨 ns 读取观察原料；无 admin_key 时退回自身身份（仅能处理自身 ns）
+        // 系统维护任务：以本 Agent 身份 + admin badge 跨 ns 读观察（与注册/代理路径一致；
+        // 勿用字面 "admin"——Memoria 侧该身份可能过期导致 401）。
         let admin_key = std::env::var("MEMORIA_ADMIN_KEY").unwrap_or_default();
         let mem_client = if admin_key.is_empty() {
             self.mcp.clone()
         } else {
-            McpClient::new(&self.config.memoria_url, "admin", &admin_key)
+            McpClient::new(
+                &self.config.memoria_url,
+                &self.config.identity.agent_id,
+                &admin_key,
+            )
         };
 
         // 1. 取游标

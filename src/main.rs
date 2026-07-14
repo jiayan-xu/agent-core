@@ -1,11 +1,12 @@
-//! agent-core Desktop — 双击即用，零配置
+//! agent-core — HTTP 引擎（默认无窗）
 //!
-//! 内嵌 WebView（无浏览器），系统托盘图标。
-//! 首次运行自动打开配置页，填个名字和密钥就能聊。
+//! 默认以服务模式运行（仅 `:9753` HTTP，不弹桌面窗）。
+//! 需要内嵌 WebView「AI 助手」调试窗时显式传 `--gui`。
+//! `--service` 仍保留，与默认行为等价（兼容旧脚本/托盘）。
 //! 内置巡检循环：每 30 分钟调用 Dashboard MCP 执行定时任务。
 
 // P2-1 修复：仅 release 模式下隐藏控制台窗口，debug 模式保留
-// --service 模式仍需控制台输出用于调试，通过 Cargo features 控制
+// GUI 模式用 windows subsystem；默认/service 保留控制台便于运维日志
 #![cfg_attr(
     all(not(debug_assertions), not(feature = "service")),
     windows_subsystem = "windows"
@@ -371,6 +372,10 @@ struct AppState {
     ns_cache: tokio::sync::Mutex<HashMap<String, (Vec<String>, std::time::Instant)>>,
     /// 协作收件箱「已读游标」：agent_id → 最近一次查看的 ISO 时间（用于未读计数）
     collab_seen: tokio::sync::Mutex<HashMap<String, String>>,
+    /// Dream 巩固：上次成功跑完的本地日历日（YYYY-MM-DD），避免 02–05 点巡检重复巩固
+    consolidate_last_ymd: tokio::sync::Mutex<String>,
+    /// Dream 巩固：最近一次结果摘要（供 /health、/api/admin/consolidate）
+    consolidate_last: tokio::sync::Mutex<serde_json::Value>,
 }
 
 /// 构造 401 未授权响应
@@ -652,9 +657,12 @@ async fn trace_middleware(request: Request, next: Next) -> axum::response::Respo
 }
 
 fn main() {
-    // --service 模式：无窗口后台服务
+    // 默认无窗服务；仅 --gui / --desktop 才开「AI 助手」WebView。
+    // --service 与默认等价（兼容托盘与旧启动脚本）。
     init_tracing();
-    let is_service = std::env::args().any(|a| a == "--service");
+    let args: Vec<String> = std::env::args().collect();
+    let want_gui = args.iter().any(|a| a == "--gui" || a == "--desktop");
+    let is_service = !want_gui; // 默认 / --service → 无窗
 
     let config = load_or_create_config();
     let path = config_path();
@@ -690,6 +698,8 @@ fn main() {
                 auth_cache: tokio::sync::Mutex::new(HashMap::new()),
                 ns_cache: tokio::sync::Mutex::new(HashMap::new()),
                 collab_seen: tokio::sync::Mutex::new(HashMap::new()),
+                consolidate_last_ymd: tokio::sync::Mutex::new(String::new()),
+                consolidate_last: tokio::sync::Mutex::new(serde_json::json!({"status":"never"})),
             });
 
             // 先绑定端口，确保服务立即可用（即使 Memoria 慢/未就绪也不阻塞启动）
@@ -771,11 +781,19 @@ fn main() {
                             let insight = agent.run_insights(&agent_ns).await;
                             tracing::info!("{}", insight);
                         }
-                        // 暗知识层 A2：低峰（02:00-05:00 本地时间）执行夜间巩固
-                        let hour = Local::now().hour();
-                        if (2..=4).contains(&hour) {
+                        // 暗知识层 A2：低峰（02:00-04:59 本地）每日最多巩固一轮
+                        let now_local = Local::now();
+                        let hour = now_local.hour();
+                        let ymd = now_local.format("%Y-%m-%d").to_string();
+                        let already = {
+                            let g = patrol_state.consolidate_last_ymd.lock().await;
+                            *g == ymd
+                        };
+                        if (2..=4).contains(&hour) && !already {
+                            let default_ns = format!("agent/{}", agent.config.identity.agent_id);
                             let ns_list = std::env::var("CONSOLIDATE_NAMESPACES")
-                                .unwrap_or_else(|_| "agent/xujiayan".to_string());
+                                .unwrap_or(default_ns);
+                            let mut results = Vec::new();
                             for ns in ns_list
                                 .split(',')
                                 .map(|s| s.trim())
@@ -783,7 +801,16 @@ fn main() {
                             {
                                 let res = agent.consolidate(ns).await;
                                 tracing::info!("[consolidate] {}", res);
+                                results.push(serde_json::json!({"ns": ns, "result": res}));
                             }
+                            *patrol_state.consolidate_last_ymd.lock().await = ymd.clone();
+                            *patrol_state.consolidate_last.lock().await = serde_json::json!({
+                                "status": "ok",
+                                "trigger": "nightly",
+                                "ymd": ymd,
+                                "at": now_local.to_rfc3339(),
+                                "results": results,
+                            });
                         }
                         // 每轮检查 dashboard agent_worker 健康（端口 8011）
                         let agent_ok = reqwest::get("http://127.0.0.1:8011/health")
@@ -860,6 +887,7 @@ fn main() {
                     "/api/admin/harness/activate",
                     post(handle_admin_harness_activate),
                 )
+                .route("/api/admin/consolidate", post(handle_admin_consolidate))
                 .route("/api/save-config", post(handle_save_config))
                 .route("/api/collab/inbox", get(handle_collab_inbox))
                 .route("/api/collab/send", post(handle_collab_send))
@@ -945,12 +973,98 @@ async fn handle_logo() -> impl axum::response::IntoResponse {
 }
 
 /// 公开健康检查（无鉴权）。供 PFAiX 状态条 / 诊断包探测。
-async fn handle_health() -> Json<serde_json::Value> {
+/// 附带 Memoria 公开 /health 的 embed 摘要 + 最近 Dream 巩固状态。
+async fn handle_health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let memoria_url = {
+        let cfg = st.config.lock().await;
+        cfg.server.clone()
+    };
+    let memoria_health = reqwest::Client::new()
+        .get(format!("{}/health", memoria_url.trim_end_matches('/')))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .ok();
+    let (memoria_ok, embed) = if let Some(resp) = memoria_health {
+        let status = resp.status().is_success();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        (status, body.get("embed").cloned().unwrap_or(serde_json::Value::Null))
+    } else {
+        (false, serde_json::json!({"status":"fail","message":"memoria /health 不可达"}))
+    };
+    let dream = st.consolidate_last.lock().await.clone();
+    let overall = if memoria_ok
+        && embed
+            .get("status")
+            .and_then(|s| s.as_str())
+            .map(|s| s == "pass")
+            .unwrap_or(false)
+    {
+        "ok"
+    } else if memoria_ok {
+        "degraded"
+    } else {
+        "fail"
+    };
     Json(serde_json::json!({
         "service": "agent-core",
-        "status": "ok",
+        "status": overall,
         "version": env!("CARGO_PKG_VERSION"),
+        "memoria": { "reachable": memoria_ok, "embed": embed },
+        "dream": dream,
     }))
+}
+
+/// 手动触发 Dream 巩固（鉴权路由）。body 可选 `{ "namespaces": ["agent/xxx"] }`。
+async fn handle_admin_consolidate(
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> axum::response::Response {
+    let agent_guard = st.agent.lock().await;
+    let Some(ref agent) = *agent_guard else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "agent 尚未就绪"})),
+        )
+            .into_response();
+    };
+    let default_ns = format!("agent/{}", agent.config.identity.agent_id);
+    let ns_list: Vec<String> = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("namespaces").and_then(|a| a.as_array()).cloned())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .filter(|v: &Vec<String>| !v.is_empty())
+        .unwrap_or_else(|| {
+            std::env::var("CONSOLIDATE_NAMESPACES")
+                .unwrap_or(default_ns)
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
+    let mut results = Vec::new();
+    for ns in &ns_list {
+        let res = agent.consolidate(ns).await;
+        results.push(serde_json::json!({"ns": ns, "result": res}));
+    }
+    drop(agent_guard);
+    let now_local = Local::now();
+    let ymd = now_local.format("%Y-%m-%d").to_string();
+    let summary = serde_json::json!({
+        "status": "ok",
+        "trigger": "manual",
+        "ymd": ymd,
+        "at": now_local.to_rfc3339(),
+        "results": results,
+    });
+    *st.consolidate_last_ymd.lock().await = ymd;
+    *st.consolidate_last.lock().await = summary.clone();
+    Json(summary).into_response()
 }
 
 async fn handle_config(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
