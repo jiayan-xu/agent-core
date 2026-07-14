@@ -241,23 +241,120 @@ struct CollabApprovalBody {
     reason: Option<String>,
 }
 
-/// 协作可达策略（§3.3）：校验「调用者能否以某类型发往某范围」。
-/// 仅做粗粒度可达性；跨租户/跨公司的实际隔离由 Memoria NS 门控兜底。
-fn collab_reachability(caller_ns: &[String], scope: &str, etype: &str) -> bool {
-    let in_org = caller_ns
-        .iter()
-        .any(|n| n == &format!("org/{}", ORG_COMPANY) || n.starts_with(&format!("org/{}/", ORG_COMPANY)) || n == "*");
-    match scope {
-        // 公司级广播：仅通知/制度类；须公司级角色（持有 org 根 ns）
-        "org" => in_org && matches!(etype, "notify" | "announcement"),
-        // 部门级：通知 / 问询 / 审批请求
-        "dept" => matches!(etype, "notify" | "query" | "approval_request"),
-        // 项目级：默认更窄（通知 / 问询）
-        "proj" => matches!(etype, "notify" | "query"),
-        // 单点：审批请求 / 问询 / 通知 / 普通消息（同组织内；跨公司由 NS 门控拒绝）
-        "agent" => matches!(etype, "approval_request" | "query" | "notify" | "message"),
-        _ => false,
+/// 公司级广播白名单：环境变量 `COLLAB_ORG_BROADCASTERS`（逗号分隔 agent_id）。
+/// 未设置时默认 `office-agent`（行政/办公室）；`*` 持有者仍可发。
+fn org_broadcasters() -> Vec<String> {
+    match std::env::var("COLLAB_ORG_BROADCASTERS") {
+        Ok(s) if !s.trim().is_empty() => s
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect(),
+        _ => vec!["office-agent".to_string()],
     }
+}
+
+fn ns_blob(ns: &[String]) -> String {
+    ns.join(",")
+}
+
+fn caller_in_org(caller_ns: &[String]) -> bool {
+    let blob = ns_blob(caller_ns);
+    caller_ns.iter().any(|n| n == "*")
+        || blob.contains(&format!("org/{}", ORG_COMPANY))
+}
+
+fn caller_has_dept(caller_ns: &[String], dept: &str) -> bool {
+    let needle = format!("dept/{}", dept);
+    caller_ns.iter().any(|n| n == "*") || ns_blob(caller_ns).contains(&needle)
+}
+
+fn caller_has_proj(caller_ns: &[String], proj: &str) -> bool {
+    let needle = format!("proj/{}", proj);
+    caller_ns.iter().any(|n| n == "*") || ns_blob(caller_ns).contains(&needle)
+}
+
+fn can_org_broadcast(caller_id: &str, caller_ns: &[String]) -> bool {
+    // 注意：持有 `*`（Memoria admin）也不自动获得公司广播权，
+    // 避免 dashboard-agent 等服务身份误发国庆通知；须显式进白名单或 role。
+    let role_ok = caller_ns.iter().any(|n| {
+        n == "role/office"
+            || n == "role/hr"
+            || n.ends_with("/role/office")
+            || n.ends_with("/role/hr")
+    });
+    role_ok || org_broadcasters().iter().any(|id| id == caller_id)
+}
+
+/// 协作可达策略（§3.3）：校验「调用者能否以某类型发往某范围」。
+/// - org：仅 notify/announcement，且须广播白名单 / role/office|hr（admin `*` 不自动放行）
+/// - dept/proj：须 scope_id，且调用者 NS 含对应 dept/proj
+fn collab_reachability(
+    caller_id: &str,
+    caller_ns: &[String],
+    scope: &str,
+    scope_id: &str,
+    etype: &str,
+) -> Result<(), String> {
+    match scope {
+        "org" => {
+            if !matches!(etype, "notify" | "announcement") {
+                return Err(format!("可达策略拒绝：scope=org 不允许 type={}", etype));
+            }
+            if !caller_in_org(caller_ns) {
+                return Err("可达策略拒绝：非本公司成员不可发公司广播".into());
+            }
+            if !can_org_broadcast(caller_id, caller_ns) {
+                return Err(
+                    "可达策略拒绝：公司广播仅限办公室/HR 角色或 COLLAB_ORG_BROADCASTERS 白名单"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
+        "dept" => {
+            if scope_id.trim().is_empty() {
+                return Err("可达策略拒绝：scope=dept 必须指定 scope_id".into());
+            }
+            if !matches!(etype, "notify" | "query" | "approval_request") {
+                return Err(format!("可达策略拒绝：scope=dept 不允许 type={}", etype));
+            }
+            if !caller_has_dept(caller_ns, scope_id.trim()) {
+                return Err(format!(
+                    "可达策略拒绝：你不在部门「{}」内，无法向该部门广播",
+                    scope_id.trim()
+                ));
+            }
+            Ok(())
+        }
+        "proj" => {
+            if scope_id.trim().is_empty() {
+                return Err("可达策略拒绝：scope=proj 必须指定 scope_id".into());
+            }
+            if !matches!(etype, "notify" | "query") {
+                return Err(format!("可达策略拒绝：scope=proj 不允许 type={}", etype));
+            }
+            if !caller_has_proj(caller_ns, scope_id.trim()) {
+                return Err(format!(
+                    "可达策略拒绝：你不在项目「{}」内，无法向该项目广播",
+                    scope_id.trim()
+                ));
+            }
+            Ok(())
+        }
+        "agent" => {
+            if matches!(etype, "approval_request" | "query" | "notify" | "message") {
+                Ok(())
+            } else {
+                Err(format!("可达策略拒绝：scope=agent 不允许 type={}", etype))
+            }
+        }
+        _ => Err(format!("未知 scope: {}", scope)),
+    }
+}
+
+fn peer_in_company(namespace: &str) -> bool {
+    namespace.contains(&format!("org/{}", ORG_COMPANY)) || namespace.contains('*')
 }
 
 struct AppState {
@@ -1148,7 +1245,14 @@ async fn handle_collab_send(
 
     // 1) type 白名单
     let etype = body.r#type.trim();
-    let allowed_types = ["query", "query_result", "notify", "approval_request", "message"];
+    let allowed_types = [
+        "query",
+        "query_result",
+        "notify",
+        "announcement",
+        "approval_request",
+        "message",
+    ];
     if !allowed_types.contains(&etype) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -1159,12 +1263,11 @@ async fn handle_collab_send(
 
     // 2) 可达策略（§3.3）
     let scope = body.scope.trim();
-    if !collab_reachability(&allowed_ns, scope, etype) {
+    let scope_id = body.scope_id.clone().unwrap_or_default();
+    if let Err(msg) = collab_reachability(&agent_id, &allowed_ns, scope, &scope_id, etype) {
         return (
             axum::http::StatusCode::FORBIDDEN,
-            axum::Json(serde_json::json!(
-                {"error": format!("可达策略拒绝：scope={} 不允许 type={}", scope, etype)}
-            )),
+            axum::Json(serde_json::json!({"error": msg})),
         )
             .into_response();
     }
@@ -1176,7 +1279,6 @@ async fn handle_collab_send(
         .unwrap_or_else(|| format!("agent/{}", agent_id));
     let now = chrono::Utc::now().to_rfc3339();
     let msg_id = format!("col_{}_{}", chrono::Utc::now().timestamp_millis(), etype);
-    let scope_id = body.scope_id.clone().unwrap_or_default();
 
     // 4) 投递
     let agent_guard = st.agent.lock().await;
@@ -1221,10 +1323,8 @@ async fn handle_collab_send(
                             let ns = peers_ns_of(&peers, id);
                             match scope {
                                 "org" => ns.contains(&format!("org/{}", ORG_COMPANY)),
-                                "dept" => scope_id.is_empty()
-                                    || ns.contains(&format!("dept/{}", scope_id)),
-                                "proj" => scope_id.is_empty()
-                                    || ns.contains(&format!("proj/{}", scope_id)),
+                                "dept" => ns.contains(&format!("dept/{}", scope_id)),
+                                "proj" => ns.contains(&format!("proj/{}", scope_id)),
                                 _ => false,
                             }
                         })
@@ -1451,18 +1551,24 @@ async fn handle_collab_peers(
     };
     drop(agent_guard);
     match res {
-        Ok(agents) => axum::Json(serde_json::json!({
-            "agents": agents
+        Ok(agents) => {
+            let filtered: Vec<_> = agents
                 .iter()
-                .map(|a| serde_json::json!({
-                    "agent_id": a["agent_id"],
-                    "display_name": a["display_name"],
-                    "namespace": a["namespace"],
-                    "permission": a["permission"],
-                }))
-                .collect::<Vec<_>>(),
-        }))
-        .into_response(),
+                .filter(|a| {
+                    let ns = a["namespace"].as_str().unwrap_or("");
+                    peer_in_company(ns)
+                })
+                .map(|a| {
+                    serde_json::json!({
+                        "agent_id": a["agent_id"],
+                        "display_name": a["display_name"],
+                        "namespace": a["namespace"],
+                        "permission": a["permission"],
+                    })
+                })
+                .collect();
+            axum::Json(serde_json::json!({ "agents": filtered })).into_response()
+        }
         Err(e) => (
             axum::http::StatusCode::BAD_GATEWAY,
             axum::Json(serde_json::json!({"error": e})),
@@ -2412,4 +2518,34 @@ fn _load_icon() -> Option<tao::window::Icon> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod collab_policy_tests {
+    use super::*;
+
+    #[test]
+    fn org_broadcast_requires_whitelist() {
+        let ns = vec![format!("org/{}", ORG_COMPANY)];
+        // 普通成员有 org ns 也不能发
+        assert!(collab_reachability("random-user", &ns, "org", ORG_COMPANY, "notify").is_err());
+        // 白名单默认 office-agent
+        assert!(collab_reachability("office-agent", &ns, "org", ORG_COMPANY, "notify").is_ok());
+        // org+query 仍拒绝
+        assert!(collab_reachability("office-agent", &ns, "org", ORG_COMPANY, "query").is_err());
+    }
+
+    #[test]
+    fn dept_requires_scope_id_and_membership() {
+        let ns = vec!["org/cs-pufa-2nd-thermal/dept/gufei".to_string()];
+        assert!(collab_reachability("u1", &ns, "dept", "", "notify").is_err());
+        assert!(collab_reachability("u1", &ns, "dept", "gufei", "notify").is_ok());
+        assert!(collab_reachability("u1", &ns, "dept", "finance", "notify").is_err());
+    }
+
+    #[test]
+    fn peer_in_company_filter() {
+        assert!(peer_in_company("agent/x,org/cs-pufa-2nd-thermal"));
+        assert!(!peer_in_company("agent/y,org/other-co"));
+    }
 }

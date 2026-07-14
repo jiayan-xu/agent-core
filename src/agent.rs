@@ -1745,6 +1745,22 @@ impl AgentCore {
             } else {
                 Self::legacy_parts(content, from, &time)
             }
+        } else if let Some(rest) = content.strip_prefix('[') {
+            // 过渡期：旧 Memoria 可能把 JSON 塞进 `[subject] {envelope}` 的 body
+            if let Some(end) = rest.find(']') {
+                let body_part = rest[end + 1..].trim_start();
+                if let Ok(env) = serde_json::from_str::<serde_json::Value>(body_part) {
+                    if env.get("type").is_some() {
+                        return Self::map_a2a_message(&serde_json::json!({
+                            "id": id,
+                            "from": from,
+                            "time": time,
+                            "content": body_part,
+                        }));
+                    }
+                }
+            }
+            Self::legacy_parts(content, from, &time)
         } else {
             Self::legacy_parts(content, from, &time)
         };
@@ -1783,7 +1799,11 @@ impl AgentCore {
                 "a2a_send",
                 &serde_json::json!({
                     "to": to_agent,
+                    // 结构化信封（Memoria 优先存 content）
                     "content": envelope.to_string(),
+                    // 兼容旧 Memoria：若仍忽略 content，至少 subject 可读；body 再带一份 JSON
+                    "subject": envelope.get("subject").and_then(|v| v.as_str()).unwrap_or(""),
+                    "body": envelope.to_string(),
                     "namespace": format!("agent/{}", to_agent),
                 }),
             )
