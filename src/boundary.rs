@@ -821,6 +821,89 @@ pub fn is_dangerous_tool(name: &str) -> bool {
     ToolClassifier::new().classify(name) == "dangerous"
 }
 
+/// 判断工具是否「纯只读」——可不经用户确认直接自动执行。
+///
+/// 与 `ToolClassifier::register_from_tools` 的只读判定保持一致的前缀逻辑：
+/// 仅 `query_` / `search_` / `get_` / `check_` / `read_` / `list_` / `fuzzy_match_` /
+/// `match_` / `review_` / `diagnose_` / `explain_` / `validate_` / `cross_` 前缀，
+/// 以及仅 SELECT 的 SQL 工具判为只读。
+///
+/// 命中写/危险前缀（`delete_` / `batch_delete` / `shutdown_` / `update_` / `insert_` /
+/// `create_`）或无法判定为只读的工具一律返回 `false`，走确认闸 / 黄线确认，
+/// 符合 P0-4「未知工具不默认放行」的安全姿态。
+///
+/// 注意：这里用前缀启发式而非 `ToolClassifier::new()` 实例——后者是空分类器，
+/// 不含 `register_from_tools` 学到的前缀，会把 `query_today` 之类误判为 unknown。
+pub fn is_read_only_tool(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    // 写 / 危险前缀：永远需要确认，绝不自动执行
+    if lower.starts_with("delete_")
+        || lower.starts_with("batch_delete")
+        || lower.starts_with("shutdown_")
+        || lower.starts_with("update_")
+        || lower.starts_with("insert_")
+        || lower.starts_with("create_")
+    {
+        return false;
+    }
+    lower.starts_with("query_")
+        || lower.starts_with("search_")
+        || lower.starts_with("get_")
+        || lower.starts_with("check_")
+        || lower.starts_with("read_")
+        || lower.starts_with("list_")
+        || lower.starts_with("fuzzy_match_")
+        || lower.starts_with("match_")
+        || lower.starts_with("review_")
+        || lower.starts_with("diagnose_")
+        || lower.starts_with("explain_")
+        || lower.starts_with("validate_")
+        || lower.starts_with("cross_")
+        || (lower.contains("sql")
+            && !lower.starts_with("update")
+            && !lower.starts_with("insert")
+            && !lower.starts_with("delete")
+            && !lower.starts_with("create"))
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+
+    #[test]
+    fn read_only_prefixes_accepted() {
+        for t in [
+            "query_today",
+            "query_yesterday",
+            "query_system_status",
+            "explain_anomaly",
+            "search_memory",
+            "get_statistics",
+            "check_status",
+            "list_vehicles",
+            "fuzzy_match_plate",
+            "execute_sql",
+        ] {
+            assert!(is_read_only_tool(t), "应为只读: {}", t);
+        }
+    }
+
+    #[test]
+    fn write_and_dangerous_rejected() {
+        for t in [
+            "delete_entrance_record",
+            "update_whitelist",
+            "insert_log",
+            "create_report",
+            "batch_delete_memories",
+            "shutdown_agent",
+            "fill_excel_log",
+        ] {
+            assert!(!is_read_only_tool(t), "不应为只读: {}", t);
+        }
+    }
+}
+
 // ══════════════════════════════════════════════════════
 // 第八条：任务确认红线
 // ══════════════════════════════════════════════════════

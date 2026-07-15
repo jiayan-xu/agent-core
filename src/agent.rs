@@ -470,9 +470,12 @@ impl AgentCore {
                     }
                 };
                 if let Some(plan) = plan_opt {
-                    // P1-2: 预览优先（非续跑、开启 preview、且多步）→ 先返回计划，不执行
+                    // 全只读计划（仅 query_/get_/explain_ 等读工具）→ 无需确认，直接执行。
+                    // 只有含写/危险步骤的多步计划才走「执行/取消」确认闸，避免对只读咨询凭空制造摩擦。
+                    let needs_confirm = Self::plan_requires_confirmation(&plan);
+                    // P1-2: 预览优先（非续跑 + 开启 preview + 多步 + 含写/危险步骤）→ 先返回计划，不执行
                     let is_resume = self.in_progress_plan.lock().await.is_some();
-                    if self.config.compositional_preview && !is_resume && plan.steps.len() > 1 {
+                    if self.config.compositional_preview && !is_resume && plan.steps.len() > 1 && needs_confirm {
                         *self.in_progress_plan.lock().await = Some(plan.clone());
                         self.checkpoint_preview(session_id, &plan).await;
                         self.session_manager
@@ -571,10 +574,11 @@ impl AgentCore {
             for m in inbox_msgs.iter().take(3) {
                 let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 let from = m.get("from").and_then(|f| f.as_str()).unwrap_or("?");
+                let preview: String = content.chars().take(200).collect();
                 prefix.push_str(&format!(
                     "- [{}] {}\n",
                     from,
-                    &content[..content.len().min(200)]
+                    preview
                 ));
             }
             enriched_message = format!("{}\n---\n{}", prefix, message);
@@ -1082,6 +1086,15 @@ impl AgentCore {
     }
 
     // ── P1-2 组合计划 HITL 辅助方法 ──
+
+    /// 计划是否含写/危险步骤（需要用户确认闸）。
+    /// 仅当任一步骤的工具不是纯只读（见 `boundary::is_read_only_tool`）时返回 true。
+    /// 全只读计划（如「查今日/昨日进厂 + 异常检测」）无需确认，应直接执行。
+    fn plan_requires_confirmation(plan: &crate::composer::ExecutionPlan) -> bool {
+        plan.steps
+            .iter()
+            .any(|s| !crate::boundary::is_read_only_tool(&s.tool))
+    }
 
     /// 进入计划预览态：记录 plan 但不执行（等待用户确认）
     async fn checkpoint_preview(&self, session_id: &str, plan: &crate::composer::ExecutionPlan) {
