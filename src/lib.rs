@@ -11,3 +11,4 @@ pub mod mcp_client;
 pub mod namespace;
 pub mod quota;
 pub mod session;
+pub mod self_evolution;

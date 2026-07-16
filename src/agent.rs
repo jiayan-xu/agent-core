@@ -593,6 +593,8 @@ impl AgentCore {
                 }
             }
         }
+        // O4：Self-Evolution 挂全部 search_memory→knowledge 路径
+        crate::self_evolution::append_to_knowledge(&mut knowledge, message);
 
         // ── 3. 加载历史对话 ──
         let ns = self.caller_ns(session_id);
@@ -662,6 +664,8 @@ impl AgentCore {
                 }
             }
         }
+        // O4：Self-Evolution 挂全部 search_memory→knowledge 路径（复述确认）
+        crate::self_evolution::append_to_knowledge(&mut knowledge, message);
 
         // 构建增强版 system prompt
         let mut system_prompt = self.build_system_prompt(&knowledge);
