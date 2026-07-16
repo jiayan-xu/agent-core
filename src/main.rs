@@ -97,6 +97,24 @@ struct McpSourceConfig {
 fn default_server() -> String {
     "http://127.0.0.1:9003".to_string()
 }
+
+/// Memoria admin 钥匙（运维 `.env` / `MEMORIA_ADMIN_KEY`）。用于 admin 参数与字面 admin 身份。
+fn env_memoria_admin_key(fallback: &str) -> String {
+    match std::env::var("MEMORIA_ADMIN_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => fallback.to_string(),
+    }
+}
+
+/// dashboard-agent 专属 badge（`MEMORIA_DASHBOARD_BADGE`）；与 admin 不得同 token（UNIQUE）。
+/// 未设置时回退 `MEMORIA_ADMIN_KEY`（过渡兼容，生产应显式分钥）。
+fn env_memoria_dashboard_badge(admin_fallback: &str) -> String {
+    match std::env::var("MEMORIA_DASHBOARD_BADGE") {
+        Ok(k) if !k.is_empty() => k,
+        _ => env_memoria_admin_key(admin_fallback),
+    }
+}
+
 fn default_port() -> u16 {
     9753
 }
@@ -424,12 +442,11 @@ async fn authenticate(
         return Err(unauthorized("请先通过 /api/register 注册身份"));
     };
 
-    // 鉴权密钥：显式 x-agent-key 优先；回退到安装ID身份时改用 admin key
-    // （安装实例自身没有独立 key，由 agent-core 以管理员身份代为在 Memoria 注册）。
-    let admin_key = match std::env::var("MEMORIA_ADMIN_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => st.config.lock().await.memoria_admin_key.clone(),
-    };
+    // 鉴权密钥：显式 x-agent-key 优先；legacy usertag 回退用 dashboard badge
+    // （安装实例自身没有独立 key，由 agent-core 以 dashboard-agent 身份代为在 Memoria 注册）。
+    let cfg_admin = st.config.lock().await.memoria_admin_key.clone();
+    let admin_key = env_memoria_admin_key(&cfg_admin);
+    let dash_badge = env_memoria_dashboard_badge(&cfg_admin);
     let agent_key = if !from_usertag {
         headers
             .get("x-agent-key")
@@ -437,7 +454,7 @@ async fn authenticate(
             .unwrap_or("")
             .to_string()
     } else {
-        admin_key.clone()
+        dash_badge.clone()
     };
     let (server, actor) = {
         let cfg = st.config.lock().await;
@@ -483,7 +500,8 @@ async fn authenticate(
             // 同一 namespace 字段，Memoria `get_allowed_ns` 会按逗号拆分回传，从而
             // 后续请求（缓存失效后重查）仍同时持有这两个 ns，不会因回读而丢失 dashboard。
             let install_ns = format!("agent/{},org/cs-pufa-2nd-thermal", agent_id);
-            let reg = McpClient::new(&server, &actor, &admin_key);
+            // 身份 = dashboard-agent + 专属 badge；admin_key 仅作 register 参数
+            let reg = McpClient::new(&server, &actor, &dash_badge);
             let _ = reg
                 .call_json(
                     "register_agent",
@@ -2187,18 +2205,17 @@ async fn handle_register(
     // 先生成一个本地兜底 token；若 Memoria 注册成功，会用 Memoria 实际返回的 badge 覆盖（P0 修复：必须一致，否则客户端 key 与 Memoria 存值不符导致鉴权失败）
     let mut badge_token = format!("sk-{:x}", rand::thread_rng().gen::<u128>());
 
-    // 注册到 Memoria — 从环境变量或配置读取 admin_key
-    let admin_key = match std::env::var("MEMORIA_ADMIN_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => st.config.lock().await.memoria_admin_key.clone(),
-    };
-    // P0 修复：以 dashboard-agent 身份（其 badge 持有固定 admin key）代理注册，
+    // 注册到 Memoria — admin_key 作参数；身份用 dashboard-agent 专属 badge
+    let cfg_admin = st.config.lock().await.memoria_admin_key.clone();
+    let admin_key = env_memoria_admin_key(&cfg_admin);
+    let dash_badge = env_memoria_dashboard_badge(&cfg_admin);
+    // P0 修复：以 dashboard-agent 身份（专属 badge，permission=admin）代理注册，
     // 而非字面 "admin"（DB 中持有过期 key，会导致 Memoria require_admin 401）。
     let (actor, server) = {
         let cfg = st.config.lock().await;
         (cfg.agent_id.clone(), cfg.server.clone())
     };
-    let mcp = McpClient::new(&server, &actor, &admin_key);
+    let mcp = McpClient::new(&server, &actor, &dash_badge);
     // P0 修复：Memoria 的 register_agent 会自行生成 badge 并在响应里返回；
     // 必须用它作为后续鉴权 key，否则客户端拿本地随机 token 与 Memoria 存值对不上 → -32001。
     let memoria_ok = if admin_key.is_empty() {
@@ -2247,7 +2264,7 @@ async fn handle_register(
     }
 
     // 审计日志：记录身份注册
-    let audit = AuditLogger::new(McpClient::new(&server, &actor, &admin_key));
+    let audit = AuditLogger::new(McpClient::new(&server, &actor, &dash_badge));
     audit
         .log_identity(
             &agent_id,
@@ -2314,11 +2331,10 @@ async fn handle_register_user(
     } else {
         req.display_name.trim().to_string()
     };
-    let admin_key = match std::env::var("MEMORIA_ADMIN_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => st.config.lock().await.memoria_admin_key.clone(),
-    };
-    if admin_key.is_empty() {
+    let cfg_admin = st.config.lock().await.memoria_admin_key.clone();
+    let admin_key = env_memoria_admin_key(&cfg_admin);
+    let dash_badge = env_memoria_dashboard_badge(&cfg_admin);
+    if admin_key.is_empty() || dash_badge.is_empty() {
         return Json(LoginResponse {
             ok: false,
             user_id: String::new(),
@@ -2342,13 +2358,13 @@ async fn handle_register_user(
     } else {
         default_ns.clone()
     };
-    // 以 agent-core 自身身份（dashboard-agent，已在 Memoria 持固定 admin key）调 Memoria，
-    // 其 badge == MEMORIA_ADMIN_KEY → 角色 admin，可代理 register_user/login_user。
+    // 以 dashboard-agent + MEMORIA_DASHBOARD_BADGE 调 Memoria（permission=admin），
+    // 可代理 register_user/login_user；不得与 MEMORIA_ADMIN_KEY 同 token。
     let (actor, server) = {
         let cfg = st.config.lock().await;
         (cfg.agent_id.clone(), cfg.server.clone())
     };
-    let mcp = McpClient::new(&server, &actor, &admin_key);
+    let mcp = McpClient::new(&server, &actor, &dash_badge);
     match mcp
         .call_json(
             "register_user",
@@ -2416,11 +2432,10 @@ async fn handle_login(
             error: Some("用户名或口令错误".to_string()),
         });
     }
-    let admin_key = match std::env::var("MEMORIA_ADMIN_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => st.config.lock().await.memoria_admin_key.clone(),
-    };
-    if admin_key.is_empty() {
+    let cfg_admin = st.config.lock().await.memoria_admin_key.clone();
+    let admin_key = env_memoria_admin_key(&cfg_admin);
+    let dash_badge = env_memoria_dashboard_badge(&cfg_admin);
+    if admin_key.is_empty() || dash_badge.is_empty() {
         return Json(LoginResponse {
             ok: false,
             user_id: String::new(),
@@ -2430,13 +2445,13 @@ async fn handle_login(
             error: Some("服务未就绪，请稍后重试".to_string()),
         });
     }
-    // P0 修复：以 dashboard-agent 身份代理登录（其 badge 持有固定 admin key），
+    // P0 修复：以 dashboard-agent + 专属 badge 代理登录，
     // 而非字面 "admin"（DB 中过期 key 会导致 require_admin 401）。
     let (actor, server) = {
         let cfg = st.config.lock().await;
         (cfg.agent_id.clone(), cfg.server.clone())
     };
-    let mcp = McpClient::new(&server, &actor, &admin_key);
+    let mcp = McpClient::new(&server, &actor, &dash_badge);
     match mcp
         .call_json(
             "login_user",
@@ -2501,11 +2516,17 @@ async fn handle_login(
 }
 
 async fn build_agent(config: &Config) -> Result<AgentCore, String> {
-    // P1-1: 分离密钥用途
-    let badge_token = std::env::var("MEMORIA_ADMIN_KEY").unwrap_or_default();
+    // K3：身份 badge 与 admin 钥匙分钥（badge_token UNIQUE）
     let admin_key = if !config.memoria_admin_key.is_empty() {
         config.memoria_admin_key.clone()
+    } else {
+        env_memoria_admin_key("")
+    };
+    let badge_token = env_memoria_dashboard_badge(&admin_key);
+    let admin_key = if !admin_key.is_empty() {
+        admin_key
     } else if !badge_token.is_empty() {
+        // 过渡：未设 admin 时勿把 dashboard badge 当 admin（UNIQUE 风险）；仅兼容空配置联调
         badge_token.clone()
     } else {
         config.api_key.clone()

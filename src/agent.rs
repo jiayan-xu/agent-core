@@ -1908,10 +1908,9 @@ impl AgentCore {
             .to_string()
     }
 
-    /// 从 Memoria 搜索记忆。
-    /// PFAiX 强制隔离：同时搜索调用者私有 namespace（按 session_id 解析）
-    /// 与 allowed_ns 中的共享 namespace，合并后返回；既保证个人记忆隔离，
-    /// 又保留部门级共享知识库召回。
+    /// 从 Memoria 拉取会话开场上下文。
+    /// 优先 `memory_context`（profile + recall）；失败则降级 `memory_search_v2`。
+    /// PFAiX 强制隔离：同时覆盖调用者私有 ns 与 allowed_ns 共享 ns。
     async fn search_memory(
         &self,
         query: &str,
@@ -1927,9 +1926,84 @@ impl AgentCore {
         }
 
         let mut merged: Vec<serde_json::Value> = Vec::new();
+        let mut used_context = false;
+
         for ns in &targets {
-            if merged.len() >= 6 {
+            if merged.len() >= 8 {
                 break;
+            }
+            // P0：优先 memory_context（会话档案 + 轻量 recall）
+            let ctx = self
+                .mcp
+                .call_json(
+                    "memory_context",
+                    &serde_json::json!({
+                        "namespace": ns,
+                        "query": query,
+                        "recall_k": 3,
+                        "include_profile": true,
+                    }),
+                )
+                .await;
+
+            if let Ok(val) = &ctx {
+                if val["status"].as_str() == Some("ok") {
+                    used_context = true;
+                    if let Some(block) = val["prompt_block"].as_str() {
+                        let trimmed = block.trim();
+                        if !trimmed.is_empty() && trimmed.len() > 10 {
+                            let item = serde_json::json!({
+                                "content": trimmed,
+                                "source": "memory_context",
+                                "namespace": ns,
+                            });
+                            if !merged.contains(&item) {
+                                merged.push(item);
+                            }
+                        }
+                    } else {
+                        for key in ["static", "dynamic"] {
+                            if let Some(arr) = val["profile"][key].as_array() {
+                                for it in arr {
+                                    if let Some(c) = it["content"].as_str() {
+                                        if c.len() > 10 {
+                                            let item = serde_json::json!({
+                                                "content": c,
+                                                "source": format!("profile_{}", key),
+                                                "namespace": ns,
+                                            });
+                                            if !merged.contains(&item) {
+                                                merged.push(item);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(arr) = val["recall"].as_array() {
+                            for it in arr {
+                                if let Some(c) = it["content"].as_str() {
+                                    if c.len() > 10 {
+                                        let item = serde_json::json!({
+                                            "content": c,
+                                            "source": "memory_context_recall",
+                                            "namespace": ns,
+                                        });
+                                        if !merged.contains(&item) {
+                                            merged.push(item);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            // 单 ns context 失败时尝试旧检索
+            if used_context {
+                continue;
             }
             let result = self
                 .mcp
@@ -1951,6 +2025,36 @@ impl AgentCore {
                         }
                         if merged.len() >= 6 {
                             break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 全部 context 失败时兜底旧检索
+        if merged.is_empty() {
+            for ns in &targets {
+                let result = self
+                    .mcp
+                    .call_json(
+                        "memory_search_v2",
+                        &serde_json::json!({
+                            "query": query,
+                            "namespace": ns,
+                            "max_results": 3,
+                            "intent": "WHAT",
+                        }),
+                    )
+                    .await;
+                if let Ok(val) = result {
+                    if let Some(arr) = val["results"].as_array() {
+                        for item in arr.iter().cloned() {
+                            if !merged.contains(&item) {
+                                merged.push(item);
+                            }
+                            if merged.len() >= 6 {
+                                break;
+                            }
                         }
                     }
                 }
@@ -2074,7 +2178,11 @@ impl AgentCore {
             "memory_search",
             "memory_search_v2",
             "memory_remember",
+            "memory",
             "memory_observe",
+            "memory_profile",
+            "memory_context",
+            "memory_recall",
             "a2a_send",
             "a2a_recv",
             "register_agent",
@@ -2746,7 +2854,7 @@ impl AgentCore {
         };
 
         if !knowledge.is_empty() {
-            prompt.push_str("## 相关知识（来自记忆系统）\n");
+            prompt.push_str("## 记忆档案\n");
             for k in knowledge {
                 prompt.push_str(&format!("- {}\n", k));
             }
@@ -2851,16 +2959,20 @@ impl AgentCore {
     /// 以 admin 身份调用 memoria（系统维护任务，合法跨命名空间读取观察原料）。
     /// ns 隔离：每个 ns 独立游标、独立 pattern 库。
     pub async fn consolidate(&self, ns: &str) -> String {
-        // 系统维护任务：以本 Agent 身份 + admin badge 跨 ns 读观察（与注册/代理路径一致；
+        // 系统维护任务：以本 Agent 身份 + dashboard badge 跨 ns 读观察（与注册/代理路径一致；
         // 勿用字面 "admin"——Memoria 侧该身份可能过期导致 401）。
-        let admin_key = std::env::var("MEMORIA_ADMIN_KEY").unwrap_or_default();
-        let mem_client = if admin_key.is_empty() {
+        let dash_badge = std::env::var("MEMORIA_DASHBOARD_BADGE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("MEMORIA_ADMIN_KEY").ok())
+            .unwrap_or_default();
+        let mem_client = if dash_badge.is_empty() {
             self.mcp.clone()
         } else {
             McpClient::new(
                 &self.config.memoria_url,
                 &self.config.identity.agent_id,
-                &admin_key,
+                &dash_badge,
             )
         };
 
