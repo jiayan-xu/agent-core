@@ -3212,12 +3212,54 @@ impl AgentCore {
                             edge_count += 1;
                         }
                     }
+                    // Phase B / M1.3：实体共现回填 — 同条记忆共现的实体对补 related_to 边
+                    //（轻量启发式；不上 cross-encoder；冲突仍走 supersede，禁止 DELETE）
+                    let mut cooccur_edges = 0u64;
+                    let mut mem_to_ents: std::collections::HashMap<String, Vec<String>> =
+                        std::collections::HashMap::new();
+                    for (ename, eid) in &entity_id_map {
+                        for item in &items {
+                            let content =
+                                item.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                            let mem_id =
+                                item.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                            if !mem_id.is_empty() && content.contains(ename.as_str()) {
+                                mem_to_ents
+                                    .entry(mem_id.to_string())
+                                    .or_default()
+                                    .push(eid.clone());
+                            }
+                        }
+                    }
+                    for (mem_id, eids) in &mem_to_ents {
+                        let mut uniq = eids.clone();
+                        uniq.sort();
+                        uniq.dedup();
+                        for i in 0..uniq.len() {
+                            for j in (i + 1)..uniq.len() {
+                                let _ = mem_client
+                                    .call(
+                                        "entity_add_edge",
+                                        &serde_json::json!({
+                                            "source_entity_id": uniq[i],
+                                            "target_entity_id": uniq[j],
+                                            "relation_type": "related_to",
+                                            "evidence": format!("cooccur in memory {}", mem_id),
+                                            "namespace": ns
+                                        }),
+                                    )
+                                    .await;
+                                cooccur_edges += 1;
+                            }
+                        }
+                    }
                     if !entities.is_empty() {
                         tracing::info!(
-                            "consolidate[{}] NER: {} entities, {} edges",
+                            "consolidate[{}] NER: {} entities, {} edges, {} cooccur",
                             ns,
                             entities.len(),
-                            edge_count
+                            edge_count,
+                            cooccur_edges
                         );
                     }
                 }
