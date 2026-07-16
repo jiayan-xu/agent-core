@@ -584,7 +584,7 @@ impl AgentCore {
             enriched_message = format!("{}\n---\n{}", prefix, message);
         }
 
-        if let Ok(Some(results)) = &mem_result {
+        if let Ok((Some(results), _ledger)) = &mem_result {
             for item in results.iter().take(3) {
                 if let Some(content) = item.get("content").and_then(|c| c.as_str()) {
                     if content.len() > 10 {
@@ -594,7 +594,12 @@ impl AgentCore {
             }
         }
         // O4：Self-Evolution 挂全部 search_memory→knowledge 路径
-        crate::self_evolution::append_to_knowledge(&mut knowledge, message);
+        let ledger = mem_result
+            .as_ref()
+            .ok()
+            .map(|(_, l)| l.as_slice())
+            .unwrap_or(&[]);
+        crate::self_evolution::append_to_knowledge(&mut knowledge, message, ledger);
 
         // ── 3. 加载历史对话 ──
         let ns = self.caller_ns(session_id);
@@ -655,7 +660,9 @@ impl AgentCore {
         );
 
         let mut knowledge = Vec::new();
-        if let Ok(Some(results)) = &mem_result {
+        let mut mem_ledger: Vec<serde_json::Value> = Vec::new();
+        if let Ok((Some(results), ledger)) = &mem_result {
+            mem_ledger = ledger.clone();
             for item in results.iter().take(3) {
                 if let Some(content) = item.get("content").and_then(|c| c.as_str()) {
                     if content.len() > 10 {
@@ -665,7 +672,7 @@ impl AgentCore {
             }
         }
         // O4：Self-Evolution 挂全部 search_memory→knowledge 路径（复述确认）
-        crate::self_evolution::append_to_knowledge(&mut knowledge, message);
+        crate::self_evolution::append_to_knowledge(&mut knowledge, message, &mem_ledger);
 
         // 构建增强版 system prompt
         let mut system_prompt = self.build_system_prompt(&knowledge);
@@ -1920,7 +1927,7 @@ impl AgentCore {
         query: &str,
         session_id: &str,
         allowed_ns: &[String],
-    ) -> Result<Option<Vec<serde_json::Value>>, String> {
+    ) -> Result<(Option<Vec<serde_json::Value>>, Vec<serde_json::Value>), String> {
         let caller_ns = self.caller_ns(session_id);
         let mut targets = vec![caller_ns];
         for ns in allowed_ns {
@@ -1930,6 +1937,7 @@ impl AgentCore {
         }
 
         let mut merged: Vec<serde_json::Value> = Vec::new();
+        let mut ledger_rows: Vec<serde_json::Value> = Vec::new();
         let mut used_context = false;
 
         for ns in &targets {
@@ -1953,6 +1961,11 @@ impl AgentCore {
             if let Ok(val) = &ctx {
                 if val["status"].as_str() == Some("ok") {
                     used_context = true;
+                    if let Some(arr) = val["ledger"].as_array() {
+                        for row in arr {
+                            ledger_rows.push(row.clone());
+                        }
+                    }
                     if let Some(block) = val["prompt_block"].as_str() {
                         let trimmed = block.trim();
                         if !trimmed.is_empty() && trimmed.len() > 10 {
@@ -2065,11 +2078,14 @@ impl AgentCore {
             }
         }
 
-        Ok(if merged.is_empty() {
-            None
-        } else {
-            Some(merged)
-        })
+        Ok((
+            if merged.is_empty() {
+                None
+            } else {
+                Some(merged)
+            },
+            ledger_rows,
+        ))
     }
 
     /// 检查 A2A 收件箱中的审批响应
