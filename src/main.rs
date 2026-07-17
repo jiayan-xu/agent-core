@@ -394,6 +394,64 @@ struct AppState {
     consolidate_last_ymd: tokio::sync::Mutex<String>,
     /// Dream 巩固：最近一次结果摘要（供 /health、/api/admin/consolidate）
     consolidate_last: tokio::sync::Mutex<serde_json::Value>,
+    /// 白龙马 A2 TICK 心跳句柄（用户消息到达时 interrupt 抢占在途 tick）
+    consciousness: tokio::sync::Mutex<Option<Arc<Consciousness>>>,
+}
+
+/// 白龙马 A2: TICK 意识主循环（心跳 / 抢占 / watchdog）
+/// 持有 AppState 以便空闲 tick 访问 Agent；interrupt 由用户消息 handler 触发抢占。
+struct Consciousness {
+    state: Arc<AppState>,
+    interrupt: Arc<tokio::sync::Notify>,
+}
+
+impl Consciousness {
+    fn new(state: Arc<AppState>) -> Arc<Self> {
+        Arc::new(Self {
+            state,
+            interrupt: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    /// 用户消息到达 → 打断在途 tick（等价白龙马 AbortController.abort）
+    fn interrupt(&self) {
+        self.interrupt.notify_one();
+    }
+
+    async fn run(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_secs(20 * 60)); // 空闲默认 20 分钟
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tracing::info!("consciousness: TICK 循环启动（空闲 20min / 抢占 / 600s watchdog）");
+        loop {
+            tokio::select! {
+                _ = self.interrupt.notified() => {
+                    tracing::info!("consciousness: 收到抢占信号（用户消息在途），跳过本轮空闲 tick");
+                    continue;
+                }
+                _ = tick.tick() => {}
+            }
+            let st = self.state.clone();
+            let intr = self.interrupt.clone();
+            let wd = tokio::time::timeout(Duration::from_secs(600), async move {
+                tokio::select! {
+                    _ = intr.notified() => {
+                        tracing::info!("consciousness: tick 工作进行中被抢占，终止");
+                    }
+                    _ = Consciousness::tick_once(&st) => {}
+                }
+            }).await;
+            if wd.is_err() {
+                tracing::warn!(target: "consciousness_watchdog", "consciousness: 空闲 tick 超时(>600s)被 watchdog 回收");
+            }
+        }
+    }
+
+    async fn tick_once(state: &AppState) {
+        let guard = state.agent.lock().await;
+        if let Some(ref agent) = *guard {
+            agent.run_idle_tick().await;
+        }
+    }
 }
 
 /// 构造 401 未授权响应
@@ -718,6 +776,7 @@ fn main() {
                 collab_seen: tokio::sync::Mutex::new(HashMap::new()),
                 consolidate_last_ymd: tokio::sync::Mutex::new(String::new()),
                 consolidate_last: tokio::sync::Mutex::new(serde_json::json!({"status":"never"})),
+                consciousness: tokio::sync::Mutex::new(None),
             });
 
             // 先绑定端口，确保服务立即可用（即使 Memoria 慢/未就绪也不阻塞启动）
@@ -742,6 +801,10 @@ fn main() {
                                 reg_config.agent_id, reg_config.server
                             );
                             *reg_state.agent.lock().await = Some(agent);
+                            // A2: 启动白龙马 TICK 心跳（空闲 20min / 抢占 / 600s watchdog）
+                            let cons = Consciousness::new(reg_state.clone());
+                            tokio::spawn(cons.clone().run());
+                            *reg_state.consciousness.lock().await = Some(cons);
                         }
                         Err(e) => {
                             println!("! Agent 初始化失败: {}（可在设置页重试）", e);
@@ -1138,6 +1201,10 @@ async fn handle_chat(
     Extension(ctx): Extension<AuthContext>,
     Json(req): Json<ChatRequest>,
 ) -> axum::response::Response {
+    // A2: 白龙马 TICK 心跳 —— 用户消息到达，抢占在途空闲 tick
+    if let Some(ref c) = *st.consciousness.lock().await {
+        c.interrupt();
+    }
     let agent_guard = st.agent.lock().await;
     if let Some(ref agent) = *agent_guard {
         let reply = agent
@@ -1173,6 +1240,10 @@ async fn handle_chat_stream(
         tokio::sync::mpsc::UnboundedReceiver<Result<SseEvent, Infallible>>,
     ) = tokio::sync::mpsc::unbounded_channel();
 
+    // A2: 白龙马 TICK 心跳 —— 用户消息到达，抢占在途空闲 tick
+    if let Some(ref c) = *st.consciousness.lock().await {
+        c.interrupt();
+    }
     let agent_guard = st.agent.lock().await;
     let has_agent = agent_guard.is_some();
     drop(agent_guard);
@@ -1952,6 +2023,10 @@ async fn handle_v1_chat(
     headers: axum::http::HeaderMap,
     Json(req): Json<V1ChatRequest>,
 ) -> axum::response::Response {
+    // A2: 白龙马 TICK 心跳 —— 用户消息到达，抢占在途空闲 tick
+    if let Some(ref c) = *st.consciousness.lock().await {
+        c.interrupt();
+    }
     let agent_guard = st.agent.lock().await;
     let reply = if let Some(ref agent) = *agent_guard {
         // 输入校验：消息长度限制 32KB，消息数限制 100

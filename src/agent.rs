@@ -79,6 +79,24 @@ pub struct AgentConfig {
     pub approver_id: Option<String>,
 }
 
+/// 白龙马 A3：Focus Stack → Thread 模型
+/// 一个「话题线程（episode）」归档条目。当前焦点任务被切换时，压缩结论后
+/// 软隐藏进 Memoria（tags=["focus_conclusion","absorbed:<sid>"]）+ 本地索引，
+/// 切回时由 recall 召回结论注入，避免长上下文被旧话题撑爆。
+#[derive(Debug, Clone)]
+pub struct EpisodeArchive {
+    /// 话题稳定键（首条用户消息归一化）
+    pub topic_key: String,
+    /// 原始首条用户消息（预览）
+    pub first_message: String,
+    /// LLM 压缩后的结论（一句话到一段）
+    pub conclusion: String,
+    /// 写入 Memoria 的记忆 id（若写入成功）
+    pub memory_id: Option<String>,
+    /// 归档时间戳（秒）
+    pub archived_at: i64,
+}
+
 /// Agent 核心
 pub struct AgentCore {
     pub config: AgentConfig,
@@ -112,6 +130,9 @@ pub struct AgentCore {
     pub degrade: Arc<DegradeMonitor>,
     /// P2-1: 命名空间级配额与成本（tool 轮次 / 日 token 预算 / 并发会话）
     pub quota: Arc<std::sync::Mutex<NsQuotaStore>>,
+    /// 白龙马 A3: Focus Stack → Thread 模型 —— 已归档话题（episode）软隐藏索引
+    /// key = topic_key；value = 归档元数据。切回时由 recall_episode_for 召回结论注入。
+    pub episode_archive: Arc<tokio::sync::Mutex<HashMap<String, EpisodeArchive>>>,
 }
 
 /// P2-1: 会话级配额守卫（RAII）。离开作用域自动 leave_session，避免并发计数泄漏。
@@ -212,6 +233,7 @@ impl AgentCore {
             in_progress_step_results: Arc::new(Mutex::new(HashMap::new())),
             degrade,
             quota: Arc::new(std::sync::Mutex::new(NsQuotaStore::new())),
+            episode_archive: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -584,6 +606,14 @@ impl AgentCore {
             enriched_message = format!("{}\n---\n{}", prefix, message);
         }
 
+        // A1: 记忆召回数（供 prefetch 日志 exposed_tools/recalled_memories 配对观测）
+        let recalled = mem_result
+            .as_ref()
+            .ok()
+            .and_then(|(r, _)| r.as_ref())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        tracing::info!(recalled_memories = recalled, "prefetch: 记忆召回");
         if let Ok((Some(results), _ledger)) = &mem_result {
             for item in results.iter().take(3) {
                 if let Some(content) = item.get("content").and_then(|c| c.as_str()) {
@@ -1209,16 +1239,153 @@ impl AgentCore {
     }
 
     /// 话题切换检测：当前任务未完成，检测到话题切换
-    async fn handle_topic_switch(&self, _message: &str, session_id: &str) -> String {
+    async fn handle_topic_switch(&self, message: &str, session_id: &str) -> String {
         let task = self
             .session_manager
             .get_original_message(session_id)
             .await
             .unwrap_or_default();
         let task_preview: String = task.chars().take(80).collect();
+
+        // 白龙马 A3：当前焦点任务被切换 → 把旧话题压缩归档（软隐藏进 Memoria + 本地索引）
+        let mut archived_note = String::new();
+        if !task.is_empty() {
+            if let Some(conclusion) = self.archive_current_episode(session_id, &task).await {
+                archived_note = format!("\n\n📦 已把上一个话题归档为记忆（切回时自动召回）：{conclusion}");
+            }
+        }
+
+        // 白龙马 A3：新消息可能在恢复一个已归档的话题线程 → 召回结论注入
+        let mut recall_note = String::new();
+        if let Some(recall) = self.recall_episode_for(message).await {
+            recall_note = format!("\n\n🔁 检测到这可能是之前归档过的话题，已为你恢复上下文：\n{recall}");
+        }
+
         format!(
-            "[Task 管理]\n\n检测到您可能换了话题。当前任务还在处理：{task_preview}\n\n请选择：\n- \"继续\" → 继续当前任务\n- \"暂停\" → 暂停当前任务\n- \"结束\" → 结束当前任务"
+            "[Task 管理]\n\n检测到您可能换了话题。当前任务还在处理：{task_preview}{archived_note}{recall_note}\n\n请选择：\n- \"继续\" → 继续当前任务\n- \"暂停\" → 暂停当前任务\n- \"结束\" → 结束当前任务"
         )
+    }
+
+    /// 白龙马 A3：把当前焦点话题压缩为结论并归档（软隐藏进 Memoria + 本地索引）。
+    /// 返回压缩后的结论文本（用于即时提示）；无历史可归档时返回 None。
+    async fn archive_current_episode(&self, session_id: &str, first_message: &str) -> Option<String> {
+        // 1. 取本会话历史作为压缩原料
+        let history = self.load_history(session_id).await;
+        if history.len() < 2 {
+            return None;
+        }
+        // 2. 构造压缩用的原始转录（截断，控制 token 成本）
+        let mut transcript = String::new();
+        for m in history.iter().take(40) {
+            let role = &m.role;
+            let content = m.content.clone().unwrap_or_default();
+            let line: String = content.chars().take(600).collect();
+            if !line.is_empty() {
+                transcript.push_str(&format!("[{role}] {line}\n"));
+            }
+        }
+        if transcript.trim().is_empty() {
+            return None;
+        }
+        // 3. LLM 压缩（失败则退回首尾拼接）
+        let conclusion = match self.compress_episode(&transcript).await {
+            Some(c) if !c.trim().is_empty() => c,
+            _ => {
+                let head: String = first_message.chars().take(120).collect();
+                let tail = history
+                    .last()
+                    .and_then(|m| m.content.clone())
+                    .unwrap_or_default();
+                let tail: String = tail.chars().take(200).collect();
+                format!("{head} ……（结论）{tail}")
+            }
+        };
+
+        let topic_key = Self::topic_key_of(first_message);
+        let ns = self.caller_ns(session_id);
+        let archived_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // 4. 软隐藏写入 Memoria：tags 标记 focus_conclusion + absorbed，搜索时默认不进主召回
+        let mut memory_id = None;
+        let args = serde_json::json!({
+            "content": format!("[episode_conclusion] {}\n\nsession={}", conclusion, session_id),
+            "tags": ["focus_conclusion", format!("absorbed:{}", session_id)],
+            "category": "episode_conclusion",
+            "confidence": 75,
+            "namespace": ns,
+        });
+        if let Ok(resp) = self.mcp.call_json("memory_remember", &args).await {
+            memory_id = resp
+                .get("memory_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| resp.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()));
+            tracing::info!(topic_key = %topic_key, memory_id = ?memory_id, "A3: episode 已归档进 Memoria");
+        } else {
+            tracing::warn!(topic_key = %topic_key, "A3: episode 写 Memoria 失败（仅本地索引）");
+        }
+
+        // 5. 本地索引（切回召回用）
+        let entry = EpisodeArchive {
+            topic_key: topic_key.clone(),
+            first_message: first_message.to_string(),
+            conclusion: conclusion.clone(),
+            memory_id,
+            archived_at,
+        };
+        self.episode_archive.lock().await.insert(topic_key, entry);
+
+        Some(conclusion)
+    }
+
+    /// 白龙马 A3：LLM 把会话转录压缩成一段结论；任何失败返回 None（调用方退回拼接）。
+    async fn compress_episode(&self, transcript: &str) -> Option<String> {
+        let prompt = format!(
+            "你是一个对话压缩器。请把下面的对话转录压缩成一段简洁结论（3-5 句，保留关键决策、结果、待办），\
+             不要复述过程，不要加前缀。若信息不足就概括要点。\n\n## 转录\n{}",
+            transcript
+        );
+        let msg = crate::llm::Message {
+            role: "user".to_string(),
+            content: Some(prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        match self.llm.chat(&[msg], &[]).await {
+            Ok(r) if !r.text.trim().is_empty() => Some(r.text.trim().to_string()),
+            _ => None,
+        }
+    }
+
+    /// 白龙马 A3：根据新消息召回匹配的已归档话题结论（Focus Stack 切回）。
+    async fn recall_episode_for(&self, message: &str) -> Option<String> {
+        let key = Self::topic_key_of(message);
+        let guard = self.episode_archive.lock().await;
+        guard.get(&key).map(|e| e.conclusion.clone())
+    }
+
+    /// 白龙马 A3：话题稳定键 —— 首条用户消息归一化（小写 + 去标点 + 前 24 字符 + 稳定哈希）。
+    fn topic_key_of(s: &str) -> String {
+        let s = s.to_lowercase();
+        let norm: String = s
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .collect();
+        let norm = norm.split_whitespace().collect::<Vec<_>>().join(" ");
+        let prefix: String = norm.chars().take(24).collect();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::Hash;
+        use std::hash::Hasher;
+        norm.hash(&mut hasher);
+        let h = hasher.finish();
+        if prefix.is_empty() {
+            format!("tk_{h:016x}")
+        } else {
+            format!("{prefix}_{h:016x}")
+        }
     }
 
     /// 从 SessionManager 加载历史对话（按调用者 namespace 隔离）
@@ -1241,6 +1408,65 @@ impl AgentCore {
     }
 
     /// LLM 调用循环（支持多轮 tool calling）
+    // ── A1: 白龙马 ACI 请求前上下文预取（工具子集选择，只选 schema 不调工具）──
+    const EXPOSE_TOOL_CAP: usize = 12;
+
+    fn prefetch_tokens(s: &str) -> Vec<String> {
+        let s = s.to_lowercase();
+        let s: String = s.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
+        let mut toks = Vec::new();
+        for w in s.split_whitespace() {
+            if w.len() >= 2 { toks.push(w.to_string()); }
+        }
+        let cn: Vec<char> = s.chars().filter(|c| !c.is_alphanumeric() && !c.is_whitespace()).collect();
+        for w in cn.windows(2) {
+            toks.push(w.iter().collect());
+        }
+        toks
+    }
+
+    fn score_tool_relevance(&self, query: &str, name: &str, desc: &str) -> f64 {
+        let q = Self::prefetch_tokens(query);
+        let t = Self::prefetch_tokens(&format!("{} {}", name, desc));
+        if q.is_empty() || t.is_empty() { return 0.0; }
+        let hit = q.iter().filter(|w| t.contains(w)).count();
+        hit as f64 / (q.len().min(t.len())) as f64
+    }
+
+    /// 白龙马 ACI 的 selectTools 等价物：按当前消息(task_context)从全量工具中选 top-K 暴露给 LLM。
+    /// 其余工具本轮不进 schema（模型仍可经 find_tool 被动发现，复用现有机制）。
+    async fn select_exposed_tools(&self, message: &str, allowed_ns: &[String]) -> Vec<ToolDef> {
+        let all = self.fetch_tools_filtered(allowed_ns).await;
+        let total = all.len();
+        if total <= Self::EXPOSE_TOOL_CAP {
+            tracing::info!(exposed_tools = total, total = total, "prefetch: 工具数未超阈值，全量暴露");
+            return all;
+        }
+        let mut scored: Vec<(f64, ToolDef)> = all
+            .into_iter()
+            .map(|t| {
+                let s = self.score_tool_relevance(message, &t.function.name, &t.function.description);
+                (s, t)
+            })
+            .collect();
+        let max_score = scored.iter().map(|(s, _)| *s).fold(0.0f64, f64::max);
+        if max_score <= 0.0 {
+            tracing::info!(exposed_tools = total, total = total, "prefetch: 相关性全 0，退回全量暴露");
+            return scored.into_iter().map(|(_, t)| t).collect();
+        }
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let top: Vec<ToolDef> = scored.into_iter().take(Self::EXPOSE_TOOL_CAP).map(|(_, t)| t).collect();
+        tracing::info!(exposed_tools = top.len(), total = total, "prefetch: 按 task_context 选暴露工具子集");
+        top
+    }
+
+    /// A2: 白龙马 TICK 心跳 —— 空闲 tick 工作体（silent，不回复用户）
+    #[tracing::instrument(skip_all, fields(agent_id = %self.config.identity.agent_id))]
+    pub async fn run_idle_tick(&self) {
+        tracing::info!("consciousness_tick: 空闲心跳（silent，不回复用户，仅更新内部状态）");
+        // Phase B 增强：向 Memoria 发 consolidation 建议 / 主动调用无害只读工具（guarded）
+    }
+
     async fn llm_loop(
         &self,
         mut messages: Vec<Message>,
@@ -1250,8 +1476,8 @@ impl AgentCore {
         allowed_ns: &[String],
         trace_id: &str,
     ) -> String {
-        // 从 Memoria 取可用工具列表
-        let tools = self.fetch_tools_filtered(allowed_ns).await;
+        // 从 Memoria 取可用工具列表（A1: 白龙马 ACI 请求前按 task_context 选暴露子集）
+        let tools = self.select_exposed_tools(raw_message, allowed_ns).await;
         // P1-4: 构建工具名 → JSON Schema 映射，用于参数校验
         let tool_schemas: HashMap<String, serde_json::Value> = tools
             .iter()
