@@ -2393,7 +2393,20 @@ impl AgentCore {
                 .and_then(|&i| self.mcp_sources.get(i))
                 .map(|s| s.name.clone())
         };
-        let result = client.call(tool_name, args).await;
+        // P2.2d：可选 retain 路径 — chat memory_remember 时 LLM 抽取 signal tags
+        let mut call_args = args.clone();
+        if (tool_name == "memory_remember" || tool_name == "memory")
+            && crate::text_signals::llm_retain_signals_enabled()
+        {
+            if let Some(content) = call_args.get("content").and_then(|c| c.as_str()) {
+                if !content.trim().is_empty() {
+                    let tags = self.llm_extract_signal_tags_single(content).await;
+                    crate::text_signals::enrich_remember_args(&mut call_args, &tags);
+                }
+            }
+        }
+
+        let result = client.call(tool_name, &call_args).await;
         if let Err(ref e) = result {
             self.audit_logger
                 .mcp_retry(
@@ -2967,6 +2980,58 @@ impl AgentCore {
         format!("洞见: {}", reply)
     }
 
+    /// P2.2d：LLM 批量抽取 text_signals → `signal:*` tags（consolidate retain 路径）。
+    async fn llm_extract_signal_tags_batch(&self, texts: &[String]) -> Vec<Vec<String>> {
+        if !crate::text_signals::llm_text_signals_enabled() || texts.is_empty() {
+            return vec![Vec::new(); texts.len()];
+        }
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let prompt = crate::text_signals::build_extract_prompt(&refs);
+        let msg = crate::llm::Message {
+            role: "system".to_string(),
+            content: Some(prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        match self.llm.chat(&[msg], &[]).await {
+            Ok(reply) => {
+                let items = crate::text_signals::parse_llm_signal_array(reply.text.trim());
+                crate::text_signals::map_llm_signals_by_index(&items, texts.len())
+            }
+            Err(e) => {
+                tracing::warn!("[text_signals] consolidate LLM 抽取失败: {}", e);
+                vec![Vec::new(); texts.len()]
+            }
+        }
+    }
+
+    /// P2.2d：单条 retain 路径 LLM 抽取（需 AGENT_TEXT_SIGNALS_LLM_RETAIN=1）。
+    async fn llm_extract_signal_tags_single(&self, content: &str) -> Vec<String> {
+        if !crate::text_signals::llm_retain_signals_enabled() || content.trim().is_empty() {
+            return Vec::new();
+        }
+        let prompt = crate::text_signals::build_extract_prompt(&[content]);
+        let msg = crate::llm::Message {
+            role: "system".to_string(),
+            content: Some(prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        match self.llm.chat(&[msg], &[]).await {
+            Ok(reply) => {
+                let items = crate::text_signals::parse_llm_signal_array(reply.text.trim());
+                items
+                    .first()
+                    .map(crate::text_signals::signal_tags_from_llm_item)
+                    .unwrap_or_default()
+            }
+            Err(e) => {
+                tracing::warn!("[text_signals] retain LLM 抽取失败: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
     /// 暗知识层 A2：通用夜间巩固编排器（泛化 run_insights）
     ///
     /// 流程（agent-core 出脑子，memoria 当哑存储）：
@@ -3086,24 +3151,34 @@ impl AgentCore {
             .filter(|l| !l.is_empty())
             .take(5)
             .collect();
+        let clean_patterns: Vec<String> = patterns
+            .iter()
+            .map(|p| {
+                p.trim_start_matches(|c: char| {
+                    c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' '
+                })
+                .to_string()
+            })
+            .collect();
+
+        // P2.2d：consolidate retain 路径 — LLM 抽取 signal tags 并随 memory_remember 持久化
+        let signal_tags_by_idx = self
+            .llm_extract_signal_tags_batch(&clean_patterns)
+            .await;
+
         let mut written = 0u64;
-        for p in patterns {
-            // 去掉可能的序号/项目符号前缀（"1. "、"- "、"、 "）
-            let clean = p.trim_start_matches(|c: char| {
-                c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' '
+        for (i, clean) in clean_patterns.iter().enumerate() {
+            let mut args = serde_json::json!({
+                "content": format!("[pattern] {} | ns={}", clean, ns),
+                "tags": ["pattern", "auto_consolidated"],
+                "category": "pattern",
+                "confidence": 70,
+                "namespace": ns
             });
-            let _ = mem_client
-                .call(
-                    "memory_remember",
-                    &serde_json::json!({
-                        "content": format!("[pattern] {} | ns={}", clean, ns),
-                        "tags": ["pattern", "auto_consolidated"],
-                        "category": "pattern",
-                        "confidence": 70,
-                        "namespace": ns
-                    }),
-                )
-                .await;
+            if let Some(st) = signal_tags_by_idx.get(i) {
+                crate::text_signals::enrich_remember_args(&mut args, st);
+            }
+            let _ = mem_client.call("memory_remember", &args).await;
             written += 1;
         }
 

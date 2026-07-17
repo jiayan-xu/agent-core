@@ -12,3 +12,4 @@ pub mod namespace;
 pub mod quota;
 pub mod session;
 pub mod self_evolution;
+pub mod text_signals;
