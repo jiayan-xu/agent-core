@@ -151,6 +151,7 @@ pub fn enrich_remember_args(args: &mut Value, signal_tags: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn parse_llm_array_tolerant() {

@@ -6,6 +6,8 @@
 pub mod prompt_injection;
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 // ── 安全锁辅助函数（锁中毒时优雅降级，不 panic）──
@@ -223,6 +225,14 @@ impl ToolCheck {
             reason: reason.to_string(),
         }
     }
+    /// 放行但附带说明（如"已在沙箱内执行"），reason 仅作审计记录
+    pub fn allow_note(reason: &str) -> Self {
+        ToolCheck {
+            allow: true,
+            level: None,
+            reason: reason.to_string(),
+        }
+    }
 }
 
 // ══════════════════════════════════════════════════════
@@ -269,6 +279,10 @@ impl PermissionChain {
 // 第二条：代码与执行隔离红线
 // ══════════════════════════════════════════════════════
 
+/// 沙箱启用开关（进程级，默认启用）。未启用时任何 require-sandbox 的工具一律红闸硬拦，
+/// 避免"门控被架空"——这正是此前 `exec_*` 只有门控、无实现时的语义漏洞。
+static SANDBOX_ENABLED: AtomicBool = AtomicBool::new(true);
+
 pub struct ExecutionSandbox;
 
 impl ExecutionSandbox {
@@ -281,11 +295,46 @@ impl ExecutionSandbox {
     ];
     const REQUIRES_REVIEW: &'static [&'static str] = &["delete_", "batch_", "shutdown_"];
 
-    pub fn check(tool_name: &str) -> ToolCheck {
-        for pattern in Self::REQUIRES_SANDBOX {
-            if tool_name == *pattern || tool_name.starts_with(pattern) {
-                return ToolCheck::red(&format!("{} 必须在沙箱中执行", tool_name));
+    /// 设置沙箱启用状态（main 启动时按配置调用；默认 true）
+    pub fn set_enabled(v: bool) {
+        SANDBOX_ENABLED.store(v, Ordering::SeqCst);
+    }
+
+    pub fn is_enabled() -> bool {
+        SANDBOX_ENABLED.load(Ordering::SeqCst)
+    }
+
+    /// 检查工具是否需在沙箱内执行。
+    /// - `path`：可选的文件路径参数，命中敏感 deny 列表或越出严格沙箱根时红闸拦截。
+    /// - 沙箱未启用 → 任何 require-sandbox 工具硬拦（绝不裸跑）。
+    pub fn check(tool_name: &str, path: Option<&Path>) -> ToolCheck {
+        let requires = Self::REQUIRES_SANDBOX
+            .iter()
+            .any(|p| tool_name == *p || tool_name.starts_with(p));
+        if requires {
+            if !Self::is_enabled() {
+                return ToolCheck::red(&format!(
+                    "{} 必须在沙箱中执行，但沙箱未启用（拒绝裸跑）",
+                    tool_name
+                ));
             }
+            if let Some(p) = path {
+                if let Some(reason) = Self::path_violation(p) {
+                    return ToolCheck::red(&format!("{} 沙箱路径门闸：{}", tool_name, reason));
+                }
+                // 若配置了严格沙箱根，越界即拦（未配置则仅 deny 列表生效，避免误伤合法读盘）
+                if let Some(root) = crate::sandbox::resolve_sandbox_root() {
+                    if !Self::under_root(p, &root) {
+                        return ToolCheck::red(&format!(
+                            "{} 试图访问沙箱根 {:?} 之外的路径 {:?}",
+                            tool_name,
+                            root,
+                            p
+                        ));
+                    }
+                }
+            }
+            return ToolCheck::allow_note(&format!("{} 已在沙箱内执行", tool_name));
         }
         for pattern in Self::REQUIRES_REVIEW {
             if tool_name.starts_with(pattern) {
@@ -294,6 +343,87 @@ impl ExecutionSandbox {
         }
         ToolCheck::allow()
     }
+
+    /// 敏感路径组件 / 文件名（命中即视为越界，沙箱内也禁读）
+    const DENY_COMPONENTS: &'static [&'static str] =
+        &[".ssh", ".gnupg", ".aws", ".azure", ".config/gcloud"];
+    const DENY_FILENAMES: &'static [&'static str] = &[
+        "id_ed25519",
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519.pub",
+        "credentials",
+        "gserviceaccount.json",
+    ];
+
+    /// 返回命中敏感路径的原因（用于红闸 reason），无违规则 None
+    fn path_violation(p: &Path) -> Option<String> {
+        let norm = normalize(p);
+        for comp in Self::DENY_COMPONENTS {
+            let want = std::ffi::OsStr::new(*comp);
+            if norm.components().any(|c| c.as_os_str() == want) {
+                return Some(format!("命中敏感目录组件 {}", comp));
+            }
+        }
+        if let Some(name) = norm.file_name() {
+            let n = name.to_string_lossy().to_lowercase();
+            if Self::DENY_FILENAMES.contains(&n.as_str()) || n.ends_with(".pem") || n.ends_with(".key")
+            {
+                return Some(format!("命中敏感文件 {}", n));
+            }
+        }
+        None
+    }
+
+    fn under_root(p: &Path, root: &Path) -> bool {
+        normalize(p).starts_with(normalize(root))
+    }
+}
+
+/// 把路径规范化为绝对、去 `..` 的形式（存在则 canonicalize，否则按 cwd 拼接后清理）
+fn normalize(p: &Path) -> PathBuf {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    };
+    abs.canonicalize().unwrap_or_else(|_| {
+        let mut out = PathBuf::new();
+        for c in abs.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
+    })
+}
+
+/// 从工具参数中抽取显式文件路径参数做门闸（命令型参数 command/code/sql 不含路径，不抽）
+fn extract_path_arg(args: &serde_json::Value) -> Option<&Path> {
+    const KEYS: &[&str] = &[
+        "path",
+        "file",
+        "file_path",
+        "filepath",
+        "dir",
+        "directory",
+        "target",
+    ];
+    if let Some(obj) = args.as_object() {
+        for k in KEYS {
+            if let Some(v) = obj.get(*k) {
+                if let Some(s) = v.as_str() {
+                    return Some(Path::new(s));
+                }
+            }
+        }
+    }
+    None
 }
 
 // ══════════════════════════════════════════════════════
@@ -545,7 +675,7 @@ impl ComplianceBoundary {
         }
 
         // ── ② 代码与执行隔离 ──
-        let sandbox = ExecutionSandbox::check(tool_name);
+        let sandbox = ExecutionSandbox::check(tool_name, extract_path_arg(args));
         if !sandbox.allow {
             return sandbox;
         }
@@ -1094,12 +1224,42 @@ mod tests {
 
     #[test]
     fn test_execution_sandbox() {
-        let r = ExecutionSandbox::check("exec_shell");
+        use std::path::Path;
+
+        // 沙箱默认启用
+        ExecutionSandbox::set_enabled(true);
+
+        // exec_* 在沙箱内放行（不再"永被硬拦但无实现"）
+        let r = ExecutionSandbox::check("exec_shell", None);
+        assert!(r.allow);
+
+        // 非执行类工具不受沙箱门控
+        let r = ExecutionSandbox::check("query_plate", None);
+        assert!(r.allow);
+
+        // 沙箱未启用 → 任何 require-sandbox 工具硬拦（绝不裸跑）
+        ExecutionSandbox::set_enabled(false);
+        let r = ExecutionSandbox::check("exec_shell", None);
+        assert!(!r.allow);
+        assert_eq!(r.level, Some(BlockLevel::Red));
+        ExecutionSandbox::set_enabled(true);
+
+        // 路径门闸：命中 .ssh 敏感目录 → 红闸
+        let r = ExecutionSandbox::check(
+            "exec_shell",
+            Some(Path::new("C:/test/.ssh/id_ed25519")),
+        );
         assert!(!r.allow);
         assert_eq!(r.level, Some(BlockLevel::Red));
 
-        let r = ExecutionSandbox::check("query_plate");
+        // 路径门闸：工作区内路径允许
+        let r = ExecutionSandbox::check("exec_shell", Some(Path::new("C:/workspace/script.py")));
         assert!(r.allow);
+
+        // REVIEW 类仍走黄线
+        let r = ExecutionSandbox::check("delete_user", None);
+        assert!(!r.allow);
+        assert_eq!(r.level, Some(BlockLevel::Yellow));
     }
 
     #[test]

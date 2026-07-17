@@ -296,6 +296,16 @@ fn spawn_process(command: &str, args: &[String]) -> Child {
         // 强制子进程 stdout UTF-8，避免 Windows 本地代码页导致 JSON-RPC 行非法
         .env("PYTHONUTF8", "1")
         .env("PYTHONIOENCODING", "utf-8");
+
+    // 注入沙箱根：供守规 MCP/工具自检（路径门闸、写前快照）
+    if let Some(root) = crate::sandbox::resolve_sandbox_root() {
+        cmd.env("AGENT_SANDBOX_ROOT", root);
+    }
+    // 可选 cwd 约束（默认关，避免破坏依赖相对路径的 MCP）
+    if let Some(root) = crate::sandbox::cwd_root() {
+        cmd.current_dir(root);
+    }
+
     // Windows: 防止 spawn 的 MCP 子进程（如 python）弹出控制台窗口
     #[cfg(windows)]
     {
@@ -303,7 +313,14 @@ fn spawn_process(command: &str, args: &[String]) -> Child {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd.spawn().expect("failed to spawn MCP server process")
+    let child = cmd
+        .spawn()
+        .expect("failed to spawn MCP server process");
+
+    // 后置约束：纳入 Job Object（kill-on-close），斩断孤儿/逃逸子进程
+    crate::sandbox::confine_child_process(&child);
+
+    child
 }
 
 // ── 统一 McpClient 枚举 ──

@@ -2406,6 +2406,28 @@ impl AgentCore {
             }
         }
 
+        // ── A2 文件级 checkpoint：WRITE/dangerous 工具执行前快照其 path 参数指向的现有文件 ──
+        let fc_level = {
+            let b = self.boundary.lock().await;
+            b.classifier
+                .lock()
+                .map(|c| c.classify(tool_name).to_string())
+                .unwrap_or_else(|_| "unknown".to_string())
+        };
+        let fc_snapshots: Vec<String> =
+            if fc_level == "write" || fc_level == "dangerous" {
+                crate::file_checkpoint::snapshot_args(args)
+            } else {
+                Vec::new()
+            };
+        if !fc_snapshots.is_empty() {
+            tracing::debug!(
+                "file_checkpoint: 为 {} 快照 {} 个文件路径，执行失败将自动回滚",
+                tool_name,
+                fc_snapshots.len()
+            );
+        }
+
         let result = client.call(tool_name, &call_args).await;
         if let Err(ref e) = result {
             self.audit_logger
@@ -2418,6 +2440,15 @@ impl AgentCore {
                     None,
                 )
                 .await;
+        }
+        // A2 回滚：工具执行失败且此前曾快照 → 自动恢复被改写的文件
+        if result.is_err() && !fc_snapshots.is_empty() {
+            tracing::warn!(
+                "file_checkpoint: {} 执行失败，回滚 {} 个文件快照",
+                tool_name,
+                fc_snapshots.len()
+            );
+            crate::file_checkpoint::restore_many(&fc_snapshots);
         }
         result
     }
