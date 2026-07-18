@@ -146,7 +146,12 @@
     2. A3 原计划 Memoria 新增 `episodes` 表 + `conversations.focus_absorbed` 列；改为**纯 agent-core 实现**（复用 `memories.tags` 列软隐藏 + 本地 HashMap），**不动生产 Memoria schema 迁移**，与 A1/A2 同级、零迁移风险。
 - [x] 编译通过（`cargo build --release`，master，无错误）
 - [x] 冒烟通过：新 exe 绑定 `:9753`；`/health` 返回 `status:ok` 且 `memoria.reachable:true`；日志确认 `consciousness: TICK 循环启动` + 首跳 `consciousness_tick: 空闲心跳` 已执行；`Agent 已就绪（dashboard-agent@:9003）` 注册成功。
-- [ ] Phase B 待 A 稳定后开工（A4 consolidation round-robin / 主动预取实验 / 多端唤醒）
+- [x] **Phase B 已全部落地（A4 + 主动预取 + 多端唤醒）— 2026-07-18**
+  - **A4 TICK round-robin consolidation**：`Consciousness::tick_once` 每次空闲 tick 推进一个 namespace 的 `agent.consolidate(ns)`（游标 `consolidate_cursor` 内存态、不持久化，对齐白龙马 `consolidation-loop.js` 每 30min 一个实体）；内层 300s 预算超时，外层 TICK 已有 600s watchdog。ns 列表来自 `CONSOLIDATE_NAMESPACES`（默认单 agent ns）。
+  - **多端唤醒（拉模型）**：`background_events` 队列 + `GET /api/agent/events?since=&limit=` 轮询端点（统一鉴权保护）；A4 consolidate / 主动预取产出事件入队，PFAiX 前端轮询即可"唤醒"，零改造 PFAiX。
+  - **主动预取实验（guarded，默认关）**：`guarded_prefetch` 识别「只读 + 无必填参数」工具做 liveness probe；`AGENT_PRETEST=1` 开启候选识别，`AGENT_PRETEST_EXEC=1` 才实际 dummy 调用（默认关），带 60s 预算超时。对齐白龙马死代码 cron 预热的**反面**——只探测工具可用性，不预执行业务数据。
+  - **两处对原方案的合理收敛（降风险/零改造）**：① A4 不照搬白龙马「实体级」调度（我方 consolidate 颗粒度为 ns，多 ns 由 `CONSOLIDATE_NAMESPACES` 覆盖）；② 多端唤醒用「拉模型事件端点」而非「推模型」（PFAiX 无接收推送端点，grep 证实），更稳且零改造。
+- [x] 冒烟验证（Phase B）：新 exe 绑定 :9753；`/health` status:ok 且 memoria.reachable:true；日志确认 `A4: 空闲 tick 推进 consolidation round-robin ns=agent/dashboard-agent cursor=0` + `consolidate[...]: 无新观察` 实锤 A4 调通；`/api/agent/events` 返回 HTTP 401（路由已注册、受鉴权保护）。
 
 ---
 

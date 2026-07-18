@@ -28,7 +28,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tao::{
@@ -396,6 +396,32 @@ struct AppState {
     consolidate_last: tokio::sync::Mutex<serde_json::Value>,
     /// 白龙马 A2 TICK 心跳句柄（用户消息到达时 interrupt 抢占在途 tick）
     consciousness: tokio::sync::Mutex<Option<Arc<Consciousness>>>,
+    /// 白龙马 Phase B A4: consolidation round-robin 游标（内存态，v1 不持久化，对齐白龙马游标）
+    consolidate_cursor: tokio::sync::Mutex<usize>,
+    /// 白龙马 Phase B: 多端唤醒 —— 后台活动事件队列（供 PFAiX 轮询拉取"唤醒"）
+    background_events: tokio::sync::Mutex<std::collections::VecDeque<BackgroundEvent>>,
+    /// 白龙马 Phase B: 事件自增 id
+    next_event_id: AtomicU64,
+}
+
+/// 白龙马 Phase B：多端唤醒 —— 后台活动事件（心跳自主产生的活动，供 PFAiX 拉取"唤醒"）
+/// 采用拉模型：agent-core 单方面维护队列 + 暴露 /api/agent/events，不依赖 PFAiX 改代码。
+#[derive(Clone, serde::Serialize)]
+struct BackgroundEvent {
+    id: u64,
+    ts: String,
+    kind: String, // "consolidate" | "prefetch"
+    summary: String,
+}
+impl BackgroundEvent {
+    fn new(kind: &str, summary: String) -> Self {
+        Self {
+            id: 0, // 由 emit_event 分配自增 id
+            ts: Local::now().to_rfc3339(),
+            kind: kind.to_string(),
+            summary,
+        }
+    }
 }
 
 /// 白龙马 A2: TICK 意识主循环（心跳 / 抢占 / watchdog）
@@ -447,9 +473,123 @@ impl Consciousness {
     }
 
     async fn tick_once(state: &AppState) {
+        // 取 agent 引用（沿用 A2 模式：持锁跨 await 调用 silent 心跳 + A4）
         let guard = state.agent.lock().await;
-        if let Some(ref agent) = *guard {
-            agent.run_idle_tick().await;
+        let Some(agent) = guard.as_ref() else { return; };
+
+        // 1) 静默心跳（更新内部状态，不回复用户）—— A2 原始语义
+        agent.run_idle_tick().await;
+
+        // 2) A4: round-robin consolidation（对齐白龙马每 30min 一个实体；我方按 ns 推进）
+        if let Some(ev) = Self::consolidate_round_robin(state, agent).await {
+            Self::emit_event(state, ev).await;
+        }
+
+        // 3) 主动预取实验（guarded，默认关）
+        if let Some(ev) = Self::guarded_prefetch(agent).await {
+            Self::emit_event(state, ev).await;
+        }
+    }
+
+    /// A4: 空闲 tick 推进一个 namespace 的 consolidation（round-robin 游标）
+    /// 对齐白龙马 consolidation-loop.js：每轮只处理一个候选，游标内存态不持久化。
+    async fn consolidate_round_robin(state: &AppState, agent: &AgentCore) -> Option<BackgroundEvent> {
+        let default_ns = format!("agent/{}", agent.config.identity.agent_id);
+        let ns_list: Vec<String> = std::env::var("CONSOLIDATE_NAMESPACES")
+            .unwrap_or_else(|_| default_ns.clone())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if ns_list.is_empty() {
+            return None;
+        }
+        let idx = {
+            let mut c = state.consolidate_cursor.lock().await;
+            let i = *c % ns_list.len();
+            *c = *c + 1;
+            i
+        };
+        let ns = &ns_list[idx];
+        tracing::info!(target: "consciousness", ns = %ns, cursor = idx, "A4: 空闲 tick 推进 consolidation round-robin");
+        // 内层预算超时（外层 TICK 已有 600s watchdog），避免单次 consolidate 卡住整轮
+        let res = tokio::time::timeout(Duration::from_secs(300), agent.consolidate(ns)).await;
+        match res {
+            Ok(summary) => {
+                let summary = format!("consolidate[{}]: {}", ns, summary);
+                tracing::info!(target: "consciousness", "{}", summary);
+                Some(BackgroundEvent::new("consolidate", summary))
+            }
+            Err(_) => {
+                tracing::warn!(target: "consciousness_watchdog", ns = %ns, "A4: consolidate 超时(>300s)跳过");
+                None
+            }
+        }
+    }
+
+    /// 主动预取实验（对齐白龙马死代码 cron 预热的反面：只探测工具可用性，不预执行业务数据）
+    /// 默认关闭；AGENT_PRETEST=1 才识别候选，AGENT_PRETEST_EXEC=1 才实际 dummy 调用（默认关）。
+    async fn guarded_prefetch(agent: &AgentCore) -> Option<BackgroundEvent> {
+        let enabled = std::env::var("AGENT_PRETEST")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+        let allowed_ns: Vec<String> = vec![format!("agent/{}", agent.config.identity.agent_id)];
+        let tools = agent.fetch_tools_filtered(&allowed_ns).await;
+        // 选第一个「只读 + 无必填参数」的工具做 liveness probe
+        let candidate = tools.iter().find(|t| {
+            let name = t.function.name.as_str();
+            if !agent_core::boundary::is_read_only_tool(name) {
+                return false;
+            }
+            let required = t.function.parameters.get("required").and_then(|r| r.as_array());
+            match required {
+                None => true,
+                Some(arr) => arr.is_empty(),
+            }
+        });
+        let Some(tool) = candidate else {
+            tracing::info!(target: "consciousness", "guarded_prefetch: 无合适只读候选工具");
+            return None;
+        };
+        let tool_name = tool.function.name.clone();
+        let exec = std::env::var("AGENT_PRETEST_EXEC")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !exec {
+            let summary = format!(
+                "prefetch[probe]: 候选只读工具={}（未实际调用，AGENT_PRETEST_EXEC 未开）",
+                tool_name
+            );
+            tracing::info!(target: "consciousness", "{}", summary);
+            return Some(BackgroundEvent::new("prefetch", summary));
+        }
+        // 实际 dummy 调用（仅无副作用的空参 READ 工具），带 60s 预算
+        let trace_id = format!("prefetch-{}", Local::now().timestamp());
+        let call = tokio::time::timeout(
+            Duration::from_secs(60),
+            agent.call_tool_routed(&tool_name, &serde_json::json!({}), &allowed_ns, &trace_id),
+        )
+        .await;
+        let summary = match call {
+            Ok(Ok(out)) => format!("prefetch[exec]: {}=ok ({}B)", tool_name, out.len()),
+            Ok(Err(e)) => format!("prefetch[exec]: {}=err: {}", tool_name, e),
+            Err(_) => format!("prefetch[exec]: {}=timeout(>60s)", tool_name),
+        };
+        tracing::info!(target: "consciousness", "{}", summary);
+        Some(BackgroundEvent::new("prefetch", summary))
+    }
+
+    /// 多端唤醒：把后台活动事件入队（供 PFAiX 轮询 /api/agent/events 拉取"唤醒"）
+    async fn emit_event(state: &AppState, mut ev: BackgroundEvent) {
+        let id = state.next_event_id.fetch_add(1, Ordering::SeqCst);
+        ev.id = id;
+        let mut q = state.background_events.lock().await;
+        q.push_back(ev);
+        while q.len() > 200 {
+            q.pop_front();
         }
     }
 }
@@ -777,6 +917,9 @@ fn main() {
                 consolidate_last_ymd: tokio::sync::Mutex::new(String::new()),
                 consolidate_last: tokio::sync::Mutex::new(serde_json::json!({"status":"never"})),
                 consciousness: tokio::sync::Mutex::new(None),
+                consolidate_cursor: tokio::sync::Mutex::new(0),
+                background_events: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+                next_event_id: AtomicU64::new(1),
             });
 
             // 先绑定端口，确保服务立即可用（即使 Memoria 慢/未就绪也不阻塞启动）
@@ -969,6 +1112,7 @@ fn main() {
                     post(handle_admin_harness_activate),
                 )
                 .route("/api/admin/consolidate", post(handle_admin_consolidate))
+                .route("/api/agent/events", axum::routing::get(handle_agent_events))
                 .route("/api/save-config", post(handle_save_config))
                 .route("/api/collab/inbox", get(handle_collab_inbox))
                 .route("/api/collab/send", post(handle_collab_send))
@@ -1146,6 +1290,38 @@ async fn handle_admin_consolidate(
     *st.consolidate_last_ymd.lock().await = ymd;
     *st.consolidate_last.lock().await = summary.clone();
     Json(summary).into_response()
+}
+
+/// 白龙马 Phase B 多端唤醒：返回后台活动事件（since 之后的增量），供 PFAiX 轮询"唤醒"
+/// 不依赖 PFAiX 改代码（拉模型）；事件由空闲 tick 的 A4 consolidation / 主动预取产生。
+async fn handle_agent_events(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    let since: u64 = q.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let limit: usize = q
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let (events, cursor) = {
+        let qd = st.background_events.lock().await;
+        let events: Vec<BackgroundEvent> = qd
+            .iter()
+            .filter(|e| e.id > since)
+            .take(limit)
+            .cloned()
+            .collect();
+        let cursor = *st.consolidate_cursor.lock().await;
+        (events, cursor)
+    };
+    let next_since = events.last().map(|e| e.id).unwrap_or(since);
+    Json(serde_json::json!({
+        "events": events,
+        "cursor": cursor,
+        "next_since": next_since,
+    }))
+    .into_response()
 }
 
 async fn handle_config(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
