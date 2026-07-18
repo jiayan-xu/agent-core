@@ -152,6 +152,12 @@
   - **主动预取实验（guarded，默认关）**：`guarded_prefetch` 识别「只读 + 无必填参数」工具做 liveness probe；`AGENT_PRETEST=1` 开启候选识别，`AGENT_PRETEST_EXEC=1` 才实际 dummy 调用（默认关），带 60s 预算超时。对齐白龙马死代码 cron 预热的**反面**——只探测工具可用性，不预执行业务数据。
   - **两处对原方案的合理收敛（降风险/零改造）**：① A4 不照搬白龙马「实体级」调度（我方 consolidate 颗粒度为 ns，多 ns 由 `CONSOLIDATE_NAMESPACES` 覆盖）；② 多端唤醒用「拉模型事件端点」而非「推模型」（PFAiX 无接收推送端点，grep 证实），更稳且零改造。
 - [x] 冒烟验证（Phase B）：新 exe 绑定 :9753；`/health` status:ok 且 memoria.reachable:true；日志确认 `A4: 空闲 tick 推进 consolidation round-robin ns=agent/dashboard-agent cursor=0` + `consolidate[...]: 无新观察` 实锤 A4 调通；`/api/agent/events` 返回 HTTP 401（路由已注册、受鉴权保护）。
+- [x] **Phase C 已全部落地（条件式本地资源门控）— 2026-07-18**
+  - **新模块 `src/resources.rs`**：`LocalResourceSnapshot`（ssh_hosts / ssh_keys / known_hosts / git_user）+ `scan_local_resources()`（纯只读元数据：ssh config 别名、私钥**对名不读内容/指纹**、known_hosts 去重 host、gitconfig `[user]`；home 走 `USERPROFILE`/`HOME` 环境变量，**绝不硬编码路径**）+ `resource_block_for()`（条件式门控：仅消息命中 ssh/部署/提交/git 等规则才生成文本块）。
+  - **`agent.rs`**：`local_resources` 字段 + `AgentCore::new` 接收共享 `Arc` + `execute_chat` 与 `rephrase_and_confirm` 两处条件注入 + `inject_resources_if_relevant` helper。
+  - **`main.rs`**：`AppState` 加 `local_resources` 字段 + 启动扫描一次共享 + `build_agent` 传参（`handle_save_config` handler 从 `State` 取共享快照）。
+  - **一处收敛**：不吸收白龙马 `desktop-scanner`（agent-core 是后端服务、不面向用户桌面，桌面扫描留给 PFAiX 前端）。
+- [x] 冒烟验证（Phase C）：新 exe 绑定 :9753；`/health` status:ok；日志确认 `本地资源快照扫描完成（只读元数据） ssh_hosts=0 ssh_keys=1 known_hosts=5 git_user=true`（不读私钥内容）；A4/consolidation 无回归。
 
 ---
 
