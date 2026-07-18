@@ -51,6 +51,7 @@ use agent_core::harness::HarnessStore;
 use agent_core::llm::LlmConfig;
 use agent_core::approval::ApprovalResponse;
 use agent_core::mcp_client::McpClient;
+use agent_core::resources::SharedResourceSnapshot;
 
 /// 公司根命名空间（与 agent.toml 的 mcp_source namespace org/ 前缀、Memoria 注册一致）
 const ORG_COMPANY: &str = "cs-pufa-2nd-thermal";
@@ -400,6 +401,8 @@ struct AppState {
     consolidate_cursor: tokio::sync::Mutex<usize>,
     /// 白龙马 Phase B: 多端唤醒 —— 后台活动事件队列（供 PFAiX 轮询拉取"唤醒"）
     background_events: tokio::sync::Mutex<std::collections::VecDeque<BackgroundEvent>>,
+    /// 白龙马 Phase C: 条件式本地资源门控 —— 启动扫描的只读资源快照句柄（与 AgentCore 共享）
+    local_resources: SharedResourceSnapshot,
     /// 白龙马 Phase B: 事件自增 id
     next_event_id: AtomicU64,
 }
@@ -906,6 +909,9 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        // 白龙马 Phase C: 启动扫描一次本机资源只读元数据（ssh/git），供条件式门控注入
+        let local_resources: SharedResourceSnapshot =
+            Arc::new(std::sync::Mutex::new(agent_core::resources::scan_local_resources()));
         rt.block_on(async move {
             let state = Arc::new(AppState {
                 config: Mutex::new(config.clone()),
@@ -917,6 +923,7 @@ fn main() {
                 consolidate_last_ymd: tokio::sync::Mutex::new(String::new()),
                 consolidate_last: tokio::sync::Mutex::new(serde_json::json!({"status":"never"})),
                 consciousness: tokio::sync::Mutex::new(None),
+                local_resources: local_resources.clone(),
                 consolidate_cursor: tokio::sync::Mutex::new(0),
                 background_events: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
                 next_event_id: AtomicU64::new(1),
@@ -937,7 +944,7 @@ fn main() {
                 let reg_state = state.clone();
                 let reg_config = config.clone();
                 tokio::spawn(async move {
-                    match build_agent(&reg_config).await {
+                    match build_agent(&reg_config, local_resources.clone()).await {
                         Ok(agent) => {
                             println!(
                                 "✓ Agent 已就绪（{}@{}）",
@@ -1355,7 +1362,7 @@ async fn handle_save_config(
     save_config(&cfg);
     drop(cfg);
     let cfg = st.config.lock().await.clone();
-    match build_agent(&cfg).await {
+    match build_agent(&cfg, st.local_resources.clone()).await {
         Ok(agent) => {
             *st.agent.lock().await = Some(agent);
             Json(SetupResponse {
@@ -2766,7 +2773,7 @@ async fn handle_login(
     }
 }
 
-async fn build_agent(config: &Config) -> Result<AgentCore, String> {
+async fn build_agent(config: &Config, local_resources: SharedResourceSnapshot) -> Result<AgentCore, String> {
     // K3：身份 badge 与 admin 钥匙分钥（badge_token UNIQUE）
     let admin_key = if !config.memoria_admin_key.is_empty() {
         config.memoria_admin_key.clone()
@@ -2870,7 +2877,7 @@ async fn build_agent(config: &Config) -> Result<AgentCore, String> {
         .map_err(|e| format!("创建 Harness 存储失败: {}", e))?;
     let checkpoint = CheckpointStore::open(&cwd.join("checkpoints.db").to_string_lossy())
         .map_err(|e| format!("创建 Checkpoint 存储失败: {}", e))?;
-    let agent = AgentCore::new(agent_config, harness, checkpoint);
+    let agent = AgentCore::new(agent_config, harness, checkpoint, local_resources);
     // P2-C: 同步 Memoria 注册的 namespace 到本地 NamespaceRegistry
     agent.sync_namespace_from_identity();
     Ok(agent)

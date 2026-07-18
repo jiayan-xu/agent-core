@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod approval;
+pub mod resources;
 pub mod audit;
 pub mod boundary;
 pub mod checkpoint;

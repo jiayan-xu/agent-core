@@ -133,6 +133,10 @@ pub struct AgentCore {
     /// 白龙马 A3: Focus Stack → Thread 模型 —— 已归档话题（episode）软隐藏索引
     /// key = topic_key；value = 归档元数据。切回时由 recall_episode_for 召回结论注入。
     pub episode_archive: Arc<tokio::sync::Mutex<HashMap<String, EpisodeArchive>>>,
+    /// 白龙马 Phase C: 条件式本地资源门控 —— 启动扫描的只读资源快照（ssh/git 元数据）。
+    /// 仅当用户消息命中资源规则时由 execute_chat / rephrase_and_confirm 注入 system prompt，
+    /// 零常态泄露面、零 prompt 膨胀（见 resources.rs 安全红线）。
+    pub local_resources: crate::resources::SharedResourceSnapshot,
 }
 
 /// P2-1: 会话级配额守卫（RAII）。离开作用域自动 leave_session，避免并发计数泄漏。
@@ -168,7 +172,12 @@ impl InboxCache {
 
 impl AgentCore {
     /// 创建 Agent 核心
-    pub fn new(config: AgentConfig, harness: HarnessStore, checkpoint: CheckpointStore) -> Self {
+    pub fn new(
+        config: AgentConfig,
+        harness: HarnessStore,
+        checkpoint: CheckpointStore,
+        local_resources: crate::resources::SharedResourceSnapshot,
+    ) -> Self {
         let mcp = McpClient::new(
             &config.memoria_url,
             &config.identity.agent_id,
@@ -234,6 +243,7 @@ impl AgentCore {
             degrade,
             quota: Arc::new(std::sync::Mutex::new(NsQuotaStore::new())),
             episode_archive: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            local_resources,
         }
     }
 
@@ -640,7 +650,9 @@ impl AgentCore {
             .await;
 
         // ── 4. 构建消息列表 ──
-        let system_prompt = self.build_system_prompt(&knowledge);
+        let mut system_prompt = self.build_system_prompt(&knowledge);
+        // 白龙马 Phase C: 条件式本地资源门控（仅消息命中 ssh/git/部署 等规则才注入）
+        self.inject_resources_if_relevant(&mut system_prompt, message);
         let mut messages = Vec::new();
         messages.push(Message {
             role: "system".to_string(),
@@ -706,6 +718,9 @@ impl AgentCore {
 
         // 构建增强版 system prompt
         let mut system_prompt = self.build_system_prompt(&knowledge);
+
+        // 白龙马 Phase C: 条件式本地资源门控（仅消息命中 ssh/git/部署 等规则才注入）
+        self.inject_resources_if_relevant(&mut system_prompt, message);
 
         // SAD 核心：注入可用工具信息，让 LLM 复述时对齐能力
         if !tools.is_empty() {
@@ -3095,6 +3110,21 @@ impl AgentCore {
         }
 
         None
+    }
+
+    /// 白龙马 Phase C: 条件式本地资源门控
+    /// 仅当用户消息命中资源规则、且快照确实存在可注入资源时，把资源块追加到 system prompt。
+    /// 同步读 std::sync::Mutex（快照只读、无 await，不在持锁跨 await 风险区）。
+    fn inject_resources_if_relevant(&self, system_prompt: &mut String, message: &str) {
+        let snap = self
+            .local_resources
+            .lock()
+            .expect("resource snapshot mutex poisoned");
+        if let Some(block) = crate::resources::resource_block_for(message, &snap) {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&block);
+            tracing::info!(target: "resources", "条件命中：注入本地资源快照块到 system prompt");
+        }
     }
 
     /// 构建 system prompt
