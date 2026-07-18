@@ -3,6 +3,7 @@ pub mod approval;
 pub mod resources;
 pub mod audit;
 pub mod boundary;
+pub mod boot_lifecycle;
 pub mod checkpoint;
 pub mod composer;
 pub mod degrade;

@@ -8,6 +8,7 @@ pub mod prompt_injection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 // ── 安全锁辅助函数（锁中毒时优雅降级，不 panic）──
@@ -619,6 +620,10 @@ pub struct ComplianceBoundary {
     pub classifier: Mutex<ToolClassifier>,
     /// 审批管理器（P2-D 接入 check_tool）
     pub approval_manager: crate::approval::ApprovalManager,
+    /// Phase A (OpenClaw 吸收): 崩溃循环 safe_mode 闩锁。
+    /// 进入后抑制危险/未分类/外发工具的自动执行，直至人工解除。
+    /// 用 Arc<AtomicBool> 以支持 &self 下切换，且可与主流程共享同一标志。
+    pub safe_mode: Arc<AtomicBool>,
 }
 
 impl ComplianceBoundary {
@@ -629,7 +634,18 @@ impl ComplianceBoundary {
             kill_switch: KillSwitch::new(),
             classifier: Mutex::new(ToolClassifier::new()),
             approval_manager: crate::approval::ApprovalManager::new(),
+            safe_mode: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Phase A: 设置/清除 safe_mode 闩锁（&self 即可，因内部用 AtomicBool）。
+    pub fn set_safe_mode(&self, on: bool) {
+        self.safe_mode.store(on, Ordering::SeqCst);
+    }
+
+    /// Phase A: 读取当前 safe_mode 状态。
+    pub fn is_safe_mode(&self) -> bool {
+        self.safe_mode.load(Ordering::SeqCst)
     }
 
     /// 注册工具分类（运行时动态添加）
@@ -665,6 +681,20 @@ impl ComplianceBoundary {
                 "系统已终止（{:?}），拒绝所有操作",
                 self.kill_switch.state()
             ));
+        }
+
+        // ── Phase A: safe_mode（崩溃循环后进入）──
+        // 抑制危险/未分类/外发工具的「自动执行」，仅保留健康探针与运维 RPC。
+        // 控制面（HTTP/WS）照常拉起，运维可连接诊断；危险操作需人工介入解除 safe_mode。
+        if self.is_safe_mode() {
+            let level = with_classifier(&self.classifier, "unknown", |c| c.classify(tool_name));
+            let is_export = !DataExfiltrationGuard::check_export(tool_name).allow;
+            if level == "dangerous" || level == "unknown" || is_export {
+                return ToolCheck::red(&format!(
+                    "safe_mode 激活：抑制危险/未分类/外发工具 {}（需人工介入解除）",
+                    tool_name
+                ));
+            }
         }
 
         // ── ③ 进化边界：不可修改治理层 ──

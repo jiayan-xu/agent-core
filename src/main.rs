@@ -1888,6 +1888,13 @@ async fn handle_collab_approval(
             // 记录本地 ApprovalManager（解阻塞本实例等待中的审批）
             let agent_guard = st.agent.lock().await;
             if let Some(ref agent) = *agent_guard {
+                // A2: 从 pending 审批取回 operation_hash，使响应与请求绑定（防 LLM 自批）。
+                let op_hash = agent
+                    .approval_manager
+                    .get_pending(&approval_id)
+                    .await
+                    .map(|p| p.operation_hash)
+                    .unwrap_or_default();
                 let _ = agent.approval_manager.record_response(
                     ApprovalResponse {
                         r#type: "approval_response".to_string(),
@@ -1895,6 +1902,7 @@ async fn handle_collab_approval(
                         approved: decision_ok,
                         reason: body.reason.clone(),
                         approver_id: agent_id.clone(),
+                        operation_hash: op_hash,
                     },
                 ).await;
             }
@@ -2872,14 +2880,27 @@ async fn build_agent(config: &Config, local_resources: SharedResourceSnapshot) -
         system_prompt_template: None, // P2-3: 使用内置默认模板
         approver_id: None,           // P2-D: 无审批人（保持现有行为）
     };
+    // A1 (OpenClaw 吸收): 记录启动并判定是否进入 safe_mode（崩溃循环保护）。
+    // 返回 (启动记录 id, 是否需抑制危险/未分类/外发工具自动执行)。
+    let (boot_id, boot_safe) = agent_core::boot_lifecycle::enter_phase_a();
     let cwd = std::env::current_dir().unwrap_or_default();
     let harness = HarnessStore::open(&cwd.join("harness.db").to_string_lossy())
         .map_err(|e| format!("创建 Harness 存储失败: {}", e))?;
     let checkpoint = CheckpointStore::open(&cwd.join("checkpoints.db").to_string_lossy())
         .map_err(|e| format!("创建 Checkpoint 存储失败: {}", e))?;
     let agent = AgentCore::new(agent_config, harness, checkpoint, local_resources);
+    // A1: safe_mode 激活时，抑制危险/未分类/外发工具的自动执行（需人工介入解除）。
+    {
+        let b = agent.boundary.lock().await;
+        b.set_safe_mode(boot_safe);
+    }
+    // A3 (OpenClaw 吸收): 挂载本地耐久审计库（与 harness/checkpoint 同目录）。
+    let audit_db = cwd.join("audit_events.db").to_string_lossy().to_string();
+    agent.audit_logger.attach_db(&audit_db);
     // P2-C: 同步 Memoria 注册的 namespace 到本地 NamespaceRegistry
     agent.sync_namespace_from_identity();
+    // A1: 本次启动健康完成，标记后不再计入「不干净启动」。
+    agent_core::boot_lifecycle::mark_healthy(boot_id);
     Ok(agent)
 }
 

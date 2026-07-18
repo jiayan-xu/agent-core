@@ -4,6 +4,7 @@
 //! 通过 A2A 向审批人发送审批请求，等待审批结果后再执行。
 
 use std::collections::HashMap;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 /// 审批状态
@@ -28,6 +29,10 @@ pub struct PendingApproval {
     pub requester_id: String,
     pub status: ApprovalStatus,
     pub created_at: f64,
+    /// Phase A (OpenClaw crestidan 吸收): 操作的规范化指纹。
+    /// 由 host 在创建请求时计算，审批响应必须回显同一指纹，
+    /// 否则视为「操作被偷换」而拒绝（防模型自我批准 / 审批-执行错位）。
+    pub operation_hash: String,
 }
 
 /// 审批请求（通过 A2A 发送）
@@ -50,6 +55,8 @@ pub struct ApprovalResponse {
     pub approved: bool,
     pub reason: Option<String>,
     pub approver_id: String,
+    /// Phase A: 审批人必须回显创建时的操作指纹；与 PendingApproval.operation_hash 不一致即拒绝。
+    pub operation_hash: String,
 }
 
 /// 审批管理器
@@ -85,6 +92,8 @@ impl ApprovalManager {
             tool_name
         );
         let now = now_secs();
+        // Phase A: host 计算操作指纹（防后续审批-执行错位 / 模型自我批准）
+        let operation_hash = compute_operation_hash(tool_name, arguments);
 
         let mut outgoing = self.outgoing.lock().await;
         outgoing.insert(
@@ -98,6 +107,7 @@ impl ApprovalManager {
                 requester_id: requester_id.to_string(),
                 status: ApprovalStatus::Pending,
                 created_at: now,
+                operation_hash,
             },
         );
 
@@ -163,6 +173,7 @@ impl ApprovalManager {
             "arguments": approval.arguments,
             "requester_id": approval.requester_id,
             "requester_ns": requester_ns,
+            "operation_hash": approval.operation_hash,
         })
     }
 
@@ -196,8 +207,21 @@ impl ApprovalManager {
                 .and_then(|r| r.as_str())
                 .map(|s| s.to_string()),
             approver_id: msg["approver_id"].as_str()?.to_string(),
+            operation_hash: msg["operation_hash"].as_str()?.to_string(),
         })
     }
+}
+
+/// Phase A (OpenClaw crestidan 吸收): 计算操作的规范化指纹。
+///
+/// 取 `{tool, args}` 的规范化 JSON 串的 sha256。审批创建时由 host 计算并随请求下发的指纹，
+/// 审批响应必须回显同一指纹；不一致即视为「操作被偷换」（防模型自我批准 / 审批-执行错位）。
+fn compute_operation_hash(tool_name: &str, arguments: &serde_json::Value) -> String {
+    let canonical = serde_json::json!({ "tool": tool_name, "args": arguments });
+    let s = serde_json::to_string(&canonical).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 impl Default for ApprovalManager {
@@ -279,6 +303,7 @@ mod tests {
             approved: true,
             reason: None,
             approver_id: "approver-01".to_string(),
+            operation_hash: "op_hash_test".to_string(),
         };
         am.record_response(resp).await;
 
@@ -304,6 +329,7 @@ mod tests {
             approved: false,
             reason: Some("非维护时间，拒绝关停".to_string()),
             approver_id: "admin".to_string(),
+            operation_hash: "op_hash_test".to_string(),
         };
         am.record_response(resp).await;
 
@@ -334,6 +360,7 @@ mod tests {
             "approved": true,
             "reason": "可以执行",
             "approver_id": "admin-01",
+            "operation_hash": "apr_123",
         });
         let resp = ApprovalManager::parse_approval_response(&msg).unwrap();
         assert_eq!(resp.approval_id, "apr_123");
@@ -353,6 +380,7 @@ mod tests {
             requester_id: "agent-001".to_string(),
             status: ApprovalStatus::Pending,
             created_at: 1000.0,
+            operation_hash: "op_hash_456".to_string(),
         };
         let json = am.build_a2a_request(&approval, "agent/agent-001/dept/运营部");
         assert_eq!(json["type"], "approval_request");
@@ -401,6 +429,7 @@ mod tests {
             approved: true,
             reason: None,
             approver_id: "approver-01".to_string(),
+            operation_hash: "op_hash_test".to_string(),
         };
         am.record_response(resp).await;
         am.remove(&aid).await;

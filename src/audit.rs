@@ -15,6 +15,9 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
+
 use crate::mcp_client::McpClient;
 use serde::Serialize;
 
@@ -59,6 +62,23 @@ impl AuditEventType {
             AuditEventType::IdentityChange => "identity_change",
         }
     }
+
+    /// 由 `as_str` 的持久化字符串还原枚举（耐久库读回用）。
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "auth_fail" => Some(AuditEventType::AuthFail),
+            "boundary_deny" => Some(AuditEventType::BoundaryDeny),
+            "approval_created" => Some(AuditEventType::ApprovalCreated),
+            "approval_approved" => Some(AuditEventType::ApprovalApproved),
+            "approval_rejected" => Some(AuditEventType::ApprovalRejected),
+            "mcp_retry" => Some(AuditEventType::McpRetry),
+            "checkpoint_resume" => Some(AuditEventType::CheckpointResume),
+            "harness_hit" => Some(AuditEventType::HarnessHit),
+            "tool_invocation" => Some(AuditEventType::ToolInvocation),
+            "identity_change" => Some(AuditEventType::IdentityChange),
+            _ => None,
+        }
+    }
 }
 
 /// 单条审计事件
@@ -98,6 +118,9 @@ pub struct AuditLogger {
     mcp: McpClient,
     /// 本地有界环形缓冲（只读查询 API 用）
     events: Mutex<VecDeque<AuditEvent>>,
+    /// A3 (OpenClaw 吸收): 本地耐久审计元数据表（SQLite）。
+    /// None 表示未挂载（如单测 / build_agent 之前）；挂载后即使 Memoria 不可用也有耐久副本。
+    db: Mutex<Option<Connection>>,
 }
 
 const RING_CAPACITY: usize = 2000;
@@ -108,10 +131,42 @@ impl AuditLogger {
         AuditLogger {
             mcp,
             events: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
+            db: Mutex::new(None),
         }
     }
 
-    /// 记录一条事件（脱敏 → 入环 → 异步写 Memoria）
+    /// A3: 挂载（或创建）本地耐久审计库 `audit_events.db`。
+    /// 失败仅告警，不影响内存环形缓冲与 Memoria 双写（best-effort 耐久层）。
+    pub fn attach_db(&self, path: &str) {
+        match Connection::open(path) {
+            Ok(c) => {
+                let _ = c.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS audit_events (
+                        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts           TEXT NOT NULL,
+                        trace_id     TEXT NOT NULL,
+                        agent_id     TEXT NOT NULL,
+                        session_id   TEXT,
+                        event_type   TEXT NOT NULL,
+                        tool_call_id TEXT,
+                        detail       TEXT,
+                        meta         TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_audit_trace ON audit_events(trace_id);
+                    CREATE INDEX IF NOT EXISTS idx_audit_toolcall ON audit_events(tool_call_id);",
+                );
+                if let Ok(mut g) = self.db.lock() {
+                    *g = Some(c);
+                }
+                tracing::info!("[audit] attached durable store: {}", path);
+            }
+            Err(e) => {
+                tracing::error!("[audit] attach_db failed ({}): {}", path, e);
+            }
+        }
+    }
+
+    /// 记录一条事件（脱敏 → 入环 → 耐久库 → 异步写 Memoria）
     pub async fn record_event(&self, mut ev: AuditEvent) {
         ev.detail = redact(&ev.detail);
         // 1) 本地环形缓冲（有界）
@@ -120,6 +175,31 @@ impl AuditLogger {
                 buf.pop_front();
             }
             buf.push_back(ev.clone());
+        }
+        // 1.5) A3: 本地耐久库（SQLite，best-effort；失败忽略，不阻塞主流程）
+        let tool_call_id = tool_call_hash(&ev);
+        if let Ok(g) = self.db.lock() {
+            if let Some(c) = g.as_ref() {
+                let meta = serde_json::json!({
+                    "agent_id": ev.agent_id,
+                    "event_type": ev.event_type.as_str(),
+                });
+                let _ = c.execute(
+                    "INSERT INTO audit_events \
+                     (ts, trace_id, agent_id, session_id, event_type, tool_call_id, detail, meta) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        ev.ts,
+                        ev.trace_id,
+                        ev.agent_id,
+                        ev.session_id,
+                        ev.event_type.as_str(),
+                        tool_call_id,
+                        ev.detail,
+                        meta.to_string(),
+                    ],
+                );
+            }
         }
         // 2) 异步写 Memoria（耐久；失败忽略）
         let payload = serde_json::json!({
@@ -166,6 +246,42 @@ impl AuditLogger {
         // 最新在前
         out.reverse();
         out.into_iter().take(limit).collect()
+    }
+
+    /// A3: 从本地耐久库读取最近 limit 条（Memoria 不可用时的兜底审计源）。
+    /// 未挂载 db 时返回空。
+    pub fn recent_from_db(&self, limit: usize) -> Vec<AuditEvent> {
+        let guard = match self.db.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let c = match guard.as_ref() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        let mut stmt = match c.prepare(
+            "SELECT ts, trace_id, agent_id, session_id, event_type, detail \
+             FROM audit_events ORDER BY id DESC LIMIT ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            let et_s: String = r.get(4)?;
+            Ok(AuditEvent {
+                ts: r.get(0)?,
+                trace_id: r.get(1)?,
+                agent_id: r.get(2)?,
+                session_id: r.get(3)?,
+                event_type: AuditEventType::from_str(&et_s)
+                    .unwrap_or(AuditEventType::ToolInvocation),
+                detail: r.get(5)?,
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(|x| x.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     // ── 类型化便捷构造器（detail 自动脱敏） ──
@@ -346,6 +462,27 @@ impl AuditLogger {
     }
 }
 
+/// A3: 为「工具相关」事件生成内容哈希 tool_call_id（sha256）。
+/// 用途：去重 / 关联重试调用；非工具事件（如 auth_fail / identity_change）返回 None。
+fn tool_call_hash(ev: &AuditEvent) -> Option<String> {
+    use AuditEventType::*;
+    match ev.event_type {
+        ToolInvocation | BoundaryDeny | ApprovalCreated | ApprovalApproved | ApprovalRejected => {
+            let mut h = Sha256::new();
+            let canon = format!(
+                "{}|{}|{}|{}",
+                ev.agent_id,
+                ev.event_type.as_str(),
+                ev.detail,
+                ev.trace_id
+            );
+            h.update(canon.as_bytes());
+            Some(format!("{:x}", h.finalize()))
+        }
+        _ => None,
+    }
+}
+
 /// 本地时间戳（YYYY-MM-DD HH:MM:SS）
 fn now_ts() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
@@ -455,6 +592,7 @@ mod tests {
         let logger = AuditLogger {
             mcp: McpClient::new("http://127.0.0.1:9", "test", "x"),
             events: Mutex::new(VecDeque::new()),
+            db: Mutex::new(None),
         };
         // 直接验证 recent_events 过滤逻辑（不触发 record_event 的网络写入）
         let tid = "trace-001";
