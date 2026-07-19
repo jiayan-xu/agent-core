@@ -74,6 +74,8 @@ struct Config {
     memoria_admin_key: String,
     #[serde(default)]
     mcp_source: Vec<McpSourceConfig>,
+    #[serde(default)]
+    personas: Vec<PersonaConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +95,27 @@ struct McpSourceConfig {
     /// 例：`dept/工程部/proj/P1` 仅对该命名空间及其祖先/后代可见；留空=全局可见。
     #[serde(default)]
     namespace: Option<String>,
+}
+
+/// Phase 5：配置化分身定义（agent.toml [[personas]] 表）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersonaConfig {
+    /// 分身 id（必填，不得为 "default"）
+    id: String,
+    #[serde(default)]
+    display_name: String,
+    /// 拥有者 user_id；缺省用 Config.agent_id
+    #[serde(default)]
+    owner_user_id: String,
+    /// 工具白名单；缺省空 = 不限制
+    #[serde(default)]
+    tool_allowlist: Vec<String>,
+    /// 该分身专属 memory 命名空间；缺省空
+    #[serde(default)]
+    memory_namespace: String,
+    /// 启动即压入的目标栈（goals）
+    #[serde(default)]
+    goals: Vec<String>,
 }
 
 fn default_server() -> String {
@@ -826,6 +849,7 @@ fn load_or_create_config() -> Config {
         cors_origins: Vec::new(),
         memoria_admin_key: String::new(),
         mcp_source: Vec::new(),
+        personas: Vec::new(),
     };
     let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());
     cfg
@@ -956,22 +980,23 @@ fn main() {
                                 reg_config.agent_id, reg_config.server
                             );
                             *reg_state.agent.lock().await = Some(agent);
-                            // Phase 3：注册示例并联分身「analyst」，与 default 并联验证多分身并发 tick
+                            // Phase 5：从 agent.toml [[personas]] 配置表加载并联分身（default 已在 AgentCore::new 注册）
                             {
                                 let g = reg_state.agent.lock().await;
                                 if let Some(ref a) = *g {
-                                    let _ = a.create_persona(
-                                        "analyst",
-                                        "分析分身",
-                                        &reg_config.agent_id,
-                                        Vec::new(),
-                                        "agent/analyst".to_string(),
-                                    );
-                                    // Phase 4：给 analyst 压一个示例目标，验证 goal_stack 真实接线
-                                    let _ = a.push_persona_goal(
-                                        "analyst",
-                                        "持续监控 agent-core 演进，主动提出可落地的优化建议",
-                                    );
+                                    for pc in &reg_config.personas {
+                                        let owner = if pc.owner_user_id.is_empty() { &reg_config.agent_id } else { &pc.owner_user_id };
+                                        let _ = a.create_persona(
+                                            &pc.id,
+                                            &pc.display_name,
+                                            owner,
+                                            pc.tool_allowlist.clone(),
+                                            pc.memory_namespace.clone(),
+                                        );
+                                        for goal in &pc.goals {
+                                            let _ = a.push_persona_goal(&pc.id, goal);
+                                        }
+                                    }
                                 }
                             }
                             // A2: 启动白龙马 TICK 心跳（空闲 20min / 抢占 / 600s watchdog）
