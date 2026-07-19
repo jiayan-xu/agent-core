@@ -341,18 +341,69 @@ impl AgentCore {
         }
     }
 
-    /// Phase 2：遍历已注册分身，对每个非 Sleeping 分身跑一次真实 tick
-    pub async fn persona_tick_all(&self) -> Vec<String> {
-        if self.tick_scheduler.count() == 0 {
+    /// Phase 3：并发遍历已注册分身，对每个非 Sleeping 分身并发跑一次真实 tick（返回 (persona_id, 文本)）
+    pub async fn persona_tick_all(&self) -> Vec<(String, String)> {
+        // 确保 default 分身始终在场（显式注册的其他分身不影响 default）
+        if !self.tick_scheduler.contains("default") {
             let p = self.get_persona("default");
             self.tick_scheduler.register(crate::runtime::self_runtime::SelfRuntime::new(p));
         }
         let rts = self.tick_scheduler.non_sleeping_runtimes();
-        let mut out = Vec::new();
-        for rt in rts {
-            out.push(self.run_persona_tick(&rt).await);
+        let futures = rts.iter().map(|rt| {
+            let id = rt.persona.persona_id.clone();
+            async move {
+                let line = self.run_persona_tick(rt).await;
+                (id, line)
+            }
+        });
+        futures::future::join_all(futures).await
+    }
+
+    /// Phase 3：运行时创建一个新分身，并注册进 tick 调度器
+    pub fn create_persona(
+        &self,
+        persona_id: &str,
+        display_name: &str,
+        owner_user_id: &str,
+        tool_allowlist: Vec<String>,
+        memory_namespace: String,
+    ) -> Result<(), String> {
+        if persona_id == "default" {
+            return Err("default 分身不可重建".to_string());
         }
-        out
+        let persona = crate::runtime::self_runtime::Persona {
+            persona_id: persona_id.to_string(),
+            display_name: display_name.to_string(),
+            owner_user_id: owner_user_id.to_string(),
+            workspace_dir: None,
+            tool_allowlist,
+            memory_namespace: memory_namespace.clone(),
+            badge_token: self.config.identity.badge_token.clone(),
+            ns_full_path: self.config.identity.ns_full_path.clone(),
+        };
+        let mut m = self.personas.lock().unwrap_or_else(|p| p.into_inner());
+        m.insert(persona_id.to_string(), persona.clone());
+        drop(m);
+        self.tick_scheduler.register(crate::runtime::self_runtime::SelfRuntime::new(persona));
+        Ok(())
+    }
+
+    /// Phase 3：列出所有已注册分身
+    pub fn list_personas(&self) -> Vec<crate::runtime::self_runtime::Persona> {
+        let m = self.personas.lock().unwrap_or_else(|p| p.into_inner());
+        m.values().cloned().collect()
+    }
+
+    /// Phase 3：删除一个分身（default 不可删）
+    pub fn remove_persona(&self, persona_id: &str) -> Result<(), String> {
+        if persona_id == "default" {
+            return Err("default 分身不可删除".to_string());
+        }
+        let mut m = self.personas.lock().unwrap_or_else(|p| p.into_inner());
+        m.remove(persona_id);
+        drop(m);
+        self.tick_scheduler.unregister(persona_id);
+        Ok(())
     }
 
     /// 从 session_id 解析调用者专属命名空间。

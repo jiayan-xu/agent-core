@@ -38,6 +38,12 @@ impl TickScheduler {
         map.len()
     }
 
+    /// 是否已注册某分身
+    pub fn contains(&self, id: &str) -> bool {
+        let map = self.runtimes.lock().unwrap_or_else(|p| p.into_inner());
+        map.contains_key(id)
+    }
+
     /// 返回所有非 Sleeping 的分身运行时（克隆，供 AgentCore 驱动真实 tick）
     pub fn non_sleeping_runtimes(&self) -> Vec<SelfRuntime> {
         let map = self.runtimes.lock().unwrap_or_else(|p| p.into_inner());

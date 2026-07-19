@@ -494,8 +494,8 @@ impl Consciousness {
         }
 
         // Phase 2: 分身真实 tick（复用空闲 tick 循环，每个已注册分身跑一次真实 LLM tick）
-        for line in agent.persona_tick_all().await {
-            tracing::info!(target: "consciousness", "persona tick: {}", line);
+        for (pid, line) in agent.persona_tick_all().await {
+            tracing::info!(target: "consciousness", "persona tick [{}]: {}", pid, line);
         }
     }
 
@@ -956,6 +956,19 @@ fn main() {
                                 reg_config.agent_id, reg_config.server
                             );
                             *reg_state.agent.lock().await = Some(agent);
+                            // Phase 3：注册示例并联分身「analyst」，与 default 并联验证多分身并发 tick
+                            {
+                                let g = reg_state.agent.lock().await;
+                                if let Some(ref a) = *g {
+                                    let _ = a.create_persona(
+                                        "analyst",
+                                        "分析分身",
+                                        &reg_config.agent_id,
+                                        Vec::new(),
+                                        "agent/analyst".to_string(),
+                                    );
+                                }
+                            }
                             // A2: 启动白龙马 TICK 心跳（空闲 20min / 抢占 / 600s watchdog）
                             let cons = Consciousness::new(reg_state.clone());
                             tokio::spawn(cons.clone().run());
@@ -1131,6 +1144,9 @@ fn main() {
                 .route("/api/collab/approval", post(handle_collab_approval))
                 .route("/api/collab/peers", get(handle_collab_peers))
                 .route("/v1/chat/completions", post(handle_v1_chat))
+                .route("/api/persona", post(handle_persona_create).get(handle_persona_list))
+                .route("/api/persona/{id}", delete(handle_persona_delete))
+                .route("/api/session/persona", post(handle_session_persona_bind))
                 .layer(from_fn_with_state(state.clone(), auth_middleware));
 
             let cors = build_cors_layer(&host, port, &config.cors_origins);
@@ -1302,6 +1318,101 @@ async fn handle_admin_consolidate(
     *st.consolidate_last_ymd.lock().await = ymd;
     *st.consolidate_last.lock().await = summary.clone();
     Json(summary).into_response()
+}
+
+/// Phase 3：运行时创建分身
+async fn handle_persona_create(
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> axum::response::Response {
+    let v = match body {
+        Some(Json(v)) => v,
+        None => return (axum::http::StatusCode::BAD_REQUEST, "missing body").into_response(),
+    };
+    let persona_id = match v.get("persona_id").and_then(|x| x.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return (axum::http::StatusCode::BAD_REQUEST, "persona_id required").into_response(),
+    };
+    let display_name = v.get("display_name").and_then(|x| x.as_str()).unwrap_or(&persona_id).to_string();
+    let owner_user_id = v.get("owner_user_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let tool_allowlist: Vec<String> = v
+        .get("tool_allowlist")
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let memory_namespace = v.get("memory_namespace").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let g = st.agent.lock().await;
+    let Some(ref agent) = *g else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+    };
+    match agent.create_persona(&persona_id, &display_name, &owner_user_id, tool_allowlist, memory_namespace) {
+        Ok(()) => Json(serde_json::json!({"ok": true, "persona_id": persona_id})).into_response(),
+        Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+/// Phase 3：列出所有分身
+async fn handle_persona_list(
+    State(st): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let g = st.agent.lock().await;
+    let Some(ref agent) = *g else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+    };
+    let list: Vec<serde_json::Value> = agent
+        .list_personas()
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "persona_id": p.persona_id,
+                "display_name": p.display_name,
+                "owner_user_id": p.owner_user_id,
+                "tool_allowlist": p.tool_allowlist,
+                "memory_namespace": p.memory_namespace,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({"personas": list})).into_response()
+}
+
+/// Phase 3：删除分身
+async fn handle_persona_delete(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(st): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let g = st.agent.lock().await;
+    let Some(ref agent) = *g else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+    };
+    match agent.remove_persona(&id) {
+        Ok(()) => Json(serde_json::json!({"ok": true, "removed": id})).into_response(),
+        Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+/// Phase 3：把会话绑定到某分身
+async fn handle_session_persona_bind(
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> axum::response::Response {
+    let v = match body {
+        Some(Json(v)) => v,
+        None => return (axum::http::StatusCode::BAD_REQUEST, "missing body").into_response(),
+    };
+    let session_id = match v.get("session_id").and_then(|x| x.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return (axum::http::StatusCode::BAD_REQUEST, "session_id required").into_response(),
+    };
+    let persona_id = match v.get("persona_id").and_then(|x| x.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return (axum::http::StatusCode::BAD_REQUEST, "persona_id required").into_response(),
+    };
+    let g = st.agent.lock().await;
+    let Some(ref agent) = *g else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+    };
+    agent.bind_session_persona(&session_id, &persona_id);
+    Json(serde_json::json!({"ok": true, "session_id": session_id, "persona_id": persona_id})).into_response()
 }
 
 /// 白龙马 Phase B 多端唤醒：返回后台活动事件（since 之后的增量），供 PFAiX 轮询"唤醒"
