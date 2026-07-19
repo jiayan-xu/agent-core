@@ -248,3 +248,46 @@ PFAiX 聊天弹窗 + 回复空白的根因之一是 agent-core 对 `stream:true`
 - `cargo build --release` 通过（57.78s）
 - 运行时冒烟：`:9753` 监听、Agent 就绪；`persona tick: 下一步将等待用户提出具体问题或任务…`（真实 LLM 调用经 persona_tick_all 驱动）无 panic
 - Nova 编译期修复：qclaw 误用 `Persona.goal_stack`（实为 `SelfRuntime` 字段）→ `run_persona_tick` 改收 `&SelfRuntime`
+
+## 2026-07-19 (Phase 3) — 分身 CRUD API + 会话绑定 + 并发并联 tick
+
+### 背景
+Phase 1/2 后多分身只有 "default" 一个真分身。Phase 3 让多分身从「只有 default」进化为「可运行时创建多个真分身 + 会话绑定 API + 并发并联 tick」，验证 default 与 analyst 两套分身真并联。
+
+### 变更（authored-by: QClaw 自身 LLM @ :13810/gateway openclaw/main；reviewed-by: Nova）
+- `src/agent.rs`：
+  - 新增 `create_persona` / `list_personas` / `remove_persona`（操作 `personas` + `tick_scheduler`，`default` 受保护不可重建/删除）
+  - `persona_tick_all` 改 `futures::future::join_all` 并发，返回 `(persona_id, text)` 以便日志区分并联分身
+- `src/main.rs`：
+  - 新增 4 个 handler：`POST /api/persona`（创建）、`GET /api/persona`（列出）、`DELETE /api/persona/{id}`（删除）、`POST /api/session/persona`（会话绑定分身），注册进 `protected` router
+  - agent 就绪后注册示例并联分身「analyst」（memory_namespace=`agent/analyst`），与 `default` 并联验证
+  - `Consciousness::tick_once` 日志带 `persona_id`：`persona tick [<id>]: ...`
+- `src/scheduler/tick_scheduler.rs` — 新增 `contains(id)` 方法
+
+### 验证
+- `cargo build --release` 通过（45.96s）
+- 运行时冒烟：`persona tick [default]: …` 与 `persona tick [analyst]: …` 两条并发输出（证明两套分身并联真实 LLM tick），`:9753` 监听、无 panic
+- Nova 修复：① qclaw 误用 `st`（作用域内实为 `state`）且插入时机过早（agent 未就绪）→ 改插到 `Ok(agent)` 分支入队之后用 `reg_state`；② `persona_tick_all` 原仅在 `count()==0` 注册 default，引入 analyst 后 default 反而漏跑 → 改 `contains("default")` 确保 default 始终在场
+- 本地 commit `9dc9b73`（3 文件 +177 行，未推送公开仓库）
+
+## 2026-07-19 (Phase 4) — 目标驱动分身 + 单分身查询 API
+
+### 背景
+Phase 3 后分身可创建与绑定，但分身目标栈（goal_stack）未对外暴露、无驱动入口。Phase 4 让分身「能驱动目标」——压入 goal 真实影响 Consciousness tick 的 LLM 规划，并支持查询单分身详情（含目标栈）。
+
+### 变更（authored-by: QClaw 自身 LLM @ :13810/gateway openclaw/main；reviewed-by: Nova）
+- `src/scheduler/tick_scheduler.rs` — 新增 `push_goal(id, goal)` / `goals_of(id)`
+- `src/agent.rs` — 新增 `push_persona_goal(persona_id, goal)` / `get_persona_goals(persona_id)`（`default` 不可改 goal）
+- `src/main.rs` — 新增 `POST /api/persona/{id}/goal`（压目标）、`GET /api/persona/{id}`（查详情含 goals），注册进 `protected` router；启动即给 analyst 压示例目标
+
+### 验证
+- `cargo build --release` 通过（44.61s）
+- 运行时冒烟：`persona tick [analyst]` 输出反映压入目标（持续追踪 agent-core 变更、提出优化方案），`persona tick [default]` 仍走空目标分支 —— `goal_stack` 真实生效、多分身目标驱动并联无 panic
+- 本地 commit `0a28fc0`（3 文件 +79 行，未推送公开仓库）
+
+---
+
+## 圆桌多分身吸收总览（Phase 1–4）
+- 全部代码改动 **authored-by: QClaw 自身 LLM**（13810 网关 `openclaw/main`，自身 GLM 池，不经 agent-core 代理）；Nova 负责精确源码上下文提供、幂等落盘、编译验证与逻辑/编译修复。
+- 公开仓库铁律：4 个 commit 均在本地 `master`，**未推送**（推送前需再扫密钥/绝对路径并获你确认）。
+- 未跟踪文件 `src/mcp_server.rs`、`docs/qclaw_a2a_bridge.md` 仍刻意不提交（不参与编译）。
