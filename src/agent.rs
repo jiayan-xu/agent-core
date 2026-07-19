@@ -145,6 +145,10 @@ pub struct AgentCore {
     pub local_resources: crate::resources::SharedResourceSnapshot,
     /// 多分身容器（Phase 1）：persona_id → Persona；默认含 "default" 分身
     pub personas: std::sync::Mutex<std::collections::HashMap<String, crate::runtime::self_runtime::Persona>>,
+    /// Phase 2：会话 → 分身 绑定（分身级工具白名单接线）
+    pub session_personas: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Phase 2：分身 tick 调度器注册表（真实 tick 由 AgentCore 驱动，避免循环依赖）
+    pub tick_scheduler: crate::scheduler::tick_scheduler::TickScheduler,
 }
 
 /// P2-1: 会话级配额守卫（RAII）。离开作用域自动 leave_session，避免并发计数泄漏。
@@ -267,6 +271,8 @@ impl AgentCore {
                 m.insert("default".to_string(), default_persona);
                 m
             }),
+            session_personas: std::sync::Mutex::new(std::collections::HashMap::new()),
+            tick_scheduler: crate::scheduler::tick_scheduler::TickScheduler::default(),
         }
     }
 
@@ -302,6 +308,51 @@ impl AgentCore {
                 persona_id, tool_name
             ))
         }
+    }
+
+    /// Phase 2：绑定会话到分身（缺省回退 "default"）
+    pub fn bind_session_persona(&self, session_id: &str, persona_id: &str) {
+        let mut m = self.session_personas.lock().unwrap_or_else(|p| p.into_inner());
+        m.insert(session_id.to_string(), persona_id.to_string());
+    }
+
+    /// Phase 2：解析会话所属分身（缺省 "default"）
+    pub fn persona_for_session(&self, session_id: &str) -> String {
+        let m = self.session_personas.lock().unwrap_or_else(|p| p.into_inner());
+        m.get(session_id).cloned().unwrap_or_else(|| "default".to_string())
+    }
+
+    /// Phase 2：分身真实 tick —— 用该分身目标驱动一次真实 LLM 调用（仅规划，不执行工具）
+    pub async fn run_persona_tick(&self, rt: &crate::runtime::self_runtime::SelfRuntime) -> String {
+        let goal = rt.goal_stack.last().cloned().unwrap_or_else(|| "（无目标）".to_string());
+        let prompt = format!(
+            "[分身 {}] 本轮 tick 目标：{}\n请以一句话简述你下一步会做什么（仅规划，不执行工具）。",
+            rt.persona.persona_id, goal
+        );
+        let msg = crate::llm::Message {
+            role: "user".to_string(),
+            content: Some(prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        match self.llm.chat(&[msg], &[]).await {
+            Ok(r) => r.text,
+            Err(e) => format!("[{}] tick LLM 调用失败: {}", rt.persona.persona_id, e),
+        }
+    }
+
+    /// Phase 2：遍历已注册分身，对每个非 Sleeping 分身跑一次真实 tick
+    pub async fn persona_tick_all(&self) -> Vec<String> {
+        if self.tick_scheduler.count() == 0 {
+            let p = self.get_persona("default");
+            self.tick_scheduler.register(crate::runtime::self_runtime::SelfRuntime::new(p));
+        }
+        let rts = self.tick_scheduler.non_sleeping_runtimes();
+        let mut out = Vec::new();
+        for rt in rts {
+            out.push(self.run_persona_tick(&rt).await);
+        }
+        out
     }
 
     /// 从 session_id 解析调用者专属命名空间。
@@ -449,7 +500,7 @@ impl AgentCore {
         if is_confirm(trimmed) {
             if let Some(action) = self.session_manager.take_pending_action(session_id).await {
                 let result = match self
-                    .call_tool_routed(&action.tool_name, &action.arguments, allowed_ns, &trace_id)
+                    .call_tool_routed(&action.tool_name, &self.persona_for_session(session_id), &action.arguments, allowed_ns, &trace_id)
                     .await
                 {
                     Ok(text) => text,
@@ -920,7 +971,7 @@ impl AgentCore {
                         }
                     }
 
-                    match this.call_tool_routed(&tool, &args, allowed_ns, "").await {
+                    match this.call_tool_routed(&tool, "default", &args, allowed_ns, "").await {
                         Ok(result) => {
                             this.audit_logger.log_tool_call(
                                 &this.config.identity.agent_id, &tool, &args, true
@@ -1842,7 +1893,7 @@ impl AgentCore {
 
                 // 通过 MCP 调用工具（按名称路由到正确的源）
                 let result = match self
-                    .call_tool_routed(&tc.name, &tc.arguments, allowed_ns, trace_id)
+                    .call_tool_routed(&tc.name, &self.persona_for_session(session_id), &tc.arguments, allowed_ns, trace_id)
                     .await
                 {
                     Ok(text) => text,
@@ -2435,7 +2486,7 @@ impl AgentCore {
             {
                 // 审批通过，执行工具
                 let result = match self
-                    .call_tool_routed(&approval.tool_name, &approval.arguments, allowed_ns, "")
+                    .call_tool_routed(&approval.tool_name, "default", &approval.arguments, allowed_ns, "")
                     .await
                 {
                     Ok(text) => text,
@@ -2572,12 +2623,13 @@ impl AgentCore {
     pub async fn call_tool_routed(
         &self,
         tool_name: &str,
+        persona_id: &str,
         args: &serde_json::Value,
         allowed_ns: &[String],
         trace_id: &str,
     ) -> Result<String, String> {
-        // ── Phase 1：分身级工具白名单（默认分身 allowlist 为空 → 不限制） ──
-        if let Err(e) = self.check_persona_tool("default", tool_name) {
+        // ── Phase 1+2：分身级工具白名单（真实 persona_id 来自会话；缺省 "default"） ──
+        if let Err(e) = self.check_persona_tool(persona_id, tool_name) {
             return Err(e);
         }
         // ── P1-5 降级收缩门控（全局 → 源级 → 模式级） ──
@@ -3150,7 +3202,7 @@ impl AgentCore {
                     break;
                 }
                 let result = self
-                    .call_tool_routed(tool_name, &args, allowed_ns, "")
+                    .call_tool_routed(tool_name, "default", &args, allowed_ns, "")
                     .await;
                 if result.is_err() {
                     all_ok = false;
@@ -3276,6 +3328,7 @@ impl AgentCore {
         let data = self
             .call_tool_routed(
                 "query_entrance",
+                "default",
                 &serde_json::json!({
                     "date_from": week_ago, "date_to": today, "limit": 500,
                 }),
@@ -3287,6 +3340,7 @@ impl AgentCore {
         let stats = self
             .call_tool_routed(
                 "query_monthly_stats",
+                "default",
                 &serde_json::json!({
                     "year": chrono::Local::now().year(), "month": chrono::Local::now().month(),
                 }),

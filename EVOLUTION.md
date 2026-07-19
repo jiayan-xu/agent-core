@@ -210,3 +210,41 @@ PFAiX 聊天弹窗 + 回复空白的根因之一是 agent-core 对 `stream:true`
 
 ### 同批已实现待推送（协作）
 - A2A collab M2–M4 写路径 + 公司广播白名单/scope 收紧 + E2E（见近期 collab 提交）
+
+## 2026-07-19 (Phase 1) — 多分身容器 / Persona 一等公民
+
+### 背景
+圆桌会议（Nova + QClaw + agent-core 真三方）整理出方案：把 Persona / SelfRuntime 提升为一等公民，使 AgentCore 从单例变为多分身容器，为后续「真多 agent 并行」打底。
+
+### 变更（authored-by: QClaw 自身 LLM @ :13810/gateway openclaw/main，不经 agent-core 代理；reviewed-by: Nova）
+- `src/lib.rs` — 声明 `runtime` / `scheduler` 模块
+- `src/agent.rs` — `AgentIdentity` +5 字段（persona_id / owner_user_id / workspace_dir / tool_allowlist / memory_namespace）；`AgentCore` +`personas` 多分身容器；`default_persona` 注入；新增 `get_persona` / `check_persona_tool` 方法；`call_tool_routed` 开头插入分身级工具白名单闸门（默认 "default"，allowlist 空不限制）
+- `src/main.rs` — `AgentIdentity` 唯一字面量构造点补全 5 字段
+- `src/session.rs` — 新增 `persona_session_key(persona_id, session_id)` 分身感知 session key
+- `src/runtime/self_runtime.rs`（新建）— `Persona` / `TickState` / `SelfRuntime`
+- `src/scheduler/tick_scheduler.rs`（新建）— `TickScheduler`
+
+### 验证
+- `cargo build --release` 通过（46.95s 全量）
+- 本地 commit `f396669`（8 文件 +202 行，未推送公开仓库）
+- 向后兼容：旧调用走 "default" 分身
+
+## 2026-07-19 (Phase 2) — 分身白名单接线 + SelfRuntime 真实 tick + Consciousness 调度入口
+
+### 背景
+在 Phase 1 骨架上，让分身白名单真正接线（`call_tool_routed` 用真实 persona_id）、SelfRuntime 跑真实 LLM tick、并在已运行的 Consciousness 空闲循环里接入分身调度。
+
+### 变更（authored-by: QClaw 自身 LLM @ :13810/gateway openclaw/main；reviewed-by: Nova）
+- `src/agent.rs`：
+  - `call_tool_routed` 签名新增 `persona_id: &str`，闸门用真实 persona（仅 `execute_chat` 内两处传 `persona_for_session(session_id)`，其余内部调用点传 `"default"`）
+  - `AgentCore` +`session_personas`（会话→分身绑定）+ `tick_scheduler`（注册表）
+  - 新增 `bind_session_persona` / `persona_for_session` / `run_persona_tick`（真实 LLM 调用）/ `persona_tick_all`
+  - 9 处 `call_tool_routed` 调用点插入 `persona_id`
+- `src/runtime/self_runtime.rs` — `SelfRuntime` 加 `#[derive(Clone)]`（供 tick_scheduler 克隆）
+- `src/scheduler/tick_scheduler.rs` — `tick_all` 改为 `non_sleeping_runtimes()`
+- `src/main.rs` — `Consciousness::tick_once` 空闲循环接入分身真实 tick
+
+### 验证
+- `cargo build --release` 通过（57.78s）
+- 运行时冒烟：`:9753` 监听、Agent 就绪；`persona tick: 下一步将等待用户提出具体问题或任务…`（真实 LLM 调用经 persona_tick_all 驱动）无 panic
+- Nova 编译期修复：qclaw 误用 `Persona.goal_stack`（实为 `SelfRuntime` 字段）→ `run_persona_tick` 改收 `&SelfRuntime`

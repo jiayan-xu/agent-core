@@ -24,6 +24,7 @@ pub enum TickState {
 }
 
 /// 分身运行时实例
+#[derive(Debug, Clone)]
 pub struct SelfRuntime {
     pub ns: String,
     pub persona: Persona,

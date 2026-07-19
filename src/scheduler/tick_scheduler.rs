@@ -38,12 +38,12 @@ impl TickScheduler {
         map.len()
     }
 
-    /// 遍历非 Sleeping 的 runtime 调 execute_tick，收集结果
-    pub fn tick_all(&self) -> Vec<String> {
+    /// 返回所有非 Sleeping 的分身运行时（克隆，供 AgentCore 驱动真实 tick）
+    pub fn non_sleeping_runtimes(&self) -> Vec<SelfRuntime> {
         let map = self.runtimes.lock().unwrap_or_else(|p| p.into_inner());
         map.values()
             .filter(|rt| rt.tick_state != crate::runtime::self_runtime::TickState::Sleeping)
-            .map(|rt| rt.execute_tick())
+            .cloned()
             .collect()
     }
 }

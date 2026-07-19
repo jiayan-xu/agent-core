@@ -492,6 +492,11 @@ impl Consciousness {
         if let Some(ev) = Self::guarded_prefetch(agent).await {
             Self::emit_event(state, ev).await;
         }
+
+        // Phase 2: 分身真实 tick（复用空闲 tick 循环，每个已注册分身跑一次真实 LLM tick）
+        for line in agent.persona_tick_all().await {
+            tracing::info!(target: "consciousness", "persona tick: {}", line);
+        }
     }
 
     /// A4: 空闲 tick 推进一个 namespace 的 consolidation（round-robin 游标）
@@ -573,7 +578,7 @@ impl Consciousness {
         let trace_id = format!("prefetch-{}", Local::now().timestamp());
         let call = tokio::time::timeout(
             Duration::from_secs(60),
-            agent.call_tool_routed(&tool_name, &serde_json::json!({}), &allowed_ns, &trace_id),
+            agent.call_tool_routed(&tool_name, "default", &serde_json::json!({}), &allowed_ns, &trace_id),
         )
         .await;
         let summary = match call {
@@ -979,7 +984,7 @@ fn main() {
                         let agent_ns = vec![agent.config.identity.ns()];
                         let tasks = [("system_ops", serde_json::json!({"action": "status"}))];
                         for (tool, args) in &tasks {
-                            match agent.call_tool_routed(tool, args, &agent_ns, "").await {
+                            match agent.call_tool_routed(tool, "default", args, &agent_ns, "").await {
                                 Ok(reply) => {
                                     fail_count = 0;
                                     tracing::info!(
