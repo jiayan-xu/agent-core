@@ -967,6 +967,11 @@ fn main() {
                                         Vec::new(),
                                         "agent/analyst".to_string(),
                                     );
+                                    // Phase 4：给 analyst 压一个示例目标，验证 goal_stack 真实接线
+                                    let _ = a.push_persona_goal(
+                                        "analyst",
+                                        "持续监控 agent-core 演进，主动提出可落地的优化建议",
+                                    );
                                 }
                             }
                             // A2: 启动白龙马 TICK 心跳（空闲 20min / 抢占 / 600s watchdog）
@@ -1145,7 +1150,8 @@ fn main() {
                 .route("/api/collab/peers", get(handle_collab_peers))
                 .route("/v1/chat/completions", post(handle_v1_chat))
                 .route("/api/persona", post(handle_persona_create).get(handle_persona_list))
-                .route("/api/persona/{id}", delete(handle_persona_delete))
+                .route("/api/persona/{id}", delete(handle_persona_delete).get(handle_persona_get))
+                .route("/api/persona/{id}/goal", post(handle_persona_goal_push))
                 .route("/api/session/persona", post(handle_session_persona_bind))
                 .layer(from_fn_with_state(state.clone(), auth_middleware));
 
@@ -1413,6 +1419,47 @@ async fn handle_session_persona_bind(
     };
     agent.bind_session_persona(&session_id, &persona_id);
     Json(serde_json::json!({"ok": true, "session_id": session_id, "persona_id": persona_id})).into_response()
+}
+
+/// Phase 4：给分身压入目标，驱动真实 tick
+async fn handle_persona_goal_push(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> axum::response::Response {
+    let goal = match body.and_then(|Json(v)| v.get("goal").and_then(|x| x.as_str().map(|s| s.to_string()))) {
+        Some(s) if !s.is_empty() => s,
+        _ => return (axum::http::StatusCode::BAD_REQUEST, "goal required").into_response(),
+    };
+    let g = st.agent.lock().await;
+    let Some(ref agent) = *g else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+    };
+    match agent.push_persona_goal(&id, &goal) {
+        Ok(()) => Json(serde_json::json!({"ok": true, "persona_id": id, "goal": goal})).into_response(),
+        Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+/// Phase 4：查询单分身详情（含目标栈）
+async fn handle_persona_get(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(st): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let g = st.agent.lock().await;
+    let Some(ref agent) = *g else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+    };
+    let p = agent.get_persona(&id);
+    let goals = agent.get_persona_goals(&id);
+    Json(serde_json::json!({
+        "persona_id": p.persona_id,
+        "display_name": p.display_name,
+        "owner_user_id": p.owner_user_id,
+        "tool_allowlist": p.tool_allowlist,
+        "memory_namespace": p.memory_namespace,
+        "goals": goals,
+    })).into_response()
 }
 
 /// 白龙马 Phase B 多端唤醒：返回后台活动事件（since 之后的增量），供 PFAiX 轮询"唤醒"

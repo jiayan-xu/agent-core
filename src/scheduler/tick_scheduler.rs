@@ -44,6 +44,20 @@ impl TickScheduler {
         map.contains_key(id)
     }
 
+    /// 给某分身压入目标（驱动真实 tick；字段 pub 可直接改）
+    pub fn push_goal(&self, id: &str, goal: &str) {
+        let mut map = self.runtimes.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(rt) = map.get_mut(id) {
+            rt.goal_stack.push(goal.to_string());
+        }
+    }
+
+    /// 取某分身的目标栈
+    pub fn goals_of(&self, id: &str) -> Vec<String> {
+        let map = self.runtimes.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(id).map(|rt| rt.goal_stack.clone()).unwrap_or_default()
+    }
+
     /// 返回所有非 Sleeping 的分身运行时（克隆，供 AgentCore 驱动真实 tick）
     pub fn non_sleeping_runtimes(&self) -> Vec<SelfRuntime> {
         let map = self.runtimes.lock().unwrap_or_else(|p| p.into_inner());

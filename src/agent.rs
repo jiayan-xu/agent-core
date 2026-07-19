@@ -406,6 +406,23 @@ impl AgentCore {
         Ok(())
     }
 
+    /// Phase 4：给分身压入一个目标（驱动真实 tick）
+    pub fn push_persona_goal(&self, persona_id: &str, goal: &str) -> Result<(), String> {
+        {
+            let m = self.personas.lock().unwrap_or_else(|p| p.into_inner());
+            if !m.contains_key(persona_id) {
+                return Err(format!("分身『{}』不存在", persona_id));
+            }
+        }
+        self.tick_scheduler.push_goal(persona_id, goal);
+        Ok(())
+    }
+
+    /// Phase 4：取分身当前目标栈
+    pub fn get_persona_goals(&self, persona_id: &str) -> Vec<String> {
+        self.tick_scheduler.goals_of(persona_id)
+    }
+
     /// 从 session_id 解析调用者专属命名空间。
     /// session_id 格式为 `jan/{agent_id}/{user_tag}/{conversation_id}`（PFAiX
     /// 分发版注入 x-user-id/x-user-tag/x-conversation-id 后生成）。
