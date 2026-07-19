@@ -116,6 +116,9 @@ struct PersonaConfig {
     /// 启动即压入的目标栈（goals）
     #[serde(default)]
     goals: Vec<String>,
+    /// 该分身专属 LLM 配置；缺省空 = 圆桌/tick 时回退全局 client，并由圆桌自动从 LLM 池分配
+    #[serde(default)]
+    llm: Option<LlmConfig>,
 }
 
 fn default_server() -> String {
@@ -992,6 +995,7 @@ fn main() {
                                             owner,
                                             pc.tool_allowlist.clone(),
                                             pc.memory_namespace.clone(),
+                                            pc.llm.clone(),
                                         );
                                         for goal in &pc.goals {
                                             let _ = a.push_persona_goal(&pc.id, goal);
@@ -1178,6 +1182,7 @@ fn main() {
                 .route("/api/persona/{id}", delete(handle_persona_delete).get(handle_persona_get))
                 .route("/api/persona/{id}/goal", post(handle_persona_goal_push))
                 .route("/api/session/persona", post(handle_session_persona_bind))
+                .route("/api/roundtable", post(handle_panel_discuss))
                 .layer(from_fn_with_state(state.clone(), auth_middleware));
 
             let cors = build_cors_layer(&host, port, &config.cors_origins);
@@ -1372,11 +1377,14 @@ async fn handle_persona_create(
         .map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
     let memory_namespace = v.get("memory_namespace").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let llm: Option<LlmConfig> = v
+        .get("llm")
+        .and_then(|x| serde_json::from_value(x.clone()).ok());
     let g = st.agent.lock().await;
     let Some(ref agent) = *g else {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
     };
-    match agent.create_persona(&persona_id, &display_name, &owner_user_id, tool_allowlist, memory_namespace) {
+    match agent.create_persona(&persona_id, &display_name, &owner_user_id, tool_allowlist, memory_namespace, llm) {
         Ok(()) => Json(serde_json::json!({"ok": true, "persona_id": persona_id})).into_response(),
         Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
     }
@@ -1484,6 +1492,60 @@ async fn handle_persona_get(
         "tool_allowlist": p.tool_allowlist,
         "memory_namespace": p.memory_namespace,
         "goals": goals,
+    })).into_response()
+}
+
+/// Phase 6：圆桌（native，自动分配 LLM，不依赖 qclaw）
+///
+/// 多分身就同一议题发表立场 → 主席（默认 default）收敛共识；
+/// 结论最佳努力写入 Memoria（调用者自身 ns）。LLM 分配由 `AgentCore::run_roundtable` 完成：
+/// 配置/圆桌池自动轮询到多个 provider，做到真多 LLM。
+async fn handle_panel_discuss(
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> axum::response::Response {
+    let v = match body {
+        Some(Json(v)) => v,
+        None => return (axum::http::StatusCode::BAD_REQUEST, "missing body").into_response(),
+    };
+    let topic = match v.get("topic").and_then(|x| x.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return (axum::http::StatusCode::BAD_REQUEST, "topic required").into_response(),
+    };
+    let chair = v.get("chair").and_then(|x| x.as_str()).map(|s| s.to_string());
+    let session_id = v.get("session_id").and_then(|x| x.as_str()).unwrap_or("");
+    let g = st.agent.lock().await;
+    let Some(ref agent) = *g else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+    };
+    let result = agent.run_roundtable(&topic, chair.as_deref()).await;
+    // 最佳努力写入 Memoria（调用者自身 ns）
+    let ns = agent.caller_ns(session_id);
+    let stances_text = result
+        .stances
+        .iter()
+        .map(|(id, s)| format!("【{}】{}", id, s))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = format!(
+        "[roundtable] topic={}\nconsensus={}\n---\n{}",
+        topic, result.consensus, stances_text
+    );
+    let args = serde_json::json!({
+        "content": content,
+        "tags": ["roundtable"],
+        "category": "roundtable",
+        "confidence": 80,
+        "namespace": ns,
+    });
+    if agent.mcp.call_json("memory_remember", &args).await.is_ok() {
+        tracing::info!(ns = %ns, "roundtable 结论已写入 Memoria");
+    }
+    Json(serde_json::json!({
+        "ok": true,
+        "topic": topic,
+        "stances": result.stances.iter().map(|(id, s)| serde_json::json!({"persona_id": id, "stance": s})).collect::<Vec<_>>(),
+        "consensus": result.consensus,
     })).into_response()
 }
 
@@ -3023,7 +3085,7 @@ async fn build_agent(config: &Config, local_resources: SharedResourceSnapshot) -
         tool_allowlist: Vec::new(),
         memory_namespace: None,
     };
-    // P0-1: 设置 failover fallbacks
+    // P0-1: 设置 failover fallbacks（备用层不变；圆桌多 LLM 自动分配复用此池）
     let doubao_key = std::env::var("DOUBAO_API_KEY").unwrap_or_default();
     let fallbacks = if !doubao_key.is_empty() {
         vec![(

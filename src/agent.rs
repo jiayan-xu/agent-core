@@ -182,6 +182,14 @@ impl InboxCache {
     }
 }
 
+/// Phase 6：圆桌结果
+pub struct RoundtableResult {
+    /// 各分身立场：(persona_id, stance)
+    pub stances: Vec<(String, String)>,
+    /// 主席收敛结论
+    pub consensus: String,
+}
+
 impl AgentCore {
     /// 创建 Agent 核心
     pub fn new(
@@ -244,6 +252,7 @@ impl AgentCore {
             memory_namespace: String::new(),
             badge_token: config.identity.badge_token.clone(),
             ns_full_path: config.identity.ns_full_path.clone(),
+            llm: None,
         };
         AgentCore {
             config,
@@ -291,6 +300,7 @@ impl AgentCore {
             memory_namespace: String::new(),
             badge_token: self.config.identity.badge_token.clone(),
             ns_full_path: self.config.identity.ns_full_path.clone(),
+            llm: None,
         })
     }
 
@@ -335,7 +345,9 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         };
-        match self.llm.chat(&[msg], &[]).await {
+        // 优先用分身专属 LLM，否则回退全局 client
+        let client = rt.persona.llm.as_ref().unwrap_or(&self.llm);
+        match client.chat(&[msg], &[]).await {
             Ok(r) => r.text,
             Err(e) => format!("[{}] tick LLM 调用失败: {}", rt.persona.persona_id, e),
         }
@@ -367,10 +379,12 @@ impl AgentCore {
         owner_user_id: &str,
         tool_allowlist: Vec<String>,
         memory_namespace: String,
+        llm: Option<LlmConfig>,
     ) -> Result<(), String> {
         if persona_id == "default" {
             return Err("default 分身不可重建".to_string());
         }
+        let llm_client = llm.map(LlmClient::new);
         let persona = crate::runtime::self_runtime::Persona {
             persona_id: persona_id.to_string(),
             display_name: display_name.to_string(),
@@ -380,6 +394,7 @@ impl AgentCore {
             memory_namespace: memory_namespace.clone(),
             badge_token: self.config.identity.badge_token.clone(),
             ns_full_path: self.config.identity.ns_full_path.clone(),
+            llm: llm_client,
         };
         let mut m = self.personas.lock().unwrap_or_else(|p| p.into_inner());
         m.insert(persona_id.to_string(), persona.clone());
@@ -423,6 +438,82 @@ impl AgentCore {
         self.tick_scheduler.goals_of(persona_id)
     }
 
+    /// Phase 6：构造 LLM 池 = 全局主 + 所有 fallbacks（failover 不变，仅用于圆桌轮询分配）
+    fn llm_pool(&self) -> Vec<LlmConfig> {
+        let mut pool = vec![self.config.llm.clone()];
+        let base = &self.config.llm;
+        for (b, m, k) in &base.fallbacks {
+            pool.push(LlmConfig {
+                base_url: b.clone(),
+                model: m.clone(),
+                api_key: k.clone(),
+                max_tokens: base.max_tokens,
+                temperature: base.temperature,
+                fallbacks: vec![],
+            });
+        }
+        pool
+    }
+
+    /// Phase 6：圆桌 —— 多分身就同一议题发表立场并收敛
+    ///
+    /// LLM 分配策略（真多 LLM）：
+    /// - 若分身显式配置了 `Persona.llm`，用其专属 client；
+    /// - 否则从 LLM 池（全局主 + fallbacks）按分身序号轮询自动分配不同 provider，
+    ///   使一次圆桌天然打到多个模型，无需手工为每个分身配 key。
+    /// 主席（默认 `default` 或指定）用全局 client 收敛共识。
+    pub async fn run_roundtable(&self, topic: &str, chair_persona: Option<&str>) -> RoundtableResult {
+        // 参与者：所有已注册分身（default 始终在场），按 persona_id 排序保证确定性
+        let mut personas = self.list_personas();
+        personas.sort_by(|a, b| a.persona_id.cmp(&b.persona_id));
+        let pool = self.llm_pool();
+        let mut stances: Vec<(String, String)> = Vec::new();
+        for (i, p) in personas.iter().enumerate() {
+            // 显式配置优先；否则按序号从池里轮询自动分配（真多 LLM）
+            let (client, provider_label) = match &p.llm {
+                Some(c) => (c.clone(), "persona-configured".to_string()),
+                None => {
+                    let cfg = &pool[i % pool.len()];
+                    (LlmClient::new(cfg.clone()), cfg.model.clone())
+                }
+            };
+            tracing::info!(persona = %p.persona_id, provider = %provider_label, "roundtable: 分配 LLM");
+            let sys = format!(
+                "你是分身『{}』（{}）。请从你的角色视角独立发表观点，不要附和他人。",
+                p.persona_id, p.display_name
+            );
+            let user = format!("圆桌议题：{}\n请给出你的立场（2-4 句）。", topic);
+            let msgs = vec![
+                crate::llm::Message { role: "system".to_string(), content: Some(sys), tool_calls: None, tool_call_id: None },
+                crate::llm::Message { role: "user".to_string(), content: Some(user), tool_calls: None, tool_call_id: None },
+            ];
+            let stance = match client.chat(&msgs, &[]).await {
+                Ok(r) => r.text,
+                Err(e) => format!("(LLM 调用失败: {})", e),
+            };
+            stances.push((p.persona_id.clone(), stance));
+        }
+
+        // 主席收敛
+        let chair_id = chair_persona.unwrap_or("default").to_string();
+        let joined = stances
+            .iter()
+            .map(|(id, s)| format!("【{}】{}", id, s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sys_chair = format!("你是圆桌主席（{}）。请综合各方立场，给出一句话共识结论。", chair_id);
+        let user_chair = format!("议题：{}\n各方立场：\n{}\n\n请给出共识结论。", topic, joined);
+        let chair_msgs = vec![
+            crate::llm::Message { role: "system".to_string(), content: Some(sys_chair), tool_calls: None, tool_call_id: None },
+            crate::llm::Message { role: "user".to_string(), content: Some(user_chair), tool_calls: None, tool_call_id: None },
+        ];
+        let consensus = match self.llm.chat(&chair_msgs, &[]).await {
+            Ok(r) => r.text,
+            Err(e) => format!("(主席收敛失败: {})", e),
+        };
+        RoundtableResult { stances, consensus }
+    }
+
     /// 从 session_id 解析调用者专属命名空间。
     /// session_id 格式为 `jan/{agent_id}/{user_tag}/{conversation_id}`（PFAiX
     /// 分发版注入 x-user-id/x-user-tag/x-conversation-id 后生成）。
@@ -432,7 +523,7 @@ impl AgentCore {
     ///   - 登录模式：agent_id=user_id → `agent/{user_id}/user/{user_id}`，记忆跨设备连续；
     ///   - legacy 模式：agent_id=user_tag=install_id → `agent/{install_id}/user/{install_id}`，与原行为一致。
     /// 旧格式或解析失败时回退到 agent 自身 ns，保持向后兼容。
-    fn caller_ns(&self, session_id: &str) -> String {
+    pub fn caller_ns(&self, session_id: &str) -> String {
         let parts: Vec<&str> = session_id.split('/').collect();
         if parts.len() >= 4 && parts[0] == "jan" {
             let agent_id = parts[1];

@@ -2,6 +2,8 @@
 //!
 //! 仅依赖 std + crate 内部路径，不引入新第三方依赖。
 
+use crate::llm::LlmClient;
+
 /// 分身身份与配置
 #[derive(Debug, Clone)]
 pub struct Persona {
@@ -13,6 +15,8 @@ pub struct Persona {
     pub memory_namespace: String,
     pub badge_token: String,
     pub ns_full_path: Option<String>,
+    /// 该分身专属 LLM（None = 圆桌/ tick 时回退到全局 client）
+    pub llm: Option<LlmClient>,
 }
 
 /// 分身运行时的 tick 状态

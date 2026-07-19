@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 /// SSE 流式事件
@@ -28,7 +28,7 @@ pub enum SseEvent {
 }
 
 /// LLM 配置
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     pub base_url: String,
     pub model: String,
@@ -109,9 +109,19 @@ pub struct ToolDefFunction {
 }
 
 /// LLM 客户端
+#[derive(Clone)]
 pub struct LlmClient {
     client: Client,
     config: LlmConfig,
+}
+
+impl std::fmt::Debug for LlmClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmClient")
+            .field("provider", &self.config.base_url)
+            .field("model", &self.config.model)
+            .finish()
+    }
 }
 
 impl LlmClient {
