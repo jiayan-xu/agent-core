@@ -339,6 +339,15 @@ impl Default for SessionManager {
     }
 }
 
+/// Phase 1：分身感知的 session key。persona_id 为空时回退旧行为（纯 session_id）。
+pub fn persona_session_key(persona_id: &str, session_id: &str) -> String {
+    if persona_id.is_empty() {
+        session_id.to_string()
+    } else {
+        format!("{}::{}", persona_id, session_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

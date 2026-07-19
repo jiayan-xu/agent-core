@@ -28,6 +28,12 @@ pub struct AgentIdentity {
     /// 多租户层级命名空间完整路径（如 `/dept/运营部/project/固废平台`）
     /// 为 None 时保持旧行为：`agent/{agent_id}`
     pub ns_full_path: Option<String>,
+    /// 分身维度字段（Phase 1）—— 可选/可空，不影响旧单 agent 行为
+    pub persona_id: Option<String>,
+    pub owner_user_id: Option<String>,
+    pub workspace_dir: Option<std::path::PathBuf>,
+    pub tool_allowlist: Vec<String>,
+    pub memory_namespace: Option<String>,
 }
 
 impl AgentIdentity {
@@ -137,6 +143,8 @@ pub struct AgentCore {
     /// 仅当用户消息命中资源规则时由 execute_chat / rephrase_and_confirm 注入 system prompt，
     /// 零常态泄露面、零 prompt 膨胀（见 resources.rs 安全红线）。
     pub local_resources: crate::resources::SharedResourceSnapshot,
+    /// 多分身容器（Phase 1）：persona_id → Persona；默认含 "default" 分身
+    pub personas: std::sync::Mutex<std::collections::HashMap<String, crate::runtime::self_runtime::Persona>>,
 }
 
 /// P2-1: 会话级配额守卫（RAII）。离开作用域自动 leave_session，避免并发计数泄漏。
@@ -223,6 +231,16 @@ impl AgentCore {
         }
 
         let mcp_for_audit = mcp.clone();
+        let default_persona = crate::runtime::self_runtime::Persona {
+            persona_id: "default".to_string(),
+            display_name: config.identity.agent_id.clone(),
+            owner_user_id: config.identity.agent_id.clone(),
+            workspace_dir: None,
+            tool_allowlist: Vec::new(),
+            memory_namespace: String::new(),
+            badge_token: config.identity.badge_token.clone(),
+            ns_full_path: config.identity.ns_full_path.clone(),
+        };
         AgentCore {
             config,
             mcp,
@@ -244,6 +262,45 @@ impl AgentCore {
             quota: Arc::new(std::sync::Mutex::new(NsQuotaStore::new())),
             episode_archive: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             local_resources,
+            personas: std::sync::Mutex::new({
+                let mut m = std::collections::HashMap::new();
+                m.insert("default".to_string(), default_persona);
+                m
+            }),
+        }
+    }
+
+    /// 取分身；缺省回退到 "default" 分身，保证旧调用兼容
+    pub fn get_persona(&self, id: &str) -> crate::runtime::self_runtime::Persona {
+        let map = self.personas.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(p) = map.get(id) {
+            return p.clone();
+        }
+        map.get("default").cloned().unwrap_or_else(|| crate::runtime::self_runtime::Persona {
+            persona_id: "default".to_string(),
+            display_name: self.config.identity.agent_id.clone(),
+            owner_user_id: self.config.identity.agent_id.clone(),
+            workspace_dir: None,
+            tool_allowlist: Vec::new(),
+            memory_namespace: String::new(),
+            badge_token: self.config.identity.badge_token.clone(),
+            ns_full_path: self.config.identity.ns_full_path.clone(),
+        })
+    }
+
+    /// Phase 1：分身级工具白名单校验。allowlist 为空 = 不限制（沿用 boundary 全局策略）
+    pub fn check_persona_tool(&self, persona_id: &str, tool_name: &str) -> Result<(), String> {
+        let p = self.get_persona(persona_id);
+        if p.tool_allowlist.is_empty() {
+            return Ok(());
+        }
+        if p.tool_allowlist.iter().any(|t| t == tool_name) {
+            Ok(())
+        } else {
+            Err(format!(
+                "🛡️ 分身『{}』无权调用工具『{}』（不在其白名单内）",
+                persona_id, tool_name
+            ))
         }
     }
 
@@ -2519,6 +2576,10 @@ impl AgentCore {
         allowed_ns: &[String],
         trace_id: &str,
     ) -> Result<String, String> {
+        // ── Phase 1：分身级工具白名单（默认分身 allowlist 为空 → 不限制） ──
+        if let Err(e) = self.check_persona_tool("default", tool_name) {
+            return Err(e);
+        }
         // ── P1-5 降级收缩门控（全局 → 源级 → 模式级） ──
         // 1) Kill switch：全局拒绝一切工具调用，仅系统状态查询可用
         if self.degrade.kill_switch_on() {

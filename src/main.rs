@@ -2829,6 +2829,11 @@ async fn build_agent(config: &Config, local_resources: SharedResourceSnapshot) -
         namespace: format!("agent/{}", config.agent_id),
         badge_token: badge_token.clone(),
         ns_full_path,
+        persona_id: None,
+        owner_user_id: None,
+        workspace_dir: None,
+        tool_allowlist: Vec::new(),
+        memory_namespace: None,
     };
     // P0-1: 设置 failover fallbacks
     let doubao_key = std::env::var("DOUBAO_API_KEY").unwrap_or_default();

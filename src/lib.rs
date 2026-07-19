@@ -15,5 +15,7 @@ pub mod file_checkpoint;
 pub mod quota;
 pub mod sandbox;
 pub mod session;
+pub mod runtime;
+pub mod scheduler;
 pub mod self_evolution;
 pub mod text_signals;
