@@ -48,7 +48,7 @@ use agent_core::agent::{AgentConfig, AgentCore, AgentIdentity};
 use agent_core::audit::AuditLogger;
 use agent_core::boundary::PermissionLevel;
 use agent_core::harness::HarnessStore;
-use agent_core::llm::LlmConfig;
+use agent_core::llm::{LlmConfig, LlmProvider};
 use agent_core::approval::ApprovalResponse;
 use agent_core::mcp_client::McpClient;
 use agent_core::resources::SharedResourceSnapshot;
@@ -76,6 +76,9 @@ struct Config {
     mcp_source: Vec<McpSourceConfig>,
     #[serde(default)]
     personas: Vec<PersonaConfig>,
+    /// 全局 LLM 池（主 + fallbacks）。缺省则回退旧硬编码 deepseek 主 + DOUBAO_API_KEY 备用。
+    #[serde(default)]
+    llm: Option<LlmConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -853,6 +856,7 @@ fn load_or_create_config() -> Config {
         memoria_admin_key: String::new(),
         mcp_source: Vec::new(),
         personas: Vec::new(),
+        llm: None,
     };
     let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());
     cfg
@@ -3133,21 +3137,33 @@ async fn build_agent(config: &Config, local_resources: SharedResourceSnapshot) -
         tool_allowlist: Vec::new(),
         memory_namespace: None,
     };
-    // P0-1: 设置 failover fallbacks（备用层不变；圆桌多 LLM 自动分配复用此池）
-    let doubao_key = std::env::var("DOUBAO_API_KEY").unwrap_or_default();
-    let fallbacks = if !doubao_key.is_empty() {
-        vec![(
-            "https://ark.cn-beijing.volces.com/api/v3".to_string(),
-            "doubao-lite-32k".to_string(),
-            doubao_key,
-        )]
+    // P0-1: LLM 池来源优先级：agent.toml 的 [llm] 段（用户显式配置）> 旧硬编码 deepseek 主 + DOUBAO_API_KEY 备用
+    // 圆桌多 LLM 自动分配复用此池（llm_pool = 主 + fallbacks）
+    let llm_config = if let Some(explicit) = &config.llm {
+        // 支持 ${ENV} 占位，避免明文密钥落盘（agent.toml 本身已被 gitignore，此处再给一层 env 解耦）
+        let mut lc = explicit.clone();
+        lc.api_key = expand_env(&lc.api_key);
+        for p in lc.fallbacks.iter_mut() {
+            p.base_url = expand_env(&p.base_url);
+            p.api_key = expand_env(&p.api_key);
+        }
+        lc
     } else {
-        Vec::new()
-    };
-    let llm_config = LlmConfig {
-        api_key: config.api_key.clone(),
-        fallbacks,
-        ..Default::default()
+        let doubao_key = std::env::var("DOUBAO_API_KEY").unwrap_or_default();
+        let fallbacks = if !doubao_key.is_empty() {
+            vec![LlmProvider {
+                base_url: "https://ark.cn-beijing.volces.com/api/v3".to_string(),
+                model: "doubao-lite-32k".to_string(),
+                api_key: doubao_key,
+            }]
+        } else {
+            Vec::new()
+        };
+        LlmConfig {
+            api_key: config.api_key.clone(),
+            fallbacks,
+            ..Default::default()
+        }
     };
     let mut additional_mcp = Vec::new();
     for src in &config.mcp_source {

@@ -27,16 +27,31 @@ pub enum SseEvent {
     ErrorEvt { message: String },
 }
 
+/// 备用 / 池内 LLM Provider（具名字段，便于 agent.toml 编辑维护）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmProvider {
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+}
+
+/// LlmConfig 缺省 max_tokens（供 serde(default) 使用，避免用户删字段导致解析失败）
+fn default_max_tokens() -> u32 {
+    4096
+}
+
 /// LLM 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+    #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    #[serde(default)]
     pub temperature: f64,
-    /// 备用 Provider（failover 用）
-    pub fallbacks: Vec<(String, String, String)>, // (base_url, model, api_key)
+    /// 备用 Provider 池（failover + 圆桌多 LLM 轮询；具名字段便于编辑）
+    pub fallbacks: Vec<LlmProvider>,
 }
 
 impl Default for LlmConfig {
@@ -141,12 +156,12 @@ impl LlmClient {
         tools: &[ToolDef],
     ) -> Result<LlmResponse, String> {
         // 主 Provider + 备用 Provider 列表
-        let mut providers = Vec::new();
-        providers.push((
-            self.config.base_url.clone(),
-            self.config.model.clone(),
-            self.config.api_key.clone(),
-        ));
+        let mut providers: Vec<LlmProvider> = Vec::new();
+        providers.push(LlmProvider {
+            base_url: self.config.base_url.clone(),
+            model: self.config.model.clone(),
+            api_key: self.config.api_key.clone(),
+        });
         for fb in &self.config.fallbacks {
             providers.push(fb.clone());
         }
@@ -154,7 +169,10 @@ impl LlmClient {
         let mut last_error = String::new();
         tracing::info!("llm.complete start");
 
-        for (idx, (base_url, model, api_key)) in providers.iter().enumerate() {
+        for (idx, p) in providers.iter().enumerate() {
+            let base_url = &p.base_url;
+            let model = &p.model;
+            let api_key = &p.api_key;
             let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
 
             let mut body = serde_json::json!({
@@ -271,12 +289,12 @@ impl LlmClient {
         sender: mpsc::UnboundedSender<SseEvent>,
     ) -> Result<(), String> {
         // P2-6: 主 Provider 失败时尝试备用 Provider
-        let mut providers = Vec::new();
-        providers.push((
-            self.config.base_url.clone(),
-            self.config.model.clone(),
-            self.config.api_key.clone(),
-        ));
+        let mut providers: Vec<LlmProvider> = Vec::new();
+        providers.push(LlmProvider {
+            base_url: self.config.base_url.clone(),
+            model: self.config.model.clone(),
+            api_key: self.config.api_key.clone(),
+        });
         for fb in &self.config.fallbacks {
             providers.push(fb.clone());
         }
@@ -284,7 +302,10 @@ impl LlmClient {
         let mut last_error = String::new();
         tracing::info!("llm.complete start");
 
-        for (idx, (base_url, model, api_key)) in providers.iter().enumerate() {
+        for (idx, p) in providers.iter().enumerate() {
+            let base_url = &p.base_url;
+            let model = &p.model;
+            let api_key = &p.api_key;
             match self
                 .chat_stream_single(base_url, model, api_key, messages, tools, &sender)
                 .await

@@ -442,11 +442,11 @@ impl AgentCore {
     pub fn llm_pool(&self) -> Vec<LlmConfig> {
         let mut pool = vec![self.config.llm.clone()];
         let base = &self.config.llm;
-        for (b, m, k) in &base.fallbacks {
+        for fb in &base.fallbacks {
             pool.push(LlmConfig {
-                base_url: b.clone(),
-                model: m.clone(),
-                api_key: k.clone(),
+                base_url: fb.base_url.clone(),
+                model: fb.model.clone(),
+                api_key: fb.api_key.clone(),
                 max_tokens: base.max_tokens,
                 temperature: base.temperature,
                 fallbacks: vec![],
