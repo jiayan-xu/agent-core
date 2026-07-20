@@ -9,6 +9,7 @@ use agent_core::boundary::PermissionLevel;
 use agent_core::checkpoint::{CheckpointState, CheckpointStore};
 use agent_core::harness::HarnessStore;
 use agent_core::llm::LlmConfig;
+use agent_core::meta_evolve::{MetaEvolutionConfig, SafetyConfig};
 use agent_core::resources::LocalResourceSnapshot;
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +38,8 @@ fn test_agent() -> AgentCore {
         strict_schema: false,
         system_prompt_template: None,
         approver_id: None,
+        meta_evolution: MetaEvolutionConfig::default(),
+        safety: SafetyConfig::default(),
     };
     let harness = HarnessStore::open_memory().unwrap();
     let cp = CheckpointStore::open_memory().unwrap();
@@ -144,6 +147,8 @@ async fn eval_e07_mcp_down_degrade() {
         strict_schema: false,
         system_prompt_template: None,
         approver_id: None,
+        meta_evolution: MetaEvolutionConfig::default(),
+        safety: SafetyConfig::default(),
     };
     let harness = HarnessStore::open_memory().unwrap();
     let cp = CheckpointStore::open_memory().unwrap();

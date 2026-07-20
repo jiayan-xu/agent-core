@@ -83,6 +83,10 @@ pub struct AgentConfig {
     pub system_prompt_template: Option<String>,
     /// P2-D: 审批人 ID（可选）。设置后 YELLOW 工具需经此人审批
     pub approver_id: Option<String>,
+    /// PR5: 元进化配置（默认 enabled=false，受控开启）
+    pub meta_evolution: crate::meta_evolve::MetaEvolutionConfig,
+    /// PR5: 安全配置（含审批门控模式，默认 Auto 免人工审批）
+    pub safety: crate::meta_evolve::SafetyConfig,
 }
 
 /// 白龙马 A3：Focus Stack → Thread 模型
@@ -149,6 +153,12 @@ pub struct AgentCore {
     pub session_personas: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// Phase 2：分身 tick 调度器注册表（真实 tick 由 AgentCore 驱动，避免循环依赖）
     pub tick_scheduler: crate::scheduler::tick_scheduler::TickScheduler,
+    /// PR5: 审批闸门（P-D 门控；默认 Auto 免人工审批，分类逻辑保留）
+    pub approval_gate: crate::meta_evolve::ApprovalGate,
+    /// PR5: 元进化引擎（L2 闭环；默认 enabled=false）
+    pub meta_evolver: crate::meta_evolve::MetaEvolver,
+    /// PR5: 机制账本存储（evolution_feedback + meta_prompt），与 meta_evolver 共享
+    pub meta_store: std::sync::Arc<tokio::sync::Mutex<crate::meta_evolve::MetaEvolutionStore>>,
 }
 
 /// P2-1: 会话级配额守卫（RAII）。离开作用域自动 leave_session，避免并发计数泄漏。
@@ -243,6 +253,33 @@ impl AgentCore {
         }
 
         let mcp_for_audit = mcp.clone();
+
+        // PR5: 审批闸门 + 元进化引擎（机制账本落 agent-core 本地 rusqlite）
+        let approval_gate = crate::meta_evolve::ApprovalGate::from_safety(
+            &config.safety,
+            std::env::var("APPROVER").ok().filter(|s| !s.is_empty()),
+        );
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let meta_store = {
+            let db_path = cwd.join("meta_evolution.db").to_string_lossy().to_string();
+            match crate::meta_evolve::MetaEvolutionStore::open(&db_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(target: "agent.meta_evolve", "机制账本打开失败，回退内存模式: {}", e);
+                    crate::meta_evolve::MetaEvolutionStore::open_memory()
+                        .unwrap_or_else(|e2| panic!("meta_evolution 内存库也无法打开: {}", e2))
+                }
+            }
+        };
+        let meta_store = std::sync::Arc::new(tokio::sync::Mutex::new(meta_store));
+        let meta_evolver = crate::meta_evolve::MetaEvolver::new(
+            config.meta_evolution.clone(),
+            meta_store.clone(),
+            llm.clone(),
+            config.memoria_url.clone(),
+            config.identity.agent_id.clone(),
+        );
+
         let default_persona = crate::runtime::self_runtime::Persona {
             persona_id: "default".to_string(),
             display_name: "默认分身".to_string(),
@@ -282,6 +319,9 @@ impl AgentCore {
             }),
             session_personas: std::sync::Mutex::new(std::collections::HashMap::new()),
             tick_scheduler: crate::scheduler::tick_scheduler::TickScheduler::default(),
+            approval_gate,
+            meta_evolver,
+            meta_store,
         }
     }
 
@@ -4087,14 +4127,13 @@ impl AgentCore {
             if !evo_items.is_empty() {
                 let model = self.config.llm.model.clone();
                 let patterns_txt = reply.chars().take(1500).collect::<String>();
+                // PR5：演化提示词动态化（默认回退 DEFAULT_EVOLVE_PROMPT，元进化 rollout 后读动态版）
+                let base_prompt = self.meta_evolver.current_prompt().await;
                 let mut evolved = 0u64;
                 for chunk in evo_items.chunks(80) {
                     let evo_prompt = format!(
-                        "你是记忆演化引擎。给定一批原始\"观察\"记忆和已提炼的高层模式，请为每条观察补充\"演化上下文\"：\
-                         用一句话说明该观察如何被高层模式解释或关联（不要重复原观察内容，只写增量上下文；若无关联可写\"\"）。\
-                         仅输出纯 JSON 数组，不要任何前缀后缀：\
-                         [{{\"id\":\"<记忆id>\",\"evolved_context\":\"<一句话增量上下文>\"}}]\n\n\
-                         ## 已提炼模式\n{}\n\n## 待演化观察（{} 条）\n{}",
+                        "{}\n\n## 已提炼模式\n{}\n\n## 待演化观察（{} 条）\n{}",
+                        base_prompt,
                         patterns_txt,
                         chunk.len(),
                         chunk
@@ -4116,6 +4155,14 @@ impl AgentCore {
                         for (eid, ectx) in pairs {
                             // 仅演化本批次内的 id（防御 LLM 编造 id 跨批）
                             if chunk.iter().any(|(id, _)| id == &eid) {
+                                // PR5 P-D 门控：高风险演化（supersede/override 或高危工具）需过闸。
+                                // 当前 change_type=context_update 不触发；保留以应未来路径。Auto 模式直接放行。
+                                if self.approval_gate.is_high_risk("memory_evolve", Some("context_update")) {
+                                    if let Err(rej) = self.approval_gate.check("memory_evolve", Some("context_update")) {
+                                        tracing::warn!(target: "agent.evolve", "演化被门控拒绝: {}", rej);
+                                        continue;
+                                    }
+                                }
                                 let _ = mem_client
                                     .call(
                                         "memory_evolve",
@@ -4150,6 +4197,57 @@ impl AgentCore {
             written,
             max_ts
         )
+    }
+
+    /// PR5：手动触发一轮元进化（L2 闭环）。受 `meta_evolution.enabled` 开关保护。
+    pub async fn run_meta_evolution(&self, ns: &str) -> serde_json::Value {
+        if !self.config.meta_evolution.enabled {
+            return serde_json::json!({
+                "status": "skipped",
+                "reason": "meta_evolution.enabled=false（受控开启，需在 agent.toml 显式开启）"
+            });
+        }
+        // 与 consolidate 一致的 dash_badge 取权逻辑（以本 Agent 身份 + dashboard badge 跨 ns 读）
+        let dash_badge = std::env::var("MEMORIA_DASHBOARD_BADGE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("MEMORIA_ADMIN_KEY").ok())
+            .unwrap_or_default();
+        let mem_client = if dash_badge.is_empty() {
+            self.mcp.clone()
+        } else {
+            McpClient::new(
+                &self.config.memoria_url,
+                &self.config.identity.agent_id,
+                &dash_badge,
+            )
+        };
+        let res = self.meta_evolver.run_once(&mem_client, ns).await;
+        res.to_json()
+    }
+
+    /// PR5：元进化状态（供 /api/meta-evolution/status）
+    pub async fn meta_evolution_status(&self) -> serde_json::Value {
+        let enabled = self.config.meta_evolution.enabled;
+        let hash = self.meta_evolver.current_prompt_hash().await;
+        let store = self.meta_store.lock().await;
+        let latest = store.latest_feedback();
+        let count = store.feedback_count();
+        drop(store);
+        serde_json::json!({
+            "enabled": enabled,
+            "approval_mode": self.config.safety.approval_mode.as_str(),
+            "current_prompt_hash": hash,
+            "feedback_count": count,
+            "last_feedback": latest,
+            "config": {
+                "window_days": self.config.meta_evolution.window_days,
+                "min_samples": self.config.meta_evolution.min_samples,
+                "improve_threshold": self.config.meta_evolution.improve_threshold,
+                "max_rollback_rate": self.config.meta_evolution.max_rollback_rate,
+                "cooldown_hours": self.config.meta_evolution.cooldown_hours,
+            }
+        })
     }
 }
 

@@ -46,6 +46,7 @@ use wry::WebViewBuilder;
 
 use agent_core::agent::{AgentConfig, AgentCore, AgentIdentity};
 use agent_core::audit::AuditLogger;
+use agent_core::meta_evolve::{MetaEvolutionConfig, SafetyConfig};
 use agent_core::boundary::PermissionLevel;
 use agent_core::harness::HarnessStore;
 use agent_core::llm::{LlmConfig, LlmProvider};
@@ -79,6 +80,12 @@ struct Config {
     /// 全局 LLM 池（主 + fallbacks）。缺省则回退旧硬编码 deepseek 主 + DOUBAO_API_KEY 备用。
     #[serde(default)]
     llm: Option<LlmConfig>,
+    /// PR5：元进化配置（落 [meta_evolution]，缺省全默认：enabled=false）
+    #[serde(default)]
+    meta_evolution: Option<MetaEvolutionConfig>,
+    /// PR5：安全配置（落 [safety]，缺省 ApprovalMode::Auto 免人工审批）
+    #[serde(default)]
+    safety: Option<SafetyConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -857,6 +864,8 @@ fn load_or_create_config() -> Config {
         mcp_source: Vec::new(),
         personas: Vec::new(),
         llm: None,
+        meta_evolution: None,
+        safety: None,
     };
     let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());
     cfg
@@ -1190,6 +1199,8 @@ fn main() {
                 .route("/api/persona/{id}/goal", post(handle_persona_goal_push))
                 .route("/api/session/persona", post(handle_session_persona_bind))
                 .route("/api/roundtable", post(handle_panel_discuss))
+                .route("/api/meta-evolution/run", post(handle_meta_evolution_run))
+                .route("/api/meta-evolution/status", get(handle_meta_evolution_status))
                 .layer(from_fn_with_state(state.clone(), auth_middleware));
 
             let cors = build_cors_layer(&host, port, &config.cors_origins);
@@ -1602,6 +1613,47 @@ async fn handle_panel_discuss(
     });
 
     Sse::new(UnboundedReceiverStream::new(rx)).into_response()
+}
+
+/// PR5：触发一轮元进化（POST /api/meta-evolution/run）
+async fn handle_meta_evolution_run(
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> axum::response::Response {
+    let agent_guard = st.agent.lock().await;
+    let Some(ref agent) = *agent_guard else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "agent 尚未就绪"})),
+        )
+            .into_response();
+    };
+    let default_ns = format!("agent/{}", agent.config.identity.agent_id);
+    let ns = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("namespace").and_then(|x| x.as_str()).map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_ns);
+    let res = agent.run_meta_evolution(&ns).await;
+    drop(agent_guard);
+    Json(res).into_response()
+}
+
+/// PR5：元进化状态（GET /api/meta-evolution/status）
+async fn handle_meta_evolution_status(
+    State(st): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let agent_guard = st.agent.lock().await;
+    let Some(ref agent) = *agent_guard else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "agent 尚未就绪"})),
+        )
+            .into_response();
+    };
+    let res = agent.meta_evolution_status().await;
+    drop(agent_guard);
+    Json(res).into_response()
 }
 
 /// 白龙马 Phase B 多端唤醒：返回后台活动事件（since 之后的增量），供 PFAiX 轮询"唤醒"
@@ -3202,6 +3254,8 @@ async fn build_agent(config: &Config, local_resources: SharedResourceSnapshot) -
         strict_schema: false,        // P1-4: 默认回灌 LLM 修正参数（非严格报错）
         system_prompt_template: None, // P2-3: 使用内置默认模板
         approver_id: None,           // P2-D: 无审批人（保持现有行为）
+        meta_evolution: config.meta_evolution.clone().unwrap_or_default(),
+        safety: config.safety.clone().unwrap_or_default(),
     };
     // A1 (OpenClaw 吸收): 记录启动并判定是否进入 safe_mode（崩溃循环保护）。
     // 返回 (启动记录 id, 是否需抑制危险/未分类/外发工具自动执行)。

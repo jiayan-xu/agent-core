@@ -32,5 +32,8 @@ checkpoints.db
 # Phase A 运行时库（A1 boot_lifecycle / A3 audit_events 启动期自动创建）
 agent_core_boot.db
 audit_events.db
+# PR5 元进化运行时库（自动创建，含动态提示词与反馈样本）
+meta_evolution.db
+meta_evolution.db-*
 *.bak.*
 tests/test_*.py
