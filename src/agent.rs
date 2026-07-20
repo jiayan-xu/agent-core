@@ -2954,6 +2954,35 @@ impl AgentCore {
             );
         }
 
+        // ── PR2：写入前门提取压缩（对标 Mem0；脑子在 agent-core，Memoria 哑存储） ──
+        // 在真正写 memoria 之前拦截 memory_remember / memory：用 LLM 把长 raw 拆为 N 原子事实，
+        // 原文以 memory_type=raw 存档（parent_id 指向）。失败 / 保真不过 → 降级原样写入。
+        if (tool_name == "memory_remember" || tool_name == "memory")
+            && crate::memory_extract::agent_memory_extract_enabled()
+        {
+            if let Some(content) = call_args.get("content").and_then(|c| c.as_str()) {
+                if !content.trim().is_empty() {
+                    match self
+                        .run_memory_extraction(&call_args, content, trace_id)
+                        .await
+                    {
+                        Ok(summary) => {
+                            tracing::info!("[PR2] 记忆提取压缩完成: {}", summary);
+                            return Ok(summary);
+                        }
+                        Err(reason) => {
+                            tracing::warn!(
+                                "[PR2] 记忆提取降级（原样写入）: {} | tool={}",
+                                reason,
+                                tool_name
+                            );
+                            // 降级：继续走下方单次原样写入，不阻塞
+                        }
+                    }
+                }
+            }
+        }
+
         let result = client.call(tool_name, &call_args).await;
         if let Err(ref e) = result {
             self.audit_logger
@@ -3604,6 +3633,113 @@ impl AgentCore {
                 Vec::new()
             }
         }
+    }
+
+    /// PR2：写入前门提取压缩核心逻辑。
+    ///
+    /// 流程：LLM 抽取原子事实 → 语义保真校验 → 写 raw 父 + N 原子事实（parent_id 回指）。
+    /// 任意环节失败返回 Err，由 `call_tool_routed` 降级为单次原样写入（不丢数据）。
+    async fn run_memory_extraction(
+        &self,
+        original_args: &serde_json::Value,
+        raw_content: &str,
+        trace_id: &str,
+    ) -> Result<String, String> {
+        // 1. LLM 抽取
+        let prompt = crate::memory_extract::build_extract_prompt(raw_content);
+        let msg = crate::llm::Message {
+            role: "system".to_string(),
+            content: Some(prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let reply = self
+            .llm
+            .chat(&[msg], &[])
+            .await
+            .map_err(|e| format!("LLM 提取失败: {e}"))?;
+        let ex = crate::memory_extract::parse_extraction(&reply.text)
+            .ok_or_else(|| "LLM 返回无法解析为提取结构".to_string())?;
+
+        // 2. 已原子化（单条且等价于原文）→ 无需分解，降级到原样写入，避免重复
+        if !crate::memory_extract::should_decompose(&ex, raw_content) {
+            return Err("原文已是原子事实，无需分解".to_string());
+        }
+
+        // 3. 语义保真校验：关键数字 / 日期不得丢失
+        if !crate::memory_extract::fidelity_ok(raw_content, &ex) {
+            return Err("语义保真校验不过（关键数字/日期丢失）".to_string());
+        }
+
+        // 4. 拿到 memoria client（记忆工具恒定走 self.mcp 源）
+        let client = self.find_mcp_for_tool_async("memory_remember").await;
+
+        // 5. 写 raw 父（存档原文，memory_type=raw，降低优先级让检索优先命中原子事实）
+        let mut parent_args = original_args.clone();
+        if let Some(o) = parent_args.as_object_mut() {
+            o.insert("content".to_string(), serde_json::Value::String(raw_content.to_string()));
+            o.insert("memory_type".to_string(), serde_json::Value::String("raw".to_string()));
+            o.remove("parent_id");
+            o.remove("raw_ref");
+            // 降低 raw 存档优先级（memoria importance 为整数），让检索优先命中原子事实
+            if !o.contains_key("importance") {
+                o.insert("importance".to_string(), serde_json::Value::from(1_i64));
+            }
+            if let Some(actor) = &ex.actor {
+                o.insert("actor".to_string(), serde_json::Value::String(actor.clone()));
+            }
+        }
+        let parent_resp = client
+            .call("memory_remember", &parent_args)
+            .await
+            .map_err(|e| format!("raw 父写入失败: {e}"))?;
+        let parent_id = crate::memory_extract::extract_id(&parent_resp)
+            .ok_or_else(|| "无法解析 raw 父 id".to_string())?;
+
+        // 6. 写每条原子事实（facts + entities + preferences + relations），均挂回 parent
+        let mut written = Vec::new();
+        let atom_items: Vec<(&String, &str)> = ex
+            .facts
+            .iter()
+            .map(|t| (t, ex.memory_type.as_deref().unwrap_or("declarative")))
+            .chain(ex.entities.iter().map(|t| (t, "entity")))
+            .chain(ex.preferences.iter().map(|t| (t, "preference")))
+            .chain(ex.relations.iter().map(|t| (t, "relation")))
+            .collect();
+
+        for (text, mt) in atom_items {
+            let mut a = original_args.clone();
+            if let Some(o) = a.as_object_mut() {
+                o.insert("content".to_string(), serde_json::Value::String(text.clone()));
+                o.insert("parent_id".to_string(), serde_json::Value::String(parent_id.clone()));
+                o.insert("raw_ref".to_string(), serde_json::Value::String(parent_id.clone()));
+                o.insert("memory_type".to_string(), serde_json::Value::String(mt.to_string()));
+                if let Some(actor) = &ex.actor {
+                    o.insert("actor".to_string(), serde_json::Value::String(actor.clone()));
+                }
+                // 原子事实略高于默认（memoria importance 为整数），优先于 raw 父被检索
+                if !o.contains_key("importance") {
+                    o.insert("importance".to_string(), serde_json::Value::from(4_i64));
+                }
+            }
+            if let Ok(r) = client.call("memory_remember", &a).await {
+                if let Some(id) = crate::memory_extract::extract_id(&r) {
+                    written.push(id);
+                }
+            }
+        }
+
+        let summary = format!(
+            "{{\"status\":\"extracted\",\"parent_id\":\"{}\",\"facts\":{},\"entities\":{},\"preferences\":{},\"relations\":{},\"written_ids\":{}}}",
+            parent_id,
+            ex.facts.len(),
+            ex.entities.len(),
+            ex.preferences.len(),
+            ex.relations.len(),
+            serde_json::to_string(&written).unwrap_or_else(|_| "[]".to_string())
+        );
+        tracing::debug!("[PR2] 提取汇总 trace_id={} : {}", trace_id, summary);
+        Ok(summary)
     }
 
     /// 暗知识层 A2：通用夜间巩固编排器（泛化 run_insights）

@@ -9,6 +9,8 @@ use agent_core::boundary::PermissionLevel;
 use agent_core::checkpoint::{CheckpointState, CheckpointStore};
 use agent_core::harness::HarnessStore;
 use agent_core::llm::LlmConfig;
+use agent_core::resources::LocalResourceSnapshot;
+use std::sync::{Arc, Mutex};
 
 /// 构造最小 AgentCore（内存 harness + 内存 checkpoint，不连真实 MCP）
 fn test_agent() -> AgentCore {
@@ -18,6 +20,11 @@ fn test_agent() -> AgentCore {
             namespace: "agent/eval-agent".into(),
             badge_token: String::new(),
             ns_full_path: None,
+            persona_id: None,
+            owner_user_id: None,
+            workspace_dir: None,
+            tool_allowlist: Vec::new(),
+            memory_namespace: None,
         },
         llm: LlmConfig::default(),
         memoria_url: String::new(),
@@ -33,7 +40,8 @@ fn test_agent() -> AgentCore {
     };
     let harness = HarnessStore::open_memory().unwrap();
     let cp = CheckpointStore::open_memory().unwrap();
-    AgentCore::new(config, harness, cp)
+    let local_resources = Arc::new(Mutex::new(LocalResourceSnapshot::default()));
+    AgentCore::new(config, harness, cp, local_resources)
 }
 
 #[test]
@@ -60,6 +68,7 @@ async fn eval_e06_unknown_tool_no_panic() {
     let res = agent
         .call_tool_routed(
             "this_tool_does_not_exist_xyz",
+            "default",
             &serde_json::json!({}),
             &["agent/eval-agent".to_string()],
             "eval-e06",
@@ -111,6 +120,11 @@ async fn eval_e07_mcp_down_degrade() {
             namespace: "agent/eval-agent".into(),
             badge_token: String::new(),
             ns_full_path: None,
+            persona_id: None,
+            owner_user_id: None,
+            workspace_dir: None,
+            tool_allowlist: Vec::new(),
+            memory_namespace: None,
         },
         llm: LlmConfig::default(),
         memoria_url: String::new(),
@@ -133,7 +147,8 @@ async fn eval_e07_mcp_down_degrade() {
     };
     let harness = HarnessStore::open_memory().unwrap();
     let cp = CheckpointStore::open_memory().unwrap();
-    let agent = AgentCore::new(config, harness, cp);
+    let local_resources = Arc::new(Mutex::new(LocalResourceSnapshot::default()));
+    let agent = AgentCore::new(config, harness, cp, local_resources);
 
     // 连续 3 次拉取工具（触发 UNHEALTHY_THRESHOLD）
     for _ in 0..3 {
@@ -167,7 +182,7 @@ async fn eval_e07_mcp_down_degrade() {
     let status2 = agent.degrade_status();
     assert_eq!(status2["mode"].as_str(), Some("kill_switch"));
     let res = agent
-        .call_tool_routed("any_tool", &serde_json::json!({}), &[], "eval-e07")
+        .call_tool_routed("any_tool", "default", &serde_json::json!({}), &[], "eval-e07")
         .await;
     assert!(res.is_err(), "Kill switch 开启时任何工具调用必须被拒绝");
     agent.set_kill_switch(false);

@@ -19,3 +19,4 @@ pub mod runtime;
 pub mod scheduler;
 pub mod self_evolution;
 pub mod text_signals;
+pub mod memory_extract;
