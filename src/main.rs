@@ -1495,11 +1495,12 @@ async fn handle_persona_get(
     })).into_response()
 }
 
-/// Phase 6：圆桌（native，自动分配 LLM，不依赖 qclaw）
+/// Phase 6：圆桌（native，自动分配 LLM，不依赖 qclaw）—— SSE 流式
 ///
 /// 多分身就同一议题发表立场 → 主席（默认 default）收敛共识；
-/// 结论最佳努力写入 Memoria（调用者自身 ns）。LLM 分配由 `AgentCore::run_roundtable` 完成：
-/// 配置/圆桌池自动轮询到多个 provider，做到真多 LLM。
+/// 每个分身立场完成即推 `stance` 事件，主席收敛推 `consensus`，最后推 `done`。
+/// 结论最佳努力写入 Memoria（调用者自身 ns）。LLM 分配由 `AgentCore::persona_stance`
+/// 完成：配置/圆桌池自动轮询到多个 provider，做到真多 LLM。
 async fn handle_panel_discuss(
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
@@ -1514,39 +1515,86 @@ async fn handle_panel_discuss(
     };
     let chair = v.get("chair").and_then(|x| x.as_str()).map(|s| s.to_string());
     let session_id = v.get("session_id").and_then(|x| x.as_str()).unwrap_or("");
+    // 可选 personas 筛选：前端分身多选生效。空/缺省则全部参与。
+    let selected_ids: Option<Vec<String>> = v
+        .get("personas")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty());
     let g = st.agent.lock().await;
-    let Some(ref agent) = *g else {
+    let has_agent = g.is_some();
+    drop(g);
+    if !has_agent {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
-    };
-    let result = agent.run_roundtable(&topic, chair.as_deref()).await;
-    // 最佳努力写入 Memoria（调用者自身 ns）
-    let ns = agent.caller_ns(session_id);
-    let stances_text = result
-        .stances
-        .iter()
-        .map(|(id, s)| format!("【{}】{}", id, s))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let content = format!(
-        "[roundtable] topic={}\nconsensus={}\n---\n{}",
-        topic, result.consensus, stances_text
-    );
-    let args = serde_json::json!({
-        "content": content,
-        "tags": ["roundtable"],
-        "category": "roundtable",
-        "confidence": 80,
-        "namespace": ns,
-    });
-    if agent.mcp.call_json("memory_remember", &args).await.is_ok() {
-        tracing::info!(ns = %ns, "roundtable 结论已写入 Memoria");
     }
-    Json(serde_json::json!({
-        "ok": true,
-        "topic": topic,
-        "stances": result.stances.iter().map(|(id, s)| serde_json::json!({"persona_id": id, "stance": s})).collect::<Vec<_>>(),
-        "consensus": result.consensus,
-    })).into_response()
+
+    let st_clone = st.clone();
+    let (tx, rx): (
+        tokio::sync::mpsc::UnboundedSender<Result<SseEvent, Infallible>>,
+        tokio::sync::mpsc::UnboundedReceiver<Result<SseEvent, Infallible>>,
+    ) = tokio::sync::mpsc::unbounded_channel();
+
+    let topic_c = topic.clone();
+    let chair_c = chair.clone();
+    let session_c = session_id.to_string();
+    let sel_c = selected_ids;
+    tokio::spawn(async move {
+        let g = st_clone.agent.lock().await;
+        let Some(ref agent) = *g else {
+            let _ = tx.send(Ok(SseEvent::default().event("done").data("")));
+            return;
+        };
+        let ns = agent.caller_ns(&session_c);
+        let mut personas = agent.list_personas();
+        personas.sort_by(|a, b| a.persona_id.cmp(&b.persona_id));
+        if let Some(ids) = &sel_c {
+            personas.retain(|p| ids.contains(&p.persona_id));
+        }
+        let pool = agent.llm_pool();
+        let mut stances: Vec<(String, String)> = Vec::new();
+        for (i, p) in personas.iter().enumerate() {
+            let (id, stance, prov) = agent.persona_stance(p, &topic_c, i, &pool).await;
+            let payload = serde_json::json!({
+                "persona_id": id,
+                "display_name": p.display_name,
+                "stance": stance,
+                "provider": prov,
+            });
+            let _ = tx.send(Ok(SseEvent::default().event("stance").data(payload.to_string())));
+            stances.push((id, stance));
+        }
+        let consensus = agent.chair_consensus(&topic_c, &stances, chair_c.as_deref()).await;
+        let _ = tx.send(Ok(SseEvent::default().event("consensus").data(
+            serde_json::json!({ "consensus": consensus }).to_string(),
+        )));
+        // 最佳努力写入 Memoria（调用者自身 ns）
+        let stances_text = stances
+            .iter()
+            .map(|(id, s)| format!("【{}】{}", id, s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = format!(
+            "[roundtable] topic={}\nconsensus={}\n---\n{}",
+            topic_c, consensus, stances_text
+        );
+        let args = serde_json::json!({
+            "content": content,
+            "tags": ["roundtable"],
+            "category": "roundtable",
+            "confidence": 80,
+            "namespace": ns,
+        });
+        if agent.mcp.call_json("memory_remember", &args).await.is_ok() {
+            tracing::info!(ns = %ns, "roundtable 结论已写入 Memoria");
+        }
+        let _ = tx.send(Ok(SseEvent::default().event("done").data("")));
+    });
+
+    Sse::new(UnboundedReceiverStream::new(rx)).into_response()
 }
 
 /// 白龙马 Phase B 多端唤醒：返回后台活动事件（since 之后的增量），供 PFAiX 轮询"唤醒"

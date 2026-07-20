@@ -439,7 +439,7 @@ impl AgentCore {
     }
 
     /// Phase 6：构造 LLM 池 = 全局主 + 所有 fallbacks（failover 不变，仅用于圆桌轮询分配）
-    fn llm_pool(&self) -> Vec<LlmConfig> {
+    pub fn llm_pool(&self) -> Vec<LlmConfig> {
         let mut pool = vec![self.config.llm.clone()];
         let base = &self.config.llm;
         for (b, m, k) in &base.fallbacks {
@@ -455,46 +455,45 @@ impl AgentCore {
         pool
     }
 
-    /// Phase 6：圆桌 —— 多分身就同一议题发表立场并收敛
-    ///
-    /// LLM 分配策略（真多 LLM）：
-    /// - 若分身显式配置了 `Persona.llm`，用其专属 client；
-    /// - 否则从 LLM 池（全局主 + fallbacks）按分身序号轮询自动分配不同 provider，
-    ///   使一次圆桌天然打到多个模型，无需手工为每个分身配 key。
-    /// 主席（默认 `default` 或指定）用全局 client 收敛共识。
-    pub async fn run_roundtable(&self, topic: &str, chair_persona: Option<&str>) -> RoundtableResult {
-        // 参与者：所有已注册分身（default 始终在场），按 persona_id 排序保证确定性
-        let mut personas = self.list_personas();
-        personas.sort_by(|a, b| a.persona_id.cmp(&b.persona_id));
-        let pool = self.llm_pool();
-        let mut stances: Vec<(String, String)> = Vec::new();
-        for (i, p) in personas.iter().enumerate() {
-            // 显式配置优先；否则按序号从池里轮询自动分配（真多 LLM）
-            let (client, provider_label) = match &p.llm {
-                Some(c) => (c.clone(), "persona-configured".to_string()),
-                None => {
-                    let cfg = &pool[i % pool.len()];
-                    (LlmClient::new(cfg.clone()), cfg.model.clone())
-                }
-            };
-            tracing::info!(persona = %p.persona_id, provider = %provider_label, "roundtable: 分配 LLM");
-            let sys = format!(
-                "你是分身『{}』（{}）。请从你的角色视角独立发表观点，不要附和他人。",
-                p.persona_id, p.display_name
-            );
-            let user = format!("圆桌议题：{}\n请给出你的立场（2-4 句）。", topic);
-            let msgs = vec![
-                crate::llm::Message { role: "system".to_string(), content: Some(sys), tool_calls: None, tool_call_id: None },
-                crate::llm::Message { role: "user".to_string(), content: Some(user), tool_calls: None, tool_call_id: None },
-            ];
-            let stance = match client.chat(&msgs, &[]).await {
-                Ok(r) => r.text,
-                Err(e) => format!("(LLM 调用失败: {})", e),
-            };
-            stances.push((p.persona_id.clone(), stance));
-        }
+    /// Phase 6：圆桌 —— 单个分身就议题发表立场（供 run_roundtable / SSE 流式复用）
+    pub async fn persona_stance(
+        &self,
+        p: &crate::runtime::self_runtime::Persona,
+        topic: &str,
+        index: usize,
+        pool: &[LlmConfig],
+    ) -> (String, String, String) {
+        let (client, provider_label) = match &p.llm {
+            Some(c) => (c.clone(), "persona-configured".to_string()),
+            None => {
+                let cfg = &pool[index % pool.len()];
+                (LlmClient::new(cfg.clone()), cfg.model.clone())
+            }
+        };
+        tracing::info!(persona = %p.persona_id, provider = %provider_label, "roundtable: 分配 LLM");
+        let sys = format!(
+            "你是分身『{}』（{}）。请从你的角色视角独立发表观点，不要附和他人。",
+            p.persona_id, p.display_name
+        );
+        let user = format!("圆桌议题：{}\n请给出你的立场（2-4 句）。", topic);
+        let msgs = vec![
+            crate::llm::Message { role: "system".to_string(), content: Some(sys), tool_calls: None, tool_call_id: None },
+            crate::llm::Message { role: "user".to_string(), content: Some(user), tool_calls: None, tool_call_id: None },
+        ];
+        let stance = match client.chat(&msgs, &[]).await {
+            Ok(r) => r.text,
+            Err(e) => format!("(LLM 调用失败: {})", e),
+        };
+        (p.persona_id.clone(), stance, provider_label)
+    }
 
-        // 主席收敛
+    /// Phase 6：主席收敛共识
+    pub async fn chair_consensus(
+        &self,
+        topic: &str,
+        stances: &[(String, String)],
+        chair_persona: Option<&str>,
+    ) -> String {
         let chair_id = chair_persona.unwrap_or("default").to_string();
         let joined = stances
             .iter()
@@ -507,10 +506,23 @@ impl AgentCore {
             crate::llm::Message { role: "system".to_string(), content: Some(sys_chair), tool_calls: None, tool_call_id: None },
             crate::llm::Message { role: "user".to_string(), content: Some(user_chair), tool_calls: None, tool_call_id: None },
         ];
-        let consensus = match self.llm.chat(&chair_msgs, &[]).await {
+        match self.llm.chat(&chair_msgs, &[]).await {
             Ok(r) => r.text,
             Err(e) => format!("(主席收敛失败: {})", e),
-        };
+        }
+    }
+
+    /// Phase 6：圆桌 —— 多分身就同一议题发表立场并收敛（收集式，供非流式调用 / tests）
+    pub async fn run_roundtable(&self, topic: &str, chair_persona: Option<&str>) -> RoundtableResult {
+        let mut personas = self.list_personas();
+        personas.sort_by(|a, b| a.persona_id.cmp(&b.persona_id));
+        let pool = self.llm_pool();
+        let mut stances: Vec<(String, String)> = Vec::new();
+        for (i, p) in personas.iter().enumerate() {
+            let (id, stance, _prov) = self.persona_stance(p, topic, i, &pool).await;
+            stances.push((id, stance));
+        }
+        let consensus = self.chair_consensus(topic, &stances, chair_persona).await;
         RoundtableResult { stances, consensus }
     }
 
