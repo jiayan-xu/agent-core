@@ -4067,6 +4067,82 @@ impl AgentCore {
             }
         }
 
+        // 7. PR4 Phase A：演化决策 — 为尚未演化的观察记忆合成 evolved_context（结合已提炼 pattern）
+        //    批处理 + 分批（每批 ≤80 条）限制 LLM 输出体积，避免逐条演化写风暴；
+        //    经 MCP memory_evolve 落库（Memoria 哑存储，守 H1/H2）。绝不进 call_tool_routed 热路径。
+        if written > 0 && crate::memory_evolve::agent_memory_evolve_enabled() {
+            let evo_items: Vec<(String, String)> = items
+                .iter()
+                .filter_map(|it| {
+                    let id = it.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                    let content =
+                        it.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                    if id.is_empty() || content.is_empty() {
+                        None
+                    } else {
+                        Some((id, content))
+                    }
+                })
+                .collect();
+            if !evo_items.is_empty() {
+                let model = self.config.llm.model.clone();
+                let patterns_txt = reply.chars().take(1500).collect::<String>();
+                let mut evolved = 0u64;
+                for chunk in evo_items.chunks(80) {
+                    let evo_prompt = format!(
+                        "你是记忆演化引擎。给定一批原始\"观察\"记忆和已提炼的高层模式，请为每条观察补充\"演化上下文\"：\
+                         用一句话说明该观察如何被高层模式解释或关联（不要重复原观察内容，只写增量上下文；若无关联可写\"\"）。\
+                         仅输出纯 JSON 数组，不要任何前缀后缀：\
+                         [{{\"id\":\"<记忆id>\",\"evolved_context\":\"<一句话增量上下文>\"}}]\n\n\
+                         ## 已提炼模式\n{}\n\n## 待演化观察（{} 条）\n{}",
+                        patterns_txt,
+                        chunk.len(),
+                        chunk
+                            .iter()
+                            .map(|(id, c)| {
+                                format!("{}: {}", id, c.chars().take(300).collect::<String>())
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                    let msg3 = crate::llm::Message {
+                        role: "system".to_string(),
+                        content: Some(evo_prompt),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    };
+                    if let Ok(evo_reply) = self.llm.chat(&[msg3], &[]).await {
+                        let pairs = crate::memory_evolve::parse_evolution_array(&evo_reply.text);
+                        for (eid, ectx) in pairs {
+                            // 仅演化本批次内的 id（防御 LLM 编造 id 跨批）
+                            if chunk.iter().any(|(id, _)| id == &eid) {
+                                let _ = mem_client
+                                    .call(
+                                        "memory_evolve",
+                                        &serde_json::json!({
+                                            "target_id": eid,
+                                            "namespace": ns,
+                                            "evolved_context": ectx,
+                                            "model": model,
+                                            "change_type": "context_update"
+                                        }),
+                                    )
+                                    .await;
+                                evolved += 1;
+                            }
+                        }
+                    }
+                }
+                if evolved > 0 {
+                    tracing::info!(
+                        "consolidate[{}] PR4 演化: {} 条记忆写入 evolved_context",
+                        ns,
+                        evolved
+                    );
+                }
+            }
+        }
+
         format!(
             "consolidate[{}]: 从 {} 条观察提炼 {} 条 pattern（cursor→{}）",
             ns,

@@ -877,6 +877,9 @@ impl ToolClassifier {
             "generate_month_log",
             "archive_operate",
             "organize_folders",
+            // PR4 Phase A 演化：写回 evolved_context / 回滚演化（Memoria 哑存储写操作）
+            "memory_evolve",
+            "evolution_rollback",
         ] {
             c.write_tools.insert(t.to_string());
         }
