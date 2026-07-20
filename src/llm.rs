@@ -33,11 +33,19 @@ pub struct LlmProvider {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+    /// chat/completions 路径（不同厂商约定不同：DeepSeek/硅基流动=/v1/chat/completions，火山方舟=/chat/completions）
+    #[serde(default = "default_chat_path")]
+    pub chat_path: String,
 }
 
 /// LlmConfig 缺省 max_tokens（供 serde(default) 使用，避免用户删字段导致解析失败）
 fn default_max_tokens() -> u32 {
     4096
+}
+
+/// LlmConfig 缺省 chat_path
+fn default_chat_path() -> String {
+    "/v1/chat/completions".to_string()
 }
 
 /// LLM 配置
@@ -46,6 +54,9 @@ pub struct LlmConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+    /// chat/completions 路径（不同厂商约定不同）
+    #[serde(default = "default_chat_path")]
+    pub chat_path: String,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     #[serde(default)]
@@ -60,6 +71,7 @@ impl Default for LlmConfig {
             base_url: "https://api.deepseek.com".to_string(),
             model: "deepseek-chat".to_string(),
             api_key: String::new(),
+            chat_path: "/v1/chat/completions".to_string(),
             max_tokens: 4096,
             temperature: 0.0,
             fallbacks: Vec::new(),
@@ -161,6 +173,7 @@ impl LlmClient {
             base_url: self.config.base_url.clone(),
             model: self.config.model.clone(),
             api_key: self.config.api_key.clone(),
+            chat_path: self.config.chat_path.clone(),
         });
         for fb in &self.config.fallbacks {
             providers.push(fb.clone());
@@ -173,7 +186,7 @@ impl LlmClient {
             let base_url = &p.base_url;
             let model = &p.model;
             let api_key = &p.api_key;
-            let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+            let url = format!("{}{}", base_url.trim_end_matches('/'), p.chat_path);
 
             let mut body = serde_json::json!({
                 "model": model,
@@ -294,6 +307,7 @@ impl LlmClient {
             base_url: self.config.base_url.clone(),
             model: self.config.model.clone(),
             api_key: self.config.api_key.clone(),
+            chat_path: self.config.chat_path.clone(),
         });
         for fb in &self.config.fallbacks {
             providers.push(fb.clone());
@@ -306,8 +320,9 @@ impl LlmClient {
             let base_url = &p.base_url;
             let model = &p.model;
             let api_key = &p.api_key;
+            let chat_path = &p.chat_path;
             match self
-                .chat_stream_single(base_url, model, api_key, messages, tools, &sender)
+                .chat_stream_single(base_url, model, api_key, chat_path, messages, tools, &sender)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -338,11 +353,13 @@ impl LlmClient {
         base_url: &str,
         model: &str,
         api_key: &str,
+        chat_path: &str,
         messages: &[Message],
         tools: &[ToolDef],
         sender: &mpsc::UnboundedSender<SseEvent>,
     ) -> Result<(), String> {
-        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+        let url = format!("{}{}", base_url.trim_end_matches('/'), chat_path);
+        tracing::warn!(url = %url, chat_path = %chat_path, "LLM request url (chat_path applied)");
 
         let mut body = serde_json::json!({
             "model": model,

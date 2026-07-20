@@ -3155,6 +3155,7 @@ async fn build_agent(config: &Config, local_resources: SharedResourceSnapshot) -
                 base_url: "https://ark.cn-beijing.volces.com/api/v3".to_string(),
                 model: "doubao-lite-32k".to_string(),
                 api_key: doubao_key,
+                chat_path: "/chat/completions".to_string(),
             }]
         } else {
             Vec::new()

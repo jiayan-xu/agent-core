@@ -447,6 +447,7 @@ impl AgentCore {
                 base_url: fb.base_url.clone(),
                 model: fb.model.clone(),
                 api_key: fb.api_key.clone(),
+                chat_path: fb.chat_path.clone(),
                 max_tokens: base.max_tokens,
                 temperature: base.temperature,
                 fallbacks: vec![],
