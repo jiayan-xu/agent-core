@@ -245,7 +245,7 @@ impl AgentCore {
         let mcp_for_audit = mcp.clone();
         let default_persona = crate::runtime::self_runtime::Persona {
             persona_id: "default".to_string(),
-            display_name: config.identity.agent_id.clone(),
+            display_name: "默认分身".to_string(),
             owner_user_id: config.identity.agent_id.clone(),
             workspace_dir: None,
             tool_allowlist: Vec::new(),
@@ -293,7 +293,7 @@ impl AgentCore {
         }
         map.get("default").cloned().unwrap_or_else(|| crate::runtime::self_runtime::Persona {
             persona_id: "default".to_string(),
-            display_name: self.config.identity.agent_id.clone(),
+            display_name: "默认分身".to_string(),
             owner_user_id: self.config.identity.agent_id.clone(),
             workspace_dir: None,
             tool_allowlist: Vec::new(),
