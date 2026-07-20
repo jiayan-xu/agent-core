@@ -1159,9 +1159,12 @@ fn main() {
             let protected = Router::new()
                 .route("/api/chat", post(handle_chat))
                 .route("/api/chat/stream", get(handle_chat_stream))
-                .route("/api/sessions", get(handle_sessions))
-                .route("/api/sessions/{id}", get(handle_session_load))
-                .route("/api/sessions/{id}", delete(handle_session_delete))
+                .nest(
+                    "/api/sessions",
+                    Router::new()
+                        .route("/", get(handle_sessions))
+                        .route("/{id}", get(handle_session_load).delete(handle_session_delete)),
+                )
                 .route("/api/admin/degrade", get(handle_admin_degrade))
                 .route("/api/admin/killswitch", post(handle_admin_killswitch))
                 .route("/api/metrics", get(handle_metrics))
