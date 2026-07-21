@@ -521,9 +521,12 @@ impl AgentCore {
             crate::llm::Message { role: "system".to_string(), content: Some(sys), tool_calls: None, tool_call_id: None },
             crate::llm::Message { role: "user".to_string(), content: Some(user), tool_calls: None, tool_call_id: None },
         ];
-        let stance = match client.chat(&msgs, &[]).await {
-            Ok(r) => r.text,
-            Err(e) => format!("(LLM 调用失败: {})", e),
+        // 逐调用硬性超时：避免单个 provider 卡死（如重试退避叠加）拖垮整场圆桌。
+        // 超时则该席返回占位立场，圆桌继续收敛，不让一个坏模型阻断其余模型。
+        let stance = match tokio::time::timeout(std::time::Duration::from_secs(45), client.chat(&msgs, &[])).await {
+            Ok(Ok(r)) => r.text,
+            Ok(Err(e)) => format!("(LLM 调用失败: {})", e),
+            Err(_) => "(该分身 LLM 调用超时，已跳过其立场)".to_string(),
         };
         (p.persona_id.clone(), stance, provider_label)
     }
@@ -547,9 +550,11 @@ impl AgentCore {
             crate::llm::Message { role: "system".to_string(), content: Some(sys_chair), tool_calls: None, tool_call_id: None },
             crate::llm::Message { role: "user".to_string(), content: Some(user_chair), tool_calls: None, tool_call_id: None },
         ];
-        match self.llm.chat(&chair_msgs, &[]).await {
-            Ok(r) => r.text,
-            Err(e) => format!("(主席收敛失败: {})", e),
+        // 同样加硬性超时，避免主席收敛被全局 LLM 卡死。
+        match tokio::time::timeout(std::time::Duration::from_secs(45), self.llm.chat(&chair_msgs, &[])).await {
+            Ok(Ok(r)) => r.text,
+            Ok(Err(e)) => format!("(主席收敛失败: {})", e),
+            Err(_) => "(主席收敛超时)".to_string(),
         }
     }
 
