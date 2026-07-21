@@ -4234,11 +4234,13 @@ impl AgentCore {
         let latest = store.latest_feedback();
         let count = store.feedback_count();
         drop(store);
+        let last_run_at = self.meta_evolver.last_run_at_secs().await;
         serde_json::json!({
             "enabled": enabled,
             "approval_mode": self.config.safety.approval_mode.as_str(),
             "current_prompt_hash": hash,
             "feedback_count": count,
+            "last_run_at": last_run_at,
             "last_feedback": latest,
             "config": {
                 "window_days": self.config.meta_evolution.window_days,

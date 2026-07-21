@@ -339,6 +339,20 @@ impl RolloutResult {
             feedback_id: String::new(),
         }
     }
+    fn cooldown(hours: i64) -> Self {
+        RolloutResult {
+            attempted: false,
+            status: "cooldown".into(),
+            reason: format!("距上次元进化不足 {}h（cooldown 守卫，跳过本轮）", hours),
+            baseline_rate: 0.0,
+            candidate_rate: 0.0,
+            passed: false,
+            rolled_out: false,
+            prompt_hash_before: String::new(),
+            prompt_hash_after: String::new(),
+            feedback_id: String::new(),
+        }
+    }
     fn error(msg: &str) -> Self {
         RolloutResult {
             attempted: true,
@@ -422,6 +436,10 @@ impl MetaEvolutionStore {
                     prompt_hash  TEXT NOT NULL,
                     created_at   INTEGER,
                     is_current   INTEGER DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS meta_kv (
+                    k TEXT PRIMARY KEY,
+                    v TEXT
                 );",
             )
             .map_err(|e| format!("init meta_evolution schema: {}", e))?;
@@ -521,6 +539,27 @@ impl MetaEvolutionStore {
         self.conn
             .query_row("SELECT COUNT(*) FROM evolution_feedback", [], |r| r.get::<_, i64>(0))
             .unwrap_or(0) as usize
+    }
+
+    /// 读取 kv（持久化运行态，如 last_run_at）
+    pub fn get_kv(&self, k: &str) -> Option<String> {
+        self.conn
+            .query_row("SELECT v FROM meta_kv WHERE k = ?1", params![k], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+    }
+
+    /// 写入/覆盖 kv
+    pub fn set_kv(&mut self, k: &str, v: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO meta_kv (k, v) VALUES (?1, ?2) \
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                params![k, v],
+            )
+            .map_err(|e| format!("set_kv {}: {}", k, e))?;
+        Ok(())
     }
 }
 
@@ -795,6 +834,23 @@ impl MetaEvolver {
         if !self.config.enabled {
             return RolloutResult::skipped("meta_evolution.enabled=false");
         }
+        // cooldown 守卫：避免夜班 patrol / 手动 consolidate 高频反复跑 L2
+        if self.config.cooldown_hours > 0 {
+            let now = now_secs() as i64;
+            let last = self
+                .store
+                .lock()
+                .await
+                .get_kv("last_run_at")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            if now - last < self.config.cooldown_hours * 3600 {
+                return RolloutResult::cooldown(self.config.cooldown_hours);
+            }
+            // 通过守卫 → 记录本次触发时刻（即便随后 insufficient_samples 也记，避免空转）
+            let mut g = self.store.lock().await;
+            let _ = g.set_kv("last_run_at", &now.to_string());
+        }
         let samples = self.collect_negative_samples(mem_client, 500).await;
         if samples.len() < self.config.min_samples {
             return RolloutResult {
@@ -828,6 +884,15 @@ impl MetaEvolver {
         let candidate_rate = self.estimate_candidate_rate(&cand.text, &samples, baseline);
         self.rollout_if_better(&cand, baseline, candidate_rate, &samples, ns)
             .await
+    }
+
+    /// 上次元进化触发时刻（Unix 秒），供 status 展示 cooldown 状态
+    pub async fn last_run_at_secs(&self) -> Option<i64> {
+        self.store
+            .lock()
+            .await
+            .get_kv("last_run_at")
+            .and_then(|s| s.parse::<i64>().ok())
     }
 }
 

@@ -1087,8 +1087,8 @@ fn main() {
                         };
                         if (2..=4).contains(&hour) && !already {
                             let default_ns = format!("agent/{}", agent.config.identity.agent_id);
-                            let ns_list = std::env::var("CONSOLIDATE_NAMESPACES")
-                                .unwrap_or(default_ns);
+            let ns_list = std::env::var("CONSOLIDATE_NAMESPACES")
+                .unwrap_or(default_ns.clone());
                             let mut results = Vec::new();
                             for ns in ns_list
                                 .split(',')
@@ -1099,6 +1099,11 @@ fn main() {
                                 tracing::info!("[consolidate] {}", res);
                                 results.push(serde_json::json!({"ns": ns, "result": res}));
                             }
+                            // PR5 自驱：低峰 consolidate 维护周期后触发一轮元进化
+                            // （受 meta_evolution.enabled + cooldown_hours 双重保护，非低峰/未开启则不动作）
+                            let me_val = agent.run_meta_evolution(&default_ns).await;
+                            tracing::info!(target: "consciousness", "meta_evolution(nightly): {}", me_val);
+                            results.push(serde_json::json!({"ns": default_ns, "meta_evolution": me_val}));
                             *patrol_state.consolidate_last_ymd.lock().await = ymd.clone();
                             *patrol_state.consolidate_last.lock().await = serde_json::json!({
                                 "status": "ok",
@@ -1348,7 +1353,7 @@ async fn handle_admin_consolidate(
         .filter(|v: &Vec<String>| !v.is_empty())
         .unwrap_or_else(|| {
             std::env::var("CONSOLIDATE_NAMESPACES")
-                .unwrap_or(default_ns)
+                .unwrap_or(default_ns.clone())
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
@@ -1359,6 +1364,10 @@ async fn handle_admin_consolidate(
         let res = agent.consolidate(ns).await;
         results.push(serde_json::json!({"ns": ns, "result": res}));
     }
+    // PR5 自驱：手动 consolidate 维护也触发元进化（受 enabled + cooldown 保护）
+    let me_val = agent.run_meta_evolution(&default_ns).await;
+    tracing::info!(target: "consciousness", "meta_evolution(manual): {}", me_val);
+    results.push(serde_json::json!({"ns": default_ns, "meta_evolution": me_val}));
     drop(agent_guard);
     let now_local = Local::now();
     let ymd = now_local.format("%Y-%m-%d").to_string();
