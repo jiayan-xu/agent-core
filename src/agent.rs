@@ -2374,7 +2374,7 @@ impl AgentCore {
 
     /// 代调用者向 `agent/{to_agent}` 收件箱投递一封协作信封。
     ///
-    /// 经服务端受信身份 `self.mcp`（即 `dashboard-agent`，在 Memoria 注册为 admin/`*`，
+    /// 经服务端受信身份 `self.mcp`（即 `jarvis`，在 Memoria 注册为 admin/`*`，
     /// 与现有审批流一致）中继投递。Memoria 的 `a2a_send` NS 门控
     /// 仅放行 admin 角色，故由 agent-core（可信后端）统一中继；真正的可达性策略在
     /// `handle_collab_send` 中按 §3.3 校验，NS 门控仅作纵深防御。
@@ -3801,18 +3801,18 @@ impl AgentCore {
     pub async fn consolidate(&self, ns: &str) -> String {
         // 系统维护任务：以本 Agent 身份 + dashboard badge 跨 ns 读观察（与注册/代理路径一致；
         // 勿用字面 "admin"——Memoria 侧该身份可能过期导致 401）。
-        let dash_badge = std::env::var("MEMORIA_DASHBOARD_BADGE")
+        let jarvis_badge = std::env::var("MEMORIA_JARVIS_BADGE")
             .ok()
             .filter(|s| !s.is_empty())
             .or_else(|| std::env::var("MEMORIA_ADMIN_KEY").ok())
             .unwrap_or_default();
-        let mem_client = if dash_badge.is_empty() {
+        let mem_client = if jarvis_badge.is_empty() {
             self.mcp.clone()
         } else {
             McpClient::new(
                 &self.config.memoria_url,
                 &self.config.identity.agent_id,
-                &dash_badge,
+                &jarvis_badge,
             )
         };
 
@@ -4212,19 +4212,19 @@ impl AgentCore {
                 "reason": "meta_evolution.enabled=false（受控开启，需在 agent.toml 显式开启）"
             });
         }
-        // 与 consolidate 一致的 dash_badge 取权逻辑（以本 Agent 身份 + dashboard badge 跨 ns 读）
-        let dash_badge = std::env::var("MEMORIA_DASHBOARD_BADGE")
+        // 与 consolidate 一致的 jarvis_badge 取权逻辑（以本 Agent 身份 + dashboard badge 跨 ns 读）
+        let jarvis_badge = std::env::var("MEMORIA_JARVIS_BADGE")
             .ok()
             .filter(|s| !s.is_empty())
             .or_else(|| std::env::var("MEMORIA_ADMIN_KEY").ok())
             .unwrap_or_default();
-        let mem_client = if dash_badge.is_empty() {
+        let mem_client = if jarvis_badge.is_empty() {
             self.mcp.clone()
         } else {
             McpClient::new(
                 &self.config.memoria_url,
                 &self.config.identity.agent_id,
-                &dash_badge,
+                &jarvis_badge,
             )
         };
         let res = self.meta_evolver.run_once(&mem_client, ns).await;

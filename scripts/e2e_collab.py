@@ -5,7 +5,7 @@
   - agent-core :9753 与 Memoria :9003 已启动
   - 环境变量：
       AGENT_CORE_URL          默认 http://127.0.0.1:9753
-      E2E_DASH_ID / E2E_DASH_KEY   发起方（默认 dashboard-agent + MEMORIA_ADMIN_KEY）
+      E2E_DASH_ID / E2E_DASH_KEY   发起方（默认 jarvis + MEMORIA_ADMIN_KEY）
       E2E_OFFICE_ID / E2E_OFFICE_KEY 办公室身份（须在 COLLAB_ORG_BROADCASTERS 或默认 office-agent）
       COLLAB_ORG_BROADCASTERS  可选，逗号分隔；公司广播白名单
 
@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 
 AC = os.environ.get("AGENT_CORE_URL", "http://127.0.0.1:9753").rstrip("/")
-DASH_ID = os.environ.get("E2E_DASH_ID", "dashboard-agent")
+DASH_ID = os.environ.get("E2E_DASH_ID", "jarvis")
 DASH_KEY = os.environ.get("E2E_DASH_KEY") or os.environ.get("MEMORIA_ADMIN_KEY", "")
 OFF_ID = os.environ.get("E2E_OFFICE_ID", "office-agent")
 OFF_KEY = os.environ.get("E2E_OFFICE_KEY", "")

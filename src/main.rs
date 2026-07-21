@@ -194,10 +194,10 @@ fn env_memoria_admin_key(fallback: &str) -> String {
     }
 }
 
-/// dashboard-agent 专属 badge（`MEMORIA_DASHBOARD_BADGE`）；与 admin 不得同 token（UNIQUE）。
+/// jarvis 专属 badge（`MEMORIA_JARVIS_BADGE`）；与 admin 不得同 token（UNIQUE）。
 /// 未设置时回退 `MEMORIA_ADMIN_KEY`（过渡兼容，生产应显式分钥）。
-fn env_memoria_dashboard_badge(admin_fallback: &str) -> String {
-    match std::env::var("MEMORIA_DASHBOARD_BADGE") {
+fn env_memoria_jarvis_badge(admin_fallback: &str) -> String {
+    match std::env::var("MEMORIA_JARVIS_BADGE") {
         Ok(k) if !k.is_empty() => k,
         _ => env_memoria_admin_key(admin_fallback),
     }
@@ -383,7 +383,7 @@ fn caller_has_proj(caller_ns: &[String], proj: &str) -> bool {
 
 fn can_org_broadcast(caller_id: &str, caller_ns: &[String]) -> bool {
     // 注意：持有 `*`（Memoria admin）也不自动获得公司广播权，
-    // 避免 dashboard-agent 等服务身份误发国庆通知；须显式进白名单或 role。
+    // 避免 jarvis 等服务身份误发国庆通知；须显式进白名单或 role。
     let role_ok = caller_ns.iter().any(|n| {
         n == "role/office"
             || n == "role/hr"
@@ -738,10 +738,10 @@ async fn authenticate(
     };
 
     // 鉴权密钥：显式 x-agent-key 优先；legacy usertag 回退用 dashboard badge
-    // （安装实例自身没有独立 key，由 agent-core 以 dashboard-agent 身份代为在 Memoria 注册）。
+    // （安装实例自身没有独立 key，由 agent-core 以 jarvis 身份代为在 Memoria 注册）。
     let cfg_admin = st.config.lock().await.memoria_admin_key.clone();
     let admin_key = env_memoria_admin_key(&cfg_admin);
-    let dash_badge = env_memoria_dashboard_badge(&cfg_admin);
+    let jarvis_badge = env_memoria_jarvis_badge(&cfg_admin);
     let agent_key = if !from_usertag {
         headers
             .get("x-agent-key")
@@ -749,7 +749,7 @@ async fn authenticate(
             .unwrap_or("")
             .to_string()
     } else {
-        dash_badge.clone()
+        jarvis_badge.clone()
     };
     let (server, actor) = {
         let cfg = st.config.lock().await;
@@ -795,8 +795,8 @@ async fn authenticate(
             // 同一 namespace 字段，Memoria `get_allowed_ns` 会按逗号拆分回传，从而
             // 后续请求（缓存失效后重查）仍同时持有这两个 ns，不会因回读而丢失 dashboard。
             let install_ns = format!("agent/{},org/cs-pufa-2nd-thermal", agent_id);
-            // 身份 = dashboard-agent + 专属 badge；admin_key 仅作 register 参数
-            let reg = McpClient::new(&server, &actor, &dash_badge);
+            // 身份 = jarvis + 专属 badge；admin_key 仅作 register 参数
+            let reg = McpClient::new(&server, &actor, &jarvis_badge);
             let _ = reg
                 .call_json(
                     "register_agent",
@@ -3203,17 +3203,17 @@ async fn handle_register(
     // 先生成一个本地兜底 token；若 Memoria 注册成功，会用 Memoria 实际返回的 badge 覆盖（P0 修复：必须一致，否则客户端 key 与 Memoria 存值不符导致鉴权失败）
     let mut badge_token = format!("sk-{:x}", rand::thread_rng().gen::<u128>());
 
-    // 注册到 Memoria — admin_key 作参数；身份用 dashboard-agent 专属 badge
+    // 注册到 Memoria — admin_key 作参数；身份用 jarvis 专属 badge
     let cfg_admin = st.config.lock().await.memoria_admin_key.clone();
     let admin_key = env_memoria_admin_key(&cfg_admin);
-    let dash_badge = env_memoria_dashboard_badge(&cfg_admin);
-    // P0 修复：以 dashboard-agent 身份（专属 badge，permission=admin）代理注册，
+    let jarvis_badge = env_memoria_jarvis_badge(&cfg_admin);
+    // P0 修复：以 jarvis 身份（专属 badge，permission=admin）代理注册，
     // 而非字面 "admin"（DB 中持有过期 key，会导致 Memoria require_admin 401）。
     let (actor, server) = {
         let cfg = st.config.lock().await;
         (cfg.agent_id.clone(), cfg.server.clone())
     };
-    let mcp = McpClient::new(&server, &actor, &dash_badge);
+    let mcp = McpClient::new(&server, &actor, &jarvis_badge);
     // P0 修复：Memoria 的 register_agent 会自行生成 badge 并在响应里返回；
     // 必须用它作为后续鉴权 key，否则客户端拿本地随机 token 与 Memoria 存值对不上 → -32001。
     let memoria_ok = if admin_key.is_empty() {
@@ -3262,7 +3262,7 @@ async fn handle_register(
     }
 
     // 审计日志：记录身份注册
-    let audit = AuditLogger::new(McpClient::new(&server, &actor, &dash_badge));
+    let audit = AuditLogger::new(McpClient::new(&server, &actor, &jarvis_badge));
     audit
         .log_identity(
             &agent_id,
@@ -3331,8 +3331,8 @@ async fn handle_register_user(
     };
     let cfg_admin = st.config.lock().await.memoria_admin_key.clone();
     let admin_key = env_memoria_admin_key(&cfg_admin);
-    let dash_badge = env_memoria_dashboard_badge(&cfg_admin);
-    if admin_key.is_empty() || dash_badge.is_empty() {
+    let jarvis_badge = env_memoria_jarvis_badge(&cfg_admin);
+    if admin_key.is_empty() || jarvis_badge.is_empty() {
         return Json(LoginResponse {
             ok: false,
             user_id: String::new(),
@@ -3356,13 +3356,13 @@ async fn handle_register_user(
     } else {
         default_ns.clone()
     };
-    // 以 dashboard-agent + MEMORIA_DASHBOARD_BADGE 调 Memoria（permission=admin），
+    // 以 jarvis + MEMORIA_JARVIS_BADGE 调 Memoria（permission=admin），
     // 可代理 register_user/login_user；不得与 MEMORIA_ADMIN_KEY 同 token。
     let (actor, server) = {
         let cfg = st.config.lock().await;
         (cfg.agent_id.clone(), cfg.server.clone())
     };
-    let mcp = McpClient::new(&server, &actor, &dash_badge);
+    let mcp = McpClient::new(&server, &actor, &jarvis_badge);
     match mcp
         .call_json(
             "register_user",
@@ -3432,8 +3432,8 @@ async fn handle_login(
     }
     let cfg_admin = st.config.lock().await.memoria_admin_key.clone();
     let admin_key = env_memoria_admin_key(&cfg_admin);
-    let dash_badge = env_memoria_dashboard_badge(&cfg_admin);
-    if admin_key.is_empty() || dash_badge.is_empty() {
+    let jarvis_badge = env_memoria_jarvis_badge(&cfg_admin);
+    if admin_key.is_empty() || jarvis_badge.is_empty() {
         return Json(LoginResponse {
             ok: false,
             user_id: String::new(),
@@ -3443,13 +3443,13 @@ async fn handle_login(
             error: Some("服务未就绪，请稍后重试".to_string()),
         });
     }
-    // P0 修复：以 dashboard-agent + 专属 badge 代理登录，
+    // P0 修复：以 jarvis + 专属 badge 代理登录，
     // 而非字面 "admin"（DB 中过期 key 会导致 require_admin 401）。
     let (actor, server) = {
         let cfg = st.config.lock().await;
         (cfg.agent_id.clone(), cfg.server.clone())
     };
-    let mcp = McpClient::new(&server, &actor, &dash_badge);
+    let mcp = McpClient::new(&server, &actor, &jarvis_badge);
     match mcp
         .call_json(
             "login_user",
@@ -3520,7 +3520,7 @@ async fn build_agent(config: &Config, local_resources: SharedResourceSnapshot) -
     } else {
         env_memoria_admin_key("")
     };
-    let badge_token = env_memoria_dashboard_badge(&admin_key);
+    let badge_token = env_memoria_jarvis_badge(&admin_key);
     let admin_key = if !admin_key.is_empty() {
         admin_key
     } else if !badge_token.is_empty() {
