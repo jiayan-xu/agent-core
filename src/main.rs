@@ -47,9 +47,10 @@ use wry::WebViewBuilder;
 use agent_core::agent::{AgentConfig, AgentCore, AgentIdentity};
 use agent_core::audit::AuditLogger;
 use agent_core::meta_evolve::{MetaEvolutionConfig, SafetyConfig};
+use agent_core::code_evolve::{apply_patch, eval_crate, find_up, git_commit, git_diff, git_revert, propose_fn, EvalResult};
 use agent_core::boundary::PermissionLevel;
 use agent_core::harness::HarnessStore;
-use agent_core::llm::{LlmConfig, LlmProvider};
+use agent_core::llm::{LlmClient, LlmConfig, LlmProvider};
 use agent_core::approval::ApprovalResponse;
 use agent_core::mcp_client::McpClient;
 use agent_core::resources::SharedResourceSnapshot;
@@ -86,6 +87,56 @@ struct Config {
     /// PR5：安全配置（落 [safety]，缺省 ApprovalMode::Auto 免人工审批）
     #[serde(default)]
     safety: Option<SafetyConfig>,
+    /// Phase 7：代码自我进化引擎配置（落 [code_evolution]）。缺省全默认：enabled=false（关闭）。
+    /// 安全要点：默认 dry_run（只产 diff 不提交）、allow_commit=false（双重闸门）、目标必须在隔离仓库。
+    #[serde(default)]
+    code_evolution: Option<CodeEvolutionConfig>,
+}
+
+/// Phase 7：代码自我进化引擎配置
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CodeEvolutionConfig {
+    /// 总开关。缺省 false（关闭）。
+    #[serde(default)]
+    enabled: bool,
+    /// 进化目标源文件路径（必须是隔离仓库内的文件；含 agent-core/memoria 路径的请求会被拒绝）。
+    #[serde(default)]
+    target_path: Option<String>,
+    /// 进化代数预算。缺省 4。
+    #[serde(default = "default_evo_gens")]
+    generations: usize,
+    /// 连续失败/无进展达此数 → 熔断 HARD STOP。缺省 3。
+    #[serde(default = "default_evo_circuit")]
+    circuit_failures: usize,
+    /// 默认 dry_run：true=只产 diff 不提交（人类否决闸门），false=允许在 apply 时提交。
+    #[serde(default = "default_true")]
+    dry_run_default: bool,
+    /// 是否允许真正提交到 git（与请求参数 apply 双重闸门，两者皆 true 才落盘）。缺省 false。
+    #[serde(default)]
+    allow_commit: bool,
+    /// 专用进化密钥（建议走 ${ENV} 注入，如 ${EVOLVE_KEY}）。触发进化必须携带匹配的 `x-evolve-key` 头，
+    /// 否则 401；配置为空则 fail-closed 拒绝任何进化请求（P0-1，避免「端口可达即可触发进化」）。
+    #[serde(default)]
+    evolve_key: Option<String>,
+    /// 目标函数名（默认 "fib"）。引擎只改这一个函数，其余（含测试）不动。
+    #[serde(default = "default_fn_name")]
+    fn_name: String,
+    /// 提议用的专属 LLM 配置；缺省空 = 复用全局主 LlmClient。
+    #[serde(default)]
+    model: Option<LlmConfig>,
+}
+
+fn default_evo_gens() -> usize {
+    4
+}
+fn default_evo_circuit() -> usize {
+    3
+}
+fn default_fn_name() -> String {
+    "fib".to_string()
+}
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,6 +492,8 @@ struct AppState {
     local_resources: SharedResourceSnapshot,
     /// 白龙马 Phase B: 事件自增 id
     next_event_id: AtomicU64,
+    /// Phase 7：进化回路并发守卫（true=正在跑 /api/evolve，防止多请求并发覆盖隔离仓库）
+    evolve_running: AtomicBool,
 }
 
 /// 白龙马 Phase B：多端唤醒 —— 后台活动事件（心跳自主产生的活动，供 PFAiX 拉取"唤醒"）
@@ -839,6 +892,31 @@ fn load_or_create_config() -> Config {
                     *ns = expand_env(ns);
                 }
             }
+            // 展开每个并联分身专属 LLM 的 ${ENV} 占位符（与全局 LLM 池在 build_agent 里的展开保持一致，
+            // 否则分身若写 api_key="${AGENT_API_KEY}" 会被原样发到 API 导致鉴权失败）
+            for pc in &mut cfg.personas {
+                if let Some(llm) = &mut pc.llm {
+                    llm.base_url = expand_env(&llm.base_url);
+                    llm.api_key = expand_env(&llm.api_key);
+                    llm.chat_path = expand_env(&llm.chat_path);
+                    for f in &mut llm.fallbacks {
+                        f.base_url = expand_env(&f.base_url);
+                        f.api_key = expand_env(&f.api_key);
+                        f.chat_path = expand_env(&f.chat_path);
+                    }
+                }
+            }
+            // Phase 7：展开 code_evolution.model / evolve_key 的 ${ENV} 占位符（与分身 LLM 一致）
+            if let Some(ce) = &mut cfg.code_evolution {
+                if let Some(k) = &mut ce.evolve_key {
+                    *k = expand_env(k);
+                }
+                if let Some(m) = &mut ce.model {
+                    m.base_url = expand_env(&m.base_url);
+                    m.api_key = expand_env(&m.api_key);
+                    m.chat_path = expand_env(&m.chat_path);
+                }
+            }
             // 环境变量覆盖（环境变量 > 配置文件，仍生效）
             if let Ok(key) = std::env::var("AGENT_API_KEY") {
                 if !key.is_empty() {
@@ -866,6 +944,7 @@ fn load_or_create_config() -> Config {
         llm: None,
         meta_evolution: None,
         safety: None,
+        code_evolution: None,
     };
     let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());
     cfg
@@ -972,6 +1051,7 @@ fn main() {
                 consolidate_cursor: tokio::sync::Mutex::new(0),
                 background_events: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
                 next_event_id: AtomicU64::new(1),
+                evolve_running: AtomicBool::new(false),
             });
 
             // 先绑定端口，确保服务立即可用（即使 Memoria 慢/未就绪也不阻塞启动）
@@ -1204,6 +1284,7 @@ fn main() {
                 .route("/api/persona/{id}/goal", post(handle_persona_goal_push))
                 .route("/api/session/persona", post(handle_session_persona_bind))
                 .route("/api/roundtable", post(handle_panel_discuss))
+                .route("/api/evolve", post(handle_code_evolve))
                 .route("/api/meta-evolution/run", post(handle_meta_evolution_run))
                 .route("/api/meta-evolution/status", get(handle_meta_evolution_status))
                 .layer(from_fn_with_state(state.clone(), auth_middleware));
@@ -1619,6 +1700,291 @@ async fn handle_panel_discuss(
             tracing::info!(ns = %ns, "roundtable 结论已写入 Memoria");
         }
         let _ = tx.send(Ok(SseEvent::default().event("done").data("")));
+    });
+
+    Sse::new(UnboundedReceiverStream::new(rx)).into_response()
+}
+
+/// Phase 7：进化任务并发守卫（Drop 时复位，确保任何退出路径都释放锁）
+struct EvolveGuard<'a> {
+    flag: &'a AtomicBool,
+}
+impl<'a> Drop for EvolveGuard<'a> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Phase 7：代码自我进化引擎（POST /api/evolve，SSE 流式）
+///
+/// 安全模型（对齐圆桌共识 + 人类否决闸门 + P0 加固）：
+/// - 必须由 `[code_evolution] enabled = true` 开启，否则 403。
+/// - 必须由 `[code_evolution] evolve_key` 配置密钥，且请求携带匹配的 `x-evolve-key`（P0-1）；
+///   否则 401 / fail-closed。全局 auth_middleware 的自动开户不足以触发进化。
+/// - 目标路径经 `resolve_isolated_target` 规范化校验：拒 symlink、拒落入 agent-core / memoria
+///   源码树（含改名克隆、memoria-open）（P0-2）。
+/// - 真签名冻结：apply_patch 归一化比对签名，仅替换函数体（P0-3）。
+/// - 默认 dry_run 由 `dry_run_default` 决定（默认 true）：只产 diff（veto 事件），不落盘；
+///   须显式 `apply=true` 且配置 `allow_commit=true` 才 git commit（人类否决闸门）。
+/// - 熔断：连续失败/无进展达 `circuit_failures` 代立即停。
+async fn handle_code_evolve(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> axum::response::Response {
+    let v = match body {
+        Some(Json(v)) => v,
+        None => return (axum::http::StatusCode::BAD_REQUEST, "missing body").into_response(),
+    };
+    // 取 code_evolution 配置
+    let ce = { let c = st.config.lock().await; c.code_evolution.clone() };
+    let ce = match ce {
+        Some(c) if c.enabled => c,
+        _ => return (axum::http::StatusCode::FORBIDDEN, "code evolution disabled").into_response(),
+    };
+    // P0-1：专用进化密钥闸门（fail-closed）。即便已通过全局 auth_middleware 的自动开户，
+    // 触发进化仍必须携带与配置匹配的 `x-evolve-key`，否则 401。避免「端口可达 + 自动开户 = 即可触发进化」。
+    let cfg_evolve_key = ce.evolve_key.clone().unwrap_or_default();
+    if cfg_evolve_key.is_empty() {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "evolution key not configured (fail-closed)",
+        )
+            .into_response();
+    }
+    let supplied_key = headers
+        .get("x-evolve-key")
+        .and_then(|x| x.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if supplied_key != cfg_evolve_key {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "missing/invalid x-evolve-key",
+        )
+            .into_response();
+    }
+    // 解析参数
+    let target = v
+        .get("target_path")
+        .and_then(|x| x.as_str())
+        .map(String::from)
+        .or(ce.target_path.clone());
+    let target = match target {
+        Some(t) => t,
+        None => return (axum::http::StatusCode::BAD_REQUEST, "target_path required").into_response(),
+    };
+    // P0-2：路径隔离强化 —— 规范化 + 拒 symlink + 拒落入 agent-core/memoria 源码树（含改名克隆、memoria-open）
+    let target_p = match agent_core::code_evolve::resolve_isolated_target(&target) {
+        Ok(p) => p,
+        Err(e) => return (axum::http::StatusCode::FORBIDDEN, e).into_response(),
+    };
+    let fn_name = v
+        .get("fn_name")
+        .and_then(|x| x.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| ce.fn_name.clone());
+    let generations = v
+        .get("generations")
+        .and_then(|x| x.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(ce.generations);
+    let circuit = ce.circuit_failures.max(1);
+    // P1：apply 默认值由配置 dry_run_default 决定（默认 true → 默认 dry_run）。
+    // 此前该字段是死字段（handler 未读），现已接线生效。
+    let apply_param = v
+        .get("apply")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(!ce.dry_run_default);
+    let effective_apply = apply_param && ce.allow_commit;
+    let goal = v.get("goal").and_then(|x| x.as_str()).map(String::from).unwrap_or_else(|| {
+        "在保持正确性、签名与 `pub fn fib` 不变、且不改动 #[cfg(test)] 测试模块的前提下，优化实现使其运行更快；禁止使用 unsafe、外部 IO 或新增依赖。".to_string()
+    });
+
+    // 并发守卫：同一时刻只允许一个进化任务（防止多请求并发覆盖隔离仓库）
+    if st.evolve_running.swap(true, Ordering::SeqCst) {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            "evolution already running",
+        )
+            .into_response();
+    }
+
+    // agent 就绪 + 选取提议用 LLM（专属 model 或全局主 client）
+    let g = st.agent.lock().await;
+    if g.is_none() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "agent 尚未就绪",
+        )
+            .into_response();
+    }
+    let proposer = match &ce.model {
+        Some(m) => LlmClient::new(m.clone()),
+        None => g.as_ref().unwrap().llm.clone(),
+    };
+    drop(g);
+
+    let (tx, rx): (
+        tokio::sync::mpsc::UnboundedSender<Result<SseEvent, Infallible>>,
+        tokio::sync::mpsc::UnboundedReceiver<Result<SseEvent, Infallible>>,
+    ) = tokio::sync::mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        // 任务结束（含任意 early break）自动复位并发守卫
+        let _guard = EvolveGuard {
+            flag: &st.evolve_running,
+        };
+        let send = |ev: &str, data: serde_json::Value| {
+            let _ = tx.send(Ok(SseEvent::default().event(ev).data(data.to_string())));
+        };
+        // 派生隔离仓库的 manifest 与 git 根
+        let manifest = find_up(&target_p, "Cargo.toml").unwrap_or_else(|| target_p.clone());
+        let repo = match find_up(&target_p, ".git") {
+            Some(gd) => gd
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or(gd),
+            None => target_p.parent().unwrap_or(&target_p).to_path_buf(),
+        };
+
+        // 种子最优：以当前已提交状态为基线
+        let mut best: Option<f64> = {
+            let m = manifest.clone();
+            let e = tokio::task::spawn_blocking(move || eval_crate(&m))
+                .await
+                .unwrap_or(EvalResult {
+                    passed: false,
+                    bench_ms: None,
+                    log: "eval 失败".into(),
+                });
+            if e.passed {
+                e.bench_ms
+            } else {
+                None
+            }
+        };
+        send(
+            "info",
+            serde_json::json!({
+                "repo": repo.to_string_lossy(),
+                "manifest": manifest.to_string_lossy(),
+                "apply": effective_apply,
+                "best_seed_ms": best,
+                "goal": goal,
+            }),
+        );
+
+        let mut consecutive = 0usize;
+        let mut gens_run = 0usize;
+        for gen in 1..=generations {
+            gens_run += 1;
+            let current = match std::fs::read_to_string(&target_p) {
+                Ok(c) => c,
+                Err(e) => {
+                    send("error", serde_json::json!({"gen": gen, "msg": format!("读目标文件失败: {}", e)}));
+                    break;
+                }
+            };
+            send("gen_start", serde_json::json!({"gen": gen, "best_ms": best}));
+
+            // 1) LLM 提议
+            let new_fn = match propose_fn(&proposer, &fn_name, &current, &goal).await {
+                Ok(f) => f,
+                Err(e) => {
+                    send("proposal_error", serde_json::json!({"gen": gen, "msg": e}));
+                    consecutive += 1;
+                    if consecutive >= circuit {
+                        send("circuit_break", serde_json::json!({"reason": format!("连续 {} 代提议失败/超时", consecutive)}));
+                        break;
+                    }
+                    continue;
+                }
+            };
+            send("proposal", serde_json::json!({"gen": gen, "code": new_fn}));
+
+            // 2) 外科替换
+            let new_src = match apply_patch(&current, &fn_name, &new_fn) {
+                Ok(s) => s,
+                Err(e) => {
+                    send("rejected", serde_json::json!({"gen": gen, "reason": e}));
+                    consecutive += 1;
+                    if consecutive >= circuit {
+                        send("circuit_break", serde_json::json!({"reason": "连续被拒达上限"}));
+                        break;
+                    }
+                    continue;
+                }
+            };
+            if std::fs::write(&target_p, &new_src).is_err() {
+                send("rejected", serde_json::json!({"gen": gen, "reason": "写目标文件失败"}));
+                consecutive += 1;
+                if consecutive >= circuit {
+                    send("circuit_break", serde_json::json!({"reason": "连续失败达上限"}));
+                    break;
+                }
+                continue;
+            }
+
+            // 3) 评估（在阻塞线程跑 cargo，避免占用 async 工作线程）
+            let m = manifest.clone();
+            let ev = tokio::task::spawn_blocking(move || eval_crate(&m))
+                .await
+                .unwrap_or(EvalResult {
+                    passed: false,
+                    bench_ms: None,
+                    log: "eval 失败".into(),
+                });
+
+            if !ev.passed {
+                let _ = git_revert(&repo, &target_p);
+                send("reverted", serde_json::json!({"gen": gen, "reason": "测试/编译失败", "log": ev.log}));
+                consecutive += 1;
+                if consecutive >= circuit {
+                    send("circuit_break", serde_json::json!({"reason": "连续失败达上限"}));
+                    break;
+                }
+                continue;
+            }
+
+            // 4) 判定是否优于当前最优
+            let improved = match best {
+                None => true,
+                Some(b) => ev.bench_ms.map_or(false, |m| m < b - 1e-9),
+            };
+            if improved {
+                best = ev.bench_ms;
+                consecutive = 0;
+                if effective_apply {
+                    match git_commit(&repo, &target_p, &format!("代码进化(gen {}): 优化 {}", gen, fn_name)) {
+                        Ok(h) => send(
+                            "committed",
+                            serde_json::json!({"gen": gen, "commit": h, "bench_ms": ev.bench_ms, "log": ev.log}),
+                        ),
+                        Err(e) => {
+                            let _ = git_revert(&repo, &target_p);
+                            send("rejected", serde_json::json!({"gen": gen, "reason": format!("commit 失败: {}", e)}));
+                        }
+                    }
+                } else {
+                    let diff = git_diff(&repo, &target_p);
+                    send("veto", serde_json::json!({"gen": gen, "bench_ms": ev.bench_ms, "diff": diff, "log": ev.log}));
+                    let _ = git_revert(&repo, &target_p); // 不落盘，等待人工批准
+                }
+            } else {
+                let _ = git_revert(&repo, &target_p);
+                send("reverted", serde_json::json!({"gen": gen, "reason": "未优于当前最优", "bench_ms": ev.bench_ms}));
+                consecutive += 1;
+                if consecutive >= circuit {
+                    send("circuit_break", serde_json::json!({"reason": "连续无进展达上限"}));
+                    break;
+                }
+            }
+        }
+        send(
+            "done",
+            serde_json::json!({"gens_run": gens_run, "best_ms": best, "applied": effective_apply}),
+        );
     });
 
     Sse::new(UnboundedReceiverStream::new(rx)).into_response()
