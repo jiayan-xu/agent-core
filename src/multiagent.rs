@@ -20,10 +20,23 @@ pub struct MultiAgentConfig {
     /// 最大子 agent 数（分解出的子任务上限）
     #[serde(default = "default_fanout")]
     pub max_subagents: usize,
+    /// opt-in 守卫：消息须含此 token（如 "[compose]"）才允许劫持主路径。
+    /// 默认 `Some("[compose]")` —— 即默认不劫持，避免生产 Hard 任务被无声改写为纯 LLM 作文
+    /// （P0-2：原行为判 Hard 即整段接管、绕过工具/composer/LATS、耗时 >3min）。
+    /// 设为空字符串 "" 视为关闭 token 校验（但仍可走 task_whitelist）。
+    #[serde(default = "default_opt_in_token")]
+    pub opt_in_token: Option<String>,
+    /// 任务白名单（子串匹配）：命中其一即视为已 opt-in（即便消息无 token）。
+    #[serde(default)]
+    pub task_whitelist: Vec<String>,
 }
 
 fn default_fanout() -> usize {
     4
+}
+
+fn default_opt_in_token() -> Option<String> {
+    Some("[compose]".to_string())
 }
 
 impl Default for MultiAgentConfig {
@@ -31,6 +44,8 @@ impl Default for MultiAgentConfig {
         MultiAgentConfig {
             enabled: false,
             max_subagents: default_fanout(),
+            opt_in_token: default_opt_in_token(),
+            task_whitelist: Vec::new(),
         }
     }
 }

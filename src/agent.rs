@@ -328,7 +328,7 @@ impl AgentCore {
         let features = config.features.clone();
         let skill_registry = if features.skill_library {
             Some(
-                Arc::new(crate::skill_library::InMemorySkillRegistry::new())
+                Arc::new(crate::skill_library::InMemorySkillRegistry::new_with_defaults())
                     as Arc<dyn crate::skill_library::SkillRegistry + Send + Sync>,
             )
         } else {
@@ -3640,12 +3640,38 @@ impl AgentCore {
         if difficulty != crate::llm::TaskDifficulty::Hard {
             return None;
         }
+        // P0-2 守卫：默认须消息含 opt_in_token 或命中 task_whitelist，否则不劫持主路径
+        // （原行为判 Hard 即整段接管、绕过工具/composer/LATS、纯 LLM 作文、耗时 >3min）。
+        if !self.is_multiagent_opted_in(message, cfg) {
+            return None;
+        }
         let subtasks = crate::multiagent::plan_decomposition(&self.llm, message).await;
         if subtasks.is_empty() {
             return None;
         }
         let result = crate::multiagent::dispatch(&self.routed_llm, &subtasks).await;
+        if result.trim().is_empty() {
+            // 派发全失败 → 回退 composer+工具，不做空壳返回（P0-2 回退）
+            tracing::warn!(target: "agent.multiagent", "dispatch 全失败，回退原路径");
+            return None;
+        }
         Some(format!("[MultiAgent Compose 结果]\n\n{}", result))
+    }
+
+    /// MultiAgent opt-in 判定：消息含 opt_in_token（非空）或命中 task_whitelist 其一即放行。
+    fn is_multiagent_opted_in(
+        &self,
+        message: &str,
+        cfg: &crate::multiagent::MultiAgentConfig,
+    ) -> bool {
+        if let Some(tok) = &cfg.opt_in_token {
+            if !tok.is_empty() && message.contains(tok) {
+                return true;
+            }
+        }
+        cfg.task_whitelist
+            .iter()
+            .any(|w| !w.is_empty() && message.contains(w))
     }
 
     /// 构建 system prompt

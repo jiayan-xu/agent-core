@@ -48,8 +48,58 @@ pub struct InMemorySkillRegistry {
 }
 
 impl InMemorySkillRegistry {
+    /// 空注册表（测试 / 自定义加载用）。生产开闸请用 `new_with_defaults`。
     pub fn new() -> Self {
         Self { skills: Vec::new() }
+    }
+
+    /// 生产用：内置与 agent 真实工具/能力对应的技能，使 `features.skill_library=true`
+    /// 时 `search_by_task` 真正命中、`render_skill_block` 真正注入「## 可用技能」。
+    /// 此前 `new()` 为空表 + `Arc<dyn>` 启动后无法 `register`，导致开闸=空转（P0-1）。
+    /// 后续可改为从 toml / Memoria 加载；此处为可验证的最小内置集。
+    pub fn new_with_defaults() -> Self {
+        let mut s = Self::new();
+        s.seed_defaults();
+        s
+    }
+
+    fn seed_defaults(&mut self) {
+        let defaults: &[(&str, &str, &str, &[&str])] = &[
+            (
+                "sql",
+                "SQL 查询",
+                "编写与执行 SQL 查询（配合 execute_sql 工具）",
+                &["sql", "查询", "数据库", "select", "表"],
+            ),
+            (
+                "rust",
+                "Rust 并发",
+                "Rust 并发与安全代码生成（锁/通道/异步）",
+                &["rust", "并发", "锁", "tokio", "异步"],
+            ),
+            (
+                "regex",
+                "正则表达式",
+                "正则表达式构造与边界处理",
+                &["正则", "regex", "模式匹配"],
+            ),
+            (
+                "plate",
+                "车牌匹配",
+                "车牌号模糊匹配（配合 fuzzy_match_plate 工具）",
+                &["车牌", "plate", "车牌号"],
+            ),
+        ];
+        for (id, name, desc, kws) in defaults {
+            let _ = self.register(Skill {
+                id: id.to_string(),
+                name: name.to_string(),
+                description: desc.to_string(),
+                trigger_keywords: kws.iter().map(|s| s.to_string()).collect(),
+                body: String::new(),
+                version: 1,
+            });
+        }
     }
 }
 
@@ -141,5 +191,16 @@ mod tests {
     fn unregister_missing_errors() {
         let mut reg = InMemorySkillRegistry::new();
         assert!(reg.unregister("nope").is_err());
+    }
+
+    #[test]
+    fn seeded_registry_finds_sql() {
+        // P0-1 修复验证：new_with_defaults 必须预置内置技能，使开闸后真正命中注入
+        let reg = InMemorySkillRegistry::new_with_defaults();
+        let r = reg.search_by_task("帮我写一段 sql 查询", 5);
+        assert!(!r.is_empty(), "seeded registry 应命中 sql 技能");
+        assert_eq!(r[0].id, "sql");
+        // 无关任务仍应无命中（不污染 prompt）
+        assert!(reg.search_by_task("今天天气怎么样", 5).is_empty());
     }
 }
