@@ -42,7 +42,7 @@ mod tests {
 
     #[test]
     fn renders_when_match() {
-        let mut reg = InMemorySkillRegistry::new();
+        let reg = InMemorySkillRegistry::new();
         reg.register(sk("sql", &["sql", "查询"], "编写与优化 SQL 查询")).unwrap();
         let block = render_skill_block(&reg, "帮我写一段 sql 查询", 3);
         let b = block.expect("应渲染技能块");

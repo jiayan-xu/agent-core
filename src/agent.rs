@@ -888,7 +888,17 @@ impl AgentCore {
                 let plan_opt = if let Some(p) = self.in_progress_plan.lock().await.clone() {
                     Some(p)
                 } else {
-                    match crate::composer::decompose(&self.llm, message, &tools).await {
+                    // HY3 1.3：LATS 挂载点扩展 —— composer 多步规划也注入 LATS 提示，
+                    // 扩大生产触发面（原仅非 composer 路径在 maybe_lats_expand 展开）。
+                    // 提示作为规划上下文喂给 decompose（planner LLM），非空挂。
+                    let plan_input = match self.lats_planning_hint(message).await {
+                        Some(h) => format!(
+                            "{}\n\n## LATS 规划提示（过程树候选最优下一步）\n{}\n",
+                            message, h
+                        ),
+                        None => message.to_string(),
+                    };
+                    match crate::composer::decompose(&self.llm, &plan_input, &tools).await {
                         Ok(plan) if plan.steps.len() > 1 => Some(plan),
                         _ => None,
                     }
@@ -3587,6 +3597,18 @@ impl AgentCore {
     }
 
     /// LATS 过程树展开（挂在 execute_chat 工具轨迹循环之前）。
+    /// 计算 LATS 规划提示文本（若 LATS 启用且预算充足且展开成功）。
+    /// 非 composer 路径（maybe_lats_expand）与 composer 多步路径（decompose 前注入）
+    /// 共用，以统一扩展 LATS 在生产中的触发面（原仅非 composer 路径展开）。
+    async fn lats_planning_hint(&self, raw_message: &str) -> Option<String> {
+        let ctrl = self.lats.as_ref()?;
+        if !matches!(ctrl.decide(), crate::lats::LatsAction::Search) {
+            return None;
+        }
+        let candidates = ctrl.expand_once(&self.llm, raw_message).await;
+        candidates.into_iter().next()
+    }
+
     /// 仅 features.lats=true（self.lats=Some）时可能展开；否则直接返回 false，原路径零改动。
     /// 即便启用，预算耗尽也会自动退回贪心（见 LatsController::decide）。
     async fn maybe_lats_expand(&self, messages: &mut Vec<Message>, raw_message: &str) -> bool {
@@ -3594,26 +3616,20 @@ impl AgentCore {
             Some(c) => c,
             None => return false,
         };
-        match ctrl.decide() {
-            crate::lats::LatsAction::Greedy => false,
-            crate::lats::LatsAction::Search => {
-                let candidates = ctrl.expand_once(&self.llm, raw_message).await;
-                if let Some(best) = candidates.into_iter().next() {
-                    if let Some(sys_msg) = messages.first_mut() {
-                        if let Some(ref mut content) = sys_msg.content {
-                            content.push_str(&format!(
-                                "\n\n## LATS 规划提示（过程树候选最优下一步）\n{}\n",
-                                best
-                            ));
-                        }
-                    }
-                    ctrl.record_tokens((best.len() / 4) as u64);
-                    true
-                } else {
-                    false
-                }
+        let hint = match self.lats_planning_hint(raw_message).await {
+            Some(h) => h,
+            None => return false,
+        };
+        if let Some(sys_msg) = messages.first_mut() {
+            if let Some(ref mut content) = sys_msg.content {
+                content.push_str(&format!(
+                    "\n\n## LATS 规划提示（过程树候选最优下一步）\n{}\n",
+                    hint
+                ));
             }
         }
+        ctrl.record_tokens((hint.len() / 4) as u64);
+        true
     }
 
     /// MultiAgent Compose（子 agent 派发，非 Meta RSI）。

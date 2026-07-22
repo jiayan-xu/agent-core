@@ -68,6 +68,36 @@
 
 ---
 
+## 2026-07-22 深夜续跑（剩余 4 项收尾）
+
+状态时间：2026-07-22 深夜（P0 复盘同期，专做「剩余 4 项」：技能版本/回滚、LATS 挂载点、BoN 重跑、G 门复验补探针）。
+
+### G1（续）
+- `[已复验]` 本会话实跑：
+  ```
+  $ git status --short
+   M src/agent.rs        # LATS 挂载点扩展（lats_planning_hint 注入 composer decompose）
+   M src/features.rs     # 测试告警清理（register 改 &self）
+   M src/skill_library.rs # 版本/回滚（RwLock + version + rollback）
+  $ git log --oneline -1
+  0952a27 feat(hy3-1.3): MultiAgent dispatch 顺序→并发派发
+  ```
+  仅 3 个预期源码文件未提交；提交后这些修正进 HEAD，G1 以 HEAD 可复现维持 ✅。
+
+### G2（续）
+- `[未重跑 / 不可达]` 本会话再次探针（`curl :9003/api/system_status` + admin key）返回**空体**——本地 memoria 实例仍不可达，无法运行时重验 `evolution_log`。维持 prior 记录（`log_id=ev-1784714355431676800`），标注「未能独立复验」。
+
+### G3/G4（续）
+- `[prior 记录]` + `[已复验 diff]`（`1fdd4a5`）：维持不变，本会话未重新 redeploy / 重跑运行时。
+
+### BoN（续）
+- `[重跑中]` 本会话后台重跑 `cargo test --test eval_bon -- --ignored`（task `0dIeQ8`），结果回填于下。
+- 第三轮 prior 记录 `Δpp=0.0 / win=0 tie=5 loss=0 / 不回归` 维持为观测门过线证据。
+- **回填区**：
+  - （待 BoN 重跑完成填入真实 `Δpp / win-tie-loss / mean_single / mean_bon`；若 LLM 不稳定导致不可复现，则标注并保留 prior 观测门结论）
+
+---
+
 ## 结论（诚实版）
 
 - G1：源码/HEAD 可复现 ✅（已复验 git）。
