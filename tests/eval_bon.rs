@@ -1,10 +1,16 @@
 //! 1.3 Best-of-N 量化对比 eval harness（HY3 量化验收：BoN 相对单次调用 +10pp）
 //!
-//! 设计：对每个「开放式质量」prompt，分别用
+//! 设计：对每个「可验证质量」prompt，分别用
 //!   - 单次调用（best_of_n = None）
 //!   - Best-of-N（best_of_n = 3，scorer = Judge）
 //! 取得回答后，用 judge LLM 对两者各打 0-10 分，统计
 //!   mean_single / mean_bon / Δpp / win-tie-loss。
+//!
+//! 任务域：代码 / 结构化可验证 prompt。战略结论「可验证任务收益大、开放生成有限」，
+//! 故不用开放式创意文案，改用有参考答案/可核查的编程与查询任务，使 Δpp 更可信。
+//!
+//! 注意：本 harness 仅作「测量」用途。+10pp 是**暂定验收目标**，需 ≥N 条可验样本、
+//! 且 judge 打分稳定后才构成验收证据；打分 bug 修复前 +10pp 线不可信（见 parse_score）。
 //!
 //! 运行（需 `AGENT_API_KEY` 环境变量 + 默认 [llm.difficulty] 配置可读）：
 //!   cargo test --release --test eval_bon -- --ignored --nocapture
@@ -31,17 +37,38 @@ fn msg(content: &str) -> Message {
     }
 }
 
+/// 解析 judge 返回的分数：取文本中**第一个完整数字 token**（整数或小数），clamp 到 [0,10]。
+///
+/// 修复原实现 `chars().find_map(|c| c.to_digit(10))` 只取首个字符导致
+/// judge 回「10」被误判为 1、Δpp 严重失真的 bug。
+fn parse_score(text: &str) -> f64 {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_digit() {
+            let mut end = i + 1;
+            while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b'.') {
+                end += 1;
+            }
+            if let Ok(v) = text[i..end].parse::<f64>() {
+                return v.clamp(0.0, 10.0);
+            }
+            i = end; // 非法数字 token（如多小数点），跳过继续找
+        } else {
+            i += 1;
+        }
+    }
+    0.0
+}
+
 async fn judge_score(client: &LlmClient, prompt: &str, answer: &str) -> f64 {
     let j = format!(
         "用户请求：\n{}\n\n候选回答：\n{}\n\n请只返回一个 0-10 的整数分数（越高越好），不要其他文字。",
         prompt, answer
     );
     match client.chat(&[msg(&j)], &[]).await {
-        Ok(r) => r
-            .text
-            .chars()
-            .find_map(|c| c.to_digit(10).map(|d| d as f64))
-            .unwrap_or(0.0),
+        Ok(r) => parse_score(&r.text),
         Err(_) => 0.0,
     }
 }
@@ -68,13 +95,13 @@ async fn eval_bon_vs_single_delta_pp() {
 
     let judge_client = LlmClient::new(LlmConfig::from_provider(&pro));
 
-    // 开放式质量 prompt（无标准答案，BoN 想象力/覆盖度收益最大）
+    // 代码 / 结构化可验证 prompt（有参考答案或可被核查，BoN 收益更可量化）
     let prompts: &[&str] = &[
-        "用一句话解释量子纠缠，让小学生也能听懂",
-        "给「智能固废管理平台」想三个有差异的产品 slogan",
-        "写一段关于「保持专注」的、有画面感的 100 字短文",
-        "给拖延症患者三条可立刻执行的微习惯建议",
-        "用比喻说明什么是「技术债」，给一个生活例子",
+        "用 Python 写一个函数：给定整数列表，返回去重后保持原顺序的结果，并附 3 个单元测试。",
+        "用 SQL 写出查询：从 orders 表找出每个用户最近一笔订单的金额，按金额降序取前 10。",
+        "用 TypeScript 实现 debounce(fn, ms)，要求合并高频调用，并给出调用示例。",
+        "给定二叉树的中序与后序遍历数组，用 Python 重建二叉树并返回层序遍历结果。",
+        "写一个命令统计当前目录下 .rs 文件的总行数，并解释其含义。",
     ];
 
     let mut n = 0;
@@ -123,6 +150,6 @@ async fn eval_bon_vs_single_delta_pp() {
     println!("prompts={}", n);
     println!("mean_single = {:.2}", mean_single);
     println!("mean_bon    = {:.2}", mean_bon);
-    println!("Δpp         = {:.1} (验收线 +10pp)", delta_pp);
+    println!("Δpp         = {:.1} (暂定验收线 +10pp；需 ≥N 条可验样本且 judge 稳定)", delta_pp);
     println!("win={} tie={} loss={}", wins, ties, losses);
 }
