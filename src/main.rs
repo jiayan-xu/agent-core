@@ -91,6 +91,15 @@ struct Config {
     /// 安全要点：默认 dry_run（只产 diff 不提交）、allow_commit=false（双重闸门）、目标必须在隔离仓库。
     #[serde(default)]
     code_evolution: Option<CodeEvolutionConfig>,
+    /// HY3 1.3 三大项热路径接线开关（缺省全 false；G 门未复验前不得开启）
+    #[serde(default)]
+    features: agent_core::agent::FeatureFlags,
+    /// HY3 1.3 LATS 配置（缺省全默认：enabled=false）
+    #[serde(default)]
+    lats: agent_core::lats::LatsConfig,
+    /// HY3 1.3 MultiAgent Compose 配置（缺省全默认：enabled=false）
+    #[serde(default)]
+    multiagent: agent_core::multiagent::MultiAgentConfig,
 }
 
 /// Phase 7：代码自我进化引擎配置
@@ -1002,6 +1011,9 @@ fn load_or_create_config() -> Config {
         meta_evolution: None,
         safety: None,
         code_evolution: None,
+        features: Default::default(),
+        lats: Default::default(),
+        multiagent: Default::default(),
     };
     let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());
     cfg
@@ -3684,6 +3696,9 @@ async fn build_agent(config: &Config, local_resources: SharedResourceSnapshot) -
         approver_id: None,           // P2-D: 无审批人（保持现有行为）
         meta_evolution: config.meta_evolution.clone().unwrap_or_default(),
         safety: config.safety.clone().unwrap_or_default(),
+        features: config.features.clone(),
+        lats: config.lats.clone(),
+        multiagent: config.multiagent.clone(),
     };
     // A1 (OpenClaw 吸收): 记录启动并判定是否进入 safe_mode（崩溃循环保护）。
     // 返回 (启动记录 id, 是否需抑制危险/未分类/外发工具自动执行)。

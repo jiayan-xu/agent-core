@@ -26,7 +26,9 @@ pub struct Skill {
 }
 
 /// 技能注册表抽象
-pub trait SkillRegistry {
+/// 加 `Send + Sync` 超约束：使 `Arc<dyn SkillRegistry + Send + Sync>` 可跨线程持有
+/// （AgentCore 的 skill_registry 字段需满足 Send+Sync）。
+pub trait SkillRegistry: Send + Sync {
     /// 列出全部已注册技能
     fn list(&self) -> Vec<Skill>;
     /// 按 id 取技能

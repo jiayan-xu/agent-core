@@ -23,4 +23,7 @@ pub mod memory_extract;
 pub mod memory_evolve;
 pub mod meta_evolve;
 pub mod code_evolve;
-pub mod skill_library; // HY3 1.3+：技能库注册表（最小骨架，未接入热路径）
+pub mod skill_library; // HY3 1.3+：技能库注册表
+pub mod features; // HY3 1.3：三大项热路径接线辅助（flag 默认 OFF）
+pub mod lats; // HY3 1.3：LATS 过程树搜索（execute_chat 层，flag 默认 OFF）
+pub mod multiagent; // HY3 1.3：MultiAgent Compose 子 agent 派发（flag 默认 OFF）

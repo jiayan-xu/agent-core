@@ -1,6 +1,7 @@
 //! Agent 核心 — chat 循环 + 工具执行
 
 use chrono::Datelike;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -87,6 +88,30 @@ pub struct AgentConfig {
     pub meta_evolution: crate::meta_evolve::MetaEvolutionConfig,
     /// PR5: 安全配置（含审批门控模式，默认 Auto 免人工审批）
     pub safety: crate::meta_evolve::SafetyConfig,
+    /// HY3 1.3：三大项热路径接线开关（默认全 OFF；G 门未复验前不得开启）
+    /// 注：AgentConfig 本身不 derive serde（由代码从 Config 构造），TOML 默认值
+    /// 在 main.rs 的 `Config` 上处理，此处无需 `#[serde(default)]`。
+    pub features: FeatureFlags,
+    /// HY3 1.3：LATS 配置（仅 features.lats=true 时生效）
+    pub lats: crate::lats::LatsConfig,
+    /// HY3 1.3：MultiAgent Compose 配置（仅 features.multiagent=true 时生效）
+    pub multiagent: crate::multiagent::MultiAgentConfig,
+}
+
+/// HY3 1.3 热路径接线开关。全部默认 false。
+/// **纪律**：G1–G4 硬门未全绿、且各 DoD 未满足前，生产必须保持全 false。
+/// 「接了线但默认不启用」≠「已开闸」。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FeatureFlags {
+    /// 技能库检索结果注入 system prompt
+    #[serde(default)]
+    pub skill_library: bool,
+    /// LATS 过程树搜索挂在 execute_chat 工具轨迹循环
+    #[serde(default)]
+    pub lats: bool,
+    /// MultiAgent Compose（子 agent 派发，非 Meta RSI）
+    #[serde(default)]
+    pub multiagent: bool,
 }
 
 /// 白龙马 A3：Focus Stack → Thread 模型
@@ -160,6 +185,12 @@ pub struct AgentCore {
     pub meta_evolver: crate::meta_evolve::MetaEvolver,
     /// PR5: 机制账本存储（evolution_feedback + meta_prompt），与 meta_evolver 共享
     pub meta_store: std::sync::Arc<tokio::sync::Mutex<crate::meta_evolve::MetaEvolutionStore>>,
+    /// HY3 1.3：技能库注册表（仅 features.skill_library=true 时 Some；否则 None=不注入）
+    pub skill_registry: Option<Arc<dyn crate::skill_library::SkillRegistry + Send + Sync>>,
+    /// HY3 1.3：LATS 控制器（仅 features.lats=true 时 Some；否则 None=原路径）
+    pub lats: Option<crate::lats::LatsController>,
+    /// HY3 1.3：MultiAgent Compose 配置（仅 features.multiagent=true 时 Some；否则 None=原路径）
+    pub multiagent: Option<crate::multiagent::MultiAgentConfig>,
 }
 
 /// P2-1: 会话级配额守卫（RAII）。离开作用域自动 leave_session，避免并发计数泄漏。
@@ -293,6 +324,26 @@ impl AgentCore {
             llm: None,
         };
         let routed_llm = RoutedLlm::from_config(&config.llm);
+        // HY3 1.3：三大项热路径接线（默认 OFF；仅 features 开关开启才持有控制器）
+        let features = config.features.clone();
+        let skill_registry = if features.skill_library {
+            Some(
+                Arc::new(crate::skill_library::InMemorySkillRegistry::new())
+                    as Arc<dyn crate::skill_library::SkillRegistry + Send + Sync>,
+            )
+        } else {
+            None
+        };
+        let lats = if features.lats {
+            Some(crate::lats::LatsController::new(config.lats.clone()))
+        } else {
+            None
+        };
+        let multiagent = if features.multiagent {
+            Some(config.multiagent.clone())
+        } else {
+            None
+        };
         AgentCore {
             config,
             mcp,
@@ -325,6 +376,9 @@ impl AgentCore {
             approval_gate,
             meta_evolver,
             meta_store,
+            skill_registry,
+            lats,
+            multiagent,
         }
     }
 
@@ -817,6 +871,15 @@ impl AgentCore {
         allowed_ns: &[String],
         trace_id: &str,
     ) -> String {
+        // ── HY3 1.3：MultiAgent Compose（子 agent 派发，非 Meta RSI）──
+        // features.multiagent=false 或任务非 Hard 或分解空 → 返回 None，走原路径
+        if let Some(result) = self
+            .maybe_compose(message, user_id, session_id, allowed_ns)
+            .await
+        {
+            return result;
+        }
+
         // ── 0. 组合路由路径：多 Skill 分解 + 按序执行 ──
         if self.config.enable_compositional_routing {
             let tools = self.fetch_tools_filtered(allowed_ns).await;
@@ -982,6 +1045,8 @@ impl AgentCore {
         let mut system_prompt = self.build_system_prompt(&knowledge);
         // 白龙马 Phase C: 条件式本地资源门控（仅消息命中 ssh/git/部署 等规则才注入）
         self.inject_resources_if_relevant(&mut system_prompt, message);
+        // HY3 1.3：技能库注入（features.skill_library=false 时 skill_registry=None → 不生效）
+        self.augment_with_skills(&mut system_prompt, message);
         let mut messages = Vec::new();
         messages.push(Message {
             role: "system".to_string(),
@@ -1050,6 +1115,8 @@ impl AgentCore {
 
         // 白龙马 Phase C: 条件式本地资源门控（仅消息命中 ssh/git/部署 等规则才注入）
         self.inject_resources_if_relevant(&mut system_prompt, message);
+        // HY3 1.3：技能库注入（features.skill_library=false 时 skill_registry=None → 不生效）
+        self.augment_with_skills(&mut system_prompt, message);
 
         // SAD 核心：注入可用工具信息，让 LLM 复述时对齐能力
         if !tools.is_empty() {
@@ -1846,6 +1913,20 @@ impl AgentCore {
                 }
             }
         }
+
+        // HY3 1.3：技能库注入（features.skill_library=false 时 skill_registry=None → 不生效）
+        if let Some(reg) = self.skill_registry.as_ref() {
+            if let Some(sys_msg) = messages.first_mut() {
+                if let Some(ref mut content) = sys_msg.content {
+                    if let Some(block) = crate::features::render_skill_block(reg.as_ref(), raw_message, 3) {
+                        content.push_str(&block);
+                    }
+                }
+            }
+        }
+
+        // HY3 1.3：LATS 过程树展开（features.lats=false 时 self.lats=None → 直接返回，原路径零改动）
+        self.maybe_lats_expand(&mut messages, raw_message).await;
 
         // P2-1: 配额命名空间（与 call_tool_routed 保持一致）
         let quota_ns_llm = allowed_ns
@@ -3488,6 +3569,83 @@ impl AgentCore {
             system_prompt.push_str(&block);
             tracing::info!(target: "resources", "条件命中：注入本地资源快照块到 system prompt");
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // HY3 1.3 三大项热路径接线（全部默认 OFF，受 features 开关门控）
+    // ─────────────────────────────────────────────────────────────
+
+    /// 技能库注入：把检索到的相关技能追加到 system prompt。
+    /// 仅 features.skill_library=true（self.skill_registry=Some）时生效；否则零开销跳过。
+    fn augment_with_skills(&self, system_prompt: &mut String, task: &str) {
+        if let Some(reg) = self.skill_registry.as_ref() {
+            if let Some(block) = crate::features::render_skill_block(reg.as_ref(), task, 3) {
+                system_prompt.push_str(&block);
+                tracing::debug!(target: "agent.skill_library", "技能块注入 system prompt");
+            }
+        }
+    }
+
+    /// LATS 过程树展开（挂在 execute_chat 工具轨迹循环之前）。
+    /// 仅 features.lats=true（self.lats=Some）时可能展开；否则直接返回 false，原路径零改动。
+    /// 即便启用，预算耗尽也会自动退回贪心（见 LatsController::decide）。
+    async fn maybe_lats_expand(&self, messages: &mut Vec<Message>, raw_message: &str) -> bool {
+        let ctrl = match self.lats.as_ref() {
+            Some(c) => c,
+            None => return false,
+        };
+        match ctrl.decide() {
+            crate::lats::LatsAction::Greedy => false,
+            crate::lats::LatsAction::Search => {
+                let candidates = ctrl.expand_once(&self.llm, raw_message).await;
+                if let Some(best) = candidates.into_iter().next() {
+                    if let Some(sys_msg) = messages.first_mut() {
+                        if let Some(ref mut content) = sys_msg.content {
+                            content.push_str(&format!(
+                                "\n\n## LATS 规划提示（过程树候选最优下一步）\n{}\n",
+                                best
+                            ));
+                        }
+                    }
+                    ctrl.record_tokens((best.len() / 4) as u64);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// MultiAgent Compose（子 agent 派发，非 Meta RSI）。
+    /// 仅 features.multiagent=true 且任务判为 Hard 时分解派发；否则返回 None 走原路径。
+    async fn maybe_compose(
+        &self,
+        message: &str,
+        _user_id: &str,
+        _session_id: &str,
+        _allowed_ns: &[String],
+    ) -> Option<String> {
+        let cfg = self.multiagent.as_ref()?;
+        if !cfg.enabled {
+            return None;
+        }
+        // 仅对 Hard 任务启用，避免简单查询被无谓分解
+        let msgs = [Message {
+            role: "user".to_string(),
+            content: Some(message.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let difficulty = self.routed_llm.classify(&msgs).await;
+        if difficulty != crate::llm::TaskDifficulty::Hard {
+            return None;
+        }
+        let subtasks = crate::multiagent::plan_decomposition(&self.llm, message).await;
+        if subtasks.is_empty() {
+            return None;
+        }
+        let result = crate::multiagent::dispatch(&self.routed_llm, &subtasks).await;
+        Some(format!("[MultiAgent Compose 结果]\n\n{}", result))
     }
 
     /// 构建 system prompt

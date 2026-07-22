@@ -191,6 +191,11 @@ impl RoutedLlm {
         }
     }
 
+    /// 对外暴露难度分类（供 MultiAgent Compose 判断 Hard 任务后再分解派发）
+    pub async fn classify(&self, messages: &[Message]) -> TaskDifficulty {
+        classify_difficulty(&self.policy, messages).await
+    }
+
     pub async fn chat(&self, messages: &[Message], tools: &[ToolDef]) -> Result<LlmResponse, String> {
         let d = classify_difficulty(&self.policy, messages).await;
         tracing::info!(difficulty = ?d, "difficulty_route");
