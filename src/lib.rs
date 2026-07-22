@@ -23,3 +23,4 @@ pub mod memory_extract;
 pub mod memory_evolve;
 pub mod meta_evolve;
 pub mod code_evolve;
+pub mod skill_library; // HY3 1.3+：技能库注册表（最小骨架，未接入热路径）
