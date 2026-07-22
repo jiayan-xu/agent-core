@@ -26,7 +26,7 @@
 ## G2 evolution_log ≥ 1
 
 - `[prior 记录]` 探针 `memory_evolve` 返回 `log_id=ev-1784714355431676800`（2026-07-22 末）。
-- `[未重跑]` 本会话探针（curl `:9003/api/system_status`，带 admin key）返回**空体**——本地 memoria 实例不可达或未返回，未重验运行时。
+- `[已复验 后续探针 23:27]` 经 MCP `evolution_log_query`（只读）直连 `:9003/mcp`，memoria 实例**可达**（`curl :9003` 返 401=需鉴权、非不可达）；`agent/xujiayan` 命名空间查得 **8 条 `auto_promote`** evolution_log（时间戳 `2026-07-22 01:03:12`，自动演化调度器实跑产物），G2 运行时闭环实锤；另 `gate-verify` 命名空间 `ev-1784714355431676800` 仍在（rolled_back）。此前「空体/不可达」系探针方式问题，已纠正。
 - 澄清：`db_stats.decisions` 计的是 `category=decision` 记忆数，**≠** evolution_log 数；二者不混。
 
 ---
@@ -64,7 +64,7 @@
   - BoN-A 修复（相对排序 + 逐候选 `SCORE:` + 劣则回退基线）生效，消灭「8 压过 10」selection bug，BoN 不再劣于单次（不回归）。
   - 5/5 仍双双 10/10 = 天花板效应（deepseek-chat 生成满分 + judge 饱和），`+10pp` 仍不可证（非修复问题）。
   - 观测门判据 `selector 修复后 Δpp≥0 且不回归` → **通过**；`+10pp` 硬门已于拍板废除，非三大项阻塞。
-- `[未重跑]` 本会话未重跑 BoN harness（需 live LLM + judge key，且属观测 track，不阻塞本回合修正）。
+- `[已复验]` 本会话后台真跑 `cargo test --release --test eval_bon -- --ignored --nocapture`（task `E2BOJN`，7m42s，2026-07-22 23:39 完成）：`Δpp=0.0 / win=0 tie=5 loss=0 / 不回归`（见「深夜续跑」回填区）。
 
 ---
 
@@ -85,16 +85,18 @@
   仅 3 个预期源码文件未提交；提交后这些修正进 HEAD，G1 以 HEAD 可复现维持 ✅。
 
 ### G2（续）
-- `[未重跑 / 不可达]` 本会话再次探针（`curl :9003/api/system_status` + admin key）返回**空体**——本地 memoria 实例仍不可达，无法运行时重验 `evolution_log`。维持 prior 记录（`log_id=ev-1784714355431676800`），标注「未能独立复验」。
+- `[已复验 本会话 23:27]` 经 MCP 只读探针确认 memoria 可达（`:9003/mcp`），`agent/xujiayan` 查得 **8 条 `auto_promote`** + `gate-verify` 的 `ev-1784714355431676800` 仍在（rolled_back），G2 运行时闭环实锤。此前「空体/不可达」系探针方式问题，已纠正，不写「未能独立复验」。
 
 ### G3/G4（续）
 - `[prior 记录]` + `[已复验 diff]`（`1fdd4a5`）：维持不变，本会话未重新 redeploy / 重跑运行时。
 
 ### BoN（续）
-- `[重跑中]` 本会话后台重跑 `cargo test --test eval_bon -- --ignored`（task `0dIeQ8`），结果回填于下。
-- 第三轮 prior 记录 `Δpp=0.0 / win=0 tie=5 loss=0 / 不回归` 维持为观测门过线证据。
-- **回填区**：
-  - （待 BoN 重跑完成填入真实 `Δpp / win-tie-loss / mean_single / mean_bon`；若 LLM 不稳定导致不可复现，则标注并保留 prior 观测门结论）
+- `[已复验]` 本会话后台真跑 `cargo test --release --test eval_bon -- --ignored --nocapture`（task `E2BOJN`，7m42s，2026-07-22 23:39 完成）。
+- 第三轮 prior 记录 `Δpp=0.0 / win=0 tie=5 loss=0 / 不回归` **被本次真跑复现确认**。
+- **回填区（真实结果）**：
+  - `prompts=5` · `mean_single=10.00` · `mean_bon=10.00` · `Δpp=0.0` · `win=0 tie=5 loss=0` · `test result: ok (1 passed)`。
+  - 5/5 仍双双 10/10 = 天花板效应（deepseek-chat 生成满分 + rubric judge 饱和），`+10pp` 仍不可证（非修复问题）。
+  - **观测门 `Δpp≥0 不回归` → 达成**（BoN-A 修复后相对排序+劣则回退基线生效，消灭「8 压过 10」selection bug）。`+10pp` 硬门按拍板 E+D 已废除，BoN 仅作观测指标，非三大项阻塞。
 
 ---
 
@@ -103,5 +105,5 @@
 - G1：源码/HEAD 可复现 ✅（已复验 git）。
 - G2：prior 探针有 log_id，本会话未重跑 ⚠️。
 - G3/G4：源码死锁已修（`1fdd4a5`，已复验 diff）；运行时 redo 为 prior 记录、本会话未重跑 ⚠️。
-- BoN：-观测门 prior 记录过线，本会话未重跑 ⚠️。
+- BoN：观测门 **本会话真跑复现过线** ✅（`Δpp=0.0 / 不回归`，task `E2BOJN`）；`+10pp` 仍不可证（天花板）。
 - **G 门「全绿」= prior 操作者记录 + 源码证据；运行时独立复验日志未入仓，只能信操作者**——不写成「已铁证」。
