@@ -195,8 +195,13 @@ impl RoutedLlm {
         let d = classify_difficulty(&self.policy, messages).await;
         tracing::info!(difficulty = ?d, "difficulty_route");
         let selected = self.select(d);
+        // P1-2：Best-of-N 与工具调用隔离——Agent 循环中终答常为「空文本 + tool_calls」，
+        // 若进入 N 路采样，启发式打分只看 c.text 会把合法工具调用样本打成 -inf / 选错样本。
+        // 故 tools 非空时跳过 BoN，直接走单次普通调用（BoN 只对纯文本终答有意义）。
         match self.policy.best_of_n {
-            Some(n) if n >= 2 => self.chat_best_of_n(selected, messages, tools, n, d).await,
+            Some(n) if n >= 2 && tools.is_empty() => {
+                self.chat_best_of_n(selected, messages, tools, n, d).await
+            }
             _ => selected.chat(messages, tools).await,
         }
     }
@@ -313,6 +318,8 @@ impl RoutedLlm {
         }
     }
 
+    /// 注意：此处仅做「难度路由选择 provider」，真·SSE token 流由选中 provider 的
+    /// `LlmClient::chat_stream` 完成（RoutedLlm 不重新切片）。对外文档勿写成「RoutedLlm 假流切片」。
     pub async fn chat_stream(
         &self,
         messages: &[Message],
@@ -333,21 +340,40 @@ pub async fn classify_difficulty(policy: &DifficultyPolicy, messages: &[Message]
     }
 }
 
-/// 启发式：基于最后一条用户消息的信号
-fn classify_heuristic(messages: &[Message]) -> TaskDifficulty {
-    let last_user = messages
+/// 取最后一条 user 消息的正文（多轮对话里 last 可能是 assistant/tool，必须用此取用户意图）
+fn last_user_content(messages: &[Message]) -> String {
+    messages
         .iter()
         .rev()
         .find(|m| m.role == "user")
         .and_then(|m| m.content.clone())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// 启发式：基于最后一条用户消息的信号
+fn classify_heuristic(messages: &[Message]) -> TaskDifficulty {
+    let last_user = last_user_content(messages);
     let text = last_user.to_lowercase();
+    // P1-3：易任务白名单（寒暄 / 状态查询 / 固废运维日常查询）。命中强制 Easy，
+    // 避免默认成本模型偏激进，把中文运维/固废问答（查询/统计/车辆/称重…）误入 Hard 走 pro。
+    let easy_signals = [
+        "你好", "您好", "在吗", "hi", "hello", "hey",
+        "状态", "多少", "几辆", "几吨", "几车", "今天", "昨天", "前天",
+        "本周", "本月", "今年", "记录", "查询", "查一下", "帮我查", "查个",
+        "统计", "明细", "列表", "名单", "进厂", "出厂", "过磅", "称重",
+        "车辆", "车牌", "固废", "危废", "企业", "登录", "版本", "时间", "日期",
+    ];
+    if easy_signals.iter().any(|s| text.contains(s)) {
+        return TaskDifficulty::Easy;
+    }
+    // 收窄后的难任务信号：仅代码 / 算法 / 推理 / 架构等强信号才进 Hard。
+    // 已移除「查询/分析/复杂/函数」等过宽日常词（原会导致运维问答常走 pro）。
     let hard_signals = [
-        "```", "实现", "写代码", "编码", "debug", "调试", "修复", "bug",
+        "```", "写代码", "编码", "实现", "debug", "调试", "修复", "bug",
         "算法", "优化", "重构", "编译", "单元测试", "集成测试", "正则",
-        "regex", "sql", "查询", "递归", "动态规划", "proof", "推导",
-        "复杂", "分析", "架构", "设计模式", "并发", "async", "线程",
-        "rust", "python", "typescript", "react", "算法题", "函数",
+        "regex", "sql", "递归", "动态规划", "proof", "推导",
+        "架构", "设计模式", "并发", "async", "线程",
+        "rust", "python", "typescript", "react", "算法题",
     ];
     if hard_signals.iter().any(|s| text.contains(s)) {
         return TaskDifficulty::Hard;
@@ -365,11 +391,13 @@ async fn classify_by_judge(policy: &DifficultyPolicy, messages: &[Message]) -> T
         .map(|p| LlmConfig::from_provider(&p))
         .unwrap_or_else(LlmConfig::default);
     let client = LlmClient::new(judge_cfg);
+    // P1-1 修复：取最后一条 user 消息，而非 messages.last()（多轮里 last 常是 assistant/tool，
+    // 取错会喂给 judge 非用户内容 → 分类偏。与 classify_heuristic 一致取 last user。
+    let user_text = last_user_content(messages);
     let prompt = Message {
         role: "user".to_string(),
         content: Some(
-            "判断下述用户任务的难度，仅回复 easy 或 hard：\n".to_string()
-                + &messages.last().and_then(|m| m.content.clone()).unwrap_or_default(),
+            "判断下述用户任务的难度，仅回复 easy 或 hard：\n".to_string() + &user_text,
         ),
         tool_calls: None,
         tool_call_id: None,
@@ -795,5 +823,76 @@ impl LlmClient {
 
         let _ = sender.send(SseEvent::DoneEvt);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    fn msg(role: &str, content: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn heuristic_easy_whitelist_ops_query() {
+        // P1-3：固废运维日常查询/寒暄应走 Easy，不误入 Hard 走 pro
+        assert_eq!(
+            classify_heuristic(&[msg("user", "查询本周进厂车辆记录")]),
+            TaskDifficulty::Easy
+        );
+        assert_eq!(
+            classify_heuristic(&[msg("user", "今天称重多少吨")]),
+            TaskDifficulty::Easy
+        );
+        assert_eq!(classify_heuristic(&[msg("user", "你好，在吗")]), TaskDifficulty::Easy);
+    }
+
+    #[test]
+    fn heuristic_hard_code_signal() {
+        assert_eq!(
+            classify_heuristic(&[msg("user", "帮我用 rust 写一个并发函数")]),
+            TaskDifficulty::Hard
+        );
+        assert_eq!(
+            classify_heuristic(&[msg("user", "实现快速排序算法")]),
+            TaskDifficulty::Hard
+        );
+    }
+
+    #[test]
+    fn heuristic_takes_last_user_not_assistant() {
+        // P1-1 同源逻辑：多轮里 last 是 assistant 含「实现」，最后一条 user 是寒暄/查询 → 应为 Easy
+        let msgs = vec![
+            msg("user", "你好"),
+            msg("assistant", "你好，有什么可以帮你？实现登录功能的话……"),
+            msg("user", "查询一下昨天的企业信息"),
+        ];
+        assert_eq!(classify_heuristic(&msgs), TaskDifficulty::Easy);
+    }
+
+    #[test]
+    fn score_heuristic_empty_negative_inf() {
+        // P1-2 动机：空文本（工具调用终答）打分 -inf，确保不会被 BoN 选为最优
+        let c = LlmResponse {
+            text: String::new(),
+            tool_calls: vec![],
+        };
+        let s = score_heuristic(&c, false);
+        assert!(s.is_infinite() && s.is_sign_negative());
+    }
+
+    #[test]
+    fn score_heuristic_code_bonus() {
+        let c = LlmResponse {
+            text: "```rust\nfn main() {}\n```".to_string(),
+            tool_calls: vec![],
+        };
+        assert!(score_heuristic(&c, true) > 0.0);
     }
 }

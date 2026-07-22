@@ -329,9 +329,52 @@ fn expand_config_llm_env(cfg: &mut Config) {
     }
 }
 
+/// P1-4：运行时解析——克隆后展开全部 ${ENV} 占位符（顶层 + mcp_source + 三处 LlmConfig）+ 环境变量覆盖。
+/// 关键：只作用于克隆体，绝不修改存储态 config；从而 save_config 序列化的是带占位的原始配置，不泄漏明文密钥。
+/// 单一展开入口仍为 `expand_config_llm_env` + `expand_env`，未引入第二套展开逻辑。
+fn resolve_config_for_runtime(cfg: &Config) -> Config {
+    let mut r = cfg.clone();
+    // 顶层字段
+    r.api_key = expand_env(&r.api_key);
+    r.memoria_admin_key = expand_env(&r.memoria_admin_key);
+    r.server = expand_env(&r.server);
+    for src in &mut r.mcp_source {
+        src.url = expand_env(&src.url);
+        src.token = expand_env(&src.token);
+        src.command = expand_env(&src.command);
+        src.args = src.args.iter().map(|a| expand_env(a)).collect();
+        if let Some(ns) = src.namespace.as_mut() {
+            *ns = expand_env(ns);
+        }
+    }
+    // 统一展开所有 LlmConfig（全局池 + 分身池 + code_evolution 池）——单一入口
+    expand_config_llm_env(&mut r);
+    // 环境变量覆盖（环境变量 > 配置文件）
+    if let Ok(key) = std::env::var("AGENT_API_KEY") {
+        if !key.is_empty() {
+            r.api_key = key;
+        }
+    }
+    if let Ok(key) = std::env::var("MEMORIA_ADMIN_KEY") {
+        if !key.is_empty() {
+            r.memoria_admin_key = key;
+        }
+    }
+    r
+}
+
 impl Config {
+    /// 是否已配置：agent_id 非空，且 api_key 经「占位符展开 / 环境变量 / 字面量」任一方式可得。
+    /// 关键：判定时解析，但**不原地改写**存储态 config —— 保持 `${ENV}` 占位，避免 handle_save_config
+    /// 把占位回写成明文（P1-4）。运行时真实 key 由 resolve_config_for_runtime 在克隆体上展开。
     fn configured(&self) -> bool {
-        !self.agent_id.is_empty() && !self.api_key.is_empty()
+        if self.agent_id.is_empty() {
+            return false;
+        }
+        if !expand_env(&self.api_key).is_empty() {
+            return true;
+        }
+        std::env::var("AGENT_API_KEY").map(|k| !k.is_empty()).unwrap_or(false)
     }
 }
 
@@ -938,34 +981,10 @@ fn config_path() -> String {
 fn load_or_create_config() -> Config {
     let path = config_path();
     if let Ok(text) = std::fs::read_to_string(&path) {
-        if let Ok(mut cfg) = toml::from_str::<Config>(&text) {
-            // P2-6：先展开配置中的 ${ENV} 占位符，避免明文密钥落盘
-            cfg.api_key = expand_env(&cfg.api_key);
-            cfg.memoria_admin_key = expand_env(&cfg.memoria_admin_key);
-            cfg.server = expand_env(&cfg.server);
-            for src in &mut cfg.mcp_source {
-                src.url = expand_env(&src.url);
-                src.token = expand_env(&src.token);
-                src.command = expand_env(&src.command);
-                src.args = src.args.iter().map(|a| expand_env(a)).collect();
-                if let Some(ns) = src.namespace.as_mut() {
-                    *ns = expand_env(ns);
-                }
-            }
-            // 统一展开所有 LlmConfig 的 ${ENV} 占位符：全局池 + 分身池 + code_evolution 池。
-            // 单一入口 expand_config_llm_env，杜绝「load 展开分身 / build 展开全局」的分裂漏字段。
-            expand_config_llm_env(&mut cfg);
-            // 环境变量覆盖（环境变量 > 配置文件，仍生效）
-            if let Ok(key) = std::env::var("AGENT_API_KEY") {
-                if !key.is_empty() {
-                    cfg.api_key = key;
-                }
-            }
-            if let Ok(key) = std::env::var("MEMORIA_ADMIN_KEY") {
-                if !key.is_empty() {
-                    cfg.memoria_admin_key = key;
-                }
-            }
+        if let Ok(cfg) = toml::from_str::<Config>(&text) {
+            // P1-4 修复：load 阶段不再原地展开 ${ENV} 占位符。
+            // 存储态（AppState.config）始终保留占位符，save 时不会把 ${AGENT_API_KEY} 回写成明文。
+            // 运行时展开交由 resolve_config_for_runtime（克隆后展开），见 build_agent 调用点。
             return cfg;
         }
     }
@@ -1107,7 +1126,7 @@ fn main() {
                 let reg_state = state.clone();
                 let reg_config = config.clone();
                 tokio::spawn(async move {
-                    match build_agent(&reg_config, local_resources.clone()).await {
+                    match build_agent(&resolve_config_for_runtime(&reg_config), local_resources.clone()).await {
                         Ok(agent) => {
                             println!(
                                 "✓ Agent 已就绪（{}@{}）",
@@ -2132,7 +2151,7 @@ async fn handle_save_config(
     save_config(&cfg);
     drop(cfg);
     let cfg = st.config.lock().await.clone();
-    match build_agent(&cfg, st.local_resources.clone()).await {
+    match build_agent(&resolve_config_for_runtime(&cfg), st.local_resources.clone()).await {
         Ok(agent) => {
             *st.agent.lock().await = Some(agent);
             Json(SetupResponse {
