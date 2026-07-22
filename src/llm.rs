@@ -219,6 +219,17 @@ impl RoutedLlm {
         n: usize,
         d: TaskDifficulty,
     ) -> Result<LlmResponse, String> {
+        // BoN-A：先拿 temp=0 基线；采样劣于基线则回退，避免「选到 8 压过单次 10」回归。
+        let mut baseline_client = base.clone();
+        baseline_client.config.temperature = 0.0;
+        let baseline = match baseline_client.chat(messages, tools).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(err = %e, "best_of_n baseline failed, falling back to single call");
+                return base.chat(messages, tools).await;
+            }
+        };
+
         let temp = self.policy.sample_temperature.unwrap_or(0.7);
         let mut samplers: Vec<LlmClient> = Vec::with_capacity(n);
         for _ in 0..n {
@@ -236,12 +247,13 @@ impl RoutedLlm {
                 "best_of_n_sample_errors"
             );
         }
-        let candidates: Vec<LlmResponse> = results.into_iter().filter_map(|r| r.ok()).collect();
+        let mut candidates: Vec<LlmResponse> = results.into_iter().filter_map(|r| r.ok()).collect();
         if candidates.is_empty() {
-            // 兜底：所有采样失败则退化为单次普通调用，保证请求不整体失败
-            tracing::warn!("best_of_n all samples failed, falling back to single call");
-            return base.chat(messages, tools).await;
+            tracing::warn!("best_of_n all samples failed, returning baseline");
+            return Ok(baseline);
         }
+        // 基线参与评选，保证「不比单次更差」
+        candidates.push(baseline.clone());
         if candidates.len() == 1 {
             return Ok(candidates.into_iter().next().unwrap());
         }
@@ -253,6 +265,20 @@ impl RoutedLlm {
                 best_score = *sc;
                 best_idx = i;
             }
+        }
+        let baseline_idx = candidates.len() - 1;
+        let baseline_score = scores.get(baseline_idx).copied().unwrap_or(0.0);
+        // 采样最优不严格优于基线 → 回退基线（平局也回退，偏好确定性）
+        if best_idx != baseline_idx && best_score <= baseline_score + f64::EPSILON {
+            tracing::info!(
+                best_of_n = n,
+                scores = ?scores,
+                chosen = "baseline_fallback",
+                best_score,
+                baseline_score,
+                "best_of_n_select"
+            );
+            return Ok(baseline);
         }
         tracing::info!(best_of_n = n, scores = ?scores, chosen = best_idx, "best_of_n_select");
         Ok(candidates.into_iter().nth(best_idx).unwrap())
@@ -269,7 +295,8 @@ impl RoutedLlm {
     }
 
     async fn score_by_judge(&self, messages: &[Message], candidates: &[LlmResponse]) -> Vec<f64> {
-        // P2-2：judge_provider 缺失或 api_key 为空时显式暴露配置无效，回退启发式打分
+        // BoN-A：与 eval_bon 对齐——弃用「一次吐绝对分数组」弱提示（Δpp=-4 /「8 压过 10」根因）。
+        // 优先 1 次相对排序；失败再逐候选 SCORE:（与 eval 同解析器）。
         let judge_cfg = match self.policy.judge_provider.clone() {
             Some(p) if !p.api_key.is_empty() => LlmConfig::from_provider(&p),
             Some(_) => {
@@ -278,7 +305,7 @@ impl RoutedLlm {
                     reason = "judge_provider.api_key empty",
                     "best_of_n judge 配置无效，回退启发式打分"
                 );
-                LlmConfig::default()
+                return self.score_heuristic_all(messages, candidates);
             }
             None => {
                 tracing::warn!(
@@ -286,55 +313,104 @@ impl RoutedLlm {
                     reason = "judge_provider not configured",
                     "best_of_n judge 配置无效，回退启发式打分"
                 );
-                LlmConfig::default()
+                return self.score_heuristic_all(messages, candidates);
             }
         };
         let client = LlmClient::new(judge_cfg);
-        let last_user = messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .and_then(|m| m.content.clone())
-            .unwrap_or_default();
-        let candidates_text: String = candidates
+        let last_user = last_user_content(messages);
+
+        if let Some(order) = self.ask_relative_rank(&client, &last_user, candidates).await {
+            if order.len() == candidates.len() {
+                let n = candidates.len() as f64;
+                let mut by_rank = vec![0.0; candidates.len()];
+                let mut ok = true;
+                for (rank, idx1) in order.iter().enumerate() {
+                    if *idx1 >= 1 && *idx1 <= candidates.len() {
+                        by_rank[idx1 - 1] = n - rank as f64;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                // 必须是 1..=n 的排列
+                if ok {
+                    let mut seen = vec![false; candidates.len()];
+                    for idx1 in &order {
+                        if seen[idx1 - 1] {
+                            ok = false;
+                            break;
+                        }
+                        seen[idx1 - 1] = true;
+                    }
+                }
+                if ok && by_rank.iter().all(|s| *s > 0.0) {
+                    tracing::info!(order = ?order, "best_of_n relative_rank applied");
+                    return by_rank;
+                }
+            }
+        }
+
+        let mut scores = Vec::with_capacity(candidates.len());
+        for (i, c) in candidates.iter().enumerate() {
+            let prompt = Message {
+                role: "user".to_string(),
+                content: Some(format!(
+                    "用户请求：\n{}\n\n候选 #{} 回答：\n{}\n\n请按下列维度打分（0-10）：正确性、完整性、有无明显错误/幻觉、格式可用性。\
+先简短说明扣分点，最后一行只输出：SCORE: <0-10 数字，可含一位小数>",
+                    last_user, i + 1, c.text
+                )),
+                tool_calls: None,
+                tool_call_id: None,
+            };
+            match client.chat(&[prompt], &[]).await {
+                Ok(r) => scores.push(parse_judge_score(&r.text)),
+                Err(e) => {
+                    tracing::warn!(candidate = i, err = %e, "best_of_n judge 单候选失败，该候选记 0");
+                    scores.push(0.0);
+                }
+            }
+        }
+        scores
+    }
+
+    fn score_heuristic_all(&self, messages: &[Message], candidates: &[LlmResponse]) -> Vec<f64> {
+        let is_code = classify_heuristic(messages) == TaskDifficulty::Hard;
+        candidates.iter().map(|c| score_heuristic(c, is_code)).collect()
+    }
+
+    /// 请 judge 给出从优到劣的候选编号排序（1-based）。失败返回 None。
+    async fn ask_relative_rank(
+        &self,
+        client: &LlmClient,
+        last_user: &str,
+        candidates: &[LlmResponse],
+    ) -> Option<Vec<usize>> {
+        let list: String = candidates
             .iter()
             .enumerate()
-            .map(|(i, c)| format!("#{}: {}\n", i + 1, c.text))
+            .map(|(i, c)| {
+                let preview: String = c.text.chars().take(400).collect();
+                format!("#{}\n{}\n", i + 1, preview)
+            })
             .collect();
         let prompt = Message {
             role: "user".to_string(),
             content: Some(format!(
-                "用户请求：\n{}\n\n下面是 {} 个候选回答，请对质量逐个打分（0-10，越高质量越好），仅返回 JSON 数组如 [7,9,6]，不要其他文字。\n{}",
+                "用户请求：\n{}\n\n以下是 {} 个候选回答（已截断预览）。请从优到劣排序，\
+只返回 JSON 数组，元素为候选编号（1-based），例如 [2,1,3]，不要其他文字。\n{}",
                 last_user,
                 candidates.len(),
-                candidates_text
+                list
             )),
             tool_calls: None,
             tool_call_id: None,
         };
-        match client.chat(&[prompt], &[]).await {
-            Ok(r) => {
-                let txt = &r.text;
-                if let Some(start) = txt.find('[') {
-                    if let Some(end) = txt[start..].find(']') {
-                        let arr_str = &txt[start..start + end + 1];
-                        if let Ok(arr) = serde_json::from_str::<Vec<f64>>(arr_str) {
-                            if arr.len() == candidates.len() {
-                                return arr;
-                            }
-                        }
-                    }
-                }
-                tracing::warn!("best_of_n judge 解析失败，回退启发式打分");
-                let is_code = classify_heuristic(messages) == TaskDifficulty::Hard;
-                candidates.iter().map(|c| score_heuristic(c, is_code)).collect()
-            }
-            Err(e) => {
-                tracing::warn!("best_of_n judge 调用失败，回退启发式打分: {}", e);
-                let is_code = classify_heuristic(messages) == TaskDifficulty::Hard;
-                candidates.iter().map(|c| score_heuristic(c, is_code)).collect()
-            }
-        }
+        let r = client.chat(&[prompt], &[]).await.ok()?;
+        let txt = &r.text;
+        let start = txt.find('[')?;
+        let end = txt[start..].find(']')?;
+        let arr_str = &txt[start..start + end + 1];
+        serde_json::from_str::<Vec<usize>>(arr_str).ok()
     }
 
     /// 注意：此处仅做「难度路由选择 provider」，真·SSE token 流由选中 provider 的
@@ -448,6 +524,48 @@ async fn classify_by_judge(policy: &DifficultyPolicy, messages: &[Message]) -> T
         Ok(r) if r.text.to_lowercase().contains("hard") => TaskDifficulty::Hard,
         _ => TaskDifficulty::Easy,
     }
+}
+
+/// 解析 judge 返回的分数（与 `tests/eval_bon.rs` 口径对齐，BoN-A）。
+/// 1) 优先取显式 `SCORE: X`；2) 回退取首个完整数字 token；clamp 到 [0,10]。
+pub fn parse_judge_score(text: &str) -> f64 {
+    if let Some(pos) = text.find("SCORE") {
+        let rest = &text[pos..];
+        let b = rest.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i].is_ascii_digit() {
+                let mut end = i + 1;
+                while end < b.len() && (b[end].is_ascii_digit() || b[end] == b'.') {
+                    end += 1;
+                }
+                if let Ok(v) = rest[i..end].parse::<f64>() {
+                    return v.clamp(0.0, 10.0);
+                }
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_digit() {
+            let mut end = i + 1;
+            while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b'.') {
+                end += 1;
+            }
+            if let Ok(v) = text[i..end].parse::<f64>() {
+                return v.clamp(0.0, 10.0);
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    0.0
 }
 
 /// Best-of-N 启发式打分（零额外调用，作为 Judge 不可用时的回退）
@@ -1099,5 +1217,13 @@ mod eval_tests {
         }
         eprintln!("classification accuracy = {}/{} = {:.1}%", correct, total, acc * 100.0);
         assert!(acc >= 0.90, "分类准确率 {:.1}% 低于验收线 90%", acc * 100.0);
+    }
+
+    #[test]
+    fn parse_judge_score_prefers_score_line_and_handles_ten() {
+        assert_eq!(parse_judge_score("理由...\nSCORE: 10"), 10.0);
+        assert_eq!(parse_judge_score("SCORE: 8.5"), 8.5);
+        assert_eq!(parse_judge_score("满分 10 分"), 10.0); // 完整 token，非首字符 1
+        assert_eq!(parse_judge_score("无数字"), 0.0);
     }
 }

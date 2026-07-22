@@ -18,7 +18,7 @@
 //!
 //! 默认 `#[ignore]`，避免无 key / 无网络时 CI 失败；需要真实 LLM 调用才跑。
 
-use agent_core::llm::{LlmClient, LlmConfig, LlmProvider, Message, RoutedLlm};
+use agent_core::llm::{LlmClient, LlmConfig, LlmProvider, Message, RoutedLlm, parse_judge_score};
 
 fn provider(model: &str, key: &str) -> LlmProvider {
     LlmProvider {
@@ -38,52 +38,9 @@ fn msg(content: &str) -> Message {
     }
 }
 
-/// 解析 judge 返回的分数：
-/// 1) 优先取显式 `SCORE: X`（X 可含一位小数）；
-/// 2) 回退取文本中**第一个完整数字 token**（整数或小数），clamp 到 [0,10]。
-///
-/// 修复原实现 `chars().find_map(|c| c.to_digit(10))` 只取首个字符导致
-/// judge 回「10」被误判为 1、Δpp 严重失真的 bug。
+/// 解析 judge 返回的分数：委托 `llm::parse_judge_score`（BoN-A 生产/eval 统一入口）。
 fn parse_score(text: &str) -> f64 {
-    // 1) 显式 SCORE: X
-    if let Some(pos) = text.find("SCORE") {
-        let rest = &text[pos..];
-        let b = rest.as_bytes();
-        let mut i = 0;
-        while i < b.len() {
-            if b[i].is_ascii_digit() {
-                let mut end = i + 1;
-                while end < b.len() && (b[end].is_ascii_digit() || b[end] == b'.') {
-                    end += 1;
-                }
-                if let Ok(v) = rest[i..end].parse::<f64>() {
-                    return v.clamp(0.0, 10.0);
-                }
-                i = end;
-            } else {
-                i += 1;
-            }
-        }
-    }
-    // 2) 第一个完整数字 token
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if c.is_ascii_digit() {
-            let mut end = i + 1;
-            while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b'.') {
-                end += 1;
-            }
-            if let Ok(v) = text[i..end].parse::<f64>() {
-                return v.clamp(0.0, 10.0);
-            }
-            i = end;
-        } else {
-            i += 1;
-        }
-    }
-    0.0
+    parse_judge_score(text)
 }
 
 async fn judge_score(client: &LlmClient, prompt: &str, rubric: &str, answer: &str) -> f64 {
