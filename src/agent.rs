@@ -12,7 +12,7 @@ use crate::boundary::{self, BlockLevel, ComplianceBoundary, PermissionLevel};
 use crate::checkpoint::{CheckpointState, CheckpointStore};
 use crate::degrade::{DegradeMode, DegradeMonitor, UNHEALTHY_THRESHOLD};
 use crate::harness::{self, ExecutionLog, HarnessStore};
-use crate::llm::{LlmClient, LlmConfig, Message, ToolDef};
+use crate::llm::{DifficultyPolicy, LlmClient, LlmConfig, Message, ToolDef, RoutedLlm};
 use crate::mcp_client::{McpClient, McpSource};
 use crate::namespace::NamespaceRegistry;
 use crate::quota::NsQuotaStore;
@@ -113,6 +113,7 @@ pub struct AgentCore {
     pub mcp: McpClient,              // Memoria MCP（主）
     pub mcp_sources: Vec<McpSource>, // 全部 MCP 源（含 Memoria）
     pub llm: LlmClient,
+    pub routed_llm: RoutedLlm,
     pub boundary: Arc<Mutex<ComplianceBoundary>>,
     pub harness: Arc<Mutex<HarnessStore>>,
     /// 执行日志（用于 distill）
@@ -291,11 +292,13 @@ impl AgentCore {
             ns_full_path: config.identity.ns_full_path.clone(),
             llm: None,
         };
+        let routed_llm = RoutedLlm::from_config(&config.llm);
         AgentCore {
             config,
             mcp,
             mcp_sources,
             llm,
+            routed_llm,
             boundary: Arc::new(Mutex::new(boundary)),
             harness: Arc::new(Mutex::new(harness)),
             execution_log: Arc::new(Mutex::new(Vec::new())),
@@ -490,6 +493,7 @@ impl AgentCore {
                 chat_path: fb.chat_path.clone(),
                 max_tokens: base.max_tokens,
                 temperature: base.temperature,
+                difficulty: DifficultyPolicy::default(),
                 fallbacks: vec![],
             });
         }
@@ -1876,7 +1880,7 @@ impl AgentCore {
                     quota_ns_llm, e
                 );
             }
-            let response = match self.llm.chat(&messages, &tools).await {
+            let response = match self.routed_llm.chat(&messages, &tools).await {
                 Ok(r) => r,
                 // P1-5：LLM 主/备 Provider 均失败 → 返回「可重试错误」，而非裸崩
                 Err(e) => {

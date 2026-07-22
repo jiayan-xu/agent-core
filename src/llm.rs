@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use futures::future::join_all;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -63,6 +64,9 @@ pub struct LlmConfig {
     pub temperature: f64,
     /// 备用 Provider 池（failover + 圆桌多 LLM 轮询；具名字段便于编辑）
     pub fallbacks: Vec<LlmProvider>,
+    /// 难度路由策略（易/难任务选择不同 provider；缺省不路由）
+    #[serde(default)]
+    pub difficulty: DifficultyPolicy,
 }
 
 impl Default for LlmConfig {
@@ -75,8 +79,338 @@ impl Default for LlmConfig {
             max_tokens: 4096,
             temperature: 0.0,
             fallbacks: Vec::new(),
+            difficulty: DifficultyPolicy::default(),
         }
     }
+}
+
+/// 任务难度（难度路由用）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskDifficulty {
+    #[default]
+    Easy,
+    Hard,
+}
+
+/// 难度分类方式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassifyMode {
+    /// 启发式规则（零额外调用，默认）
+    #[default]
+    Heuristic,
+    /// 用 judge_provider 跑一次廉价分类调用
+    Judge,
+}
+
+/// Best-of-N 打分方式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScorerMode {
+    /// 启发式规则（零额外调用，默认）
+    #[default]
+    Heuristic,
+    /// 用 judge_provider 跑一次廉价打分（对所有候选一次性打分）
+    Judge,
+}
+
+/// 难度路由策略：易→easy provider，难→hard provider；缺省不路由（用主模型）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DifficultyPolicy {
+    /// 易任务 Provider（如 flash）。None 表示用主模型
+    #[serde(default)]
+    pub easy: Option<LlmProvider>,
+    /// 难任务 Provider（如 reasoning/pro）。None 表示用主模型
+    #[serde(default)]
+    pub hard: Option<LlmProvider>,
+    /// 分类方式（默认 heuristic）
+    #[serde(default)]
+    pub classify: ClassifyMode,
+    /// Best-of-N 采样数（>=2 开启；None 关闭，默认关闭以零成本）
+    #[serde(default)]
+    pub best_of_n: Option<usize>,
+    /// Best-of-N 打分方式（默认 heuristic）
+    #[serde(default)]
+    pub scorer: ScorerMode,
+    /// Best-of-N 采样温度（默认 0.7，制造多样性）
+    #[serde(default)]
+    pub sample_temperature: Option<f64>,
+    /// judge 模式使用的分类/打分模型（None 则用主模型作 judge）
+    #[serde(default)]
+    pub judge_provider: Option<LlmProvider>,
+}
+
+impl LlmConfig {
+    /// 从单个 Provider 构造一个最小 LlmConfig（便于 easy/hard 路由）
+    pub fn from_provider(p: &LlmProvider) -> Self {
+        LlmConfig {
+            base_url: p.base_url.clone(),
+            model: p.model.clone(),
+            api_key: p.api_key.clone(),
+            chat_path: p.chat_path.clone(),
+            max_tokens: 4096,
+            temperature: 0.0,
+            fallbacks: Vec::new(),
+            difficulty: DifficultyPolicy::default(),
+        }
+    }
+}
+
+/// 难度路由包装：在 LlmClient 之上按任务难度选择 provider
+#[derive(Clone)]
+pub struct RoutedLlm {
+    base: LlmClient,
+    easy: Option<LlmClient>,
+    hard: Option<LlmClient>,
+    policy: DifficultyPolicy,
+}
+
+impl std::fmt::Debug for RoutedLlm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoutedLlm")
+            .field("base_model", &self.base.config.model)
+            .field("has_easy", &self.easy.is_some())
+            .field("has_hard", &self.hard.is_some())
+            .field("classify", &self.policy.classify)
+            .finish()
+    }
+}
+
+impl RoutedLlm {
+    pub fn from_config(cfg: &LlmConfig) -> Self {
+        let base = LlmClient::new(cfg.clone());
+        let easy = cfg.difficulty.easy.as_ref().map(|p| LlmClient::new(LlmConfig::from_provider(p)));
+        let hard = cfg.difficulty.hard.as_ref().map(|p| LlmClient::new(LlmConfig::from_provider(p)));
+        RoutedLlm { base, easy, hard, policy: cfg.difficulty.clone() }
+    }
+
+    fn select(&self, d: TaskDifficulty) -> &LlmClient {
+        match d {
+            TaskDifficulty::Easy => self.easy.as_ref().unwrap_or(&self.base),
+            TaskDifficulty::Hard => self.hard.as_ref().unwrap_or(&self.base),
+        }
+    }
+
+    pub async fn chat(&self, messages: &[Message], tools: &[ToolDef]) -> Result<LlmResponse, String> {
+        let d = classify_difficulty(&self.policy, messages).await;
+        tracing::info!(difficulty = ?d, "difficulty_route");
+        let selected = self.select(d);
+        match self.policy.best_of_n {
+            Some(n) if n >= 2 => self.chat_best_of_n(selected, messages, tools, n, d).await,
+            _ => selected.chat(messages, tools).await,
+        }
+    }
+
+    async fn chat_best_of_n(
+        &self,
+        base: &LlmClient,
+        messages: &[Message],
+        tools: &[ToolDef],
+        n: usize,
+        d: TaskDifficulty,
+    ) -> Result<LlmResponse, String> {
+        let temp = self.policy.sample_temperature.unwrap_or(0.7);
+        let mut samplers: Vec<LlmClient> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut s = base.clone();
+            s.config.temperature = temp;
+            samplers.push(s);
+        }
+        let tasks: Vec<_> = samplers.iter().map(|s| s.chat(messages, tools)).collect();
+        let results = join_all(tasks).await;
+        let errors: Vec<String> = results.iter().filter_map(|r| r.as_ref().err().cloned()).collect();
+        if !errors.is_empty() {
+            tracing::warn!(
+                n_failed = errors.len(),
+                first_err = %errors.first().unwrap(),
+                "best_of_n_sample_errors"
+            );
+        }
+        let candidates: Vec<LlmResponse> = results.into_iter().filter_map(|r| r.ok()).collect();
+        if candidates.is_empty() {
+            // 兜底：所有采样失败则退化为单次普通调用，保证请求不整体失败
+            tracing::warn!("best_of_n all samples failed, falling back to single call");
+            return base.chat(messages, tools).await;
+        }
+        if candidates.len() == 1 {
+            return Ok(candidates.into_iter().next().unwrap());
+        }
+        let scores = self.score(messages, &candidates, d).await;
+        let mut best_idx = 0usize;
+        let mut best_score = f64::NEG_INFINITY;
+        for (i, sc) in scores.iter().enumerate() {
+            if *sc > best_score {
+                best_score = *sc;
+                best_idx = i;
+            }
+        }
+        tracing::info!(best_of_n = n, scores = ?scores, chosen = best_idx, "best_of_n_select");
+        Ok(candidates.into_iter().nth(best_idx).unwrap())
+    }
+
+    async fn score(&self, messages: &[Message], candidates: &[LlmResponse], d: TaskDifficulty) -> Vec<f64> {
+        match self.policy.scorer {
+            ScorerMode::Judge => self.score_by_judge(messages, candidates).await,
+            ScorerMode::Heuristic => {
+                let is_code = d == TaskDifficulty::Hard;
+                candidates.iter().map(|c| score_heuristic(c, is_code)).collect()
+            }
+        }
+    }
+
+    async fn score_by_judge(&self, messages: &[Message], candidates: &[LlmResponse]) -> Vec<f64> {
+        let judge_cfg = self
+            .policy
+            .judge_provider
+            .clone()
+            .map(|p| LlmConfig::from_provider(&p))
+            .unwrap_or_else(LlmConfig::default);
+        let client = LlmClient::new(judge_cfg);
+        let last_user = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .and_then(|m| m.content.clone())
+            .unwrap_or_default();
+        let candidates_text: String = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("#{}: {}\n", i + 1, c.text))
+            .collect();
+        let prompt = Message {
+            role: "user".to_string(),
+            content: Some(format!(
+                "用户请求：\n{}\n\n下面是 {} 个候选回答，请对质量逐个打分（0-10，越高质量越好），仅返回 JSON 数组如 [7,9,6]，不要其他文字。\n{}",
+                last_user,
+                candidates.len(),
+                candidates_text
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        match client.chat(&[prompt], &[]).await {
+            Ok(r) => {
+                let txt = &r.text;
+                if let Some(start) = txt.find('[') {
+                    if let Some(end) = txt[start..].find(']') {
+                        let arr_str = &txt[start..start + end + 1];
+                        if let Ok(arr) = serde_json::from_str::<Vec<f64>>(arr_str) {
+                            if arr.len() == candidates.len() {
+                                return arr;
+                            }
+                        }
+                    }
+                }
+                tracing::warn!("best_of_n judge 解析失败，回退启发式打分");
+                let is_code = classify_heuristic(messages) == TaskDifficulty::Hard;
+                candidates.iter().map(|c| score_heuristic(c, is_code)).collect()
+            }
+            Err(e) => {
+                tracing::warn!("best_of_n judge 调用失败，回退启发式打分: {}", e);
+                let is_code = classify_heuristic(messages) == TaskDifficulty::Hard;
+                candidates.iter().map(|c| score_heuristic(c, is_code)).collect()
+            }
+        }
+    }
+
+    pub async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        sender: mpsc::UnboundedSender<SseEvent>,
+    ) -> Result<(), String> {
+        let d = classify_difficulty(&self.policy, messages).await;
+        tracing::info!(difficulty = ?d, "difficulty_route_stream");
+        self.select(d).chat_stream(messages, tools, sender).await
+    }
+}
+
+/// 按策略分类任务难度
+pub async fn classify_difficulty(policy: &DifficultyPolicy, messages: &[Message]) -> TaskDifficulty {
+    match policy.classify {
+        ClassifyMode::Judge => classify_by_judge(policy, messages).await,
+        ClassifyMode::Heuristic => classify_heuristic(messages),
+    }
+}
+
+/// 启发式：基于最后一条用户消息的信号
+fn classify_heuristic(messages: &[Message]) -> TaskDifficulty {
+    let last_user = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.content.clone())
+        .unwrap_or_default();
+    let text = last_user.to_lowercase();
+    let hard_signals = [
+        "```", "实现", "写代码", "编码", "debug", "调试", "修复", "bug",
+        "算法", "优化", "重构", "编译", "单元测试", "集成测试", "正则",
+        "regex", "sql", "查询", "递归", "动态规划", "proof", "推导",
+        "复杂", "分析", "架构", "设计模式", "并发", "async", "线程",
+        "rust", "python", "typescript", "react", "算法题", "函数",
+    ];
+    if hard_signals.iter().any(|s| text.contains(s)) {
+        return TaskDifficulty::Hard;
+    }
+    if last_user.chars().count() > 800 {
+        return TaskDifficulty::Hard;
+    }
+    TaskDifficulty::Easy
+}
+
+async fn classify_by_judge(policy: &DifficultyPolicy, messages: &[Message]) -> TaskDifficulty {
+    let judge_cfg = policy
+        .judge_provider
+        .clone()
+        .map(|p| LlmConfig::from_provider(&p))
+        .unwrap_or_else(LlmConfig::default);
+    let client = LlmClient::new(judge_cfg);
+    let prompt = Message {
+        role: "user".to_string(),
+        content: Some(
+            "判断下述用户任务的难度，仅回复 easy 或 hard：\n".to_string()
+                + &messages.last().and_then(|m| m.content.clone()).unwrap_or_default(),
+        ),
+        tool_calls: None,
+        tool_call_id: None,
+    };
+    match client.chat(&[prompt], &[]).await {
+        Ok(r) if r.text.to_lowercase().contains("hard") => TaskDifficulty::Hard,
+        _ => TaskDifficulty::Easy,
+    }
+}
+
+/// Best-of-N 启发式打分（零额外调用，作为 Judge 不可用时的回退）
+fn score_heuristic(c: &LlmResponse, is_code: bool) -> f64 {
+    let text = &c.text;
+    let len = text.chars().count();
+    if len == 0 {
+        return f64::NEG_INFINITY;
+    }
+    let mut s = (len.min(1500) as f64) * 0.01;
+    let low = text.to_lowercase();
+    if low.contains("抱歉")
+        || low.contains("i cannot")
+        || low.contains("作为ai")
+        || low.contains("我无法")
+        || low.contains("i'm unable")
+        || low.contains("i am unable")
+    {
+        s -= 50.0;
+    }
+    if is_code {
+        if text.contains("```") {
+            s += 20.0;
+        }
+        if text.contains("fn ")
+            || text.contains("def ")
+            || text.contains("function ")
+            || text.contains("impl ")
+        {
+            s += 10.0;
+        }
+    }
+    s
 }
 
 /// LLM 响应中的工具调用

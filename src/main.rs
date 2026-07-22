@@ -269,6 +269,35 @@ fn expand_env(value: &str) -> String {
     result
 }
 
+/// 展开单个 Provider 的所有 ${ENV} 占位符字段（base_url / api_key / chat_path）。
+/// 统一入口：主池 / fallbacks / 难度三路都走这里，避免「修一条漏一条」。
+fn expand_provider(p: &mut LlmProvider) {
+    p.base_url = expand_env(&p.base_url);
+    p.api_key = expand_env(&p.api_key);
+    p.chat_path = expand_env(&p.chat_path);
+}
+
+/// 展开整份 LlmConfig 的 ${ENV} 占位符：主池字段 + fallbacks + 难度三路。
+/// build_agent 全局池统一调用此处，替代原先只展开 api_key/fallbacks 部分字段的写法，
+/// 杜绝「只展开 api_key 漏掉 base_url/chat_path」导致路由 401（见 build_agent 历史 bug）。
+fn expand_llm_config(cfg: &mut LlmConfig) {
+    cfg.base_url = expand_env(&cfg.base_url);
+    cfg.api_key = expand_env(&cfg.api_key);
+    cfg.chat_path = expand_env(&cfg.chat_path);
+    for p in cfg.fallbacks.iter_mut() {
+        expand_provider(p);
+    }
+    if let Some(p) = cfg.difficulty.easy.as_mut() {
+        expand_provider(p);
+    }
+    if let Some(p) = cfg.difficulty.hard.as_mut() {
+        expand_provider(p);
+    }
+    if let Some(p) = cfg.difficulty.judge_provider.as_mut() {
+        expand_provider(p);
+    }
+}
+
 impl Config {
     fn configured(&self) -> bool {
         !self.agent_id.is_empty() && !self.api_key.is_empty()
@@ -3570,13 +3599,11 @@ async fn build_agent(config: &Config, local_resources: SharedResourceSnapshot) -
     // P0-1: LLM 池来源优先级：agent.toml 的 [llm] 段（用户显式配置）> 旧硬编码 deepseek 主 + DOUBAO_API_KEY 备用
     // 圆桌多 LLM 自动分配复用此池（llm_pool = 主 + fallbacks）
     let llm_config = if let Some(explicit) = &config.llm {
-        // 支持 ${ENV} 占位，避免明文密钥落盘（agent.toml 本身已被 gitignore，此处再给一层 env 解耦）
+        // 支持 ${ENV} 占位，避免明文密钥落盘（agent.toml 本身已被 gitignore，此处再给一层 env 解耦）。
+        // 统一经 expand_llm_config 展开主池 + fallbacks + 难度三路的全部 ${ENV} 字段，
+        // 杜绝「只展开 api_key 漏掉 base_url/chat_path」导致路由 401（见 build_agent 历史 bug）。
         let mut lc = explicit.clone();
-        lc.api_key = expand_env(&lc.api_key);
-        for p in lc.fallbacks.iter_mut() {
-            p.base_url = expand_env(&p.base_url);
-            p.api_key = expand_env(&p.api_key);
-        }
+        expand_llm_config(&mut lc);
         lc
     } else {
         let doubao_key = std::env::var("DOUBAO_API_KEY").unwrap_or_default();
