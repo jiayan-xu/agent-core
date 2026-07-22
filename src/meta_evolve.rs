@@ -1101,6 +1101,7 @@ mod tests {
             max_tokens: 4096,
             temperature: 0.0,
             fallbacks: Vec::new(),
+            ..Default::default()
         })
     }
 

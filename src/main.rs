@@ -238,8 +238,12 @@ fn expand_env(value: &str) -> String {
                 if closed {
                     if let Ok(v) = std::env::var(&name) {
                         result.push_str(&v);
+                    } else {
+                        // 未设置：保留 ${NAME} 原样（与 $NAME 行为一致，便于发现配置缺失）
+                        result.push_str("${");
+                        result.push_str(&name);
+                        result.push('}');
                     }
-                    // 未设置：保留 ${NAME} 原样
                 } else {
                     result.push_str("${");
                     result.push_str(&name);
@@ -257,6 +261,10 @@ fn expand_env(value: &str) -> String {
                 if !name.is_empty() {
                     if let Ok(v) = std::env::var(&name) {
                         result.push_str(&v);
+                    } else {
+                        // 未设置：保留 $NAME 原样（与 ${NAME} 行为一致，便于发现配置缺失）
+                        result.push('$');
+                        result.push_str(&name);
                     }
                 } else {
                     result.push('$');
@@ -295,6 +303,29 @@ fn expand_llm_config(cfg: &mut LlmConfig) {
     }
     if let Some(p) = cfg.difficulty.judge_provider.as_mut() {
         expand_provider(p);
+    }
+}
+
+/// 统一展开 Config 内所有 LlmConfig 的 ${ENV} 占位符：全局池 + 分身专属池 + code_evolution 专属池。
+/// 单一入口，彻底消除「personas 在 load 展开、全局 llm 在 build_agent 展开」的分裂
+/// （分裂曾导致新增字段时漏改一处 → 路由 401）。新增任何嵌套 provider 字段，
+/// 只改 `expand_provider` / `expand_llm_config` 一处即可。
+fn expand_config_llm_env(cfg: &mut Config) {
+    if let Some(llm) = cfg.llm.as_mut() {
+        expand_llm_config(llm);
+    }
+    for pc in cfg.personas.iter_mut() {
+        if let Some(llm) = pc.llm.as_mut() {
+            expand_llm_config(llm);
+        }
+    }
+    if let Some(ce) = cfg.code_evolution.as_mut() {
+        if let Some(k) = ce.evolve_key.as_mut() {
+            *k = expand_env(k);
+        }
+        if let Some(m) = ce.model.as_mut() {
+            expand_llm_config(m);
+        }
     }
 }
 
@@ -921,31 +952,9 @@ fn load_or_create_config() -> Config {
                     *ns = expand_env(ns);
                 }
             }
-            // 展开每个并联分身专属 LLM 的 ${ENV} 占位符（与全局 LLM 池在 build_agent 里的展开保持一致，
-            // 否则分身若写 api_key="${AGENT_API_KEY}" 会被原样发到 API 导致鉴权失败）
-            for pc in &mut cfg.personas {
-                if let Some(llm) = &mut pc.llm {
-                    llm.base_url = expand_env(&llm.base_url);
-                    llm.api_key = expand_env(&llm.api_key);
-                    llm.chat_path = expand_env(&llm.chat_path);
-                    for f in &mut llm.fallbacks {
-                        f.base_url = expand_env(&f.base_url);
-                        f.api_key = expand_env(&f.api_key);
-                        f.chat_path = expand_env(&f.chat_path);
-                    }
-                }
-            }
-            // Phase 7：展开 code_evolution.model / evolve_key 的 ${ENV} 占位符（与分身 LLM 一致）
-            if let Some(ce) = &mut cfg.code_evolution {
-                if let Some(k) = &mut ce.evolve_key {
-                    *k = expand_env(k);
-                }
-                if let Some(m) = &mut ce.model {
-                    m.base_url = expand_env(&m.base_url);
-                    m.api_key = expand_env(&m.api_key);
-                    m.chat_path = expand_env(&m.chat_path);
-                }
-            }
+            // 统一展开所有 LlmConfig 的 ${ENV} 占位符：全局池 + 分身池 + code_evolution 池。
+            // 单一入口 expand_config_llm_env，杜绝「load 展开分身 / build 展开全局」的分裂漏字段。
+            expand_config_llm_env(&mut cfg);
             // 环境变量覆盖（环境变量 > 配置文件，仍生效）
             if let Ok(key) = std::env::var("AGENT_API_KEY") {
                 if !key.is_empty() {
@@ -3599,12 +3608,10 @@ async fn build_agent(config: &Config, local_resources: SharedResourceSnapshot) -
     // P0-1: LLM 池来源优先级：agent.toml 的 [llm] 段（用户显式配置）> 旧硬编码 deepseek 主 + DOUBAO_API_KEY 备用
     // 圆桌多 LLM 自动分配复用此池（llm_pool = 主 + fallbacks）
     let llm_config = if let Some(explicit) = &config.llm {
-        // 支持 ${ENV} 占位，避免明文密钥落盘（agent.toml 本身已被 gitignore，此处再给一层 env 解耦）。
-        // 统一经 expand_llm_config 展开主池 + fallbacks + 难度三路的全部 ${ENV} 字段，
-        // 杜绝「只展开 api_key 漏掉 base_url/chat_path」导致路由 401（见 build_agent 历史 bug）。
-        let mut lc = explicit.clone();
-        expand_llm_config(&mut lc);
-        lc
+        // ${ENV} 已在 load_or_create_config().expand_config_llm_env 统一展开
+        // （全局池 + 分身池 + code_evolution 池三处一处搞定），此处直接 clone 即可，
+        // 不再重复展开，彻底消除「load 展开分身 / build 展开全局」的分裂导致漏字段。
+        explicit.clone()
     } else {
         let doubao_key = std::env::var("DOUBAO_API_KEY").unwrap_or_default();
         let fallbacks = if !doubao_key.is_empty() {
@@ -3740,5 +3747,65 @@ mod collab_policy_tests {
     fn peer_in_company_filter() {
         assert!(peer_in_company("agent/x,org/cs-pufa-2nd-thermal"));
         assert!(!peer_in_company("agent/y,org/other-co"));
+    }
+}
+
+/// expand_env 的 ${ENV} 展开单测（覆盖 P2 的对称性修复与三类 ${X} 占位场景）。
+#[cfg(test)]
+mod env_expand_tests {
+    use super::expand_env;
+
+    #[test]
+    fn expands_braced_var_when_set() {
+        std::env::set_var("HY3_EV_SET", "secret123");
+        assert_eq!(expand_env("token=${HY3_EV_SET}"), "token=secret123");
+        std::env::remove_var("HY3_EV_SET");
+    }
+
+    #[test]
+    fn preserves_braced_var_when_unset() {
+        std::env::remove_var("HY3_EV_MISSING");
+        assert_eq!(
+            expand_env("token=${HY3_EV_MISSING}"),
+            "token=${HY3_EV_MISSING}"
+        );
+    }
+
+    #[test]
+    fn expands_braced_var_embedded_in_url() {
+        std::env::set_var("HY3_EV_MODEL", "gpt-4");
+        assert_eq!(
+            expand_env("https://api.example.com/v1/${HY3_EV_MODEL}/chat"),
+            "https://api.example.com/v1/gpt-4/chat"
+        );
+        std::env::remove_var("HY3_EV_MODEL");
+    }
+
+    #[test]
+    fn expands_bare_var_when_set() {
+        std::env::set_var("HY3_EV_BARE", "val");
+        assert_eq!(expand_env("x=$HY3_EV_BARE"), "x=val");
+        std::env::remove_var("HY3_EV_BARE");
+    }
+
+    #[test]
+    fn preserves_bare_var_when_unset_is_symmetric() {
+        std::env::remove_var("HY3_EV_BARE2");
+        assert_eq!(expand_env("token=$HY3_EV_BARE2"), "token=$HY3_EV_BARE2");
+    }
+
+    #[test]
+    fn no_dollar_passthrough() {
+        assert_eq!(expand_env("plain text no placeholder"), "plain text no placeholder");
+    }
+
+    #[test]
+    fn mixed_braced_and_literal() {
+        std::env::set_var("HY3_EV_MIX", "abc");
+        assert_eq!(
+            expand_env("pre/${HY3_EV_MIX}/mid/$HY3_EV_MIX/post"),
+            "pre/abc/mid/abc/post"
+        );
+        std::env::remove_var("HY3_EV_MIX");
     }
 }
