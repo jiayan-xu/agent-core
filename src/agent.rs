@@ -3649,7 +3649,9 @@ impl AgentCore {
         if subtasks.is_empty() {
             return None;
         }
-        let result = crate::multiagent::dispatch(&self.routed_llm, &subtasks).await;
+        let result =
+            crate::multiagent::dispatch_with_timeout(&self.routed_llm, &subtasks, cfg.subagent_timeout_secs)
+                .await;
         if result.trim().is_empty() {
             // 派发全失败 → 回退 composer+工具，不做空壳返回（P0-2 回退）
             tracing::warn!(target: "agent.multiagent", "dispatch 全失败，回退原路径");

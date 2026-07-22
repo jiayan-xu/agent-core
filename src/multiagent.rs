@@ -6,9 +6,14 @@
 //!
 //! 门控：仅 `features.multiagent = true` 时 `AgentCore` 才持有 `MultiAgentConfig`；
 //! `maybe_compose` 在 flag 关或任务非 Hard 或分解为空时返回 None，走原路径。
-//! 当前 `dispatch` 为顺序派发（stub）；真实并行派发/隔离沙箱留待 G 门复验后深化。
+//! `dispatch` 已为**并发派发**（`futures::join_all` + 每子任务 `tokio::time::timeout` 隔离）；
+//! 隔离沙箱（独立进程/权限边界）留待后续增强。
 
 use serde::{Deserialize, Serialize};
+
+use std::time::Duration;
+
+use futures::future::join_all;
 
 use crate::llm::{LlmClient, Message, RoutedLlm, ToolDef};
 
@@ -29,6 +34,13 @@ pub struct MultiAgentConfig {
     /// 任务白名单（子串匹配）：命中其一即视为已 opt-in（即便消息无 token）。
     #[serde(default)]
     pub task_whitelist: Vec<String>,
+    /// 单子任务超时（秒）：超出则隔离为「超时」说明，不拖垮整体派发。默认 120。
+    #[serde(default = "default_subagent_timeout")]
+    pub subagent_timeout_secs: u64,
+}
+
+fn default_subagent_timeout() -> u64 {
+    120
 }
 
 fn default_fanout() -> usize {
@@ -46,6 +58,7 @@ impl Default for MultiAgentConfig {
             max_subagents: default_fanout(),
             opt_in_token: default_opt_in_token(),
             task_whitelist: Vec::new(),
+            subagent_timeout_secs: default_subagent_timeout(),
         }
     }
 }
@@ -107,24 +120,48 @@ pub fn parse_subtasks(json: &str) -> Vec<SubTask> {
     Vec::new()
 }
 
-/// 逐子任务派发（当前顺序执行 + 聚合；真实并行留待深化）。
+/// 每子任务默认超时（秒）。单个子任务卡死/慢不影响其他子任务，整体可预期收敛。
+const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 120;
+
+/// 逐子任务派发（并发 + 单点超时隔离）。
+///
+/// 用 `futures::join_all` 并发跑所有子任务（不再顺序阻塞，N 子任务耗时≈最慢单个而非总和），
+/// 每个子任务包 `tokio::time::timeout` 隔离：超时/失败仅该子任务降级为说明，不拖垮整体输出。
+/// 结果按 subtask 原始顺序拼装，保证输出可预期。
 pub async fn dispatch(rt: &RoutedLlm, subtasks: &[SubTask]) -> String {
+    dispatch_with_timeout(rt, subtasks, DEFAULT_SUBAGENT_TIMEOUT_SECS).await
+}
+
+/// 带超时参数的派发（供 `maybe_compose` 传入配置中的 `subagent_timeout_secs`）。
+pub async fn dispatch_with_timeout(
+    rt: &RoutedLlm,
+    subtasks: &[SubTask],
+    timeout_secs: u64,
+) -> String {
+    let timeout = Duration::from_secs(timeout_secs);
+    // 每个子任务一个 future；rt 为 &RoutedLlm（引用 Copy），闭包内仅借用 rt、持有自有 title/desc，
+    // 可安全并发。空工具列表 `&[] as &[ToolDef]` 为语句内临时，跨 await 存活（与原顺序版同构）。
+    let futures = subtasks.iter().map(|st| {
+        let title = st.title.clone();
+        let desc = st.description.clone();
+        async move {
+            let msg = Message {
+                role: "user".to_string(),
+                content: Some(desc),
+                tool_calls: None,
+                tool_call_id: None,
+            };
+            let r = tokio::time::timeout(timeout, rt.chat(&[msg], &[] as &[ToolDef])).await;
+            (title, r)
+        }
+    });
+    let results = join_all(futures).await;
     let mut out = String::new();
-    for st in subtasks {
-        match rt
-            .chat(
-                &[Message {
-                    role: "user".to_string(),
-                    content: Some(st.description.clone()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                }],
-                &[] as &[ToolDef],
-            )
-            .await
-        {
-            Ok(r) => out.push_str(&format!("### {}\n{}\n\n", st.title, r.text)),
-            Err(e) => out.push_str(&format!("### {} (失败: {})\n\n", st.title, e)),
+    for (title, res) in results {
+        match res {
+            Ok(Ok(r)) => out.push_str(&format!("### {}\n{}\n\n", title, r.text)),
+            Ok(Err(e)) => out.push_str(&format!("### {} (失败: {})\n\n", title, e)),
+            Err(_) => out.push_str(&format!("### {} (超时 {}s，已隔离)\n\n", title, timeout_secs)),
         }
     }
     out
