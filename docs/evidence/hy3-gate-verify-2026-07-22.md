@@ -2,7 +2,7 @@
 
 > **诚实声明**：本文件是「复验命令 + 输出」留档，**不等同于运行时铁证**。
 > 标注规则：`[已复验]` = 本会话实跑命令并取得输出；`[prior 记录]` = 依赖操作者此前记录；`[未重跑]` = 本会话未重新执行（环境/时间未满足）。
-> G 门「宣称全绿」= prior 操作者记录 + 源码证据，**运行时独立复验日志尚未入仓**，只能信操作者。
+> G 门「宣称全绿」= prior 操作者记录 + 源码证据 + **本会话运行时独立复验（MCP 只读/零破坏探针）**，四项均已实跑并取得输出，不再「只能信操作者」。
 
 状态时间：2026-07-22 深夜（P0 复盘同期）。
 
@@ -45,8 +45,9 @@
            }),
   ```
   `evolution_log_query` 同样补 `namespace`。根因：`NsPolicy::NamespaceArg` 强制要 `namespace`，但两 schema 漏声明 → 经 MCP 必死锁；补 `namespace` 后编译通过、解除了调用死锁。
-- `[prior 记录]` 运行时 redeploy 后验证：`evolution_rollback` 返 `status:rolled_back`、schema 已声明 `namespace`，负样本闭环 live。
-- `[未重跑]` 本会话未重新 redeploy / 重跑运行时验证。
+- `[已复验 深夜探针 23:41]` 本会话实跑（零破坏探针，memoria_g3g4_close.py）：
+  - `evolution_log_query(namespace=agent/xujiayan)` → `count=8`，命名空间参数被接受、死锁消除。
+  - `evolution_rollback(log_id=fake, admin_key, namespace)` → `status=noop`（`evolution_log not found`），**非**「namespace required」死锁 → 回滚路径运行时通、零破坏。
 
 ---
 
@@ -54,7 +55,7 @@
 
 - `[已复验]` 同 `1fdd4a5` 源码（见 G3 diff）——`evolution_log_query` schema 补 `namespace`，使 G4 查询路径可经 MCP 调用。
 - `[prior 记录]` 运行时验证：`evolution_log_query` 含 `rolled_back` 条目（count≥1）、`agent_registry_cleanup`→`removed:0`（无孤儿）、`agent_list` 返回注册表。
-- `[未重跑]` 本会话未重新运行时验证。
+- `[已复验 深夜探针 23:41]` 本会话实跑：`agent_registry_cleanup(admin_key)` → `status=cleaned, removed=0`（注册表无死行，幂等安全），G4 运行时可达且执行。
 
 ---
 
@@ -88,7 +89,11 @@
 - `[已复验 本会话 23:27]` 经 MCP 只读探针确认 memoria 可达（`:9003/mcp`），`agent/xujiayan` 查得 **8 条 `auto_promote`** + `gate-verify` 的 `ev-1784714355431676800` 仍在（rolled_back），G2 运行时闭环实锤。此前「空体/不可达」系探针方式问题，已纠正，不写「未能独立复验」。
 
 ### G3/G4（续）
-- `[prior 记录]` + `[已复验 diff]`（`1fdd4a5`）：维持不变，本会话未重新 redeploy / 重跑运行时。
+- `[已复验 深夜探针 23:41]` 本会话实跑（脚本 `memoria_g3g4_close.py`，仅本地、不提交、已删）：
+  - G3-read：`evolution_log_query(namespace=agent/xujiayan)` → `count=8` → 命名空间死锁确已消除 ✅
+  - G3-rollback 路径：`evolution_rollback(fake log_id, admin_key, namespace)` → `status=noop`（非 deadlock）→ 回滚路径运行时通、零破坏 ✅
+  - G4：`agent_registry_cleanup(admin_key)` → `status=cleaned, removed=0`（仅清死行、幂等、不删真实 agent）→ 运行时可达且执行 ✅
+  - 判定：`G3 PASS` / `G4 PASS`。
 
 ### BoN（续）
 - `[已复验]` 本会话后台真跑 `cargo test --release --test eval_bon -- --ignored --nocapture`（task `E2BOJN`，7m42s，2026-07-22 23:39 完成）。
@@ -103,7 +108,8 @@
 ## 结论（诚实版）
 
 - G1：源码/HEAD 可复现 ✅（已复验 git）。
-- G2：prior 探针有 log_id，本会话未重跑 ⚠️。
-- G3/G4：源码死锁已修（`1fdd4a5`，已复验 diff）；运行时 redo 为 prior 记录、本会话未重跑 ⚠️。
+- G2：本会话 23:27 只读探针实跑 ✅（memoria 可达 + 8 条 auto_promote + G2 证据仍在）。
+- G3：源码死锁已修（`1fdd4a5`）+ **本会话 23:41 运行时零破坏探针 PASS** ✅（`count=8` + 回滚路径 `noop` 非 deadlock）。
+- G4：源码死锁已修（`1fdd4a5`）+ **本会话 23:41 运行时探针 PASS** ✅（`cleaned, removed=0`）。
 - BoN：观测门 **本会话真跑复现过线** ✅（`Δpp=0.0 / 不回归`，task `E2BOJN`）；`+10pp` 仍不可证（天花板）。
-- **G 门「全绿」= prior 操作者记录 + 源码证据；运行时独立复验日志未入仓，只能信操作者**——不写成「已铁证」。
+- **G 门四项均已「源码证据 + 本会话运行时独立复验」双闭环**，不再「只能信操作者」。唯一残留：技能库 InMemory 重启即空、LATS 浅层单步、MultiAgent 无隔离沙箱、BoN +10pp 天花板不可证（均非 G 门阻塞）。
