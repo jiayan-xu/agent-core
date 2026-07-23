@@ -690,7 +690,8 @@ fn score_by_majority(candidates: &[LlmResponse]) -> Vec<f64> {
 
 /// 抽取候选终答的「核心答案」用于自一致性投票。
 /// 优先代码块；否则抓「答案/结论」标记后的内容；否则取最后一段非空文本；否则整段。
-fn extract_answer(text: &str) -> String {
+/// 导出为 `pub`：eval harness（`eval_ttc.rs`）复用同一抽取器，保证单发 vs TTC 公平比对。
+pub fn extract_answer(text: &str) -> String {
     // 代码块
     if let Some(start) = text.find("```") {
         if let Some(end) = text[start + 3..].find("```") {
