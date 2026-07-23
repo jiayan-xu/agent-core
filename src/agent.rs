@@ -1487,10 +1487,7 @@ impl AgentCore {
             Some(c) => c,
             None => return,
         };
-        // 战略罗盘「可观测」：崩溃/重启后续跑恢复计数（仅当存在非 New 控制面状态）
-        if cp.state != CheckpointState::New {
-            self.metrics.inc_checkpoint_recovery();
-        }
+        let mut recovered_ok = true;
         // P2-2: Checkpoint 恢复事件（崩溃续跑可观测）
         let state_str = match cp.state {
             CheckpointState::New => "New",
@@ -1502,6 +1499,11 @@ impl AgentCore {
             CheckpointState::Done => "Done",
             CheckpointState::Failed => "Failed",
         };
+        // 战略罗盘「可观测」：崩溃/重启后续跑恢复计数（仅当存在非 New 控制面状态）
+        if cp.state != CheckpointState::New {
+            self.metrics.inc_checkpoint_recovery();
+            self.metrics.inc_checkpoint_recovery_by_state(state_str);
+        }
         self.audit_logger
             .checkpoint_resume(&self.config.identity.agent_id, session_id, state_str, "")
             .await;
@@ -1550,12 +1552,18 @@ impl AgentCore {
             }
             CheckpointState::ExecutingPlan => {
                 // 恢复进行中的计划与已完成步骤，供 execute_plan 续跑
+                let mut plan_ok = true;
                 if let Some(plan_val) = cp.payload.get("plan") {
-                    if let Ok(plan) =
-                        serde_json::from_value::<crate::composer::ExecutionPlan>(plan_val.clone())
-                    {
-                        *self.in_progress_plan.lock().await = Some(plan);
+                    match serde_json::from_value::<crate::composer::ExecutionPlan>(plan_val.clone()) {
+                        Ok(plan) => {
+                            *self.in_progress_plan.lock().await = Some(plan);
+                        }
+                        Err(_) => {
+                            plan_ok = false;
+                        }
                     }
+                } else {
+                    plan_ok = false;
                 }
                 if let Some(sr) = cp.payload.get("step_results").and_then(|v| v.as_object()) {
                     let mut map = self.in_progress_step_results.lock().await;
@@ -1569,15 +1577,24 @@ impl AgentCore {
                 self.session_manager
                     .set_state(session_id, SessionState::Confirmed)
                     .await;
+                if !plan_ok {
+                    recovered_ok = false;
+                }
             }
             CheckpointState::PlanPreview => {
                 // 恢复进行中的计划，等待用户「执行 / 取消 / 修改」
+                let mut plan_ok = true;
                 if let Some(plan_val) = cp.payload.get("plan") {
-                    if let Ok(plan) =
-                        serde_json::from_value::<crate::composer::ExecutionPlan>(plan_val.clone())
-                    {
-                        *self.in_progress_plan.lock().await = Some(plan);
+                    match serde_json::from_value::<crate::composer::ExecutionPlan>(plan_val.clone()) {
+                        Ok(plan) => {
+                            *self.in_progress_plan.lock().await = Some(plan);
+                        }
+                        Err(_) => {
+                            plan_ok = false;
+                        }
                     }
+                } else {
+                    plan_ok = false;
                 }
                 self.session_manager
                     .set_state(session_id, SessionState::AwaitingConfirmation)
@@ -1587,12 +1604,19 @@ impl AgentCore {
                         .set_original_message(session_id, msg)
                         .await;
                 }
+                if !plan_ok {
+                    recovered_ok = false;
+                }
             }
             CheckpointState::Done | CheckpointState::Failed => {
                 // 终态：清空内存待确认（checkpoint 保留供审计）
                 self.session_manager.remove_state(session_id).await;
             }
             CheckpointState::New => {}
+        }
+        // 战略罗盘「可观测」：仅当非 New 且续跑重建成功，恢复成功 +1
+        if cp.state != CheckpointState::New && recovered_ok {
+            self.metrics.inc_checkpoint_recovery_success();
         }
     }
 

@@ -7,6 +7,7 @@
 //!
 //! 通过 `/api/metrics` 暴露快照，使 G 门与 TTC/LATS 投资在生产流量里可观测。
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -24,6 +25,8 @@ pub struct MetricsRegistry {
     skill_lookups: AtomicU64,
     checkpoint_saves: AtomicU64,
     checkpoint_recoveries: AtomicU64,
+    checkpoint_recovery_success: AtomicU64,
+    checkpoint_recovery_by_state: Mutex<HashMap<String, u64>>,
     latency_sum_ms: AtomicU64,
     latency_count: AtomicU64,
     latency_ewma_ms: Mutex<f64>,
@@ -69,6 +72,15 @@ impl MetricsRegistry {
     pub fn inc_checkpoint_recovery(&self) {
         self.checkpoint_recoveries.fetch_add(1, Ordering::Relaxed);
     }
+    /// 恢复尝试按控制面状态打点（定位卡点在哪一状态）。
+    pub fn inc_checkpoint_recovery_by_state(&self, state: &str) {
+        let mut map = self.checkpoint_recovery_by_state.lock().unwrap();
+        *map.entry(state.to_string()).or_insert(0) += 1;
+    }
+    /// 恢复成功（非 New 状态且续跑重建成功）计数，用于恢复成功率。
+    pub fn inc_checkpoint_recovery_success(&self) {
+        self.checkpoint_recovery_success.fetch_add(1, Ordering::Relaxed);
+    }
 
     // ── gauge（在途执行数） ──
     pub fn gauge_in_progress(&self, delta: i64) {
@@ -108,6 +120,18 @@ impl MetricsRegistry {
             .unwrap()
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
+        // 恢复成功率 / 卡点分布（战略罗盘「可观测」深化）
+        let cr_attempts = self.checkpoint_recoveries.load(Ordering::Relaxed);
+        let cr_success = self.checkpoint_recovery_success.load(Ordering::Relaxed);
+        let cr_success_rate = if cr_attempts > 0 {
+            cr_success as f64 / cr_attempts as f64
+        } else {
+            0.0
+        };
+        let cr_by_state: serde_json::Map<String, serde_json::Value> = {
+            let m = self.checkpoint_recovery_by_state.lock().unwrap();
+            m.iter().map(|(k, v)| (k.clone(), serde_json::json!(*v))).collect()
+        };
         serde_json::json!({
             "uptime_secs": uptime,
             "features": features,
@@ -132,6 +156,12 @@ impl MetricsRegistry {
                 "count": count,
             },
             "quota": quota,
+            "checkpoint_recovery": {
+                "attempts": cr_attempts,
+                "success": cr_success,
+                "success_rate": cr_success_rate,
+                "by_state": cr_by_state,
+            },
         })
     }
 }
@@ -172,5 +202,22 @@ mod tests {
         assert_eq!(snap["latency_ms"]["avg"], 150.0);
         // EWMA: 100 → 0.8*100+0.2*200 = 120
         assert!((snap["latency_ms"]["ewma"].as_f64().unwrap() - 120.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_checkpoint_recovery_observability() {
+        let m = MetricsRegistry::new();
+        m.inc_checkpoint_recovery(); // attempt #1
+        m.inc_checkpoint_recovery_by_state("ExecutingPlan");
+        m.inc_checkpoint_recovery(); // attempt #2
+        m.inc_checkpoint_recovery_by_state("PendingApproval");
+        m.inc_checkpoint_recovery_success(); // one of two succeeded
+        let snap = m.snapshot(serde_json::json!({}), serde_json::json!({}));
+        let cr = &snap["checkpoint_recovery"];
+        assert_eq!(cr["attempts"], 2);
+        assert_eq!(cr["success"], 1);
+        assert!((cr["success_rate"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+        assert_eq!(cr["by_state"]["ExecutingPlan"], 1);
+        assert_eq!(cr["by_state"]["PendingApproval"], 1);
     }
 }
