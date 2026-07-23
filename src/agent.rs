@@ -4032,9 +4032,10 @@ impl AgentCore {
     /// 流程（agent-core 出脑子，memoria 当哑存储）：
     ///   1. dream_state_get 取游标 cursor_ts（该 ns 上次处理到的位置）
     ///   2. memory_fetch_unconsolidated 拉取 cursor 之后的未巩固观察
-    ///   3. LLM 从观察中提炼 ≤5 条可复用模式（暗知识）
-    ///   4. 每条 pattern 经 memory_remember(category=pattern) 写回 memoria
-    ///   5. dream_state_update 推进游标（幂等：重跑不会重复处理同一批）
+    ///   3. 质量过滤（短文本/测试/会话噪声剔除，防污染 pattern）
+    ///   4. LLM 从合格观察中提炼 ≤5 条可复用模式（暗知识）
+    ///   5. 再过滤后经 memory_remember(category=pattern) 写回
+    ///   6. dream_state_update 推进游标（对整批 fetched 推进，避免垃圾卡住）
     ///
     /// 以 admin 身份调用 memoria（系统维护任务，合法跨命名空间读取观察原料）。
     /// ns 隔离：每个 ns 独立游标、独立 pattern 库。
@@ -4056,6 +4057,16 @@ impl AgentCore {
             )
         };
 
+        let fetch_limit: u64 = std::env::var("CONSOLIDATE_FETCH_LIMIT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(400)
+            .clamp(50, 1000);
+        let min_obs_chars: usize = std::env::var("CONSOLIDATE_MIN_OBS_CHARS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(70);
+
         // 1. 取游标
         let ds_raw = mem_client
             .call(
@@ -4075,12 +4086,12 @@ impl AgentCore {
             })
             .unwrap_or_else(|| "1970-01-01T00:00:00".to_string());
 
-        // 2. 拉原料
+        // 2. 拉原料（多拉一点，过滤后仍够 LLM 用）
         let raw = mem_client
             .call(
                 "memory_fetch_unconsolidated",
                 &serde_json::json!({
-                    "since": cursor_ts, "limit": 200, "namespace": ns
+                    "since": cursor_ts, "limit": fetch_limit, "namespace": ns
                 }),
             )
             .await
@@ -4093,28 +4104,70 @@ impl AgentCore {
             return format!("consolidate[{}]: 无新观察（cursor={}）", ns, cursor_ts);
         }
 
-        // 3. LLM 提炼 ≤5 pattern
+        let skip_ner = std::env::var("CONSOLIDATE_SKIP_NER")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true); // 默认跳过：NER 对大批 observation 易拖垮进程，污染也大
+        let skip_evolve = std::env::var("CONSOLIDATE_SKIP_EVOLVE")
+            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+
+        // 3. 质量过滤 + 推进游标用的 max_ts（整批，含不合格）
         let mut obs_lines: Vec<String> = Vec::new();
         let mut max_ts = cursor_ts.clone();
+        let mut skipped = 0u64;
         for it in &items {
-            if let Some(c) = it.get("content").and_then(|c| c.as_str()) {
-                let c = c.trim();
-                if !c.is_empty() {
-                    obs_lines.push(c.to_string());
-                }
-            }
             if let Some(ts) = it.get("created_at").and_then(|t| t.as_str()) {
                 if ts > max_ts.as_str() {
                     max_ts = ts.to_string();
                 }
             }
+            let Some(c) = it.get("content").and_then(|c| c.as_str()) else {
+                skipped += 1;
+                continue;
+            };
+            let c = c.trim();
+            if Self::obs_ok_for_consolidate(c, min_obs_chars) {
+                obs_lines.push(c.to_string());
+            } else {
+                skipped += 1;
+            }
         }
+
+        // 关键：先推进游标再跑 LLM，避免 LLM/NER 崩溃导致同批重复提炼污染 pattern
+        let _ = mem_client
+            .call(
+                "dream_state_update",
+                &serde_json::json!({
+                    "phase": "consolidate", "namespace": ns, "cursor_ts": max_ts, "items_out": 0
+                }),
+            )
+            .await;
+
+        // 整批无合格原料
+        if obs_lines.is_empty() {
+            return format!(
+                "consolidate[{}]: 本批 {} 条均不合格（跳过 {}，cursor→{}）",
+                ns,
+                items.len(),
+                skipped,
+                max_ts
+            );
+        }
+
+        // 4. LLM 提炼 ≤5 pattern（严格：只要可复用工程/运营规则）
         let obs_text = obs_lines.join("\n- ");
         let prompt = format!(
-            "你是知识巩固引擎。以下是一批\"观察\"记忆，请从中提炼可复用的高层模式（暗知识）：\
-             反复出现的规律、隐含业务约束、用户偏好、运营常识。每条模式用一句话陈述，最多 5 条。\
-             若观察里没有可提炼的模式，只输出\"无模式\"。\n\n## 待巩固观察（{} 条，命名空间 {}）\n- {}",
-            items.len(), ns, obs_text.chars().take(6000).collect::<String>()
+            "你是知识巩固引擎。只从观察中提炼**可长期复用**的高层规则（架构取舍、运维约束、业务偏好、排障经验）。\n\
+             硬性禁止写成 pattern：\n\
+             - 一次性会话过程、工具回显、文件路径流水账、cron 任务日志\n\
+             - 测试/冒烟/世界杯等无关话题\n\
+             - 复述某条观察原文、或过短空话\n\
+             每条模式一句话、具体可执行，最多 5 条。若无可提炼内容，只输出「无模式」。\n\n\
+             ## 待巩固观察（合格 {} / 本批拉取 {}，命名空间 {}）\n- {}",
+            obs_lines.len(),
+            items.len(),
+            ns,
+            obs_text.chars().take(6000).collect::<String>()
         );
         let msg = crate::llm::Message {
             role: "system".to_string(),
@@ -4126,35 +4179,44 @@ impl AgentCore {
             Ok(r) => r.text.trim().to_string(),
             Err(e) => return format!("consolidate[{}] LLM 失败: {}", ns, e),
         };
-        if reply.is_empty() || reply == "无模式" {
-            // 无模式也要推进游标，避免反复扫描同一批
-            let _ = mem_client
-                .call(
-                    "dream_state_update",
-                    &serde_json::json!({
-                        "phase": "consolidate", "namespace": ns, "cursor_ts": max_ts, "items_out": 0
-                    }),
-                )
-                .await;
-            return format!("consolidate[{}]: 无模式（已推进游标 {}）", ns, max_ts);
+        if reply.is_empty() || reply == "无模式" || (reply.contains("无模式") && reply.chars().count() < 20) {
+            return format!(
+                "consolidate[{}]: 无模式（合格观察 {}，跳过 {}，cursor→{}）",
+                ns,
+                obs_lines.len(),
+                skipped,
+                max_ts
+            );
         }
 
-        // 4. 写回 pattern（≤5）
+        // 5. 写回 pattern（≤5，再过一道写库过滤）
         let patterns: Vec<&str> = reply
             .lines()
             .map(|l| l.trim())
             .filter(|l| !l.is_empty())
-            .take(5)
+            .take(8) // 先多取，过滤后再截断
             .collect();
         let clean_patterns: Vec<String> = patterns
             .iter()
             .map(|p| {
                 p.trim_start_matches(|c: char| {
-                    c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' '
+                    c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' ' || c == '*'
                 })
+                .trim()
                 .to_string()
             })
+            .filter(|p| Self::pattern_ok_for_consolidate(p))
+            .take(5)
             .collect();
+
+        if clean_patterns.is_empty() {
+            return format!(
+                "consolidate[{}]: LLM 产出未过写库门槛（合格观察 {}，cursor→{}）",
+                ns,
+                obs_lines.len(),
+                max_ts
+            );
+        }
 
         // P2.2d：consolidate retain 路径 — LLM 抽取 signal tags 并随 memory_remember 持久化
         let signal_tags_by_idx = self
@@ -4177,18 +4239,18 @@ impl AgentCore {
             written += 1;
         }
 
-        // 5. 推进游标
+        // 6. 回写本轮 items_out（游标已在 LLM 前推进）
         let _ = mem_client.call("dream_state_update", &serde_json::json!({
             "phase": "consolidate", "namespace": ns, "cursor_ts": max_ts, "items_out": written
         })).await;
 
-        // 6. B 阶段：NER 实体提取（仅在提炼出 pattern 后才做，避免浪费 LLM 调用）
-        if written > 0 {
+        // 7. B 阶段：NER（默认跳过，避免大批 mention 拖垮进程）
+        if written > 0 && !skip_ner {
             let entity_prompt = format!(
                 "你负责从以下观察和已提炼模式中识别实体（person/system/tool/concept/org/project/location/event）及关系。\
                  仅输出纯 JSON，不要任何前缀后缀。\
                  若没有实体，输出 {{\"entities\":[],\"edges\":[]}}\n\n## 观察（{} 条）\n- {}\n\n## 已提炼模式\n{}",
-                items.len(),
+                obs_lines.len(),
                 obs_text.chars().take(3000).collect::<String>(),
                 reply.chars().take(1000).collect::<String>(),
             );
@@ -4355,7 +4417,7 @@ impl AgentCore {
         // 7. PR4 Phase A：演化决策 — 为尚未演化的观察记忆合成 evolved_context（结合已提炼 pattern）
         //    批处理 + 分批（每批 ≤80 条）限制 LLM 输出体积，避免逐条演化写风暴；
         //    经 MCP memory_evolve 落库（Memoria 哑存储，守 H1/H2）。绝不进 call_tool_routed 热路径。
-        if written > 0 && crate::memory_evolve::agent_memory_evolve_enabled() {
+        if written > 0 && !skip_evolve && crate::memory_evolve::agent_memory_evolve_enabled() {
             let evo_items: Vec<(String, String)> = items
                 .iter()
                 .filter_map(|it| {
@@ -4437,12 +4499,67 @@ impl AgentCore {
         }
 
         format!(
-            "consolidate[{}]: 从 {} 条观察提炼 {} 条 pattern（cursor→{}）",
+            "consolidate[{}]: 从 {} 条合格观察提炼 {} 条 pattern（本批拉取 {}，跳过 {}，cursor→{}）",
             ns,
-            items.len(),
+            obs_lines.len(),
             written,
+            items.len(),
+            skipped,
             max_ts
         )
+    }
+
+    /// 巩固原料门槛：挡短文本 / 测试 / 会话助理前缀 / cron 流水
+    fn obs_ok_for_consolidate(content: &str, min_chars: usize) -> bool {
+        let c = content.trim();
+        if c.chars().count() < min_chars {
+            return false;
+        }
+        let lower = c.to_lowercase();
+        if c.starts_with("[助理]") || c.starts_with("[cron:") {
+            return false;
+        }
+        const BLOCK: &[&str] = &[
+            "test content",
+            "测试规则",
+            "测试消息",
+            "世界杯",
+            "world cup",
+            "let me verify the file",
+            "smoke",
+        ];
+        for b in BLOCK {
+            if lower.contains(b) || c.contains(b) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// pattern 写库门槛：挡空话 / 禁题 / 过短
+    fn pattern_ok_for_consolidate(p: &str) -> bool {
+        let t = p.trim();
+        if t.chars().count() < 16 {
+            return false;
+        }
+        if t == "无模式" || t.contains("无模式") && t.chars().count() < 24 {
+            return false;
+        }
+        let lower = t.to_lowercase();
+        const BLOCK: &[&str] = &[
+            "世界杯",
+            "world cup",
+            "test content",
+            "测试规则",
+            "测试消息",
+            "let me verify",
+        ];
+        for b in BLOCK {
+            if lower.contains(b) || t.contains(b) {
+                return false;
+            }
+        }
+        true
     }
 
     /// PR5：手动触发一轮元进化（L2 闭环）。受 `meta_evolution.enabled` 开关保护。

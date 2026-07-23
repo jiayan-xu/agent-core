@@ -1,5 +1,19 @@
 # agent-core 演进日志
 
+## 2026-07-23 — PFAiX 对话栏文档归档到部门共享记忆
+
+> 助手锚点：`/api/documents/archive` / 对话栏上传 / `memoriaDeptArchive`
+
+### 能力
+- `POST /api/documents/archive`：鉴权后读本机绝对路径 PDF/DOCX，multipart 转发 Memoria `/api/documents`
+- 默认 ns=`org/cs-pufa-2nd-thermal/dept/gufei`；须调用者 `allowed_ns` 覆盖目标
+- PFAiX：`web-app/src/lib/memoriaDeptArchive.ts` + `ChatInput` 选中 PDF/DOCX 后自动归档并 toast
+
+### 验证
+- 冒烟：jarvis 调 archive → 200，`status=ok`，写入固废部门 ns
+
+---
+
 ## 2026-07-23 — P0：`/api/register` 补回 B2 双 ns（私人 + 部门共享）
 
 > **助手检索锚点**：`register` / `双 ns` / `B2` / `私人 ns` / `Onboarding` → 先读本节 + `docs/evidence/register-dual-ns-2026-07-23.md`，勿再全库考古。
