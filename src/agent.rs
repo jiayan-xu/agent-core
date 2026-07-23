@@ -3659,21 +3659,35 @@ impl AgentCore {
         if !matches!(ctrl.decide(), crate::lats::LatsAction::Search) {
             return None;
         }
-        let candidates = ctrl.expand_once(&self.llm, raw_message).await;
-        if candidates.is_empty() {
+        // 价值网络模式分流：judge 模式走多步树选优路径；heuristic（默认）走浅层候选列表。
+        // 量化显示对强模型 heuristic 树不优于浅层列表，故默认保持最稳的浅层行为不回归。
+        let plan = match ctrl.value_estimator() {
+            crate::lats::ValueEstimatorMode::Judge => {
+                let jc = self.routed_llm.judge_client();
+                ctrl.best_plan(&self.llm, raw_message, jc.as_ref()).await
+            }
+            crate::lats::ValueEstimatorMode::Heuristic => {
+                let cands = ctrl.expand_once(&self.llm, raw_message).await;
+                if cands.is_empty() {
+                    return None;
+                }
+                Some(
+                    cands
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| format!("{}. {}", i + 1, c))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            }
+        };
+        if plan.is_none() {
             return None;
         }
-        // 过程树候选「下一步」按序编号（浅层单步展开，≤max_branches 条）作为规划提示注入。
         // 两处调用点（非 composer 主路径 / composer 多步路径）统一在此记账 token，
         // 避免 composer 路径漏记导致日预算熔断失效。
-        let hint = candidates
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!("{}. {}", i + 1, c))
-            .collect::<Vec<_>>()
-            .join("\n");
-        ctrl.record_tokens((hint.len() / 4) as u64);
-        Some(hint)
+        ctrl.record_tokens((plan.as_ref().unwrap().len() / 4) as u64);
+        plan
     }
 
     /// 仅 features.lats=true（self.lats=Some）时可能展开；否则直接返回 false，原路径零改动。
@@ -3689,7 +3703,7 @@ impl AgentCore {
         if let Some(sys_msg) = messages.first_mut() {
             if let Some(ref mut content) = sys_msg.content {
                 content.push_str(&format!(
-                    "\n\n## LATS 规划提示（过程树候选最优下一步）\n{}\n",
+                    "\n\n## LATS 规划提示（过程树搜索）\n{}\n",
                     hint
                 ));
             }

@@ -199,6 +199,14 @@ impl RoutedLlm {
         classify_difficulty(&self.policy, messages).await
     }
 
+    /// 暴露 judge_provider 构造的 LlmClient（价值网络 / verifier-guided 复用），无则 None
+    pub fn judge_client(&self) -> Option<LlmClient> {
+        self.policy
+            .judge_provider
+            .as_ref()
+            .map(|p| LlmClient::new(LlmConfig::from_provider(p)))
+    }
+
     pub async fn chat(&self, messages: &[Message], tools: &[ToolDef]) -> Result<LlmResponse, String> {
         let d = classify_difficulty(&self.policy, messages).await;
         tracing::info!(difficulty = ?d, "difficulty_route");
