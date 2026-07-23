@@ -3624,16 +3624,28 @@ impl AgentCore {
             return None;
         }
         let candidates = ctrl.expand_once(&self.llm, raw_message).await;
-        candidates.into_iter().next()
+        if candidates.is_empty() {
+            return None;
+        }
+        // 过程树候选「下一步」按序编号（浅层单步展开，≤max_branches 条）作为规划提示注入。
+        // 两处调用点（非 composer 主路径 / composer 多步路径）统一在此记账 token，
+        // 避免 composer 路径漏记导致日预算熔断失效。
+        let hint = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{}. {}", i + 1, c))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ctrl.record_tokens((hint.len() / 4) as u64);
+        Some(hint)
     }
 
     /// 仅 features.lats=true（self.lats=Some）时可能展开；否则直接返回 false，原路径零改动。
     /// 即便启用，预算耗尽也会自动退回贪心（见 LatsController::decide）。
     async fn maybe_lats_expand(&self, messages: &mut Vec<Message>, raw_message: &str) -> bool {
-        let ctrl = match self.lats.as_ref() {
-            Some(c) => c,
-            None => return false,
-        };
+        if self.lats.is_none() {
+            return false;
+        }
         let hint = match self.lats_planning_hint(raw_message).await {
             Some(h) => h,
             None => return false,
@@ -3646,7 +3658,6 @@ impl AgentCore {
                 ));
             }
         }
-        ctrl.record_tokens((hint.len() / 4) as u64);
         true
     }
 
@@ -3679,7 +3690,12 @@ impl AgentCore {
         if !self.is_multiagent_opted_in(message, cfg) {
             return None;
         }
-        let subtasks = crate::multiagent::plan_decomposition(&self.llm, message).await;
+        let mut subtasks = crate::multiagent::plan_decomposition(&self.llm, message).await;
+        // 生产化：尊重 [multiagent] max_subagents 配置（plan_decomposition 内部默认 4、不读配置），
+        // 超出则截断，避免一次 Hard 任务派生过多子 agent 拖垮并发预算。
+        if subtasks.len() > cfg.max_subagents {
+            subtasks.truncate(cfg.max_subagents);
+        }
         if subtasks.is_empty() {
             return None;
         }
@@ -3705,9 +3721,14 @@ impl AgentCore {
                 return true;
             }
         }
+        // 白名单匹配：大小写不敏感 + 去首尾空白，避免「写报告」「WRITE REPORT」等形态漏匹配
+        let m = message.trim().to_lowercase();
         cfg.task_whitelist
             .iter()
-            .any(|w| !w.is_empty() && message.contains(w))
+            .any(|w| {
+                let w = w.trim().to_lowercase();
+                !w.is_empty() && m.contains(&w)
+            })
     }
 
     /// 构建 system prompt
