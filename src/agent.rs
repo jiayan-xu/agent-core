@@ -96,6 +96,8 @@ pub struct AgentConfig {
     pub lats: crate::lats::LatsConfig,
     /// HY3 1.3：MultiAgent Compose 配置（仅 features.multiagent=true 时生效）
     pub multiagent: crate::multiagent::MultiAgentConfig,
+    /// HY3 TTC：推理时计算配置（仅 features.ttc=true 时生效）
+    pub ttc: crate::ttc::TtcConfig,
 }
 
 /// HY3 1.3 热路径接线开关。全部默认 false。
@@ -112,6 +114,9 @@ pub struct FeatureFlags {
     /// MultiAgent Compose（子 agent 派发，非 Meta RSI）
     #[serde(default)]
     pub multiagent: bool,
+    /// HY3 TTC：推理时计算（终答自一致性 + 预算感知采样）
+    #[serde(default)]
+    pub ttc: bool,
 }
 
 /// 白龙马 A3：Focus Stack → Thread 模型
@@ -191,6 +196,8 @@ pub struct AgentCore {
     pub lats: Option<crate::lats::LatsController>,
     /// HY3 1.3：MultiAgent Compose 配置（仅 features.multiagent=true 时 Some；否则 None=原路径）
     pub multiagent: Option<crate::multiagent::MultiAgentConfig>,
+    /// HY3 TTC：推理时计算控制器（仅 features.ttc=true 时 Some；否则 None=原路径）
+    pub ttc: Option<crate::ttc::TtcController>,
     /// HY3 1.3 收口：记忆自进化生产证据审计器（每次 consolidate 演化落盘 JSONL，可复验 G1-G4）
     pub evolution_auditor: crate::evolution_audit::EvolutionAuditor,
 }
@@ -356,6 +363,11 @@ impl AgentCore {
         } else {
             None
         };
+        let ttc = if features.ttc {
+            Some(crate::ttc::TtcController::new(config.ttc.clone()))
+        } else {
+            None
+        };
         let core = AgentCore {
             config,
             mcp,
@@ -391,6 +403,7 @@ impl AgentCore {
             skill_registry,
             lats,
             multiagent,
+            ttc,
             evolution_auditor: crate::evolution_audit::EvolutionAuditor::new(
                 crate::evolution_audit::EvolutionAuditor::default_path(),
                 env!("CARGO_PKG_VERSION").to_string(),
@@ -2006,7 +2019,19 @@ impl AgentCore {
 
             // 无工具调用 → LLM 直接回复
             if response.tool_calls.is_empty() {
-                let reply = response.text;
+                let mut reply = response.text;
+                // HY3 TTC：终答自一致性（features.ttc=false 时 self.ttc=None → 原路径零改动）
+                if let Some(ttc) = self.ttc.as_ref() {
+                    if matches!(ttc.decide(), crate::ttc::TtcAction::Sample) {
+                        let baseline = crate::llm::LlmResponse {
+                            text: reply.clone(),
+                            tool_calls: Vec::new(),
+                        };
+                        let sampled = self.routed_llm.chat_ttc(&messages, &baseline, ttc.config()).await;
+                        reply = sampled.text;
+                        tracing::info!(target = "agent.ttc", "TTC 终答自一致性已应用");
+                    }
+                }
                 // 保存对话
                 let _ = self
                     .mcp

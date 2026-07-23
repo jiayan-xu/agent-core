@@ -1,5 +1,6 @@
 //! LLM 客户端 — 兼容 DeepSeek / OpenAI API（支持流式）
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use futures::future::join_all;
@@ -112,6 +113,8 @@ pub enum ScorerMode {
     Heuristic,
     /// 用 judge_provider 跑一次廉价打分（对所有候选一次性打分）
     Judge,
+    /// 自一致性投票（抽取核心答案多数票；零额外调用，TTC 默认）
+    Majority,
 }
 
 /// 难度路由策略：易→easy provider，难→hard provider；缺省不路由（用主模型）
@@ -285,13 +288,100 @@ impl RoutedLlm {
     }
 
     async fn score(&self, messages: &[Message], candidates: &[LlmResponse], d: TaskDifficulty) -> Vec<f64> {
-        match self.policy.scorer {
+        self.ttc_score(messages, candidates, &self.policy.scorer, d).await
+    }
+
+    /// TTC 选择器分发：Judge（相对排序打分）/ Heuristic（零额外调用）/ Majority（自一致性投票）
+    async fn ttc_score(
+        &self,
+        messages: &[Message],
+        candidates: &[LlmResponse],
+        mode: &ScorerMode,
+        d: TaskDifficulty,
+    ) -> Vec<f64> {
+        match mode {
             ScorerMode::Judge => self.score_by_judge(messages, candidates).await,
             ScorerMode::Heuristic => {
                 let is_code = d == TaskDifficulty::Hard;
                 candidates.iter().map(|c| score_heuristic(c, is_code)).collect()
             }
+            ScorerMode::Majority => score_by_majority(candidates),
         }
+    }
+
+    /// TTC 终答采样：对「终答轮」做 N 路采样 + 选择器择优。
+    /// `baseline` 为已产出的单次终答（作为保底，保证不比单次差）。
+    /// 若 `best_of_n < 2` 或预算超限 → 直接返回 baseline。
+    pub async fn chat_ttc(
+        &self,
+        messages: &[Message],
+        baseline: &LlmResponse,
+        ttc: &crate::ttc::TtcConfig,
+    ) -> LlmResponse {
+        let n = ttc.best_of_n;
+        if n < 2 {
+            return baseline.clone();
+        }
+        // 预算预估（与 llm_loop 同口径）：ctx_chars/4 * n
+        let ctx_chars: usize = messages
+            .iter()
+            .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
+            .sum();
+        let est = (ctx_chars as u64 / 4) * n as u64;
+        if est > ttc.token_budget {
+            tracing::info!(
+                target = "agent.ttc",
+                ttc = "budget_skip",
+                est,
+                budget = ttc.token_budget,
+                "TTC 预算超限，回退单次"
+            );
+            return baseline.clone();
+        }
+        let d = classify_difficulty(&self.policy, messages).await;
+        let client = self.select(d).clone();
+        let temp = ttc.sample_temperature;
+        let mut samplers: Vec<LlmClient> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut s = client.clone();
+            s.config.temperature = temp;
+            samplers.push(s);
+        }
+        let tasks: Vec<_> = samplers.iter().map(|s| s.chat(messages, &[])).collect();
+        let results = join_all(tasks).await;
+        let mut candidates: Vec<LlmResponse> = results
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .filter(|r| !r.text.is_empty())
+            .collect();
+        if candidates.is_empty() {
+            return baseline.clone();
+        }
+        // 基线参与评选，保证「不比单次更差」
+        candidates.push(baseline.clone());
+        let scores = self.ttc_score(messages, &candidates, &ttc.scorer, d).await;
+        let mut best_idx = 0usize;
+        let mut best_score = f64::NEG_INFINITY;
+        for (i, sc) in scores.iter().enumerate() {
+            if *sc > best_score {
+                best_score = *sc;
+                best_idx = i;
+            }
+        }
+        let baseline_idx = candidates.len() - 1;
+        let baseline_score = scores.get(baseline_idx).copied().unwrap_or(0.0);
+        // 采样最优不严格优于基线 → 回退基线（平局也回退，偏好确定性）
+        if best_idx != baseline_idx && best_score <= baseline_score + f64::EPSILON {
+            tracing::info!(
+                target = "agent.ttc",
+                best_of_n = n,
+                chosen = "baseline_fallback",
+                "ttc_select"
+            );
+            return baseline.clone();
+        }
+        tracing::info!(target = "agent.ttc", best_of_n = n, chosen = best_idx, "ttc_select");
+        candidates.into_iter().nth(best_idx).unwrap()
     }
 
     async fn score_by_judge(&self, messages: &[Message], candidates: &[LlmResponse]) -> Vec<f64> {
@@ -566,6 +656,68 @@ pub fn parse_judge_score(text: &str) -> f64 {
         }
     }
     0.0
+}
+
+/// 自一致性投票：抽取各候选「核心答案」做计数，多数票胜；平票则在平票候选内用启发式决出。
+/// 返回与 `candidates` 等长的分数向量（胜者 10.0，其余按情况 0）。
+fn score_by_majority(candidates: &[LlmResponse]) -> Vec<f64> {
+    if candidates.len() <= 1 {
+        return vec![1.0; candidates.len()];
+    }
+    let answers: Vec<String> = candidates.iter().map(|c| extract_answer(&c.text)).collect();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for a in &answers {
+        *counts.entry(a.clone()).or_insert(0) += 1;
+    }
+    let max_count = counts.values().copied().max().unwrap_or(0);
+    let winners: Vec<usize> = answers
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| counts.get(*a).copied().unwrap_or(0) == max_count)
+        .map(|(i, _)| i)
+        .collect();
+    let mut scores = vec![0.0; candidates.len()];
+    if winners.len() == 1 {
+        scores[winners[0]] = 10.0;
+        return scores;
+    }
+    // 平票：仅在平票候选内用启发式比较，非平票候选保持 0（确保平票胜者不被 baseline 误压）
+    for &i in &winners {
+        scores[i] = score_heuristic(&candidates[i], false);
+    }
+    scores
+}
+
+/// 抽取候选终答的「核心答案」用于自一致性投票。
+/// 优先代码块；否则抓「答案/结论」标记后的内容；否则取最后一段非空文本；否则整段。
+fn extract_answer(text: &str) -> String {
+    // 代码块
+    if let Some(start) = text.find("```") {
+        if let Some(end) = text[start + 3..].find("```") {
+            let block = &text[start + 3..start + 3 + end];
+            let code: String = block.lines().skip(1).collect::<Vec<_>>().join("\n");
+            let code = if code.trim().is_empty() { block } else { code.as_str() };
+            return code.trim().to_string();
+        }
+    }
+    // 答案/结论标记（取标记后第一行）
+    for marker in [
+        "答案：", "答案:", "结论：", "结论:", "####", "Answer:", "answer:",
+    ] {
+        if let Some(pos) = text.rfind(marker) {
+            let tail = text[pos + marker.len()..].lines().next().unwrap_or("").trim();
+            if !tail.is_empty() {
+                return tail.to_string();
+            }
+        }
+    }
+    // 最后一段非空
+    if let Some(last) = text.split("\n\n").map(|s| s.trim()).filter(|s| !s.is_empty()).last() {
+        if !last.is_empty() {
+            return last.to_string();
+        }
+    }
+    text.trim().to_string()
 }
 
 /// Best-of-N 启发式打分（零额外调用，作为 Judge 不可用时的回退）

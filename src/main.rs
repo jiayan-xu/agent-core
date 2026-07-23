@@ -100,6 +100,9 @@ struct Config {
     /// HY3 1.3 MultiAgent Compose 配置（缺省全默认：enabled=false）
     #[serde(default)]
     multiagent: agent_core::multiagent::MultiAgentConfig,
+    /// HY3 TTC 推理时计算配置（缺省全默认：enabled=false）
+    #[serde(default)]
+    ttc: agent_core::ttc::TtcConfig,
 }
 
 /// Phase 7：代码自我进化引擎配置
@@ -1014,6 +1017,7 @@ fn load_or_create_config() -> Config {
         features: Default::default(),
         lats: Default::default(),
         multiagent: Default::default(),
+        ttc: Default::default(),
     };
     let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());
     cfg
@@ -3703,6 +3707,7 @@ async fn build_agent(config: &Config, local_resources: SharedResourceSnapshot) -
         features: config.features.clone(),
         lats: config.lats.clone(),
         multiagent: config.multiagent.clone(),
+        ttc: config.ttc.clone(),
     };
     // A1 (OpenClaw 吸收): 记录启动并判定是否进入 safe_mode（崩溃循环保护）。
     // 返回 (启动记录 id, 是否需抑制危险/未分类/外发工具自动执行)。
