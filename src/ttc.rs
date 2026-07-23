@@ -29,6 +29,17 @@ pub struct TtcConfig {
     /// 单次终答请求的额外 token 预算上限（估算 = (ctx_chars/4) * best_of_n）；超限回退单次
     #[serde(default = "default_budget")]
     pub token_budget: u64,
+    /// verifier-guided 生成：终答后用 judge（judge_provider）或主模型自评打分，
+    /// 不通过（< verifier_threshold）则带批评反馈重新生成，最多 max_refine_rounds 轮。
+    /// 默认 false —— 与自一致性（sample）正交，可单独或叠加开启。
+    #[serde(default)]
+    pub verifier_enabled: bool,
+    /// 最多精炼轮数（生成 → 验证 → 重生成 循环）
+    #[serde(default = "default_refine_rounds")]
+    pub max_refine_rounds: usize,
+    /// judge 分数阈值（0-10）；>= 阈值视为通过
+    #[serde(default = "default_verifier_threshold")]
+    pub verifier_threshold: f64,
 }
 
 fn default_n() -> usize {
@@ -43,6 +54,12 @@ fn default_temp() -> f64 {
 fn default_budget() -> u64 {
     8000
 }
+fn default_refine_rounds() -> usize {
+    2
+}
+fn default_verifier_threshold() -> f64 {
+    7.0
+}
 
 impl Default for TtcConfig {
     fn default() -> Self {
@@ -52,6 +69,9 @@ impl Default for TtcConfig {
             scorer: default_scorer(),
             sample_temperature: default_temp(),
             token_budget: default_budget(),
+            verifier_enabled: false,
+            max_refine_rounds: default_refine_rounds(),
+            verifier_threshold: default_verifier_threshold(),
         }
     }
 }

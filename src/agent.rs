@@ -2020,17 +2020,28 @@ impl AgentCore {
             // 无工具调用 → LLM 直接回复
             if response.tool_calls.is_empty() {
                 let mut reply = response.text;
-                // HY3 TTC：终答自一致性（features.ttc=false 时 self.ttc=None → 原路径零改动）
+                // HY3 TTC：终答自一致性 + verifier-guided 精炼
+                // （features.ttc=false 时 self.ttc=None → 原路径零改动）
                 if let Some(ttc) = self.ttc.as_ref() {
+                    let cfg = ttc.config();
+                    let mut chosen = crate::llm::LlmResponse {
+                        text: reply.clone(),
+                        tool_calls: Vec::new(),
+                    };
+                    // 1) 终答自一致性（N 路采样 + 选择器择优）
                     if matches!(ttc.decide(), crate::ttc::TtcAction::Sample) {
-                        let baseline = crate::llm::LlmResponse {
-                            text: reply.clone(),
-                            tool_calls: Vec::new(),
-                        };
-                        let sampled = self.routed_llm.chat_ttc(&messages, &baseline, ttc.config()).await;
-                        reply = sampled.text;
+                        let sampled = self.routed_llm.chat_ttc(&messages, &chosen, cfg).await;
+                        chosen = sampled;
                         tracing::info!(target = "agent.ttc", "TTC 终答自一致性已应用");
                     }
+                    // 2) verifier-guided 精炼（judge 判不通过则带反馈重生成，基线保底）
+                    if cfg.verifier_enabled {
+                        let refined =
+                            self.routed_llm.chat_verifier_guided(&messages, &chosen, cfg).await;
+                        chosen = refined;
+                        tracing::info!(target = "agent.ttc", "TTC verifier-guided 已应用");
+                    }
+                    reply = chosen.text;
                 }
                 // 保存对话
                 let _ = self

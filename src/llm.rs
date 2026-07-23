@@ -384,6 +384,107 @@ impl RoutedLlm {
         candidates.into_iter().nth(best_idx).unwrap()
     }
 
+    /// TTC verifier-guided 生成：终答后用 judge（judge_provider）或主模型自评打分，
+    /// 不通过（< verifier_threshold）则带批评反馈重新生成，最多 max_refine_rounds 轮。
+    /// 基线保底：生成失败或全轮不通过，回退入参 baseline（不比单次更差）。
+    pub async fn chat_verifier_guided(
+        &self,
+        messages: &[Message],
+        baseline: &LlmResponse,
+        ttc: &crate::ttc::TtcConfig,
+    ) -> LlmResponse {
+        if ttc.max_refine_rounds == 0 {
+            return baseline.clone();
+        }
+        let d = classify_difficulty(&self.policy, messages).await;
+        let generator = self.select(d).clone();
+        // verifier 客户端：优先 judge_provider（配了且 key 非空），否则主模型自评
+        let verifier = match &self.policy.judge_provider {
+            Some(p) if !p.api_key.is_empty() => LlmClient::new(LlmConfig::from_provider(p)),
+            _ => self.base.clone(),
+        };
+        let task = last_user_content(messages);
+        let mut cur = baseline.clone();
+        for round in 1..=ttc.max_refine_rounds {
+            let (score, critique) = Self::verify_answer(&verifier, &task, &cur.text).await;
+            tracing::info!(
+                target = "agent.ttc",
+                mode = "verifier",
+                round,
+                score,
+                threshold = ttc.verifier_threshold,
+                "verifier_score"
+            );
+            if score >= ttc.verifier_threshold {
+                return cur;
+            }
+            if round == ttc.max_refine_rounds {
+                break;
+            }
+            let refine = Self::build_refine_messages(messages, &cur.text, &critique);
+            match generator.chat(&refine, &[]).await {
+                Ok(r) if !r.text.trim().is_empty() => cur = r,
+                _ => return baseline.clone(),
+            }
+        }
+        cur
+    }
+
+    /// 用 verifier 给「任务+答案」打分（0-10）+ 批评文本。
+    /// 失败/无法判 → 记 0 分（保守：视为不通过，触发重生成或保底）。
+    async fn verify_answer(verifier: &LlmClient, task: &str, answer: &str) -> (f64, String) {
+        let prompt = Message {
+            role: "user".to_string(),
+            content: Some(format!(
+                "你是一个严格答案审阅员。\n用户问题：\n{}\n\n待审阅答案：\n{}\n\n请判断答案是否正确、完整、有无明显错误或幻觉。\
+                 先简短指出问题（若没有问题写「无」），最后一行只输出：SCORE: <0-10 的数字，可含一位小数>",
+                task, answer
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        match verifier.chat(&[prompt], &[]).await {
+            Ok(r) => {
+                let score = parse_judge_score(&r.text);
+                let critique = r
+                    .text
+                    .lines()
+                    .filter(|l| !l.trim().to_uppercase().starts_with("SCORE:"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .trim()
+                    .to_string();
+                (score, critique)
+            }
+            Err(e) => {
+                tracing::warn!(target = "agent.ttc", err = %e, "verifier 评估失败，视为不通过");
+                (0.0, String::new())
+            }
+        }
+    }
+
+    /// 构造「带批评反馈的重新生成」消息：把上一版答案作为 assistant 轮，附用户指正。
+    fn build_refine_messages(messages: &[Message], prev: &str, critique: &str) -> Vec<Message> {
+        let mut v = messages.to_vec();
+        v.push(Message {
+            role: "assistant".to_string(),
+            content: Some(prev.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        v.push(Message {
+            role: "user".to_string(),
+            content: Some(format!(
+                "你的上一版回答被审阅指出以下问题：\n{}\n请修正并给出最终准确回答。\
+                 若题目需要明确结论，请用「答案：X」给出（如适用）。",
+                critique
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        v
+    }
+
     async fn score_by_judge(&self, messages: &[Message], candidates: &[LlmResponse]) -> Vec<f64> {
         // BoN-A：与 eval_bon 对齐——弃用「一次吐绝对分数组」弱提示（Δpp=-4 /「8 压过 10」根因）。
         // 优先 1 次相对排序；失败再逐候选 SCORE:（与 eval 同解析器）。
