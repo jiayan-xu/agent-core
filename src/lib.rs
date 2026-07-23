@@ -5,6 +5,7 @@ pub mod audit;
 pub mod boundary;
 pub mod boot_lifecycle;
 pub mod checkpoint;
+pub mod checkpoint_recovery; // 战略罗盘「持久执行深化」：checkpoint 恢复核心（可纯内存 e2e 测试）
 pub mod composer;
 pub mod degrade;
 pub mod harness;

@@ -1477,146 +1477,28 @@ impl AgentCore {
         }
     }
 
-    /// 从持久化 checkpoint 恢复控制面状态到内存（chat 入口调用）
+    /// 从持久化 checkpoint 恢复控制面状态到内存（chat 入口调用）。
+    ///
+    /// 审计无关核心见 `crate::checkpoint_recovery::apply_checkpoint_recovery`：
+    /// 计数（恢复尝试 / 按状态分桶 / 成功）+ 内存重建（session 状态 /
+    /// in_progress_plan / in_progress_step_results）在那里完成，且可被纯内存
+    /// e2e 集成测试覆盖（无需构造完整 AgentCore / Memoria 网络）。
+    /// 本方法只补 Memoria 审计日志（checkpoint_resume 写 Memoria）。
     async fn restore_checkpoint(&self, session_id: &str) {
-        let cp = {
-            let store = self.checkpoint_store.lock().await;
-            store.load(session_id)
-        };
-        let cp = match cp {
-            Some(c) => c,
-            None => return,
-        };
-        let mut recovered_ok = true;
-        // P2-2: Checkpoint 恢复事件（崩溃续跑可观测）
-        let state_str = match cp.state {
-            CheckpointState::New => "New",
-            CheckpointState::AwaitingConfirmation => "AwaitingConfirmation",
-            CheckpointState::Confirmed => "Confirmed",
-            CheckpointState::PendingApproval => "PendingApproval",
-            CheckpointState::ExecutingPlan => "ExecutingPlan",
-            CheckpointState::PlanPreview => "PlanPreview",
-            CheckpointState::Done => "Done",
-            CheckpointState::Failed => "Failed",
-        };
-        // 战略罗盘「可观测」：崩溃/重启后续跑恢复计数（仅当存在非 New 控制面状态）
-        if cp.state != CheckpointState::New {
-            self.metrics.inc_checkpoint_recovery();
-            self.metrics.inc_checkpoint_recovery_by_state(state_str);
-        }
-        self.audit_logger
-            .checkpoint_resume(&self.config.identity.agent_id, session_id, state_str, "")
-            .await;
-        match cp.state {
-            CheckpointState::AwaitingConfirmation => {
-                self.session_manager
-                    .set_state(session_id, SessionState::AwaitingConfirmation)
-                    .await;
-                if let Some(msg) = cp.payload.get("original_message").and_then(|m| m.as_str()) {
-                    self.session_manager
-                        .set_original_message(session_id, msg)
-                        .await;
-                }
-            }
-            CheckpointState::Confirmed => {
-                self.session_manager
-                    .set_state(session_id, SessionState::Confirmed)
-                    .await;
-            }
-            CheckpointState::PendingApproval => {
-                // 恢复待审批意图（审批结果需重新等待，但工具意图保留以便日志关联）
-                if let Some(pa) = cp.payload.get("pending_action") {
-                    let action = PendingAction {
-                        tool_name: pa
-                            .get("tool_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        arguments: pa
-                            .get("arguments")
-                            .cloned()
-                            .unwrap_or(serde_json::json!({})),
-                        description: pa
-                            .get("description")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                    };
-                    self.session_manager
-                        .set_pending_action(session_id, action)
-                        .await;
-                }
-                self.session_manager
-                    .set_state(session_id, SessionState::AwaitingConfirmation)
-                    .await;
-            }
-            CheckpointState::ExecutingPlan => {
-                // 恢复进行中的计划与已完成步骤，供 execute_plan 续跑
-                let mut plan_ok = true;
-                if let Some(plan_val) = cp.payload.get("plan") {
-                    match serde_json::from_value::<crate::composer::ExecutionPlan>(plan_val.clone()) {
-                        Ok(plan) => {
-                            *self.in_progress_plan.lock().await = Some(plan);
-                        }
-                        Err(_) => {
-                            plan_ok = false;
-                        }
-                    }
-                } else {
-                    plan_ok = false;
-                }
-                if let Some(sr) = cp.payload.get("step_results").and_then(|v| v.as_object()) {
-                    let mut map = self.in_progress_step_results.lock().await;
-                    for (k, v) in sr.iter() {
-                        if let (Ok(id), Some(s)) = (k.parse::<u32>(), v.as_str()) {
-                            map.insert(id, s.to_string());
-                        }
-                    }
-                }
-                // 恢复后下一次 execute_chat 会复用 in_progress_plan 续跑
-                self.session_manager
-                    .set_state(session_id, SessionState::Confirmed)
-                    .await;
-                if !plan_ok {
-                    recovered_ok = false;
-                }
-            }
-            CheckpointState::PlanPreview => {
-                // 恢复进行中的计划，等待用户「执行 / 取消 / 修改」
-                let mut plan_ok = true;
-                if let Some(plan_val) = cp.payload.get("plan") {
-                    match serde_json::from_value::<crate::composer::ExecutionPlan>(plan_val.clone()) {
-                        Ok(plan) => {
-                            *self.in_progress_plan.lock().await = Some(plan);
-                        }
-                        Err(_) => {
-                            plan_ok = false;
-                        }
-                    }
-                } else {
-                    plan_ok = false;
-                }
-                self.session_manager
-                    .set_state(session_id, SessionState::AwaitingConfirmation)
-                    .await;
-                if let Some(msg) = cp.payload.get("original_message").and_then(|m| m.as_str()) {
-                    self.session_manager
-                        .set_original_message(session_id, msg)
-                        .await;
-                }
-                if !plan_ok {
-                    recovered_ok = false;
-                }
-            }
-            CheckpointState::Done | CheckpointState::Failed => {
-                // 终态：清空内存待确认（checkpoint 保留供审计）
-                self.session_manager.remove_state(session_id).await;
-            }
-            CheckpointState::New => {}
-        }
-        // 战略罗盘「可观测」：仅当非 New 且续跑重建成功，恢复成功 +1
-        if cp.state != CheckpointState::New && recovered_ok {
-            self.metrics.inc_checkpoint_recovery_success();
+        let state = crate::checkpoint_recovery::apply_checkpoint_recovery(
+            session_id,
+            &self.checkpoint_store,
+            &self.metrics,
+            &self.session_manager,
+            &self.in_progress_plan,
+            &self.in_progress_step_results,
+        )
+        .await;
+        if let Some(st) = state {
+            let state_str = st.as_str();
+            self.audit_logger
+                .checkpoint_resume(&self.config.identity.agent_id, session_id, state_str, "")
+                .await;
         }
     }
 
