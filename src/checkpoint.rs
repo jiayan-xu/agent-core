@@ -267,4 +267,66 @@ mod tests {
         let store = CheckpointStore::open_memory().unwrap();
         assert!(store.load("nope").is_none());
     }
+
+    /// 战略罗盘「持久执行」核心实证：checkpoint 写入**文件**后，模拟进程崩溃/重启
+    /// （drop 旧 store + 同路径 reopen），状态与 payload（计划 + 步骤结果）必须存活。
+    /// 这是「可续跑持久化」成立的边界证据——`open_memory()` 测试无法覆盖此restart语义。
+    #[test]
+    fn test_file_durability_across_reopen() {
+        let path = std::env::temp_dir()
+            .join(format!("ckpt_dur_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // 「进程运行 1」：存一个进行中的多步计划 checkpoint
+        {
+            let store = CheckpointStore::open(path.to_str().unwrap()).unwrap();
+            let payload = serde_json::json!({
+                "plan": {"steps":[
+                    {"step_id":1,"description":"查询","tool":"db_query","arguments":{},"depends_on":[]},
+                    {"step_id":2,"description":"汇总","tool":"summarize","arguments":{},"depends_on":[1]}
+                ]},
+                "step_results": {"1": "ok"}
+            });
+            store
+                .save("exec1", "agent1", CheckpointState::ExecutingPlan, &payload)
+                .unwrap();
+        }
+
+        // 「进程重启」：drop 旧 store，重新打开同一文件
+        let store2 = CheckpointStore::open(path.to_str().unwrap()).unwrap();
+        let cp = store2.load("exec1").expect("checkpoint must survive reopen");
+        assert_eq!(cp.state, CheckpointState::ExecutingPlan);
+        assert_eq!(cp.payload["step_results"]["1"].as_str(), Some("ok"));
+        assert_eq!(cp.payload["plan"]["steps"][0]["tool"].as_str(), Some("db_query"));
+        assert_eq!(cp.payload["plan"]["steps"][1]["step_id"].as_u64(), Some(2));
+
+        // 恢复决策谓词（与 agent.rs restore_checkpoint 一致）：非 New => 触发恢复计数 + 续跑
+        assert!(
+            cp.state != CheckpointState::New,
+            "restored ExecutingPlan must trigger recovery path"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 文档化 `restore_checkpoint` 的恢复计数判定（state != New 才计入恢复）：
+    /// New / 不存在 => 不计入；非 New（如 PendingApproval）=> 计入。
+    #[test]
+    fn test_recovery_decision_predicate() {
+        let store = CheckpointStore::open_memory().unwrap();
+        store
+            .save("x", "a", CheckpointState::New, &serde_json::json!({}))
+            .unwrap();
+        let new_cp = store.load("x").unwrap();
+        assert_eq!(new_cp.state, CheckpointState::New);
+        assert!(!(new_cp.state != CheckpointState::New)); // 不会计入恢复
+
+        store
+            .save("y", "a", CheckpointState::PendingApproval, &serde_json::json!({}))
+            .unwrap();
+        let pa = store.load("y").unwrap();
+        assert!(pa.state != CheckpointState::New); // 会计入恢复
+
+        assert!(store.load("zzz").is_none()); // 不存在 => 不计入恢复
+    }
 }
