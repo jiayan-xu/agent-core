@@ -1,5 +1,31 @@
 # agent-core 演进日志
 
+## 2026-07-23 — P0：`/api/register` 补回 B2 双 ns（私人 + 部门共享）
+
+> **助手检索锚点**：`register` / `双 ns` / `B2` / `私人 ns` / `Onboarding` → 先读本节 + `docs/evidence/register-dual-ns-2026-07-23.md`，勿再全库考古。
+
+### 背景
+2026-07-11 已拍板 **B2**：一人一私人 ns `agent/{id}` + 组织共享 `org/cs-pufa-2nd-thermal`（`register_user` / legacy 自动开户已落实）。  
+PFAiX Onboarding 走的 `POST /api/register`（`handle_register`）事后漂移为**只写** `org/.../dept/...`，漏挂私人 ns → 同事注册无个人记忆隔离。
+
+### 变更
+- **`src/main.rs` `handle_register`**：namespace 改为  
+  `agent/{agent_id},org/{company}/dept/{department}[/div/...][/proj/...]`  
+  与 B2 / `register_user` 对齐；保留原部门 org 树作共享层。
+- **证据**：`docs/evidence/register-dual-ns-2026-07-23.md`
+
+### 部署
+- **必须**清掉/改写 `CARGO_TARGET_DIR` 指向 `agent-core/target` 再 `cargo build --release --bin agent-core`  
+  （本机常误指 Memoria `memoria-core/target`，编了不生效——见 evidence）
+- 重启 `target/release/agent-core.exe --service`（`:9753`）
+- 已注册旧身份不自动回填；需重注册或改 Memoria `agent_registry.namespace`
+
+### 验证
+- 2026-07-23 冒烟：`/api/register` → `agent/…,org/…/dept/gufei`（`DUAL_NS_OK`）；详见  
+  `docs/evidence/register-dual-ns-2026-07-23.md`
+
+---
+
 ## 2026-07-06 — McpClient 枚举重构 + Stdio 传输支持
 
 ### 背景

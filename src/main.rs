@@ -3259,16 +3259,20 @@ async fn handle_register(
         });
     }
     let agent_id = format!("{}_{}_{}", COMPANY, department, name);
-    // 层级命名空间树：org/{company}[/div/{div}]/dept/{department}[/proj/{project}]
-    // 部门领导（无项目）止于 dept；分管副总（无部门）可止于 div；CEO 可仅 org。
-    let mut namespace = if div.is_empty() {
+    // B2 双 ns（与 /api/register_user、legacy 自动开户一致）：
+    //   1) agent/{agent_id} —— 私人记忆隔离
+    //   2) org/.../dept/... —— 部门/组织共享（工具可见 + 部门记忆）
+    // 此前本路径只写了 org 树，漏挂私人 ns，属相对 B2 拍板的实现漂移。
+    // 层级：org/{company}[/div/{div}]/dept/{department}[/proj/{project}]
+    let mut org_ns = if div.is_empty() {
         format!("org/{}/dept/{}", COMPANY, department)
     } else {
         format!("org/{}/div/{}/dept/{}", COMPANY, div, department)
     };
     if !project.is_empty() {
-        namespace = format!("{}/proj/{}", namespace, project);
+        org_ns = format!("{}/proj/{}", org_ns, project);
     }
+    let namespace = format!("agent/{},{}", agent_id, org_ns);
     // 先生成一个本地兜底 token；若 Memoria 注册成功，会用 Memoria 实际返回的 badge 覆盖（P0 修复：必须一致，否则客户端 key 与 Memoria 存值不符导致鉴权失败）
     let mut badge_token = format!("sk-{:x}", rand::thread_rng().gen::<u128>());
 
