@@ -132,6 +132,16 @@ impl MetricsRegistry {
             let m = self.checkpoint_recovery_by_state.lock().unwrap();
             m.iter().map(|(k, v)| (k.clone(), serde_json::json!(*v))).collect()
         };
+        // 恢复成功率 / 卡点分布：用 format! 构造 JSON 字符串再解析，确保各字段
+        // （含 f64 的 success_rate）在 release 优化下不被 DCE（rlib / 集成测试直连 snapshot
+        // 不触发此 DCE，bin 经 axum 响应路径会触发，故用运行时字符串构造规避）。
+        let cr_by_state_str = serde_json::to_string(&serde_json::Value::Object(cr_by_state))
+            .unwrap_or_else(|_| "{}".to_string());
+        let cr_json = format!(
+            "{{\"attempts\":{},\"success\":{},\"success_rate\":{},\"by_state\":{}}}",
+            cr_attempts, cr_success, cr_success_rate, cr_by_state_str
+        );
+        let cr_value = serde_json::from_str(&cr_json).unwrap_or(serde_json::Value::Null);
         serde_json::json!({
             "uptime_secs": uptime,
             "features": features,
@@ -156,12 +166,7 @@ impl MetricsRegistry {
                 "count": count,
             },
             "quota": quota,
-            "checkpoint_recovery": {
-                "attempts": cr_attempts,
-                "success": cr_success,
-                "success_rate": cr_success_rate,
-                "by_state": cr_by_state,
-            },
+            "checkpoint_recovery": cr_value,
         })
     }
 }
