@@ -138,6 +138,7 @@ async fn eval_ttc_single_vs_selfconsistency_delta_pp() {
         scorer: ScorerMode::Majority,
         sample_temperature: 0.7,
         token_budget: 8000,
+        ..Default::default()
     };
 
     let mut n = 0usize;
