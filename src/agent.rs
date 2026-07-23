@@ -191,6 +191,8 @@ pub struct AgentCore {
     pub lats: Option<crate::lats::LatsController>,
     /// HY3 1.3：MultiAgent Compose 配置（仅 features.multiagent=true 时 Some；否则 None=原路径）
     pub multiagent: Option<crate::multiagent::MultiAgentConfig>,
+    /// HY3 1.3 收口：记忆自进化生产证据审计器（每次 consolidate 演化落盘 JSONL，可复验 G1-G4）
+    pub evolution_auditor: crate::evolution_audit::EvolutionAuditor,
 }
 
 /// P2-1: 会话级配额守卫（RAII）。离开作用域自动 leave_session，避免并发计数泄漏。
@@ -327,10 +329,20 @@ impl AgentCore {
         // HY3 1.3：三大项热路径接线（默认 OFF；仅 features 开关开启才持有控制器）
         let features = config.features.clone();
         let skill_registry = if features.skill_library {
-            Some(
-                Arc::new(crate::skill_library::InMemorySkillRegistry::new_with_defaults())
-                    as Arc<dyn crate::skill_library::SkillRegistry + Send + Sync>,
-            )
+            // HY3 1.3：技能库持久化（进程重启不丢运行时注册的技能）
+            let path = crate::skill_library::FileBackedSkillRegistry::default_path();
+            let reg: Arc<dyn crate::skill_library::SkillRegistry + Send + Sync> =
+                match crate::skill_library::FileBackedSkillRegistry::load_or_default(&path) {
+                    Ok(r) => Arc::new(r),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "agent.skill",
+                            "技能库持久化加载失败({})，回退纯内存", e
+                        );
+                        Arc::new(crate::skill_library::InMemorySkillRegistry::new_with_defaults())
+                    }
+                };
+            Some(reg)
         } else {
             None
         };
@@ -344,7 +356,7 @@ impl AgentCore {
         } else {
             None
         };
-        AgentCore {
+        let core = AgentCore {
             config,
             mcp,
             mcp_sources,
@@ -379,7 +391,13 @@ impl AgentCore {
             skill_registry,
             lats,
             multiagent,
-        }
+            evolution_auditor: crate::evolution_audit::EvolutionAuditor::new(
+                crate::evolution_audit::EvolutionAuditor::default_path(),
+                env!("CARGO_PKG_VERSION").to_string(),
+            ),
+        };
+        core.evolution_auditor.record_boot();
+        core
     }
 
     /// 取分身；缺省回退到 "default" 分身，保证旧调用兼容
@@ -4397,6 +4415,7 @@ impl AgentCore {
                         ns,
                         evolved
                     );
+                    self.evolution_auditor.record(ns, evolved, model.as_str(), "context_update");
                 }
             }
         }

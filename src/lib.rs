@@ -27,3 +27,4 @@ pub mod skill_library; // HY3 1.3+：技能库注册表
 pub mod features; // HY3 1.3：三大项热路径接线辅助（flag 默认 OFF）
 pub mod lats; // HY3 1.3：LATS 过程树搜索（execute_chat 层，flag 默认 OFF）
 pub mod multiagent; // HY3 1.3：MultiAgent Compose 子 agent 派发（flag 默认 OFF）
+pub mod evolution_audit; // HY3 1.3 收口：记忆自进化生产证据审计（本地 JSONL 落盘，可复验）

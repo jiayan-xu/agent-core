@@ -12,7 +12,8 @@
 //! 运行时经 `Arc<dyn SkillRegistry>` 也可调用（修复 P0-1「启动后无法 register」根因）。
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -248,6 +249,130 @@ impl SkillRegistry for InMemorySkillRegistry {
     }
 }
 
+/// 持久化形状（落盘用）：skills 当前快照 + 每 id 的版本历史
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistShape {
+    skills: Vec<Skill>,
+    history: HashMap<String, Vec<Skill>>,
+}
+
+impl InMemorySkillRegistry {
+    /// 导出当前全部状态（skills + 版本历史），供持久化包装落盘
+    pub fn export_state(&self) -> (Vec<Skill>, HashMap<String, Vec<Skill>>) {
+        (
+            self.skills.read().unwrap().clone(),
+            self.history.read().unwrap().clone(),
+        )
+    }
+
+    /// 从导出状态整体恢复（覆盖当前内存）。用于启动时加载持久化文件。
+    pub fn import_state(&self, skills: Vec<Skill>, history: HashMap<String, Vec<Skill>>) {
+        *self.skills.write().unwrap() = skills;
+        *self.history.write().unwrap() = history;
+    }
+}
+
+/// 文件持久化的技能注册表：包装 `InMemorySkillRegistry`，每次写操作后整体落盘 JSON。
+/// 启动从文件加载（缺失/损坏则回退 `new_with_defaults` 并立即落盘），进程重启不丢
+/// 运行时注册的技能，跨进程可共享同一文件。满足 `SkillRegistry + Send + Sync`，
+/// 可直接替换 `InMemorySkillRegistry` 作为 `Arc<dyn SkillRegistry>` 实现。
+pub struct FileBackedSkillRegistry {
+    inner: InMemorySkillRegistry,
+    path: PathBuf,
+    flush_lock: Mutex<()>,
+}
+
+impl FileBackedSkillRegistry {
+    /// 默认持久化路径：agent-core 工作目录下的 `skill_library.json`
+    /// （不硬编码绝对路径，符合隐私/可移植约定）。
+    pub fn default_path() -> PathBuf {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("skill_library.json")
+    }
+
+    /// 从文件加载；文件缺失/损坏则回退 `new_with_defaults` 并立即落盘。
+    pub fn load_or_default<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let inner = if path.exists() {
+            match std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<PersistShape>(&t).ok())
+            {
+                Some(shape) => {
+                    let reg = InMemorySkillRegistry::new();
+                    reg.import_state(shape.skills, shape.history);
+                    reg
+                }
+                None => InMemorySkillRegistry::new_with_defaults(),
+            }
+        } else {
+            InMemorySkillRegistry::new_with_defaults()
+        };
+        let me = Self {
+            inner,
+            path,
+            flush_lock: Mutex::new(()),
+        };
+        me.flush()?;
+        Ok(me)
+    }
+
+    fn flush(&self) -> std::io::Result<()> {
+        let _g = self.flush_lock.lock().unwrap();
+        let (skills, history) = self.inner.export_state();
+        let shape = PersistShape { skills, history };
+        let txt = serde_json::to_string_pretty(&shape)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&self.path, txt)
+    }
+}
+
+impl SkillRegistry for FileBackedSkillRegistry {
+    fn list(&self) -> Vec<Skill> {
+        self.inner.list()
+    }
+    fn get(&self, id: &str) -> Option<Skill> {
+        self.inner.get(id)
+    }
+    fn search_by_task(&self, task: &str, top_k: usize) -> Vec<Skill> {
+        self.inner.search_by_task(task, top_k)
+    }
+    fn register(&self, skill: Skill) -> Result<(), String> {
+        let r = self.inner.register(skill);
+        if r.is_ok() {
+            if let Err(e) = self.flush() {
+                tracing::warn!(target: "agent.skill", "技能库持久化失败: {}", e);
+            }
+        }
+        r
+    }
+    fn unregister(&self, id: &str) -> Result<(), String> {
+        let r = self.inner.unregister(id);
+        if r.is_ok() {
+            if let Err(e) = self.flush() {
+                tracing::warn!(target: "agent.skill", "技能库持久化失败: {}", e);
+            }
+        }
+        r
+    }
+    fn rollback(&self, id: &str) -> Result<Skill, String> {
+        let r = self.inner.rollback(id);
+        if r.is_ok() {
+            if let Err(e) = self.flush() {
+                tracing::warn!(target: "agent.skill", "技能库持久化失败: {}", e);
+            }
+        }
+        r
+    }
+    fn version_of(&self, id: &str) -> Option<u32> {
+        self.inner.version_of(id)
+    }
+    fn list_versions(&self, id: &str) -> Vec<Skill> {
+        self.inner.list_versions(id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +455,73 @@ mod tests {
         reg.register(sk("sql", &["sql"])).unwrap();
         assert!(reg.rollback("sql").is_err());
         assert!(reg.rollback("nope").is_err());
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    fn sk(id: &str, kws: &[&str]) -> Skill {
+        Skill {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: String::new(),
+            trigger_keywords: kws.iter().map(|s| s.to_string()).collect(),
+            body: String::new(),
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn file_backed_persists_register_across_restart() {
+        let p = std::env::temp_dir().join(format!("skill_persist_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        {
+            let reg = FileBackedSkillRegistry::load_or_default(&p).unwrap();
+            // 用非内置 seed 的 id（"mydb"），避免与内置 sql/rust/regex/plate seed 版本冲突
+            reg.register(sk("mydb", &["mydb"])).unwrap();
+            let mut v2 = sk("mydb", &["mydb"]);
+            v2.body = "v2".into();
+            reg.register(v2).unwrap();
+        }
+        {
+            let reg = FileBackedSkillRegistry::load_or_default(&p).unwrap();
+            assert_eq!(reg.version_of("mydb"), Some(2));
+            assert_eq!(reg.get("mydb").unwrap().body, "v2");
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn file_backed_persists_rollback_across_restart() {
+        let p = std::env::temp_dir().join(format!("skill_rollback_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        {
+            let reg = FileBackedSkillRegistry::load_or_default(&p).unwrap();
+            let mut v1 = sk("x", &["x"]);
+            v1.body = "a".into();
+            reg.register(v1).unwrap();
+            let mut v2 = sk("x", &["x"]);
+            v2.body = "b".into();
+            reg.register(v2).unwrap();
+            reg.rollback("x").unwrap();
+        }
+        {
+            let reg = FileBackedSkillRegistry::load_or_default(&p).unwrap();
+            assert_eq!(reg.get("x").unwrap().body, "a");
+            assert_eq!(reg.version_of("x"), Some(1));
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn file_backed_corrupt_file_falls_back_to_defaults() {
+        let p = std::env::temp_dir().join(format!("skill_corrupt_{}.json", std::process::id()));
+        let _ = std::fs::write(&p, "not valid json {{{");
+        let reg = FileBackedSkillRegistry::load_or_default(&p).unwrap();
+        // 损坏文件 → 回退默认 seed（sql 技能应可用）
+        assert!(!reg.search_by_task("sql 查询", 3).is_empty());
+        let _ = std::fs::remove_file(&p);
     }
 }
