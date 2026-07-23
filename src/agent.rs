@@ -200,6 +200,8 @@ pub struct AgentCore {
     pub ttc: Option<crate::ttc::TtcController>,
     /// HY3 1.3 收口：记忆自进化生产证据审计器（每次 consolidate 演化落盘 JSONL，可复验 G1-G4）
     pub evolution_auditor: crate::evolution_audit::EvolutionAuditor,
+    /// 战略罗盘「可观测」：运行指标注册表（零行为变化、默认开启，供 /api/metrics 暴露）
+    pub metrics: std::sync::Arc<crate::metrics::MetricsRegistry>,
 }
 
 /// P2-1: 会话级配额守卫（RAII）。离开作用域自动 leave_session，避免并发计数泄漏。
@@ -248,6 +250,7 @@ impl AgentCore {
         harness: HarnessStore,
         checkpoint: CheckpointStore,
         local_resources: crate::resources::SharedResourceSnapshot,
+        metrics: std::sync::Arc<crate::metrics::MetricsRegistry>,
     ) -> Self {
         let mcp = McpClient::new(
             &config.memoria_url,
@@ -404,6 +407,7 @@ impl AgentCore {
             lats,
             multiagent,
             ttc,
+            metrics,
             evolution_auditor: crate::evolution_audit::EvolutionAuditor::new(
                 crate::evolution_audit::EvolutionAuditor::default_path(),
                 env!("CARGO_PKG_VERSION").to_string(),
@@ -733,6 +737,9 @@ impl AgentCore {
             kws.iter().any(|w| m.contains(w))
         };
         let trimmed = message.trim();
+
+        // 战略罗盘「可观测」：每次用户消息进入计数一次（/api/chat 与 /api/chat/stream 共用 chat()）
+        self.metrics.inc_requests();
 
         // ── P1-1: 崩溃恢复——先从 checkpoint 恢复控制面状态到内存 ──
         self.restore_checkpoint(session_id).await;
@@ -1377,6 +1384,7 @@ impl AgentCore {
             .await;
         let payload = serde_json::json!({"original_message": original_message});
         let agent_id = self.config.identity.agent_id.clone();
+        self.metrics.inc_checkpoint_save();
         let _ = self.checkpoint_store.lock().await.save(
             session_id,
             &agent_id,
@@ -1391,6 +1399,7 @@ impl AgentCore {
             .set_state(session_id, SessionState::Confirmed)
             .await;
         let agent_id = self.config.identity.agent_id.clone();
+        self.metrics.inc_checkpoint_save();
         let _ = self.checkpoint_store.lock().await.save(
             session_id,
             &agent_id,
@@ -1411,6 +1420,8 @@ impl AgentCore {
             "plan": plan,
             "step_results": step_results,
         });
+        self.metrics.inc_checkpoint_save();
+        self.metrics.gauge_in_progress(1);
         let _ = self.checkpoint_store.lock().await.save(
             session_id,
             &agent_id,
@@ -1435,6 +1446,7 @@ impl AgentCore {
                 "description": action.description,
             }
         });
+        self.metrics.inc_checkpoint_save();
         let _ = self.checkpoint_store.lock().await.save(
             session_id,
             &agent_id,
@@ -1446,6 +1458,8 @@ impl AgentCore {
     /// 终态（Done / Failed）：保留 checkpoint 供审计关联
     async fn checkpoint_terminal(&self, session_id: &str, state: CheckpointState) {
         let agent_id = self.config.identity.agent_id.clone();
+        self.metrics.inc_checkpoint_save();
+        self.metrics.gauge_in_progress(-1);
         let _ = self.checkpoint_store.lock().await.save(
             session_id,
             &agent_id,
@@ -1473,6 +1487,10 @@ impl AgentCore {
             Some(c) => c,
             None => return,
         };
+        // 战略罗盘「可观测」：崩溃/重启后续跑恢复计数（仅当存在非 New 控制面状态）
+        if cp.state != CheckpointState::New {
+            self.metrics.inc_checkpoint_recovery();
+        }
         // P2-2: Checkpoint 恢复事件（崩溃续跑可观测）
         let state_str = match cp.state {
             CheckpointState::New => "New",
@@ -1960,6 +1978,7 @@ impl AgentCore {
             if let Some(sys_msg) = messages.first_mut() {
                 if let Some(ref mut content) = sys_msg.content {
                     if let Some(block) = crate::features::render_skill_block(reg.as_ref(), raw_message, 3) {
+                        self.metrics.inc_skill();
                         content.push_str(&block);
                     }
                 }
@@ -2002,10 +2021,13 @@ impl AgentCore {
                     quota_ns_llm, e
                 );
             }
+            // 战略罗盘「可观测」：主 agent 循环 LLM 调用计数
+            self.metrics.inc_llm_calls();
             let response = match self.routed_llm.chat(&messages, &tools).await {
                 Ok(r) => r,
                 // P1-5：LLM 主/备 Provider 均失败 → 返回「可重试错误」，而非裸崩
                 Err(e) => {
+                    self.metrics.inc_errors();
                     tracing::warn!("[DEGRADE] LLM 调用失败（已尝试主用+备用 Provider）: {}", e);
                     return "⚠️ LLM 服务暂时不可用（已尝试主用与备用 Provider 均失败）。请稍后重试，或检查网络与 API 密钥配置。".to_string();
                 }
@@ -2032,6 +2054,7 @@ impl AgentCore {
                     if matches!(ttc.decide(), crate::ttc::TtcAction::Sample) {
                         let sampled = self.routed_llm.chat_ttc(&messages, &chosen, cfg).await;
                         chosen = sampled;
+                        self.metrics.inc_ttc();
                         tracing::info!(target = "agent.ttc", "TTC 终答自一致性已应用");
                     }
                     // 2) verifier-guided 精炼（judge 判不通过则带反馈重生成，基线保底）
@@ -2039,6 +2062,7 @@ impl AgentCore {
                         let refined =
                             self.routed_llm.chat_verifier_guided(&messages, &chosen, cfg).await;
                         chosen = refined;
+                        self.metrics.inc_ttc_refine();
                         tracing::info!(target = "agent.ttc", "TTC verifier-guided 已应用");
                     }
                     reply = chosen.text;
@@ -3417,6 +3441,16 @@ impl AgentCore {
         })
     }
 
+    /// 战略罗盘「可观测」：特性门状态快照（控制器是否持有 = 该特性是否开启）。
+    pub fn feature_gates(&self) -> serde_json::Value {
+        serde_json::json!({
+            "skill_library": self.skill_registry.is_some(),
+            "lats": self.lats.is_some(),
+            "multiagent": self.multiagent.is_some(),
+            "ttc": self.ttc.is_some(),
+        })
+    }
+
     /// P2-1：管理员临时调整某命名空间配额策略（供 `/api/admin/quota` PUT）。
     pub fn set_ns_quota(&self, ns: &str, policy: crate::quota::NsQuotaPolicy) {
         self.quota
@@ -3644,6 +3678,7 @@ impl AgentCore {
     fn augment_with_skills(&self, system_prompt: &mut String, task: &str) {
         if let Some(reg) = self.skill_registry.as_ref() {
             if let Some(block) = crate::features::render_skill_block(reg.as_ref(), task, 3) {
+                self.metrics.inc_skill();
                 system_prompt.push_str(&block);
                 tracing::debug!(target: "agent.skill_library", "技能块注入 system prompt");
             }
@@ -3687,6 +3722,8 @@ impl AgentCore {
         // 两处调用点（非 composer 主路径 / composer 多步路径）统一在此记账 token，
         // 避免 composer 路径漏记导致日预算熔断失效。
         ctrl.record_tokens((plan.as_ref().unwrap().len() / 4) as u64);
+        // 战略罗盘「可观测」：LATS 过程树展开实际产出规划提示计数
+        self.metrics.inc_lats();
         plan
     }
 
@@ -3757,6 +3794,8 @@ impl AgentCore {
             tracing::warn!(target: "agent.multiagent", "dispatch 全失败，回退原路径");
             return None;
         }
+        // 战略罗盘「可观测」：MultiAgent Compose 实际派发成功计数
+        self.metrics.inc_multiagent();
         Some(format!("[MultiAgent Compose 结果]\n\n{}", result))
     }
 

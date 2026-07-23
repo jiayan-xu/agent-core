@@ -51,6 +51,7 @@ use agent_core::code_evolve::{apply_patch, eval_crate, find_up, git_commit, git_
 use agent_core::boundary::PermissionLevel;
 use agent_core::harness::HarnessStore;
 use agent_core::llm::{LlmClient, LlmConfig, LlmProvider};
+use agent_core::metrics::MetricsRegistry;
 use agent_core::approval::ApprovalResponse;
 use agent_core::mcp_client::McpClient;
 use agent_core::resources::SharedResourceSnapshot;
@@ -609,6 +610,8 @@ struct AppState {
     next_event_id: AtomicU64,
     /// Phase 7：进化回路并发守卫（true=正在跑 /api/evolve，防止多请求并发覆盖隔离仓库）
     evolve_running: AtomicBool,
+    /// 战略罗盘「可观测」：运行指标注册表（与 AgentCore 共享同一 Arc，供 /api/metrics 暴露）
+    metrics: Arc<MetricsRegistry>,
 }
 
 /// 白龙马 Phase B：多端唤醒 —— 后台活动事件（心跳自主产生的活动，供 PFAiX 拉取"唤醒"）
@@ -1097,6 +1100,8 @@ fn main() {
     // ── 启动 axum 后台服务 ──
     let server_ready = Arc::new(AtomicBool::new(false));
     let server_ready_clone = server_ready.clone();
+    // 战略罗盘「可观测」：在 main 作用域构建共享指标注册表（AppState 与 AgentCore 共享同一 Arc）
+    let metrics = Arc::new(MetricsRegistry::new());
 
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
@@ -1125,6 +1130,7 @@ fn main() {
                 background_events: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
                 next_event_id: AtomicU64::new(1),
                 evolve_running: AtomicBool::new(false),
+                metrics: metrics.clone(),
             });
 
             // 先绑定端口，确保服务立即可用（即使 Memoria 慢/未就绪也不阻塞启动）
@@ -1142,7 +1148,7 @@ fn main() {
                 let reg_state = state.clone();
                 let reg_config = config.clone();
                 tokio::spawn(async move {
-                    match build_agent(&resolve_config_for_runtime(&reg_config), local_resources.clone()).await {
+                    match build_agent(&resolve_config_for_runtime(&reg_config), local_resources.clone(), reg_state.metrics.clone()).await {
                         Ok(agent) => {
                             println!(
                                 "✓ Agent 已就绪（{}@{}）",
@@ -2167,7 +2173,7 @@ async fn handle_save_config(
     save_config(&cfg);
     drop(cfg);
     let cfg = st.config.lock().await.clone();
-    match build_agent(&resolve_config_for_runtime(&cfg), st.local_resources.clone()).await {
+    match build_agent(&resolve_config_for_runtime(&cfg), st.local_resources.clone(), st.metrics.clone()).await {
         Ok(agent) => {
             *st.agent.lock().await = Some(agent);
             Json(SetupResponse {
@@ -2195,6 +2201,7 @@ async fn handle_chat(
     }
     let agent_guard = st.agent.lock().await;
     if let Some(ref agent) = *agent_guard {
+        let start = std::time::Instant::now();
         let reply = agent
             .chat(
                 &req.message,
@@ -2203,6 +2210,8 @@ async fn handle_chat(
                 &ctx.allowed_ns,
             )
             .await;
+        st.metrics
+            .record_latency(start.elapsed().as_secs_f64() * 1000.0);
         Json(ChatResponse {
             reply,
             session_id: req.session_id,
@@ -2245,7 +2254,11 @@ async fn handle_chat_stream(
         tokio::spawn(async move {
             let guard = st_clone.agent.lock().await;
             if let Some(ref agent) = *guard {
+                let start = std::time::Instant::now();
                 let reply = agent.chat(&msg, &agent_id, &sid, &allowed_ns).await;
+                st_clone
+                    .metrics
+                    .record_latency(start.elapsed().as_secs_f64() * 1000.0);
                 let chars: Vec<char> = reply.chars().collect();
                 let mut i = 0;
                 while i < chars.len() {
@@ -2879,7 +2892,10 @@ async fn handle_admin_killswitch(
 async fn handle_metrics(State(st): State<Arc<AppState>>) -> axum::response::Response {
     let guard = st.agent.lock().await;
     if let Some(ref agent) = *guard {
-        Json(agent.quota_status()).into_response()
+        // 战略罗盘「可观测」：特性门状态 + 运行计数器/时延/持久执行 gauge 全量快照
+        let features = agent.feature_gates();
+        let quota = agent.quota_status();
+        Json(st.metrics.snapshot(features, quota)).into_response()
     } else {
         Json(serde_json::json!({"error": "agent not ready"})).into_response()
     }
@@ -3590,7 +3606,11 @@ async fn handle_login(
     }
 }
 
-async fn build_agent(config: &Config, local_resources: SharedResourceSnapshot) -> Result<AgentCore, String> {
+async fn build_agent(
+    config: &Config,
+    local_resources: SharedResourceSnapshot,
+    metrics: Arc<MetricsRegistry>,
+) -> Result<AgentCore, String> {
     // K3：身份 badge 与 admin 钥匙分钥（badge_token UNIQUE）
     let admin_key = if !config.memoria_admin_key.is_empty() {
         config.memoria_admin_key.clone()
@@ -3717,7 +3737,7 @@ async fn build_agent(config: &Config, local_resources: SharedResourceSnapshot) -
         .map_err(|e| format!("创建 Harness 存储失败: {}", e))?;
     let checkpoint = CheckpointStore::open(&cwd.join("checkpoints.db").to_string_lossy())
         .map_err(|e| format!("创建 Checkpoint 存储失败: {}", e))?;
-    let agent = AgentCore::new(agent_config, harness, checkpoint, local_resources);
+    let agent = AgentCore::new(agent_config, harness, checkpoint, local_resources, metrics);
     // A1: safe_mode 激活时，抑制危险/未分类/外发工具的自动执行（需人工介入解除）。
     {
         let b = agent.boundary.lock().await;
