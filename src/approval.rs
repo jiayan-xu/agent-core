@@ -4,11 +4,12 @@
 //! 通过 A2A 向审批人发送审批请求，等待审批结果后再执行。
 
 use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 /// 审批状态
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ApprovalStatus {
     /// 等待审批
     Pending,
@@ -19,7 +20,7 @@ pub enum ApprovalStatus {
 }
 
 /// 待审批项
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingApproval {
     pub approval_id: String,
     pub tool_name: String,
@@ -62,18 +63,71 @@ pub struct ApprovalResponse {
 /// 审批管理器
 ///
 /// 跟踪发出去的审批请求和收到的审批结果。
+/// L2：支持 JSON 文件持久化（store_path），使人工审批跨 agent-core 重启不丢。
 pub struct ApprovalManager {
     /// 发出去的待审批请求（approval_id → PendingApproval）
     outgoing: Mutex<HashMap<String, PendingApproval>>,
     /// 收到的审批结果（approval_id → ApprovalResponse）
     responses: Mutex<HashMap<String, ApprovalResponse>>,
+    /// 持久化路径（None = 仅内存，不落盘）
+    store_path: Option<std::path::PathBuf>,
 }
 
 impl ApprovalManager {
+    /// 内存模式（测试 / 无持久化需求）
     pub fn new() -> Self {
+        Self::new_with_store(None)
+    }
+
+    /// 带持久化的审批管理器：启动即从 store_path 反序列化恢复 pending / responses，
+    /// 使人工审批跨 agent-core 重启不丢（用户可能重启后才回到审批台点批准）。
+    pub fn new_with_store(store_path: Option<std::path::PathBuf>) -> Self {
+        let mut outgoing: HashMap<String, PendingApproval> = HashMap::new();
+        let mut responses: HashMap<String, ApprovalResponse> = HashMap::new();
+        if let Some(path) = &store_path {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                    if let Some(arr) = v.get("outgoing").and_then(|x| x.as_array()) {
+                        for item in arr {
+                            if let Ok(p) = serde_json::from_value::<PendingApproval>(item.clone()) {
+                                outgoing.insert(p.approval_id.clone(), p);
+                            }
+                        }
+                    }
+                    if let Some(arr) = v.get("responses").and_then(|x| x.as_array()) {
+                        for item in arr {
+                            if let Ok(r) = serde_json::from_value::<ApprovalResponse>(item.clone()) {
+                                responses.insert(r.approval_id.clone(), r);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         ApprovalManager {
-            outgoing: Mutex::new(HashMap::new()),
-            responses: Mutex::new(HashMap::new()),
+            outgoing: Mutex::new(outgoing),
+            responses: Mutex::new(responses),
+            store_path,
+        }
+    }
+
+    /// 原子落盘：先写 .tmp 再 rename。序列化在持锁块内完成（Value 拥有数据，离开块即释放锁）。
+    async fn persist(&self) {
+        if let Some(path) = &self.store_path {
+            let payload = {
+                let outgoing = self.outgoing.lock().await;
+                let responses = self.responses.lock().await;
+                serde_json::json!({
+                    "outgoing": outgoing.values().collect::<Vec<_>>(),
+                    "responses": responses.values().collect::<Vec<_>>(),
+                })
+            };
+            if let Ok(s) = serde_json::to_string_pretty(&payload) {
+                let tmp = path.with_extension("tmp");
+                if std::fs::write(&tmp, &s).is_ok() {
+                    let _ = std::fs::rename(&tmp, path);
+                }
+            }
         }
     }
 
@@ -110,6 +164,8 @@ impl ApprovalManager {
                 operation_hash,
             },
         );
+        drop(outgoing);
+        self.persist().await;
 
         approval_id
     }
@@ -118,6 +174,8 @@ impl ApprovalManager {
     pub async fn record_response(&self, response: ApprovalResponse) {
         let mut responses = self.responses.lock().await;
         responses.insert(response.approval_id.clone(), response);
+        drop(responses);
+        self.persist().await;
     }
 
     /// 检查审批是否已完成
@@ -138,12 +196,15 @@ impl ApprovalManager {
         outgoing.get(approval_id).cloned()
     }
 
-    /// 获取所有 pending 的审批项
+    /// 获取所有 pending 的审批项（已收到响应/已决定的不列出，避免审批台重复处理）
     pub async fn list_pending(&self) -> Vec<PendingApproval> {
         let outgoing = self.outgoing.lock().await;
+        let responses = self.responses.lock().await;
         outgoing
             .values()
-            .filter(|a| a.status == ApprovalStatus::Pending)
+            .filter(|a| {
+                a.status == ApprovalStatus::Pending && !responses.contains_key(&a.approval_id)
+            })
             .cloned()
             .collect()
     }
@@ -152,6 +213,7 @@ impl ApprovalManager {
     pub async fn remove(&self, approval_id: &str) {
         self.outgoing.lock().await.remove(approval_id);
         self.responses.lock().await.remove(approval_id);
+        self.persist().await;
     }
 
     /// pending 数量

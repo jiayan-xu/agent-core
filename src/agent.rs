@@ -84,6 +84,8 @@ pub struct AgentConfig {
     pub system_prompt_template: Option<String>,
     /// P2-D: 审批人 ID（可选）。设置后 YELLOW 工具需经此人审批
     pub approver_id: Option<String>,
+    /// L2: 人工审批通道（真人兜底）。true 时 Red/dangerous 工具改走人工审批（暴露给 dashboard 审批台），不走 a2a 到 AI agent
+    pub human_approval: bool,
     /// PR5: 元进化配置（默认 enabled=false，受控开启）
     pub meta_evolution: crate::meta_evolve::MetaEvolutionConfig,
     /// PR5: 安全配置（含审批门控模式，默认 Auto 免人工审批）
@@ -385,7 +387,8 @@ impl AgentCore {
             audit_logger: AuditLogger::new(mcp_for_audit),
             tool_route_cache: tokio::sync::Mutex::new(HashMap::new()),
             namespace_registry: std::sync::Mutex::new(NamespaceRegistry::new()),
-            approval_manager: ApprovalManager::new(),
+            // L2：审批持久化（跨重启不丢）。落 cwd/approvals.json，原子写。
+            approval_manager: ApprovalManager::new_with_store(Some(cwd.join("approvals.json"))),
             checkpoint_store: Arc::new(tokio::sync::Mutex::new(checkpoint)),
             in_progress_plan: Arc::new(Mutex::new(None)),
             in_progress_step_results: Arc::new(Mutex::new(HashMap::new())),
@@ -812,6 +815,33 @@ impl AgentCore {
         // ── 0a. 工具级确认（现有）：pending_actions 中的操作等待确认 ──
         if is_confirm(trimmed) {
             if let Some(action) = self.session_manager.take_pending_action(session_id).await {
+                // L2 安全修复：若待确认操作需人工审批，必须先获得审批人批准，防用户自批绕过
+                if let Some(aid) = &action.approval_id {
+                    match self.approval_manager.check_response(aid).await {
+                        Some(resp) if resp.approved => {
+                            // 已批准，继续执行
+                        }
+                        Some(resp) => {
+                            let reason = resp.reason.clone().unwrap_or_default();
+                            let reply = format!("⛔ 该操作已被审批人拒绝：{}", reason);
+                            let ns = self.caller_ns(session_id);
+                            let db_path = self.harness.lock().await.db_path();
+                            self.session_manager
+                                .save_to_history(session_id, &ns, &db_path, message, &reply)
+                                .await;
+                            return reply;
+                        }
+                        None => {
+                            let reply = "⏳ 该操作仍在等待审批人决定，尚未批准，无法执行。".to_string();
+                            let ns = self.caller_ns(session_id);
+                            let db_path = self.harness.lock().await.db_path();
+                            self.session_manager
+                                .save_to_history(session_id, &ns, &db_path, message, &reply)
+                                .await;
+                            return reply;
+                        }
+                    }
+                }
                 let result = match self
                     .call_tool_routed(&action.tool_name, &self.persona_for_session(session_id), &action.arguments, allowed_ns, &trace_id)
                     .await
@@ -2046,6 +2076,46 @@ impl AgentCore {
                     // 危险/红线工具：无审批人时直接硬拒绝，不进入 LLM 下一轮
                     let is_dangerous = tool_level == "dangerous";
                     if check.level == Some(BlockLevel::Red) || is_dangerous {
+                        // L2 人工审批通道：human_approval 为真时改走 dashboard 审批台（HTTP 暴露），
+                        // 不走 a2a 到 AI agent（避免 AI 批 AI、真人无兜底）。
+                        if self.config.human_approval {
+                            let aid = self
+                                .approval_manager
+                                .create_request(
+                                    &tc.name,
+                                    &tc.arguments,
+                                    &check.reason,
+                                    "dashboard-admin", // 固定标识，由 dashboard 审批台经 HTTP 回执
+                                    &self.config.identity.agent_id,
+                                )
+                                .await;
+                            // P2-2: 审批创建事件（带 trace_id）
+                            self.audit_logger
+                                .approval_event(
+                                    "created",
+                                    &self.config.identity.agent_id,
+                                    &tc.name,
+                                    &check.reason,
+                                    trace_id,
+                                    Some(session_id),
+                                )
+                                .await;
+                            // P1-1: 记录待审批到 checkpoint（崩溃恢复后审批意图仍可见）
+                            let pa = PendingAction {
+                                tool_name: tc.name.clone(),
+                                arguments: tc.arguments.clone(),
+                                description: check.reason.clone(),
+                                approval_id: Some(aid.clone()),
+                            };
+                            self.checkpoint_pending_approval(session_id, &aid, &pa)
+                                .await;
+                            let reply = format!(
+                                "AWAITING_APPROVAL:危险/红线工具「{}」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续",
+                                tc.name
+                            );
+                            self.save_to_history(session_id, raw_message, &reply).await;
+                            return reply;
+                        }
                         if let Some(approver_id) = &self.config.approver_id {
                             let aid = self
                                 .approval_manager
@@ -2093,6 +2163,7 @@ impl AgentCore {
                                 tool_name: tc.name.clone(),
                                 arguments: tc.arguments.clone(),
                                 description: check.reason.clone(),
+                                approval_id: None,
                             };
                             self.checkpoint_pending_approval(session_id, &aid, &pa)
                                 .await;
@@ -2223,6 +2294,7 @@ impl AgentCore {
                             args
                         },
                         description: format!("{} ({})", tc.name, tc.arguments),
+                        approval_id: None,
                     };
                     self.session_manager
                         .set_pending_action(session_id, action)

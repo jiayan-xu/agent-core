@@ -25,6 +25,8 @@ pub struct PendingAction {
     pub tool_name: String,
     pub arguments: serde_json::Value,
     pub description: String,
+    /// 关联的审批请求 ID（人工审批通道）。Some 时续跑须先校验审批状态，防用户自批绕过。
+    pub approval_id: Option<String>,
 }
 
 /// 会话管理器
@@ -365,6 +367,7 @@ mod tests {
             tool_name: "query_plate".to_string(),
             arguments: serde_json::json!({"plate": "京A12345"}),
             description: "查询车牌".to_string(),
+            approval_id: None,
         };
         assert_eq!(action.tool_name, "query_plate");
         assert_eq!(action.description, "查询车牌");
@@ -407,6 +410,7 @@ mod tests {
             tool_name: "manage_whitelist".to_string(),
             arguments: serde_json::json!({"action": "add"}),
             description: "添加白名单".to_string(),
+            approval_id: None,
         };
         sm.set_pending_action("s1", action).await;
         assert!(sm.has_pending_action("s1").await);

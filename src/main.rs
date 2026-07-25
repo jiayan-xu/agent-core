@@ -14,11 +14,11 @@
 
 use agent_core::checkpoint::CheckpointStore;
 use axum::{
-    extract::{Extension, Request, State},
+    extract::{Extension, Path, Request, State},
     middleware::{from_fn_with_state, Next},
     response::{
         sse::{Event as SseEvent, Sse},
-        IntoResponse,
+        Html, IntoResponse, Response,
     },
     routing::{delete, get, post},
     Json, Router,
@@ -1357,7 +1357,10 @@ fn main() {
                 .route("/api/config", get(handle_config))
                 .route("/api/register", post(handle_register))
                 .route("/api/register_user", post(handle_register_user))
-                .route("/api/login", post(handle_login));
+                .route("/api/login", post(handle_login))
+                .route("/api/approval/pending", get(handle_approval_pending))
+                .route("/api/approval/{id}/respond", post(handle_approval_respond))
+                .route("/approval-console", get(handle_approval_console));
 
             let protected = Router::new()
                 .route("/api/chat", post(handle_chat))
@@ -2778,6 +2781,210 @@ async fn handle_collab_approval(
     }
 }
 
+// ─────────────────────────────────────────────────────────────
+// L2：人工审批台（真人兜底，危险/红线工具二次确认）
+// ─────────────────────────────────────────────────────────────
+
+/// 人工审批台页面（内嵌静态 HTML，浏览器打开后配合 admin key 使用）
+async fn handle_approval_console() -> Html<&'static str> {
+    Html(APPROVAL_CONSOLE_HTML)
+}
+
+/// 审批响应请求体（POST /api/approval/{id}/respond）
+#[derive(serde::Deserialize)]
+struct ApprovalRespondBody {
+    approved: bool,
+    #[serde(default)]
+    reason: Option<String>,
+    /// 创建时计算的操作指纹，必须回显一致，否则视为操作被偷换而拒绝。
+    operation_hash: String,
+}
+
+/// admin 判定：请求携带的 x-agent-key 是否等于配置的 admin key（MEMORIA_ADMIN_KEY）
+async fn is_admin(headers: &axum::http::HeaderMap, st: &Arc<AppState>) -> bool {
+    let cfg_admin = st.config.lock().await.memoria_admin_key.clone();
+    let admin_key = env_memoria_admin_key(&cfg_admin);
+    let key = headers
+        .get("x-agent-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    !admin_key.is_empty() && key == admin_key
+}
+
+/// 列出待人工审批项（仅 admin）
+async fn handle_approval_pending(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !is_admin(&headers, &st).await {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "需要 admin 权限"})),
+        )
+            .into_response();
+    }
+    let guard = st.agent.lock().await;
+    if let Some(ref agent) = *guard {
+        let list = agent.approval_manager.list_pending().await;
+        Json(serde_json::json!({ "count": list.len(), "items": list })).into_response()
+    } else {
+        Json(serde_json::json!({"error": "agent not ready"})).into_response()
+    }
+}
+
+/// 审批人（admin）对某项审批做出决定（批准/拒绝）；校验 operation_hash 防偷换
+async fn handle_approval_respond(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ApprovalRespondBody>,
+) -> Response {
+    if !is_admin(&headers, &st).await {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "需要 admin 权限"})),
+        )
+            .into_response();
+    }
+    let guard = st.agent.lock().await;
+    if let Some(ref agent) = *guard {
+        // 取回 pending，校验 operation_hash 与创建时一致（防 LLM/调用方偷换操作）
+        let pending = agent.approval_manager.get_pending(&id).await;
+        let expected_hash = match &pending {
+            Some(p) => p.operation_hash.clone(),
+            None => {
+                return (
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "审批项不存在或已处理"})),
+                )
+                    .into_response()
+            }
+        };
+        if body.operation_hash != expected_hash {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "operation_hash 不匹配，疑似操作被偷换，已拒绝"
+                })),
+            )
+                .into_response();
+        }
+        let approved = body.approved;
+        let resp = ApprovalResponse {
+            r#type: "approval_response".to_string(),
+            approval_id: id.clone(),
+            approved,
+            reason: body.reason.clone(),
+            approver_id: "dashboard-admin".to_string(),
+            operation_hash: expected_hash.clone(),
+        };
+        agent.approval_manager.record_response(resp).await;
+        // 审计：批准 / 拒绝事件
+        let decision = if approved { "approved" } else { "rejected" };
+        let tool_name = pending
+            .as_ref()
+            .map(|p| p.tool_name.clone())
+            .unwrap_or_default();
+        agent
+            .audit_logger
+            .approval_event(
+                decision,
+                &agent.config.identity.agent_id,
+                &tool_name,
+                &body.reason.clone().unwrap_or_default(),
+                "", // 审批台上下文无 trace_id，留空不影响解阻塞
+                None,
+            )
+            .await;
+        Json(serde_json::json!({ "ok": true, "decision": decision })).into_response()
+    } else {
+        Json(serde_json::json!({"error": "agent not ready"})).into_response()
+    }
+}
+
+/// 人工审批台内嵌 HTML（fetch 直连本 agent-core 的 /api/approval/* 端点）
+const APPROVAL_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>人工审批台</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #0f1115; color: #e6e6e6; }
+  header { padding: 16px 20px; background: #171a21; border-bottom: 1px solid #2a2f3a; display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 18px; margin: 0; }
+  .wrap { padding: 20px; max-width: 1000px; margin: 0 auto; }
+  .keybar { display: flex; gap: 8px; margin-bottom: 16px; }
+  .keybar input { flex: 1; padding: 8px 10px; background: #1c2029; border: 1px solid #2a2f3a; color: #e6e6e6; border-radius: 6px; }
+  button { cursor: pointer; border: none; border-radius: 6px; padding: 8px 14px; font-size: 14px; }
+  .btn-refresh { background: #3a6df0; color: #fff; }
+  .btn-approve { background: #2e9e5b; color: #fff; }
+  .btn-reject { background: #c5453b; color: #fff; }
+  .card { background: #171a21; border: 1px solid #2a2f3a; border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; }
+  .card h3 { margin: 0 0 6px; font-size: 15px; color: #ffd479; }
+  .meta { font-size: 12px; color: #9aa4b2; margin-bottom: 8px; }
+  pre { background: #0f1115; border: 1px solid #2a2f3a; border-radius: 6px; padding: 10px; overflow: auto; font-size: 12px; color: #cdd6e3; }
+  .actions { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
+  .actions input { flex: 1; padding: 6px 8px; background: #1c2029; border: 1px solid #2a2f3a; color: #e6e6e6; border-radius: 6px; }
+  .empty { color: #9aa4b2; text-align: center; padding: 40px; }
+  .err { color: #c5453b; }
+</style>
+</head>
+<body>
+<header><h1>人工审批台</h1><span style="color:#9aa4b2;font-size:13px">危险/红线工具二次确认 · 真人兜底</span></header>
+<div class="wrap">
+  <div class="keybar">
+    <input id="adminKey" type="password" placeholder="粘贴 admin key (MEMORIA_ADMIN_KEY)">
+    <button class="btn-refresh" onclick="load()">刷新待审</button>
+  </div>
+  <div id="list"><div class="empty">点击「刷新待审」加载待审批项</div></div>
+</div>
+<script>
+const API = "http://127.0.0.1:9753";
+async function load() {
+  const key = document.getElementById("adminKey").value;
+  const list = document.getElementById("list");
+  if (!key) { list.innerHTML = '<div class="empty err">请先填写 admin key</div>'; return; }
+  list.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const r = await fetch(API + "/api/approval/pending", { headers: { "x-agent-key": key } });
+    const j = await r.json();
+    if (!r.ok) { list.innerHTML = '<div class="empty err">' + (j.error || "加载失败") + '</div>'; return; }
+    if (!j.items || j.items.length === 0) { list.innerHTML = '<div class="empty">无待审批项</div>'; return; }
+    list.innerHTML = "";
+    for (const it of j.items) {
+      const div = document.createElement("div");
+      div.className = "card";
+      const args = JSON.stringify(it.arguments, null, 2);
+      div.innerHTML = '<h3>' + esc(it.tool_name) + '</h3>' +
+        '<div class="meta">ID: ' + esc(it.approval_id) + ' · 请求方: ' + esc(it.requester_id) + ' · 创建: ' + new Date(it.created_at*1000).toLocaleString() + '</div>' +
+        '<div class="meta">说明: ' + esc(it.description) + '</div>' +
+        '<div class="meta">指纹: ' + esc(it.operation_hash) + '</div>' +
+        '<pre>' + esc(args) + '</pre>' +
+        '<div class="actions"><input id="reason-' + esc(it.approval_id) + '" placeholder="审批意见（可选）">' +
+        '<button class="btn-approve" onclick="respond(\'' + esc(it.approval_id) + '\', \'' + esc(it.operation_hash) + '\', true)">批准</button>' +
+        '<button class="btn-reject" onclick="respond(\'' + esc(it.approval_id) + '\', \'' + esc(it.operation_hash) + '\', false)">拒绝</button></div>';
+      list.appendChild(div);
+    }
+  } catch (e) { list.innerHTML = '<div class="empty err">请求出错: ' + e + '</div>'; }
+}
+async function respond(id, hash, approved) {
+  const key = document.getElementById("adminKey").value;
+  const reason = document.getElementById("reason-" + id).value;
+  const r = await fetch(API + "/api/approval/" + encodeURIComponent(id) + "/respond", {
+    method: "POST",
+    headers: { "x-agent-key": key, "Content-Type": "application/json" },
+    body: JSON.stringify({ approved: approved, reason: reason || null, operation_hash: hash })
+  });
+  const j = await r.json();
+  if (r.ok && j.ok) { alert((approved ? "已批准" : "已拒绝") + ": " + id); load(); }
+  else { alert("失败：" + (j.error || "未知错误")); }
+}
+function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+</script>
+</body>
+</html>"##;
+
 /// 协作通讯录（GET /api/collab/peers）
 ///
 /// 返回同组织已注册 Agent 列表（经 admin 中继调 Memoria `agent_list`）。
@@ -3939,6 +4146,17 @@ async fn build_agent(
             ));
         }
     }
+    // L2：从 [safety] approval_mode 推导人工审批通道。
+    // HumanInLoop → 开启 human_approval（危险工具改走 dashboard 审批台，真人兜底），
+    // 审批人固定标识 dashboard-admin（由 dashboard 审批台经 HTTP 回执，非 AI agent，避免 AI 批 AI）。
+    let safety_cfg = config.safety.clone().unwrap_or_default();
+    let human_approval =
+        safety_cfg.approval_mode == agent_core::meta_evolve::ApprovalMode::HumanInLoop;
+    let approver_id = if human_approval {
+        Some("dashboard-admin".to_string())
+    } else {
+        None
+    };
     let agent_config = AgentConfig {
         identity,
         llm: llm_config,
@@ -3951,9 +4169,10 @@ async fn build_agent(
         compositional_preview: true, // P1-2: 企业默认开启计划预览（HITL）
         strict_schema: false,        // P1-4: 默认回灌 LLM 修正参数（非严格报错）
         system_prompt_template: None, // P2-3: 使用内置默认模板
-        approver_id: None,           // P2-D: 无审批人（保持现有行为）
+        approver_id,                 // L2: HumanInLoop → dashboard-admin 审批台
+        human_approval,              // L2: 人工审批通道（真人兜底）
         meta_evolution: config.meta_evolution.clone().unwrap_or_default(),
-        safety: config.safety.clone().unwrap_or_default(),
+        safety: safety_cfg,
         features: config.features.clone(),
         lats: config.lats.clone(),
         multiagent: config.multiagent.clone(),

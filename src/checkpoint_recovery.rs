@@ -64,6 +64,12 @@ pub async fn apply_checkpoint_recovery(
         CheckpointState::PendingApproval => {
             // 恢复待审批意图（审批结果需重新等待，但工具意图保留以便日志关联）
             if let Some(pa) = cp.payload.get("pending_action") {
+                // 一并恢复关联的审批请求 ID，使跨重启后审批台回执仍能解阻塞续跑门
+                let approval_id = cp
+                    .payload
+                    .get("approval_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let action = PendingAction {
                     tool_name: pa
                         .get("tool_name")
@@ -76,6 +82,7 @@ pub async fn apply_checkpoint_recovery(
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_string(),
+                    approval_id,
                 };
                 session_manager.set_pending_action(session_id, action).await;
             }
