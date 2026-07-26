@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tao::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
@@ -642,6 +642,24 @@ impl BackgroundEvent {
 struct Consciousness {
     state: Arc<AppState>,
     interrupt: Arc<tokio::sync::Notify>,
+    /// 白龙马 A2 深化：最近一次用户活动 unix 秒（interrupt 时刷新），驱动自适应 TICK 节奏。
+    /// 用 AtomicU64 避免 Arc<Self> 内部可变性的锁开销（interrupt 与 run 并发访问）。
+    last_activity_secs: AtomicU64,
+}
+
+/// 读 env 并解析为给定类型，失败/缺失回退 default（仅用于整数类配置）。
+fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<T>().ok())
+        .unwrap_or(default)
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl Consciousness {
@@ -649,25 +667,44 @@ impl Consciousness {
         Arc::new(Self {
             state,
             interrupt: Arc::new(tokio::sync::Notify::new()),
+            last_activity_secs: AtomicU64::new(now_unix_secs()),
         })
     }
 
-    /// 用户消息到达 → 打断在途 tick（等价白龙马 AbortController.abort）
+    /// 用户消息到达 → 打断在途 tick（等价白龙马 AbortController.abort），并刷新活动时间戳。
     fn interrupt(&self) {
+        self.last_activity_secs.store(now_unix_secs(), Ordering::SeqCst);
         self.interrupt.notify_one();
     }
 
     async fn run(self: Arc<Self>) {
-        let mut tick = tokio::time::interval(Duration::from_secs(20 * 60)); // 空闲默认 20 分钟
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tracing::info!("consciousness: TICK 循环启动（空闲 20min / 抢占 / 600s watchdog）");
+        // 白龙马 A2 深化：自适应节奏（env 可配，默认向后兼容）
+        // - AGENT_TICK_IDLE_SEC：无近期活动时空闲节奏（默认 1200s=20min）
+        // - AGENT_TICK_ACTIVE_WINDOW_SEC：用户活动窗口（默认 600s）；窗口内下一跳缩到 min(idle, 120s)
+        // - 活跃期下限 120s：避免对话密集时 tick 过频挤占响应
+        let idle_sec: u64 = env_parse("AGENT_TICK_IDLE_SEC", 1200);
+        let active_window_sec: u64 = env_parse("AGENT_TICK_ACTIVE_WINDOW_SEC", 600);
+        let fast_sec: u64 = 120;
+        tracing::info!(
+            target: "consciousness",
+            idle_sec, active_window_sec, fast_sec,
+            "consciousness: TICK 循环启动（自适应节奏 / 抢占 / 600s watchdog）"
+        );
         loop {
+            // 计算下一跳：最近有用户活动 → 加速；否则按 idle 节奏
+            let since = now_unix_secs().saturating_sub(self.last_activity_secs.load(Ordering::SeqCst));
+            let next_sec = if since < active_window_sec {
+                idle_sec.min(fast_sec)
+            } else {
+                idle_sec
+            };
+            let sleep = tokio::time::sleep(Duration::from_secs(next_sec));
             tokio::select! {
                 _ = self.interrupt.notified() => {
                     tracing::info!("consciousness: 收到抢占信号（用户消息在途），跳过本轮空闲 tick");
                     continue;
                 }
-                _ = tick.tick() => {}
+                _ = sleep => {}
             }
             let st = self.state.clone();
             let intr = self.interrupt.clone();
@@ -693,12 +730,13 @@ impl Consciousness {
         // 1) 静默心跳（更新内部状态，不回复用户）—— A2 原始语义
         agent.run_idle_tick().await;
 
-        // 2) A4: round-robin consolidation（对齐白龙马每 30min 一个实体；我方按 ns 推进）
-        if let Some(ev) = Self::consolidate_round_robin(state, agent).await {
+        // 2) A4 深化: round-robin consolidation（每 tick 可推进 K 个 namespace）
+        let events = Self::consolidate_round_robin(state, agent).await;
+        for ev in events {
             Self::emit_event(state, ev).await;
         }
 
-        // 3) 主动预取实验（guarded，默认关）
+        // 3) 主动预取（深化：默认在线探针；exec 需显式开）
         if let Some(ev) = Self::guarded_prefetch(agent).await {
             Self::emit_event(state, ev).await;
         }
@@ -709,9 +747,9 @@ impl Consciousness {
         }
     }
 
-    /// A4: 空闲 tick 推进一个 namespace 的 consolidation（round-robin 游标）
-    /// 对齐白龙马 consolidation-loop.js：每轮只处理一个候选，游标内存态不持久化。
-    async fn consolidate_round_robin(state: &AppState, agent: &AgentCore) -> Option<BackgroundEvent> {
+    /// A4 深化: 空闲 tick 推进 K 个 namespace 的 consolidation（round-robin 游标）
+    /// 对齐白龙马 consolidation-loop.js：每轮按 `AGENT_CONSOLIDATE_PER_TICK`（默认 1，封顶 ns 数）推进，游标内存态不持久化。
+    async fn consolidate_round_robin(state: &AppState, agent: &AgentCore) -> Vec<BackgroundEvent> {
         let default_ns = format!("agent/{}", agent.config.identity.agent_id);
         let ns_list: Vec<String> = std::env::var("CONSOLIDATE_NAMESPACES")
             .unwrap_or_else(|_| default_ns.clone())
@@ -720,71 +758,82 @@ impl Consciousness {
             .filter(|s| !s.is_empty())
             .collect();
         if ns_list.is_empty() {
-            return None;
+            return Vec::new();
         }
-        let idx = {
-            let mut c = state.consolidate_cursor.lock().await;
-            let i = *c % ns_list.len();
-            *c = *c + 1;
-            i
-        };
-        let ns = &ns_list[idx];
-        tracing::info!(target: "consciousness", ns = %ns, cursor = idx, "A4: 空闲 tick 推进 consolidation round-robin");
-        // 内层预算超时（外层 TICK 已有 600s watchdog），避免单次 consolidate 卡住整轮
-        let res = tokio::time::timeout(Duration::from_secs(300), agent.consolidate(ns)).await;
-        match res {
-            Ok(summary) => {
-                let summary = format!("consolidate[{}]: {}", ns, summary);
-                tracing::info!(target: "consciousness", "{}", summary);
-                Some(BackgroundEvent::new("consolidate", summary))
-            }
-            Err(_) => {
-                tracing::warn!(target: "consciousness_watchdog", ns = %ns, "A4: consolidate 超时(>300s)跳过");
-                None
+        let per_tick: usize = env_parse("AGENT_CONSOLIDATE_PER_TICK", 1).clamp(1, ns_list.len());
+        let mut out = Vec::with_capacity(per_tick);
+        for _ in 0..per_tick {
+            let idx = {
+                let mut c = state.consolidate_cursor.lock().await;
+                let i = *c % ns_list.len();
+                *c = *c + 1;
+                i
+            };
+            let ns = &ns_list[idx];
+            tracing::info!(target: "consciousness", ns = %ns, cursor = idx, "A4: 空闲 tick 推进 consolidation round-robin");
+            // 内层预算超时（外层 TICK 已有 600s watchdog），避免单次 consolidate 卡住整轮
+            let res = tokio::time::timeout(Duration::from_secs(300), agent.consolidate(ns)).await;
+            match res {
+                Ok(summary) => {
+                    let summary = format!("consolidate[{}]: {}", ns, summary);
+                    tracing::info!(target: "consciousness", "{}", summary);
+                    out.push(BackgroundEvent::new("consolidate", summary));
+                }
+                Err(_) => {
+                    tracing::warn!(target: "consciousness_watchdog", ns = %ns, "A4: consolidate 超时(>300s)跳过");
+                }
             }
         }
+        out
     }
 
-    /// 主动预取实验（对齐白龙马死代码 cron 预热的反面：只探测工具可用性，不预执行业务数据）
-    /// 默认关闭；AGENT_PRETEST=1 才识别候选，AGENT_PRETEST_EXEC=1 才实际 dummy 调用（默认关）。
+    /// 主动预取实验（深化：默认在线探针）
+    /// 对齐白龙马死代码 cron 预热的反面：识别「只读 + 无必填参数」的候选工具并发事件，不预执行业务数据。
+    /// 默认开启（AGENT_PRETEST=0/false 才关）；AGENT_PRETEST_EXEC=1 才实际 dummy 调用（默认关）。
     async fn guarded_prefetch(agent: &AgentCore) -> Option<BackgroundEvent> {
+        // 深化：默认开启探针；仅 AGENT_PRETEST=0/false 才彻底关闭
         let enabled = std::env::var("AGENT_PRETEST")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
         if !enabled {
             return None;
         }
         let allowed_ns: Vec<String> = vec![format!("agent/{}", agent.config.identity.agent_id)];
         let tools = agent.fetch_tools_filtered(&allowed_ns).await;
-        // 选第一个「只读 + 无必填参数」的工具做 liveness probe
-        let candidate = tools.iter().find(|t| {
-            let name = t.function.name.as_str();
-            if !agent_core::boundary::is_read_only_tool(name) {
-                return false;
-            }
-            let required = t.function.parameters.get("required").and_then(|r| r.as_array());
-            match required {
-                None => true,
-                Some(arr) => arr.is_empty(),
-            }
-        });
-        let Some(tool) = candidate else {
+        // 收集至多 5 个「只读 + 无必填参数」的工具做 liveness probe 候选
+        let mut candidates: Vec<String> = tools
+            .iter()
+            .filter(|t| {
+                let name = t.function.name.as_str();
+                if !agent_core::boundary::is_read_only_tool(name) {
+                    return false;
+                }
+                let required = t.function.parameters.get("required").and_then(|r| r.as_array());
+                match required {
+                    None => true,
+                    Some(arr) => arr.is_empty(),
+                }
+            })
+            .map(|t| t.function.name.clone())
+            .take(5)
+            .collect();
+        if candidates.is_empty() {
             tracing::info!(target: "consciousness", "guarded_prefetch: 无合适只读候选工具");
             return None;
-        };
-        let tool_name = tool.function.name.clone();
+        }
         let exec = std::env::var("AGENT_PRETEST_EXEC")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         if !exec {
             let summary = format!(
                 "prefetch[probe]: 候选只读工具={}（未实际调用，AGENT_PRETEST_EXEC 未开）",
-                tool_name
+                candidates.join(", ")
             );
             tracing::info!(target: "consciousness", "{}", summary);
             return Some(BackgroundEvent::new("prefetch", summary));
         }
-        // 实际 dummy 调用（仅无副作用的空参 READ 工具），带 60s 预算
+        // 实际 dummy 调用（仅无副作用的空参 READ 工具），带 60s 预算（取首个候选）
+        let tool_name = candidates.remove(0);
         let trace_id = format!("prefetch-{}", Local::now().timestamp());
         let call = tokio::time::timeout(
             Duration::from_secs(60),
