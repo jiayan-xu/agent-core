@@ -100,6 +100,8 @@ pub struct AgentConfig {
     pub multiagent: crate::multiagent::MultiAgentConfig,
     /// HY3 TTC：推理时计算配置（仅 features.ttc=true 时生效）
     pub ttc: crate::ttc::TtcConfig,
+    /// 摄入侧治本过滤（opt-in）：测试命名空间隔离 / A2A 回执丢弃 / 对话实质筛选
+    pub intake_filter: crate::intake_filter::IntakeFilterConfig,
 }
 
 /// HY3 1.3 热路径接线开关。全部默认 false。
@@ -119,6 +121,10 @@ pub struct FeatureFlags {
     /// HY3 TTC：推理时计算（终答自一致性 + 预算感知采样）
     #[serde(default)]
     pub ttc: bool,
+    /// 分身在「完成任务（执行过工具）」后，将策展结论写入其专属命名空间 `agent/{pid}`。
+    /// 默认 false；开启后仅在分身会话且本轮回合确实执行了工具时写入，避免闲聊污染（消防水带）。
+    #[serde(default)]
+    pub persona_auto_memory: bool,
 }
 
 /// 白龙马 A3：Focus Stack → Thread 模型
@@ -1930,6 +1936,9 @@ impl AgentCore {
             .cloned()
             .unwrap_or_else(|| self.caller_ns(session_id));
 
+        // 本请求是否执行过工具（分身策展记忆门控：只记「做了事」的任务，不记闲聊）
+        let mut did_work = false;
+
         for _round in 0..self.config.max_tool_rounds {
             // P2-1: 日 token 预算预估（请求上下文体量），超限硬拒
             let ctx_chars: usize = messages
@@ -1968,6 +1977,8 @@ impl AgentCore {
                     return "⚠️ LLM 服务暂时不可用（已尝试主用与备用 Provider 均失败）。请稍后重试，或检查网络与 API 密钥配置。".to_string();
                 }
             };
+            // 标记本轮回合是否执行了工具（用于分身策展记忆门控）
+            did_work |= !response.tool_calls.is_empty();
             // P2-1: 记录本次 token 消耗（请求 + 响应估算），跨天自动重置
             let resp_est = (response.text.len() as u64) / 4;
             self.quota
@@ -2003,29 +2014,27 @@ impl AgentCore {
                     }
                     reply = chosen.text;
                 }
-                // 保存对话
-                let _ = self
-                    .mcp
-                    .call(
-                        "memory_observe",
-                        &serde_json::json!({
-                            "dialog": raw_message, "role": "user",
-                            "source": format!("user:{}", user_id), "session_id": session_id,
-                            "namespace": self.caller_ns(session_id),
-                        }),
-                    )
-                    .await;
-                let _ = self
-                    .mcp
-                    .call(
-                        "memory_observe",
-                        &serde_json::json!({
-                            "dialog": &reply, "role": "assistant",
-                            "source": &self.config.identity.agent_id, "session_id": session_id,
-                            "namespace": self.caller_ns(session_id),
-                        }),
-                    )
-                    .await;
+                // 保存对话（摄入过滤：测试 ns / A2A 回执 / 非实质对话 在源头拦截）
+                self.observe_filtered(
+                    raw_message,
+                    "user",
+                    &format!("user:{}", user_id),
+                    session_id,
+                    &self.caller_ns(session_id),
+                )
+                .await;
+                self.observe_filtered(
+                    &reply,
+                    "assistant",
+                    &self.config.identity.agent_id,
+                    session_id,
+                    &self.caller_ns(session_id),
+                )
+                .await;
+                // 分身在「执行过工具」的任务完成后，写策展记忆到其专属 ns
+                if did_work {
+                    self.maybe_persona_task_memory(session_id, raw_message, &reply).await;
+                }
                 // 保存到内存缓存
                 self.save_to_history(session_id, raw_message, &reply).await;
                 return reply;
@@ -2335,11 +2344,124 @@ impl AgentCore {
         match self.llm.chat(&messages, &[]).await {
             Ok(r) => {
                 let reply = r.text;
+                // 分身在「执行过工具」的任务完成后，写策展记忆到其专属 ns
+                self.maybe_persona_task_memory(session_id, raw_message, &reply).await;
                 // 保存到内存缓存（工具调用后的总结也需要保存）
                 self.save_to_history(session_id, raw_message, &reply).await;
                 reply
             }
             Err(e) => format!("LLM 总结失败: {}", e),
+        }
+    }
+
+    /// 分身在完成任务（本请求执行过工具）后，将策展结论写入其专属命名空间 `agent/{pid}`。
+    ///
+    /// 摄入过滤封装：在写入 Memoria `memory_observe` 前拦截噪声（opt-in）。
+    /// 三个子开关由 `config.intake_filter` 控制；全部关闭时等价于原 `memory_observe` 行为。
+    async fn observe_filtered(
+        &self,
+        dialog: &str,
+        role: &str,
+        source: &str,
+        session_id: &str,
+        namespace: &str,
+    ) {
+        let cfg = &self.config.intake_filter;
+        if cfg.active(cfg.dialog_substance)
+            && !crate::intake_filter::is_substantial(dialog, cfg.min_substance_len)
+        {
+            tracing::info!(target = "intake_filter", "跳过非实质对话捕获 role={} ns={}", role, namespace);
+            return;
+        }
+        if cfg.active(cfg.a2a_receipt_drop) && crate::intake_filter::is_auto_receipt(dialog) {
+            tracing::info!(target = "intake_filter", "跳过 A2A 回执捕获 role={} ns={}", role, namespace);
+            return;
+        }
+        if cfg.active(cfg.test_ns_isolation) && crate::intake_filter::is_test_namespace(namespace) {
+            tracing::info!(target = "intake_filter", "跳过测试命名空间对话捕获 ns={}", namespace);
+            return;
+        }
+        // 写入：firehose 走 admin 鉴权客户端。self.mcp 以 agent_id="user" + 空 badge_token 构造，
+        // 而 memoria 的 admin 密钥仅与 X-Agent-Id:"admin" 配对生效（其余身份配同 key 一律 -32001），
+        // 直接用 self.mcp 会导致未授权写入静默失败（捕获路径形同死亡）。这里与 maybe_persona_task_memory
+        // 一致：用 admin 身份 + 环境变量密钥写入，确保「捕获真实对话、过滤噪声」真正生效。
+        let badge = std::env::var("MEMORIA_JARVIS_BADGE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("MEMORIA_ADMIN_KEY").ok())
+            .unwrap_or_default();
+        if badge.is_empty() {
+            tracing::warn!(target = "intake_filter", "跳过对话捕获：未配置 MEMORIA_JARVIS_BADGE / MEMORIA_ADMIN_KEY");
+            return;
+        }
+        let client = McpClient::new(&self.config.memoria_url, "admin", &badge);
+        match client
+            .call_json(
+                "memory_observe",
+                &serde_json::json!({
+                    "dialog": dialog, "role": role,
+                    "source": source, "session_id": session_id,
+                    "namespace": namespace,
+                }),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => tracing::warn!(target = "intake_filter", "对话捕获写入失败: {}", e),
+        }
+    }
+
+    /// 门控（三重，防消防水带）：
+    /// 1. `features.persona_auto_memory` 开启（默认 false，opt-in）；
+    /// 2. 当前是分身会话（`persona_for_session != "default"`，主用户不走此路）；
+    /// 3. 调用方已通过 `did_work` 判定本请求确实执行过工具（闲聊/纯问答不写）。
+    ///
+    /// 以 admin/jarvis 身份跨 ns 写（与 `consolidate` 一致），忽略错误（失败只告警，不阻断终答）。
+    async fn maybe_persona_task_memory(&self, session_id: &str, goal: &str, result: &str) {
+        if !self.config.features.persona_auto_memory {
+            return;
+        }
+        let pid = self.persona_for_session(session_id);
+        if pid == "default" {
+            return; // 仅分身会话
+        }
+        let ns = format!("agent/{}", pid);
+        // 摄入过滤 Filter1：测试/实验分身命名空间不写任务记忆（避免 lme_*/pm_*/agent/rt* 污染）
+        if self
+            .config
+            .intake_filter
+            .active(self.config.intake_filter.test_ns_isolation)
+            && crate::intake_filter::is_test_namespace(&ns)
+        {
+            tracing::info!(pid = %pid, ns = %ns, "分身任务记忆跳过：测试命名空间（摄入过滤）");
+            return;
+        }
+        let goal_s: String = goal.chars().take(500).collect();
+        let result_s: String = result.chars().take(1500).collect();
+        let content = format!("[persona task | {}]\n目标：{}\n结果：{}", pid, goal_s, result_s);
+        let args = serde_json::json!({
+            "content": content,
+            "category": "persona_task",
+            "tags": ["persona", &pid],
+            "confidence": 80,
+            "namespace": ns,
+        });
+        // 跨 ns 写客户端：memoria 的 admin 密钥仅与 X-Agent-Id:"admin" 配对生效
+        // （verify01/jarvis 等身份配同一密钥会 -32001 拒绝，已实测）。
+        // 密钥只从环境变量取，绝不硬编码；无密钥则跳过，不阻断终答。
+        let badge = std::env::var("MEMORIA_JARVIS_BADGE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("MEMORIA_ADMIN_KEY").ok())
+            .unwrap_or_default();
+        if badge.is_empty() {
+            tracing::warn!(pid = %pid, ns = %ns, "分身任务记忆跳过：未配置 MEMORIA_JARVIS_BADGE / MEMORIA_ADMIN_KEY");
+            return;
+        }
+        let client = McpClient::new(&self.config.memoria_url, "admin", &badge);
+        match client.call_json("memory_remember", &args).await {
+            Ok(_) => tracing::info!(pid = %pid, ns = %ns, "分身任务记忆已写入 Memoria"),
+            Err(e) => tracing::warn!(pid = %pid, ns = %ns, "分身任务记忆写入失败: {}", e),
         }
     }
 
@@ -3174,6 +3296,42 @@ impl AgentCore {
                             );
                             // 降级：继续走下方单次原样写入，不阻塞
                         }
+                    }
+                }
+            }
+        }
+
+        // ── Intake Filter（摄入侧治本）：写入前拦截测试命名空间 / A2A 回执 ──
+        let if_cfg = &self.config.intake_filter;
+        if (tool_name == "memory_remember" || tool_name == "memory")
+            && (if_cfg.active(if_cfg.test_ns_isolation) || if_cfg.active(if_cfg.a2a_receipt_drop))
+        {
+            // Filter1：测试/实验命名空间隔离（丢弃或重定向到隔离 ns）
+            if if_cfg.active(if_cfg.test_ns_isolation) {
+                let ns = call_args
+                    .get("namespace")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+                if let Some(ns) = ns {
+                    match crate::intake_filter::resolve_ns(&ns, if_cfg) {
+                        None => {
+                            tracing::info!(target = "intake_filter", "丢弃测试命名空间 memory_remember ns={}", ns);
+                            return Ok("{\"status\":\"filtered\",\"reason\":\"test_namespace\"}".to_string());
+                        }
+                        Some(redir) if redir != ns => {
+                            call_args["namespace"] = serde_json::json!(redir.clone());
+                            tracing::info!(target = "intake_filter", "测试命名空间重定向 ns={} -> {}", ns, redir);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Filter2：A2A 自动回执丢弃
+            if if_cfg.active(if_cfg.a2a_receipt_drop) {
+                if let Some(content) = call_args.get("content").and_then(|x| x.as_str()) {
+                    if crate::intake_filter::is_auto_receipt(content) {
+                        tracing::info!(target = "intake_filter", "丢弃 A2A 回执 memory_remember");
+                        return Ok("{\"status\":\"filtered\",\"reason\":\"a2a_receipt\"}".to_string());
                     }
                 }
             }

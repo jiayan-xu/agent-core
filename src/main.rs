@@ -104,6 +104,9 @@ struct Config {
     /// HY3 TTC 推理时计算配置（缺省全默认：enabled=false）
     #[serde(default)]
     ttc: agent_core::ttc::TtcConfig,
+    /// 摄入侧治本过滤（落 [intake_filter]，缺省全默认：enabled=false，opt-in）
+    #[serde(default)]
+    intake_filter: Option<agent_core::intake_filter::IntakeFilterConfig>,
 }
 
 /// Phase 7：代码自我进化引擎配置
@@ -1048,6 +1051,7 @@ fn load_or_create_config() -> Config {
         lats: Default::default(),
         multiagent: Default::default(),
         ttc: Default::default(),
+        intake_filter: None,
     };
     let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());
     cfg
@@ -4177,6 +4181,7 @@ async fn build_agent(
         lats: config.lats.clone(),
         multiagent: config.multiagent.clone(),
         ttc: config.ttc.clone(),
+        intake_filter: config.intake_filter.clone().unwrap_or_default(),
     };
     // A1 (OpenClaw 吸收): 记录启动并判定是否进入 safe_mode（崩溃循环保护）。
     // 返回 (启动记录 id, 是否需抑制危险/未分类/外发工具自动执行)。

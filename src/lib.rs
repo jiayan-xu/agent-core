@@ -31,3 +31,4 @@ pub mod multiagent; // HY3 1.3：MultiAgent Compose 子 agent 派发（flag 默�
 pub mod ttc; // HY3 TTC：推理时计算（终答自一致性 + 预算感知采样，flag 默认 OFF）
 pub mod metrics; // 战略罗盘「可观测」：运行指标层（原子计数 + /api/metrics 快照，默认开启）
 pub mod evolution_audit; // HY3 1.3 收口：记忆自进化生产证据审计（本地 JSONL 落盘，可复验）
+pub mod intake_filter; // 摄入侧治本过滤：测试命名空间隔离 / A2A 回执丢弃 / 对话实质筛选
