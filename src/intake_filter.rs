@@ -65,7 +65,11 @@ pub fn is_test_namespace(ns: &str) -> bool {
     if l.starts_with("agent/rt") {
         return true;
     }
-    if l.contains("_test_") || l.starts_with("test_") || l.ends_with("_test") {
+    // 收紧（B 批防误伤）：仅匹配「test 作为整体前缀 / 后缀 / 裸命名空间」的情形，
+    // 不再用 contains("_test_") 做子串匹配——否则 `agent/proj_test_scripts` 这类真实命名空间
+    // 会被误判为测试件，在 quarantine_ns 为空时静默丢弃（数据丢失）。
+    // 偏向「不误删」：宁让少量测试噪声进入（可后清理），也不静默丢掉真实记忆。
+    if l.starts_with("test_") || l.ends_with("_test") || bare == "test" {
         return true;
     }
     false

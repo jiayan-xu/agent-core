@@ -3845,7 +3845,11 @@ async fn handle_register(
     }
 
     // 审计日志：记录身份注册
-    let audit = AuditLogger::new(McpClient::new(&server, &actor, &jarvis_badge));
+    // P0 修复：审计写入 Memoria 走 memory_observe（admin-only），必须用 "admin" 身份 + admin badge。
+    // 原用注册者自身 actor（如 user/jarvis）+ jarvis_badge，Memoria 一律 -32001 → 审计静默丢失
+    // （audit.rs:215 用 `let _ =` 吞错）。与 firehose 修复（agent.rs:2397/2461）同范式：
+    // badge = MEMORIA_JARVIS_BADGE || MEMORIA_ADMIN_KEY。
+    let audit = AuditLogger::new(McpClient::new(&server, "admin", &jarvis_badge));
     audit
         .log_identity(
             &agent_id,
