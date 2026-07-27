@@ -990,6 +990,21 @@ impl ToolClassifier {
             "execute_sql",
             "fuzzy_match_plate",
             "fuzzy_match_indicator",
+            // Memoria 只读：前缀 memory_ 不在 query_/search_/get_ 启发式内，必须显式列入
+            "memory_search",
+            "memory_search_v2",
+            "memory_recall",
+            "memory_profile",
+            "memory_context",
+            "memory_user_prefs",
+            "memory_recent_decisions",
+            "memory_health",
+            "memory_quota_status",
+            "dream_state_get",
+            "db_stats",
+            "audit_query",
+            "entity_search",
+            "memory_graph",
         ] {
             c.read_tools.insert(t.to_string());
         }
@@ -1005,6 +1020,14 @@ impl ToolClassifier {
             // PR4 Phase A 演化：写回 evolved_context / 回滚演化（Memoria 哑存储写操作）
             "memory_evolve",
             "evolution_rollback",
+            // Memoria 常规写入（非删库级危险）
+            "memory_remember",
+            "memory",
+            "memory_observe",
+            "dream_state_update",
+            "entity_upsert",
+            "entity_add_mention",
+            "entity_add_edge",
         ] {
             c.write_tools.insert(t.to_string());
         }
@@ -1013,6 +1036,10 @@ impl ToolClassifier {
             "batch_update_whitelist",
             "shutdown_agent",
             "batch_delete_memories",
+            "memory_merge",
+            "memory_decay",
+            "memory_import",
+            "memory_export",
         ] {
             c.dangerous_tools.insert(t.to_string());
         }
@@ -1119,12 +1146,58 @@ pub fn is_dangerous_tool(name: &str) -> bool {
     ToolClassifier::new().classify(name) == "dangerous"
 }
 
+/// Memoria MCP 工具分级（精确名）。`None` = 非具名 Memoria 工具，走通用前缀启发式。
+fn classify_memoria_tool(name: &str) -> Option<&'static str> {
+    match name {
+        "memory_search"
+        | "memory_search_v2"
+        | "memory_recall"
+        | "memory_profile"
+        | "memory_context"
+        | "memory_user_prefs"
+        | "memory_recent_decisions"
+        | "memory_health"
+        | "memory_quota_status"
+        | "dream_state_get"
+        | "db_stats"
+        | "audit_query"
+        | "entity_search"
+        | "memory_graph"
+        | "get_allowed_ns"
+        | "agent_list"
+        | "skill_market_list_installed"
+        | "skill_market_search"
+        | "skill_market_info" => Some("read"),
+        "memory_remember"
+        | "memory"
+        | "memory_observe"
+        | "dream_state_update"
+        | "memory_evolve"
+        | "evolution_rollback"
+        | "entity_upsert"
+        | "entity_add_mention"
+        | "entity_add_edge"
+        | "a2a_send"
+        | "a2a_recv"
+        | "register_agent"
+        | "skill_market_publish"
+        | "skill_market_install" => Some("write"),
+        "memory_merge"
+        | "memory_decay"
+        | "memory_import"
+        | "memory_export"
+        | "batch_delete_memories"
+        | "agent_revoke" => Some("dangerous"),
+        _ => None,
+    }
+}
+
 /// 判断工具是否「纯只读」——可不经用户确认直接自动执行。
 ///
 /// 与 `ToolClassifier::register_from_tools` 的只读判定保持一致的前缀逻辑：
 /// 仅 `query_` / `search_` / `get_` / `check_` / `read_` / `list_` / `fuzzy_match_` /
 /// `match_` / `review_` / `diagnose_` / `explain_` / `validate_` / `cross_` 前缀，
-/// 以及仅 SELECT 的 SQL 工具判为只读。
+/// 以及仅 SELECT 的 SQL 工具判为只读；另含具名 Memoria 只读工具。
 ///
 /// 命中写/危险前缀（`delete_` / `batch_delete` / `shutdown_` / `update_` / `insert_` /
 /// `create_`）或无法判定为只读的工具一律返回 `false`，走确认闸 / 黄线确认，
@@ -1133,6 +1206,12 @@ pub fn is_dangerous_tool(name: &str) -> bool {
 /// 注意：这里用前缀启发式而非 `ToolClassifier::new()` 实例——后者是空分类器，
 /// 不含 `register_from_tools` 学到的前缀，会把 `query_today` 之类误判为 unknown。
 pub fn is_read_only_tool(name: &str) -> bool {
+    if matches!(classify_memoria_tool(name), Some("read")) {
+        return true;
+    }
+    if matches!(classify_memoria_tool(name), Some("write") | Some("dangerous")) {
+        return false;
+    }
     let lower = name.to_lowercase();
     // 写 / 危险前缀：永远需要确认，绝不自动执行
     if lower.starts_with("delete_")
@@ -1181,9 +1260,24 @@ mod read_only_tests {
             "list_vehicles",
             "fuzzy_match_plate",
             "execute_sql",
+            "memory_recall",
+            "memory_search",
+            "memory_profile",
+            "memory_context",
         ] {
             assert!(is_read_only_tool(t), "应为只读: {}", t);
         }
+    }
+
+    #[test]
+    fn memoria_tools_classified() {
+        let c = ToolClassifier::new();
+        assert_eq!(c.classify("memory_recall"), "read");
+        assert_eq!(c.classify("memory_search_v2"), "read");
+        assert_eq!(c.classify("memory_remember"), "write");
+        assert_eq!(c.classify("memory_merge"), "dangerous");
+        assert!(!is_read_only_tool("memory_remember"));
+        assert!(!is_read_only_tool("memory_merge"));
     }
 
     #[test]
@@ -1196,6 +1290,7 @@ mod read_only_tests {
             "batch_delete_memories",
             "shutdown_agent",
             "fill_excel_log",
+            "memory_remember",
         ] {
             assert!(!is_read_only_tool(t), "不应为只读: {}", t);
         }

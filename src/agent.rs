@@ -36,6 +36,26 @@ fn resolve_memoria_admin_key() -> String {
         .unwrap_or_default()
 }
 
+/// 系统维护用 Memoria 客户端：身份与密钥必须配对。
+/// - `MEMORIA_ADMIN_KEY` → `X-Agent-Id: admin`
+/// - 否则 `MEMORIA_JARVIS_BADGE` → `X-Agent-Id: jarvis`
+/// - 都缺则回退调用方已有 mcp（通常是聊天身份，可能无跨 ns 权）
+fn memoria_maintenance_client(memoria_url: &str, fallback: &McpClient) -> McpClient {
+    if let Some(key) = std::env::var("MEMORIA_ADMIN_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return McpClient::new(memoria_url, "admin", &key);
+    }
+    if let Some(badge) = std::env::var("MEMORIA_JARVIS_BADGE")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return McpClient::new(memoria_url, "jarvis", &badge);
+    }
+    fallback.clone()
+}
+
 /// Agent 身份
 #[derive(Debug, Clone)]
 pub struct AgentIdentity {
@@ -2070,6 +2090,8 @@ impl AgentCore {
                     &self.caller_ns(session_id),
                 )
                 .await;
+                // 肯定/硬规则强触发 → preference 落盘（不依赖 LLM 抽取）
+                self.maybe_strong_pref_capture(session_id, raw_message).await;
                 self.observe_filtered(
                     &reply,
                     "assistant",
@@ -2454,6 +2476,82 @@ impl AgentCore {
             Ok(_) => {}
             Err(e) => tracing::warn!(target = "intake_filter", "对话捕获写入失败: {}", e),
         }
+    }
+
+    /// 用户强触发（请记住 / 硬性要求 / 以后都按…）→ `category=preference` 落盘。
+    async fn maybe_strong_pref_capture(&self, session_id: &str, user_msg: &str) {
+        let Some((content, tag)) = crate::pref_write::strong_pref_trigger(user_msg) else {
+            return;
+        };
+        let ns = self.caller_ns(session_id);
+        match self
+            .remember_opinion(&ns, &content, "preference", &[tag], 5)
+            .await
+        {
+            Ok(id) => tracing::info!(
+                target = "pref_write",
+                ns = %ns,
+                tag = tag,
+                id = %id,
+                "强触发偏好已落盘"
+            ),
+            Err(e) => tracing::warn!(target = "pref_write", "强触发偏好写入失败: {}", e),
+        }
+    }
+
+    /// 观点落盘：preference / decision（对齐 Memoria Profile 约定）。
+    pub async fn remember_opinion(
+        &self,
+        namespace: &str,
+        content: &str,
+        category: &str,
+        tags: &[&str],
+        importance: i64,
+    ) -> Result<String, String> {
+        let content = content.trim();
+        if content.is_empty() {
+            return Err("content 为空".into());
+        }
+        if category != "preference" && category != "decision" {
+            return Err(format!("category 须为 preference|decision，收到 {}", category));
+        }
+        // 与 memoria_maintenance_client 解析顺序保持一致：MEMORIA_ADMIN_KEY 优先，
+        // MEMORIA_JARVIS_BADGE 兜底；两者皆未配置时返回明确错误（此处无 fallback client）。
+        let client = if let Some(key) =
+            std::env::var("MEMORIA_ADMIN_KEY").ok().filter(|s| !s.is_empty())
+        {
+            McpClient::new(&self.config.memoria_url, "admin", &key)
+        } else if let Some(badge) =
+            std::env::var("MEMORIA_JARVIS_BADGE").ok().filter(|s| !s.is_empty())
+        {
+            McpClient::new(&self.config.memoria_url, "jarvis", &badge)
+        } else {
+            return Err("未配置 MEMORIA_ADMIN_KEY / MEMORIA_JARVIS_BADGE".into());
+        };
+        let mut tag_list: Vec<String> = tags.iter().map(|s| s.to_string()).collect();
+        if category == "preference"
+            && !tag_list
+                .iter()
+                .any(|t| t == "pref" || t == "hard_rule" || t == "style")
+        {
+            tag_list.push("pref".to_string());
+        }
+        if category == "decision" && !tag_list.iter().any(|t| t == "decision") {
+            tag_list.push("decision".to_string());
+        }
+        let args = serde_json::json!({
+            "content": content,
+            "category": category,
+            "tags": tag_list,
+            "confidence": 85,
+            "importance": importance,
+            "namespace": namespace,
+        });
+        let resp = client
+            .call("memory_remember", &args)
+            .await
+            .map_err(|e| format!("memory_remember 失败: {e}"))?;
+        crate::memory_extract::extract_id(&resp).ok_or_else(|| format!("无法解析 id: {resp}"))
     }
 
     /// 门控（三重，防消防水带）：
@@ -4292,6 +4390,34 @@ impl AgentCore {
                 o.insert("parent_id".to_string(), serde_json::Value::String(parent_id.clone()));
                 o.insert("raw_ref".to_string(), serde_json::Value::String(parent_id.clone()));
                 o.insert("memory_type".to_string(), serde_json::Value::String(mt.to_string()));
+                // Profile / memory_user_prefs 读的是 category+tags，不是 memory_type
+                if mt == "preference" {
+                    o.insert(
+                        "category".to_string(),
+                        serde_json::Value::String("preference".to_string()),
+                    );
+                    let mut tags: Vec<String> = o
+                        .get("tags")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !tags.iter().any(|t| t == "pref" || t == "hard_rule" || t == "style") {
+                        tags.push("pref".to_string());
+                    }
+                    o.insert(
+                        "tags".to_string(),
+                        serde_json::Value::Array(
+                            tags.into_iter().map(serde_json::Value::String).collect(),
+                        ),
+                    );
+                    if !o.contains_key("importance") {
+                        o.insert("importance".to_string(), serde_json::Value::from(5_i64));
+                    }
+                }
                 if let Some(actor) = &ex.actor {
                     o.insert("actor".to_string(), serde_json::Value::String(actor.clone()));
                 }
@@ -4320,6 +4446,22 @@ impl AgentCore {
         Ok(summary)
     }
 
+    /// 读 Memoria dream_state（consolidate 阶段），供 /health.dream 启动回填。
+    pub async fn peek_dream_consolidate(&self, ns: &str) -> Option<serde_json::Value> {
+        let mem_client = memoria_maintenance_client(&self.config.memoria_url, &self.mcp);
+        let ds_raw = mem_client
+            .call(
+                "dream_state_get",
+                &serde_json::json!({
+                    "phase": "consolidate",
+                    "namespace": ns
+                }),
+            )
+            .await
+            .ok()?;
+        serde_json::from_str::<serde_json::Value>(&ds_raw).ok()
+    }
+
     /// 暗知识层 A2：通用夜间巩固编排器（泛化 run_insights）
     ///
     /// 流程（agent-core 出脑子，memoria 当哑存储）：
@@ -4333,22 +4475,8 @@ impl AgentCore {
     /// 以 admin 身份调用 memoria（系统维护任务，合法跨命名空间读取观察原料）。
     /// ns 隔离：每个 ns 独立游标、独立 pattern 库。
     pub async fn consolidate(&self, ns: &str) -> String {
-        // 系统维护任务：以本 Agent 身份 + dashboard badge 跨 ns 读观察（与注册/代理路径一致；
-        // 勿用字面 "admin"——Memoria 侧该身份可能过期导致 401）。
-        let jarvis_badge = std::env::var("MEMORIA_JARVIS_BADGE")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("MEMORIA_ADMIN_KEY").ok())
-            .unwrap_or_default();
-        let mem_client = if jarvis_badge.is_empty() {
-            self.mcp.clone()
-        } else {
-            McpClient::new(
-                &self.config.memoria_url,
-                &self.config.identity.agent_id,
-                &jarvis_badge,
-            )
-        };
+        // 系统维护任务：admin/jarvis 身份与密钥必须配对（勿用聊天 agent_id + jarvis badge）。
+        let mem_client = memoria_maintenance_client(&self.config.memoria_url, &self.mcp);
 
         let fetch_limit: u64 = std::env::var("CONSOLIDATE_FETCH_LIMIT")
             .ok()
@@ -4863,21 +4991,8 @@ impl AgentCore {
                 "reason": "meta_evolution.enabled=false（受控开启，需在 agent.toml 显式开启）"
             });
         }
-        // 与 consolidate 一致的 jarvis_badge 取权逻辑（以本 Agent 身份 + dashboard badge 跨 ns 读）
-        let jarvis_badge = std::env::var("MEMORIA_JARVIS_BADGE")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("MEMORIA_ADMIN_KEY").ok())
-            .unwrap_or_default();
-        let mem_client = if jarvis_badge.is_empty() {
-            self.mcp.clone()
-        } else {
-            McpClient::new(
-                &self.config.memoria_url,
-                &self.config.identity.agent_id,
-                &jarvis_badge,
-            )
-        };
+        // 与 consolidate 一致：admin/jarvis 身份与密钥配对
+        let mem_client = memoria_maintenance_client(&self.config.memoria_url, &self.mcp);
         let res = self.meta_evolver.run_once(&mem_client, ns).await;
         res.to_json()
     }

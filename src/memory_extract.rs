@@ -112,10 +112,14 @@ pub fn parse_extraction(text: &str) -> Option<Extraction> {
     Some(ex)
 }
 
-/// 是否需要真正分解：仅当产出多于 1 条，或唯一 fact 与原文不同（避免与原文完全重复）。
+/// 是否需要真正分解：多于 1 条；或唯一 fact 与原文不同；或含 preference（须走 category=preference 写入）。
 pub fn should_decompose(ex: &Extraction, raw: &str) -> bool {
     let total = ex.facts.len() + ex.entities.len() + ex.preferences.len() + ex.relations.len();
     if total >= 2 {
+        return true;
+    }
+    // 单条 preference 也必须分解：否则降级原样写入时 category 仍是 fact，prefs/Profile 读不到
+    if !ex.preferences.is_empty() {
         return true;
     }
     // 唯一一条 fact
