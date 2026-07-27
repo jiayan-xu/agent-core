@@ -6,7 +6,16 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
+
+/// C1b: 审批态记忆 TTL（秒）
+/// - 已批准：默认 1h（非 24h，避免长时间挂起的批准被遗忘，过期需重批）
+/// - 已否决：短 TTL 60s（防重复问，过期回到黄线）
+/// - pending：24h（主要靠 resolve 时清除，TTL 兜底防泄漏）
+const APPROVED_TTL: f64 = 3600.0;
+const REJECTED_TTL: f64 = 60.0;
+const PENDING_TTL: f64 = 86400.0;
 
 /// 审批状态
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,6 +80,10 @@ pub struct ApprovalManager {
     responses: Mutex<HashMap<String, ApprovalResponse>>,
     /// 持久化路径（None = 仅内存，不落盘）
     store_path: Option<std::path::PathBuf>,
+    /// C1b: 审批态内存记忆（同步可读，供 check_tool 快查，绕过 async Mutex）。
+    /// key 形如 `pending:{tool}@{agent}` / `approved:{tool}@{agent}@{op_hash}` / `rejected:{tool}@{agent}`
+    /// value = 过期时间戳（unix secs）；TTL 过期由查询时惰性清除。不落盘（短生命周期）。
+    memory: StdMutex<HashMap<String, f64>>,
 }
 
 impl ApprovalManager {
@@ -108,6 +121,7 @@ impl ApprovalManager {
             outgoing: Mutex::new(outgoing),
             responses: Mutex::new(responses),
             store_path,
+            memory: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -140,6 +154,19 @@ impl ApprovalManager {
         approver_id: &str,
         requester_id: &str,
     ) -> String {
+        // C1b 防重复建单：同 tool+requester 已有 pending → 复用既有 id，不重复造单。
+        if crate::approval::is_pending_sync(self, tool_name, requester_id) {
+            let outgoing = self.outgoing.lock().await;
+            for (id, p) in outgoing.iter() {
+                if p.tool_name == tool_name
+                    && p.requester_id == requester_id
+                    && p.status == ApprovalStatus::Pending
+                {
+                    return id.clone();
+                }
+            }
+        }
+
         let approval_id = format!(
             "apr_{}_{}",
             chrono::Utc::now().timestamp_millis(),
@@ -165,16 +192,72 @@ impl ApprovalManager {
             },
         );
         drop(outgoing);
+        // C1b: 记录 pending 记忆（供 is_pending_sync 防重复建单）
+        if let Ok(mut mem) = self.memory.lock() {
+            mem.insert(
+                format!("pending:{}@{}", tool_name, requester_id),
+                now + PENDING_TTL,
+            );
+        }
         self.persist().await;
 
         approval_id
     }
 
     /// 记录收到的审批响应
+    ///
+    /// C1c: 兜底校验 `operation_hash` 防偷换（defense-in-depth）。
+    /// 即便 HTTP 台（main.rs:2916）与 A2A 中继（main.rs:2803）已校验，
+    /// 任何调用方到此仍拦一道错配；错配或 pending 不存在则拒绝插入。
+    /// C1b: 写入后同步更新审批态记忆（approved 含 op_hash / rejected 短 TTL）。
     pub async fn record_response(&self, response: ApprovalResponse) {
+        let approved = response.approved;
+        let approval_id = response.approval_id.clone();
+
+        // 兜底校验 operation_hash（防偷换/越权写入）
+        let pending_opt = self.get_pending(&approval_id).await;
+        match pending_opt {
+            Some(p) => {
+                if p.operation_hash != response.operation_hash {
+                    tracing::warn!(
+                        "[APPROVAL] record_response hash 不匹配，拒绝 {}",
+                        approval_id
+                    );
+                    return;
+                }
+            }
+            None => {
+                tracing::warn!("[APPROVAL] record_response 找不到 pending {}", approval_id);
+                return;
+            }
+        }
+
         let mut responses = self.responses.lock().await;
-        responses.insert(response.approval_id.clone(), response);
+        responses.insert(approval_id.clone(), response);
         drop(responses);
+
+        // C1b: 更新审批态记忆
+        if let Some(p) = self.get_pending(&approval_id).await {
+            if let Ok(mut mem) = self.memory.lock() {
+                let now = now_secs();
+                // 移除 pending 标记（已 resolve）
+                mem.remove(&format!("pending:{}@{}", p.tool_name, p.requester_id));
+                if approved {
+                    mem.insert(
+                        format!(
+                            "approved:{}@{}@{}",
+                            p.tool_name, p.requester_id, p.operation_hash
+                        ),
+                        now + APPROVED_TTL,
+                    );
+                } else {
+                    mem.insert(
+                        format!("rejected:{}@{}", p.tool_name, p.requester_id),
+                        now + REJECTED_TTL,
+                    );
+                }
+            }
+        }
         self.persist().await;
     }
 
@@ -204,6 +287,23 @@ impl ApprovalManager {
             .values()
             .filter(|a| {
                 a.status == ApprovalStatus::Pending && !responses.contains_key(&a.approval_id)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// P0 修复：返回「pending 仍在 + 已收到 approved 响应」的项——执行侧应消费的就绪集。
+    /// 与 `list_pending`（排除任何 response）互补：list_pending 给审批台看，本函数给执行侧用。
+    /// 原 `execute_approved_request` 走 `list_pending` + `is_approved` 形成死路（list_pending 已排除有 response 的项，
+    /// 故 is_approved 永为 None → 批准后执行路径恒空）。本函数修复该断路。
+    pub async fn list_approved_ready(&self) -> Vec<PendingApproval> {
+        let outgoing = self.outgoing.lock().await;
+        let responses = self.responses.lock().await;
+        outgoing
+            .values()
+            .filter(|a| {
+                a.status == ApprovalStatus::Pending
+                    && responses.get(&a.approval_id).map(|r| r.approved) == Some(true)
             })
             .cloned()
             .collect()
@@ -278,7 +378,7 @@ impl ApprovalManager {
 ///
 /// 取 `{tool, args}` 的规范化 JSON 串的 sha256。审批创建时由 host 计算并随请求下发的指纹，
 /// 审批响应必须回显同一指纹；不一致即视为「操作被偷换」（防模型自我批准 / 审批-执行错位）。
-fn compute_operation_hash(tool_name: &str, arguments: &serde_json::Value) -> String {
+pub(crate) fn compute_operation_hash(tool_name: &str, arguments: &serde_json::Value) -> String {
     let canonical = serde_json::json!({ "tool": tool_name, "args": arguments });
     let s = serde_json::to_string(&canonical).unwrap_or_default();
     let mut hasher = Sha256::new();
@@ -292,14 +392,43 @@ impl Default for ApprovalManager {
     }
 }
 
-/// 同步检查是否有 pending 审批（供 check_tool 使用）
-///
-/// check_tool 是同步方法，不能 await，所以用这个辅助函数
-/// 快速检查当前工具是否需要走审批流程。
-pub fn has_pending_approval_sync(_manager: &ApprovalManager, _tool_name: &str) -> bool {
-    // 简单实现：检查 dangerous 工具是否需要审批
-    // 完整实现需要 tokio::runtime 或 async 调用，这里保持同步
-    false
+/// C1b: 同步读取审批态记忆——是否已批准（精确 op_hash，TTL 1h）。
+/// 供 check_tool 决定是否跳过黄线（已批准=放行；未批准/已否决/无记录=仍走黄线/红闸）。
+/// 用 std Mutex 支撑的 `memory` 字段做同步快查（check_tool 是同步方法，不能 await）。
+pub fn is_approved_sync(
+    manager: &ApprovalManager,
+    tool_name: &str,
+    args: &serde_json::Value,
+    agent_id: &str,
+) -> bool {
+    let op_hash = compute_operation_hash(tool_name, args);
+    if let Ok(mut mem) = manager.memory.lock() {
+        let now = now_secs();
+        mem.retain(|_, exp| *exp > now); // 惰性清除过期项
+        mem.contains_key(&format!("approved:{}@{}@{}", tool_name, agent_id, op_hash))
+    } else {
+        false
+    }
+}
+
+/// C1b: 同步读取——是否已被否决（短 TTL 60s）。命中→check_tool 直接红闸。
+pub fn is_rejected_sync(manager: &ApprovalManager, tool_name: &str, agent_id: &str) -> bool {
+    if let Ok(mut mem) = manager.memory.lock() {
+        let now = now_secs();
+        mem.retain(|_, exp| *exp > now);
+        mem.contains_key(&format!("rejected:{}@{}", tool_name, agent_id))
+    } else {
+        false
+    }
+}
+
+/// C1b: 同步读取——是否已有 pending（防重复建单）。
+pub fn is_pending_sync(manager: &ApprovalManager, tool_name: &str, agent_id: &str) -> bool {
+    if let Ok(mem) = manager.memory.lock() {
+        mem.contains_key(&format!("pending:{}@{}", tool_name, agent_id))
+    } else {
+        false
+    }
 }
 
 fn now_secs() -> f64 {
@@ -357,6 +486,8 @@ mod tests {
                 "agent-001",
             )
             .await;
+        // 用 pending 真实 operation_hash 回显（C1c 校验要求一致）
+        let pending_hash = am.get_pending(&aid).await.unwrap().operation_hash;
 
         // 审批人批准
         let resp = ApprovalResponse {
@@ -365,7 +496,7 @@ mod tests {
             approved: true,
             reason: None,
             approver_id: "approver-01".to_string(),
-            operation_hash: "op_hash_test".to_string(),
+            operation_hash: pending_hash,
         };
         am.record_response(resp).await;
 
@@ -384,6 +515,7 @@ mod tests {
                 "agent-001",
             )
             .await;
+        let pending_hash = am.get_pending(&aid).await.unwrap().operation_hash;
 
         let resp = ApprovalResponse {
             r#type: "approval_response".to_string(),
@@ -391,11 +523,131 @@ mod tests {
             approved: false,
             reason: Some("非维护时间，拒绝关停".to_string()),
             approver_id: "admin".to_string(),
-            operation_hash: "op_hash_test".to_string(),
+            operation_hash: pending_hash,
         };
         am.record_response(resp).await;
 
         assert_eq!(am.is_approved(&aid).await, Some(false));
+    }
+
+    // ── C1 回归 / 新测试 ──
+
+    /// P0 死路修复：list_approved_ready 能命中已批准项（原 list_pending + is_approved 恒空）
+    #[tokio::test]
+    async fn test_list_approved_ready() {
+        let am = ApprovalManager::new();
+        let aid = am
+            .create_request(
+                "delete_record",
+                &serde_json::json!({"id": 1}),
+                "del",
+                "approver-01",
+                "agent-001",
+            )
+            .await;
+        let pending_hash = am.get_pending(&aid).await.unwrap().operation_hash;
+        // 审批台视角：list_pending 仍可见（尚无 response）
+        assert_eq!(am.list_pending().await.len(), 1);
+        // 执行侧视角：list_approved_ready 此时为空（未批准）
+        assert_eq!(am.list_approved_ready().await.len(), 0);
+
+        am.record_response(ApprovalResponse {
+            r#type: "approval_response".to_string(),
+            approval_id: aid.clone(),
+            approved: true,
+            reason: None,
+            approver_id: "approver-01".to_string(),
+            operation_hash: pending_hash,
+        })
+        .await;
+        // 批准后：审批台不再列出（list_pending 排除有 response 的），执行侧就绪
+        assert_eq!(am.list_pending().await.len(), 0);
+        assert_eq!(am.list_approved_ready().await.len(), 1);
+    }
+
+    /// C1c：record_response 对 operation_hash 错配应拒绝（不写入 approved）
+    #[tokio::test]
+    async fn test_record_response_hash_mismatch_rejected() {
+        let am = ApprovalManager::new();
+        let aid = am
+            .create_request(
+                "delete_record",
+                &serde_json::json!({}),
+                "del",
+                "approver-01",
+                "agent-001",
+            )
+            .await;
+        am.record_response(ApprovalResponse {
+            r#type: "approval_response".to_string(),
+            approval_id: aid.clone(),
+            approved: true,
+            reason: None,
+            approver_id: "approver-01".to_string(),
+            operation_hash: "wrong_hash".to_string(),
+        })
+        .await;
+        // 错配 → 不标记 approved
+        assert_eq!(am.is_approved(&aid).await, None);
+        assert_eq!(am.list_approved_ready().await.len(), 0);
+    }
+
+    /// C1b：批准后「换 args」不能复用批准（approved 指纹含 op_hash）
+    #[tokio::test]
+    async fn test_approved_args_isolation() {
+        let am = ApprovalManager::new();
+        // 批准 delete_record(args=A)
+        let aid_a = am
+            .create_request(
+                "delete_record",
+                &serde_json::json!({"id": 1}),
+                "del A",
+                "approver-01",
+                "agent-001",
+            )
+            .await;
+        let hash_a = am.get_pending(&aid_a).await.unwrap().operation_hash;
+        am.record_response(ApprovalResponse {
+            r#type: "approval_response".to_string(),
+            approval_id: aid_a.clone(),
+            approved: true,
+            reason: None,
+            approver_id: "approver-01".to_string(),
+            operation_hash: hash_a,
+        })
+        .await;
+
+        // args=A 已批准
+        assert!(is_approved_sync(&am, "delete_record", &serde_json::json!({"id": 1}), "agent-001"));
+        // args=B（不同 hash）未批准 → 仍走黄线
+        assert!(!is_approved_sync(&am, "delete_record", &serde_json::json!({"id": 2}), "agent-001"));
+    }
+
+    /// C1b：rejected 记忆（短 TTL）生效
+    #[tokio::test]
+    async fn test_rejected_memory() {
+        let am = ApprovalManager::new();
+        let aid = am
+            .create_request(
+                "delete_record",
+                &serde_json::json!({}),
+                "del",
+                "approver-01",
+                "agent-001",
+            )
+            .await;
+        let hash = am.get_pending(&aid).await.unwrap().operation_hash;
+        am.record_response(ApprovalResponse {
+            r#type: "approval_response".to_string(),
+            approval_id: aid.clone(),
+            approved: false,
+            reason: Some("拒绝".to_string()),
+            approver_id: "approver-01".to_string(),
+            operation_hash: hash,
+        })
+        .await;
+        assert!(is_rejected_sync(&am, "delete_record", "agent-001"));
+        assert!(!is_approved_sync(&am, "delete_record", &serde_json::json!({}), "agent-001"));
     }
 
     #[test]

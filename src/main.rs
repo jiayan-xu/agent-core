@@ -465,6 +465,8 @@ struct CollabApprovalBody {
     decision: String,
     /// 拒绝/备注理由，可选
     reason: Option<String>,
+    /// 创建时计算的操作指纹，必须回显一致，否则视为操作被偷换而拒绝（防 LLM 自批）。
+    operation_hash: String,
 }
 
 /// 公司级广播白名单：环境变量 `COLLAB_ORG_BROADCASTERS`（逗号分隔 agent_id）。
@@ -2779,16 +2781,36 @@ async fn handle_collab_approval(
     };
 
     let decision_ok = matches!(body.decision.trim(), "approve" | "yes" | "通过" | "批准");
-    let resp_env = serde_json::json!({
-        "type": "approval_response",
-        "approval_id": approval_id,
-        "approved": decision_ok,
-        "reason": body.reason.clone(),
-        "approver_id": agent_id,
-    });
 
-    // 回写 requester 收件箱
+    // 回写 requester 收件箱（先校验 operation_hash，防 A2A 中转偷换）
     let send_res = if let Some(ref agent) = *agent_guard {
+        // C1c: 取回 pending 的 operation_hash，校验 A2A 响应回显一致（防 LLM 自批 / 偷换）
+        let expected_hash = match agent.approval_manager.get_pending(&approval_id).await {
+            Some(p) => p.operation_hash,
+            None => {
+                return (
+                    axum::http::StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({"error": "审批项不存在或已处理"})),
+                )
+                    .into_response()
+            }
+        };
+        if body.operation_hash != expected_hash {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": "operation_hash 不匹配，疑似操作被偷换，已拒绝"
+                })),
+            )
+                .into_response();
+        }
+        let resp_env = serde_json::json!({
+            "type": "approval_response",
+            "approval_id": approval_id,
+            "approved": decision_ok,
+            "reason": body.reason.clone(),
+            "approver_id": agent_id,
+        });
         agent.collab_send_raw(&requester, &resp_env).await
     } else {
         Err("agent 尚未就绪".to_string())
@@ -2800,7 +2822,7 @@ async fn handle_collab_approval(
             // 记录本地 ApprovalManager（解阻塞本实例等待中的审批）
             let agent_guard = st.agent.lock().await;
             if let Some(ref agent) = *agent_guard {
-                // A2: 从 pending 审批取回 operation_hash，使响应与请求绑定（防 LLM 自批）。
+                // C1c: 已在上游校验过 operation_hash，此处直接绑定 pending 的 hash（不再强改）
                 let op_hash = agent
                     .approval_manager
                     .get_pending(&approval_id)

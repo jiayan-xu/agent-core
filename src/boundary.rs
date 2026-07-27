@@ -38,6 +38,26 @@ where
     }
 }
 
+/// C1a: 危险工具精确集（堵漏判的最后一道闸）。
+/// agent-core 内置 + memoria 路由危险工具（经 self.mcp 调用，权限归 memoria permissions.rs）。
+/// 实现时按真实工具名 grep 确认（无 memory_forget/memory_delete 等），仅收录已核实存在者。
+const HARD_DANGEROUS: &[&str] = &[
+    // agent-core 内置危险工具
+    "delete_entrance_record",
+    "shutdown_agent",
+    "batch_delete_memories",
+    "delete_record",
+    "shutdown_server",
+    // memoria 路由危险工具（写操作 / 演化 / 身份）
+    "memory_merge",
+    "memory_dedup_chain",
+    "memory_evolve",
+    "memory_evolve_auto",
+    "evolution_rollback",
+    "agent_revoke",
+    "register_agent",
+];
+
 // ── SQL 只读校验（P1-6 修复）──
 // query_sql 等工具归为 read 级，但 read 权限不应等同于"可执行任意 SQL"。
 // 这里做**正向** SELECT-only 校验：语句必须以 SELECT/WITH/EXPLAIN/PRAGMA 开头，
@@ -664,6 +684,106 @@ impl ComplianceBoundary {
         }
     }
 
+    /// C1a: 危险工具硬地板（精确集 ∪ 名称启发式）。
+    ///
+    /// 修正（评审 P0）：**不依赖分类器**——若工具被 `learn_tools` 误登为 `read`/`write`，
+    /// 分类器返回的就是 `read`/`write`，抓不到误登。地板以 `HARD_DANGEROUS` 精确集与
+    /// 破坏数据类前缀兜底，确保危险工具无论分类器如何都进入黄线（审批闸）。
+    /// 既有 `is_dangerous_tool`（蒸馏门，空分类器版）保持不变，避免回归。
+    pub fn is_dangerous_floor(&self, name: &str) -> bool {
+        if HARD_DANGEROUS.contains(&name) {
+            return true;
+        }
+        let l = name.to_lowercase();
+        l.starts_with("delete_")
+            || l.starts_with("batch_delete")
+            || l.starts_with("shutdown_")
+            || l.starts_with("drop_")
+            || l.starts_with("truncate_")
+            || l.starts_with("purge_")
+            || l.starts_with("destroy_")
+            || l.starts_with("wipe_")
+            || l.starts_with("format_")
+            || l.starts_with("reset_")
+            || l.starts_with("revoke_")
+            || l.starts_with("ban_")
+            || l.starts_with("kill_")
+            || l.starts_with("rm_")
+    }
+
+    /// C1c: 精简治理守卫（审批后执行前重跑）。
+    ///
+    /// 仅含「失败即红」的底线：kill_switch / safe_mode / 治理层 / 沙箱 / 出域 / SQL·路径参数。
+    /// 刻意跳过：供应链白名单（已批准=信任静态白名单）、权限链、黄线重弹。
+    /// 与 `call_tool_routed` 已有的 kill_switch 守卫重复，属 defense-in-depth（执行侧再卡一道）。
+    pub fn hard_guards_only(
+        &self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        namespaces: Option<&[String]>,
+    ) -> Option<ToolCheck> {
+        if !self.kill_switch.is_alive() {
+            return Some(ToolCheck::red("系统已终止，拒绝所有操作"));
+        }
+        if self.is_safe_mode() {
+            let level = with_classifier(&self.classifier, "unknown", |c| c.classify(tool_name));
+            let is_export = !DataExfiltrationGuard::check_export(tool_name).allow;
+            if level == "dangerous" || level == "unknown" || is_export {
+                return Some(ToolCheck::red(&format!(
+                    "safe_mode 激活：抑制危险/未分类/外发工具 {}（需人工介入解除）",
+                    tool_name
+                )));
+            }
+        }
+        if GovernanceGuard::is_governance(tool_name) {
+            return Some(ToolCheck::red(&format!("红线：{} 属于治理层，Agent 不可修改", tool_name)));
+        }
+        let sandbox = ExecutionSandbox::check(tool_name, extract_path_arg(args));
+        if !sandbox.allow {
+            return Some(sandbox);
+        }
+        // 跳过 supply_chain（已批准=信任静态白名单）
+        let export = DataExfiltrationGuard::check_export(tool_name);
+        if !export.allow {
+            return Some(export);
+        }
+        if let Some(ns) = namespaces {
+            let cross = DataExfiltrationGuard::check_cross_ns(ns);
+            if !cross.allow {
+                return Some(cross);
+            }
+        }
+        if let Some(obj) = args.as_object() {
+            for (key, val) in obj {
+                if let Some(s) = val.as_str() {
+                    let s_upper = s.to_uppercase();
+                    if s.contains("' --")
+                        || s.contains("';")
+                        || s_upper.contains(" UNION ")
+                        || s_upper.contains(" OR 1=1")
+                        || s_upper.contains(" AND 1=1")
+                        || s_upper.contains("DROP TABLE")
+                        || s_upper.contains("INSERT INTO")
+                        || s_upper.contains("DELETE FROM")
+                        || (s_upper.contains("UPDATE ") && s_upper.contains("SET "))
+                    {
+                        return Some(ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key)));
+                    }
+                    if s.contains("../") || s.contains("..\\") {
+                        return Some(ToolCheck::red(&format!("参数安全检查：{} 含路径穿越", key)));
+                    }
+                    if is_sql_query_param(tool_name, key) && !is_select_only(s) {
+                        return Some(ToolCheck::red(&format!(
+                            "参数安全检查：{} 必须是只读 SELECT 语句",
+                            key
+                        )));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// 综合检查一次 tool 调用，按优先级顺序执行 7 条红线
     #[tracing::instrument(skip(self, args, parent_permission), fields(tool_name = %tool_name, agent_id = %agent_id, user_role))]
     pub fn check_tool(
@@ -730,11 +850,16 @@ impl ComplianceBoundary {
         }
 
         // ── ⑨ 审批检查：dangerous 级别工具需要审批（P2-D 接入）──
-        if !crate::approval::has_pending_approval_sync(&self.approval_manager, tool_name) {
+        // C1b: 已否决（短 TTL）→ 红闸；已批准（精确 op_hash，TTL 1h）→ 直接放行不弹黄线。
+        // C1a: 危险地板（精确集 ∪ 启发式）与分类器 dangerous 一并触发黄线。
+        if crate::approval::is_rejected_sync(&self.approval_manager, tool_name, agent_id) {
+            return ToolCheck::red("该工具此前已被否决，须重新提交审批");
+        }
+        if !crate::approval::is_approved_sync(&self.approval_manager, tool_name, args, agent_id) {
             let tool_level = with_classifier(&self.classifier, "read".to_string(), |c| {
                 c.classify(tool_name).to_string()
             });
-            if tool_level == "dangerous" {
+            if tool_level == "dangerous" || self.is_dangerous_floor(tool_name) {
                 return ToolCheck::yellow(&format!("{} 需要审批，请等待审批人确认", tool_name));
             }
         }
@@ -1483,5 +1608,62 @@ mod tests {
         );
         assert!(!r.allow);
         assert_eq!(r.level, Some(BlockLevel::Red));
+    }
+
+    // ── C1a: 危险工具硬地板 ──
+
+    #[test]
+    fn test_dangerous_floor_direct() {
+        let b = ComplianceBoundary::new(None);
+        // 精确集 + 破坏数据类前缀
+        assert!(b.is_dangerous_floor("delete_record"));
+        assert!(b.is_dangerous_floor("batch_delete_memories"));
+        assert!(b.is_dangerous_floor("shutdown_agent"));
+        assert!(b.is_dangerous_floor("memory_merge"));
+        assert!(b.is_dangerous_floor("drop_table_x"));
+        assert!(b.is_dangerous_floor("purge_cache"));
+        // 非危险
+        assert!(!b.is_dangerous_floor("query_plate"));
+        assert!(!b.is_dangerous_floor("update_profile"));
+        assert!(!b.is_dangerous_floor("send_email")); // 出域走另一道闸，不在地板
+    }
+
+    #[test]
+    fn test_floor_catches_misclassified_dangerous() {
+        // 模拟误登：delete_record 被 learn 成 write（本应 dangerous），
+        // 分类器返回 write → 不会触发 unknown 黄线，但地板仍须拦成黄线（审批闸）。
+        let mut boundary = ComplianceBoundary::new(None);
+        boundary
+            .perm_chain
+            .lock()
+            .unwrap()
+            .register("test-agent", None, PermissionLevel::Admin);
+        boundary.register_tool("delete_record", "write");
+
+        let r = boundary.check_tool(
+            "delete_record",
+            &serde_json::json!({"id": 1}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "误登为 write 的危险工具仍须被地板拦成黄线（需审批）: {:?}",
+            r
+        );
+
+        // 只读工具不应触发
+        let r2 = boundary.check_tool(
+            "query_plate",
+            &serde_json::json!({}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert!(r2.allow, "query_plate 应放行: {:?}", r2);
     }
 }

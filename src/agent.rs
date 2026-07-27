@@ -2961,58 +2961,65 @@ impl AgentCore {
     }
 
     /// 执行审批通过的请求
-    /// 检查所有 pending 审批项，如果有已批准的，执行该工具并返回结果
+    /// 检查所有「已就绪」（pending 仍在 + 已批准）的审批项，执行工具并返回结果
     async fn execute_approved_request(
         &self,
         _session_id: &str,
         allowed_ns: &[String],
     ) -> Option<String> {
-        let pending_list = self.approval_manager.list_pending().await;
-        for approval in &pending_list {
-            if let Some(true) = self
-                .approval_manager
-                .is_approved(&approval.approval_id)
-                .await
-            {
-                // 审批通过，执行工具
-                let result = match self
-                    .call_tool_routed(&approval.tool_name, "default", &approval.arguments, allowed_ns, "")
-                    .await
-                {
-                    Ok(text) => text,
-                    Err(e) => format!("执行失败: {}", e),
-                };
-                let desc = approval.description.chars().take(120).collect::<String>();
-                let result_short = result.chars().take(300).collect::<String>();
-                let reply = format!(
-                    "✅ 审批通过！操作已执行。\n\n操作内容：{}\n审批人：{}\n\n{}",
-                    desc, approval.approver_id, result_short
-                );
-                // 审计日志
-                self.audit_logger
-                    .log_tool_call(
-                        &self.config.identity.agent_id,
-                        &approval.tool_name,
-                        &approval.arguments,
-                        true,
-                    )
-                    .await;
-                self.approval_manager.remove(&approval.approval_id).await;
-                return Some(reply);
-            } else if let Some(false) = self
-                .approval_manager
-                .is_approved(&approval.approval_id)
-                .await
-            {
-                // 审批被拒绝
-                let desc = approval.description.chars().take(120).collect::<String>();
-                let reply = format!(
-                    "❌ 审批被拒绝。\n\n操作内容：{}\n审批人：{}",
-                    desc, approval.approver_id
+        // P0 修复：改用 list_approved_ready —— 原 list_pending + is_approved 形成死路
+        // （list_pending 已排除有 response 的项，批准后执行路径恒空）。
+        let ready_list = self.approval_manager.list_approved_ready().await;
+        for approval in &ready_list {
+            // C1c #1: 执行期 operation_hash 重算比对（防错配 / 偷换）
+            let expected =
+                crate::approval::compute_operation_hash(&approval.tool_name, &approval.arguments);
+            if expected != approval.operation_hash {
+                tracing::warn!(
+                    "[APPROVAL] 执行期 operation_hash 不匹配，拒绝 {}",
+                    approval.tool_name
                 );
                 self.approval_manager.remove(&approval.approval_id).await;
-                return Some(reply);
+                return Some("⛔ 审批指纹不匹配，拒绝执行（疑似操作被偷换）。".to_string());
             }
+            // C1c #2: 精简治理守卫（跳过 supply_chain；已批准=信任静态白名单）
+            let guard_res = {
+                let boundary = self.boundary.lock().await;
+                boundary.hard_guards_only(&approval.tool_name, &approval.arguments, Some(allowed_ns))
+            };
+            if let Some(blocked) = guard_res {
+                tracing::warn!(
+                    "[APPROVAL] 执行被安全底线拦截: {}",
+                    blocked.reason
+                );
+                self.approval_manager.remove(&approval.approval_id).await;
+                return Some(format!("⛔ 执行被安全底线拦截：{}", blocked.reason));
+            }
+            // 审批通过，执行工具（已通过精简治理守卫）
+            let result = match self
+                .call_tool_routed(&approval.tool_name, "default", &approval.arguments, allowed_ns, "")
+                .await
+            {
+                Ok(text) => text,
+                Err(e) => format!("执行失败: {}", e),
+            };
+            let desc = approval.description.chars().take(120).collect::<String>();
+            let result_short = result.chars().take(300).collect::<String>();
+            let reply = format!(
+                "✅ 审批通过！操作已执行。\n\n操作内容：{}\n审批人：{}\n\n{}",
+                desc, approval.approver_id, result_short
+            );
+            // 审计日志
+            self.audit_logger
+                .log_tool_call(
+                    &self.config.identity.agent_id,
+                    &approval.tool_name,
+                    &approval.arguments,
+                    true,
+                )
+                .await;
+            self.approval_manager.remove(&approval.approval_id).await;
+            return Some(reply);
         }
         None
     }
