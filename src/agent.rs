@@ -20,6 +20,22 @@ use crate::quota::NsQuotaStore;
 use crate::session::{PendingAction, SessionManager, SessionState};
 use std::collections::HashMap;
 
+/// memoria admin 身份专用密钥解析（读取进程环境，启动器已将 memoria/.env 注入）。
+///
+/// memoria 的 `admin` 身份**仅接受 `MEMORIA_ADMIN_KEY`**（`MEMORIA_JARVIS_BADGE` 等
+/// 非 admin 密钥配 `X-Agent-Id:"admin"` 一律 -32001）。故 admin key 优先；
+/// 仅当 admin key 缺失时回退 jarvis badge（兜底，仍可能因 -32001 失败，但不致 panic）。
+///
+/// agent-core 的 memoria 传输凭据与聊天/权限身份（jarvis badge）是两回事：所有经
+/// `self.mcp` / firehose 管理写入必须走 admin + 此密钥。
+fn resolve_memoria_admin_key() -> String {
+    std::env::var("MEMORIA_ADMIN_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("MEMORIA_JARVIS_BADGE").ok())
+        .unwrap_or_default()
+}
+
 /// Agent 身份
 #[derive(Debug, Clone)]
 pub struct AgentIdentity {
@@ -260,11 +276,13 @@ impl AgentCore {
         local_resources: crate::resources::SharedResourceSnapshot,
         metrics: std::sync::Arc<crate::metrics::MetricsRegistry>,
     ) -> Self {
-        let mcp = McpClient::new(
-            &config.memoria_url,
-            &config.identity.agent_id,
-            &config.identity.badge_token,
-        );
+        // Memoria 主客户端（self.mcp，供 LLM 工具执行与记忆写入复用）必须走 admin 身份 + admin 密钥：
+        // memoria 的 admin 身份**仅接受 MEMORIA_ADMIN_KEY**（MEMORIA_JARVIS_BADGE 等非 admin 密钥
+        // 一律 -32001）。此前用 config.identity.badge_token（=jarvis badge）导致所有 memoria 调用
+        // 静默 -32001。agent 自身聊天/权限身份（agent_id="user" + jarvis badge）不受影响，仍由
+        // config.identity 承载，仅此处 memoria 传输凭据改为 admin。
+        let admin_key = resolve_memoria_admin_key();
+        let mcp = McpClient::new(&config.memoria_url, "admin", &admin_key);
         // 构建 MCP 源列表（Memoria 始终为第一个源）
         let mut mcp_sources = vec![McpSource::memoria(mcp.clone())];
         for (name, url, token, stdio_opt, src_ns) in &config.additional_mcp {
@@ -2385,13 +2403,11 @@ impl AgentCore {
         // 而 memoria 的 admin 密钥仅与 X-Agent-Id:"admin" 配对生效（其余身份配同 key 一律 -32001），
         // 直接用 self.mcp 会导致未授权写入静默失败（捕获路径形同死亡）。这里与 maybe_persona_task_memory
         // 一致：用 admin 身份 + 环境变量密钥写入，确保「捕获真实对话、过滤噪声」真正生效。
-        let badge = std::env::var("MEMORIA_JARVIS_BADGE")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("MEMORIA_ADMIN_KEY").ok())
-            .unwrap_or_default();
+        // admin 密钥优先（memoria 的 admin 身份仅接受 MEMORIA_ADMIN_KEY；
+        // 此前 jarvis badge 优先导致 -32001，firehose 捕获形同死亡）。
+        let badge = resolve_memoria_admin_key();
         if badge.is_empty() {
-            tracing::warn!(target = "intake_filter", "跳过对话捕获：未配置 MEMORIA_JARVIS_BADGE / MEMORIA_ADMIN_KEY");
+            tracing::warn!(target = "intake_filter", "跳过对话捕获：未配置 MEMORIA_ADMIN_KEY / MEMORIA_JARVIS_BADGE");
             return;
         }
         let client = McpClient::new(&self.config.memoria_url, "admin", &badge);
@@ -2449,13 +2465,10 @@ impl AgentCore {
         // 跨 ns 写客户端：memoria 的 admin 密钥仅与 X-Agent-Id:"admin" 配对生效
         // （verify01/jarvis 等身份配同一密钥会 -32001 拒绝，已实测）。
         // 密钥只从环境变量取，绝不硬编码；无密钥则跳过，不阻断终答。
-        let badge = std::env::var("MEMORIA_JARVIS_BADGE")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("MEMORIA_ADMIN_KEY").ok())
-            .unwrap_or_default();
+        // admin 密钥优先（同 intake_filter：memoria admin 身份仅接受 MEMORIA_ADMIN_KEY）。
+        let badge = resolve_memoria_admin_key();
         if badge.is_empty() {
-            tracing::warn!(pid = %pid, ns = %ns, "分身任务记忆跳过：未配置 MEMORIA_JARVIS_BADGE / MEMORIA_ADMIN_KEY");
+            tracing::warn!(pid = %pid, ns = %ns, "分身任务记忆跳过：未配置 MEMORIA_ADMIN_KEY / MEMORIA_JARVIS_BADGE");
             return;
         }
         let client = McpClient::new(&self.config.memoria_url, "admin", &badge);
