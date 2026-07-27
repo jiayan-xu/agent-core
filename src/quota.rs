@@ -63,7 +63,7 @@ impl NsQuotaUsage {
 }
 
 /// 默认配额常量（可在 `agent.toml` 经未来配置项覆盖；当前以代码常量兜底）
-pub const DEFAULT_MAX_TOOL_ROUNDS: u32 = 16;
+pub const DEFAULT_MAX_TOOL_ROUNDS: u32 = 200;
 pub const DEFAULT_DAILY_TOKEN_BUDGET: u64 = 500_000;
 pub const DEFAULT_MAX_CONCURRENT_SESSIONS: u32 = 8;
 
@@ -82,6 +82,13 @@ impl NsQuotaStore {
         if let Ok(v) = std::env::var("AGENT_MAX_CONCURRENT_SESSIONS") {
             if let Ok(n) = v.parse::<u32>() {
                 default_policy.max_concurrent_sessions = n.max(1);
+            }
+        }
+        // 每日工具调用轮次上限：默认 200（运营台类 agent 单日报表/诊断远超旧值 16，
+        // 16 会在几轮报表后耗尽，导致整天无法调用工具而退化成记忆编造）。可用环境变量调高/调低。
+        if let Ok(v) = std::env::var("AGENT_MAX_TOOL_ROUNDS_PER_DAY") {
+            if let Ok(n) = v.parse::<u32>() {
+                default_policy.max_tool_rounds = n.max(1);
             }
         }
         NsQuotaStore {

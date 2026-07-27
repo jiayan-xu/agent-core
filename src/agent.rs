@@ -1065,7 +1065,7 @@ impl AgentCore {
                     *self.in_progress_plan.lock().await = None;
                     self.in_progress_step_results.lock().await.clear();
 
-                    return format!("[Step 2/3: 执行 → Step 3/3: 交付]\n\n{}", result);
+                    return result;
                 }
                 // 单步或分解失败 → 降级到普通 LLM loop（fall through）
                 tracing::info!("合成路由降级到普通 LLM（单步或分解失败）");
@@ -1099,18 +1099,19 @@ impl AgentCore {
         let mut enriched_message = message.to_string();
 
         if let Ok(Some(inbox_msgs)) = &inbox_result {
-            let mut prefix = String::from("你有以下来自其他 Agent 的消息:\n");
-            for m in inbox_msgs.iter().take(3) {
-                let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                let from = m.get("from").and_then(|f| f.as_str()).unwrap_or("?");
-                let preview: String = content.chars().take(200).collect();
-                prefix.push_str(&format!(
-                    "- [{}] {}\n",
-                    from,
-                    preview
-                ));
+            if !inbox_msgs.is_empty() {
+                let mut prefix = String::from(
+                    "【后台协作待办】以下是从其他 Agent 异步收到的消息，属于独立的后台任务，与用户当前提问无关；请勿将其误认为用户当前问题，也不要对用户提及“来自其他 Agent 的消息”或询问“哪个 Agent 发的消息”：\n",
+                );
+                for m in inbox_msgs.iter().take(3) {
+                    let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let from = m.get("from").and_then(|f| f.as_str()).unwrap_or("?");
+                    let preview: String = content.chars().take(200).collect();
+                    prefix.push_str(&format!("- [{}] {}\n", from, preview));
+                }
+                prefix.push_str("\n（以上为后台待办，可在回复用户后自行处理；下面才是用户直接发来的问题）\n---\n");
+                enriched_message = format!("{}{}", prefix, message);
             }
-            enriched_message = format!("{}\n---\n{}", prefix, message);
         }
 
         // A1: 记忆召回数（供 prefetch 日志 exposed_tools/recalled_memories 配对观测）
@@ -1174,8 +1175,8 @@ impl AgentCore {
             .llm_loop(messages, session_id, message, user_id, allowed_ns, trace_id)
             .await;
 
-        // 给结果加 Step 前缀
-        format!("[Step 2/3: 执行 → Step 3/3: 交付]\n\n{}", result)
+        // 直接返回结果，不再向用户泄露内部执行步骤标记
+        result
     }
 
     /// 复述确认：用 LLM 复述用户需求，等待确认
@@ -1253,12 +1254,12 @@ impl AgentCore {
         // 无工具 LLM 调用 — 只复述，不执行
         let response = match self.llm.chat(&msgs, &[]).await {
             Ok(r) => r,
-            Err(e) => return format!("[Step 1/3: 确认理解]\n\n抱歉，理解时遇到问题：{}", e),
+            Err(e) => return format!("抱歉，理解时遇到问题：{}", e),
         };
 
         let rephrase = response.text.trim().to_string();
         format!(
-            "[Step 1/3: 确认理解]\n\n{}，我理解你的需求是：\n\n{}\n\n方向对吗？",
+            "{}，我理解你的需求是：\n\n{}\n\n方向对吗？",
             self.config.identity.agent_id,
             if rephrase.is_empty() {
                 message
@@ -4040,14 +4041,8 @@ impl AgentCore {
 - ❌ 不能改代码、不能执行系统命令
 - ❌ 不能导出数据到外部
 - ❌ 不能泄露敏感信息（密码、API Key）
-- ✅ 查询类直接执行，不需要确认
+        - ✅ 查询类直接执行，不需要确认
         - ✅ 改数据前要确认，确认后直接执行
-
-        ## 对话与确认（重要）
-        - 你收到的每一条消息都是【当前用户】直接发来的，不是其他 Agent 转发的。
-        - 收件箱里"来自其他 Agent 的消息"是独立的协作待办，与用户当前问题分开处理，绝不混为一谈，也不要对用户说"你收到的消息 / 哪个 Agent 发的消息"之类的话。
-        - 如果用户用简短肯定回复（需要 / 好的 / 去吧 / 可以 / 行 / 对 / 确认 / 查吧），且上一轮你提出了某个操作或查询建议，则视为用户已同意，直接执行该建议（调用相应工具），不要反问、不要重复确认。
-        - 当用户问"为什么 X 停止 / 为什么没变化 / 出错了 / 怎么回事"时，必须先调用相关诊断工具（如 system_ops 的 status / logs）查实情（进程状态、最近日志、错误码），再基于事实给原因；严禁只回"检查日志 / 重启服务"这类空建议。
 
         当前时间：{now}
 "#,
@@ -4055,6 +4050,18 @@ impl AgentCore {
                 now = now,
             )
         };
+
+        // 无论默认还是自定义 system_prompt_template，强制追加「对话与确认」护栏，
+        // 防止 A2A 收件箱消息与用户提问混为一谈（串台）、配额耗尽时编造旧数据、诊断类问题空建议。
+        prompt.push_str(
+            "\n\n## 对话与确认（重要）\n\
+             - 你收到的每一条消息都是【当前用户】直接发来的，不是其他 Agent 转发的。\n\
+             - 收件箱里\"来自其他 Agent 的消息\"是独立的协作待办，与用户当前问题分开处理，绝不混为一谈，也不要对用户说\"你收到的消息 / 哪个 Agent 发的消息\"之类的话，更不要去调用 a2a_recv 收取用户的问题。\n\
+             - 如果用户用简短肯定回复（需要 / 好的 / 去吧 / 可以 / 行 / 对 / 确认 / 查吧），且上一轮你提出了某个操作或查询建议，则视为用户已同意，直接执行该建议（调用相应工具），不要反问、不要重复确认。\n\
+             - 当用户问\"为什么 X 停止 / 为什么没变化 / 出错了 / 怎么回事\"时，必须先调用相关诊断工具（如 system_ops 的 status / logs）查实情（进程状态、最近日志、错误码），再基于事实给原因；严禁只回\"检查日志 / 重启服务\"这类空建议。\n\
+             - 当用户要求\"恢复 / 重启 / 启动 X 系统 / 服务\"时，先调用 system_ops 的 status 查实情；你【没有】重启类工具，无法真正执行重启，应据实说明\"我能查状态但无法重启，请通过服务管理器或运维脚本重启\"，严禁给出 systemctl / service / net start / sc 等任何具体重启命令（尤其禁止 Linux 的 systemctl 与 /var/log 路径，本机是 Windows 环境），绝不空谈或编造。\n\
+             - 当工具调用因配额限制无法执行时，必须明确告知用户\"当前工具调用配额已用尽，以下为记忆中的历史信息，可能非最新\"，严禁把记忆里的旧日期数据谎称为\"今日/昨日\"最新数据。\n",
+        );
 
         if !knowledge.is_empty() {
             prompt.push_str("## 记忆档案\n");
