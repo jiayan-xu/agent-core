@@ -423,23 +423,29 @@ fn extract_tools(data: &serde_json::Value) -> Vec<(String, String, serde_json::V
     let mut result = Vec::new();
     if let Some(tools) = data["result"]["tools"].as_array() {
         for t in tools {
-            if let Some(func) = t.get("function") {
-                let name = func
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("?")
-                    .to_string();
-                let desc = func
-                    .get("description")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let params = func
-                    .get("parameters")
-                    .cloned()
-                    .unwrap_or(serde_json::json!({"type": "object", "properties": {}}));
-                result.push((name, desc, params));
-            }
+            // 兼容两种工具 schema：
+            //  1) OpenAI 风格嵌套：{ "function": { name, description, parameters } }
+            //     （dashboard 自定义 MCP 走此分支，参数键为 parameters）
+            //  2) MCP 标准扁平：{ name, description, inputSchema }
+            //     （memoria 等标准 MCP 走此分支，参数键为 inputSchema）
+            // function 嵌套优先，否则回退到扁平结构。
+            let (name_val, desc_val, params_val) = if let Some(func) = t.get("function") {
+                (func.get("name"), func.get("description"), func.get("parameters"))
+            } else {
+                (t.get("name"), t.get("description"), t.get("inputSchema"))
+            };
+            let name = name_val
+                .and_then(|n| n.as_str())
+                .unwrap_or("?")
+                .to_string();
+            let desc = desc_val
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string();
+            let params = params_val
+                .cloned()
+                .unwrap_or(serde_json::json!({"type": "object", "properties": {}}));
+            result.push((name, desc, params));
         }
     }
     result
@@ -470,5 +476,75 @@ mod tests {
         if let McpClient::Http(ref http) = client {
             // base_url 是私有字段，只验证客户端创建成功
         }
+    }
+
+    #[test]
+    fn test_extract_tools_flat_mcp_schema() {
+        // MCP 标准扁平结构：{ name, description, inputSchema }
+        // memoria 等标准 MCP 走此分支，修复前会被解析为空。
+        let data = serde_json::json!({
+            "result": {
+                "tools": [
+                    {
+                        "name": "register_agent",
+                        "description": "register a new agent",
+                        "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}}
+                    },
+                    {
+                        "name": "memory_search",
+                        "description": "semantic search",
+                        "inputSchema": {"type": "object"}
+                    }
+                ]
+            }
+        });
+        let tools = extract_tools(&data);
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].0, "register_agent");
+        assert_eq!(tools[0].1, "register a new agent");
+        assert_eq!(tools[0].2["properties"]["id"]["type"], "string");
+        assert_eq!(tools[1].0, "memory_search");
+        assert_eq!(tools[1].1, "semantic search");
+    }
+
+    #[test]
+    fn test_extract_tools_openai_nested_kept() {
+        // OpenAI 风格嵌套：{ "function": { name, description, parameters } }
+        // dashboard 自定义 MCP 走此分支，必须保持向后兼容。
+        let data = serde_json::json!({
+            "result": {
+                "tools": [
+                    {
+                        "function": {
+                            "name": "dashboard_action",
+                            "description": "do a dashboard thing",
+                            "parameters": {"type": "object"}
+                        }
+                    }
+                ]
+            }
+        });
+        let tools = extract_tools(&data);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].0, "dashboard_action");
+        assert_eq!(tools[0].1, "do a dashboard thing");
+    }
+
+    #[test]
+    fn test_extract_tools_mixed_schemas() {
+        // 同一响应里混合两种结构，两者都应被解析。
+        let data = serde_json::json!({
+            "result": {
+                "tools": [
+                    { "name": "memory_remember", "description": "remember", "inputSchema": {"type": "object"} },
+                    { "function": { "name": "dashboard_ping", "description": "ping", "parameters": {"type": "object"} } }
+                ]
+            }
+        });
+        let tools = extract_tools(&data);
+        assert_eq!(tools.len(), 2);
+        let names: Vec<&str> = tools.iter().map(|t| t.0.as_str()).collect();
+        assert!(names.contains(&"memory_remember"));
+        assert!(names.contains(&"dashboard_ping"));
     }
 }
