@@ -164,7 +164,9 @@ mod tests {
         assert!(is_test_namespace("smoke"));
         assert!(is_test_namespace("meta_evolution"));
         assert!(is_test_namespace("agent/lme_42"));
-        assert!(is_test_namespace("foo_test_bar"));
+        // 收紧后（B 批防误删）：`*_test_*` 子串不再匹配，避免 agent/proj_test_scripts 类真实 ns 被误删。
+        // `foo_test_bar` 属歧义名，按「不误删」偏向返回 false（不再是测试件）。
+        assert!(!is_test_namespace("foo_test_bar"));
         assert!(is_test_namespace("test_run"));
         assert!(is_test_namespace("my_test"));
         // 真实命名空间不应被误判
