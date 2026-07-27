@@ -743,6 +743,9 @@ impl AgentCore {
             "没问题",
             "去吧",
             "查吧",
+            "需要",
+            "去查",
+            "查一下",
             "执行吧",
             "同意",
             "继续",
@@ -1841,6 +1844,10 @@ impl AgentCore {
     // ── A1: 白龙马 ACI 请求前上下文预取（工具子集选择，只选 schema 不调工具）──
     const EXPOSE_TOOL_CAP: usize = 12;
 
+    /// 始终暴露给 LLM 的关键工具（不论相关性打分），确保诊断/运维类能力不被 top-K 过滤掉。
+    /// 例：system_ops 是“为什么 X 停止/出错了”类问题的唯一事实来源，必须常驻 schema。
+    const ALWAYS_EXPOSE_TOOLS: &[&str] = &["system_ops"];
+
     fn prefetch_tokens(s: &str) -> Vec<String> {
         let s = s.to_lowercase();
         let s: String = s.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
@@ -1868,11 +1875,28 @@ impl AgentCore {
     async fn select_exposed_tools(&self, message: &str, allowed_ns: &[String]) -> Vec<ToolDef> {
         let all = self.fetch_tools_filtered(allowed_ns).await;
         let total = all.len();
-        if total <= Self::EXPOSE_TOOL_CAP {
-            tracing::info!(exposed_tools = total, total = total, "prefetch: 工具数未超阈值，全量暴露");
-            return all;
+        // 抽离始终暴露的工具（诊断/运维类），剩余走相关性打分
+        let always: Vec<ToolDef> = all
+            .iter()
+            .filter(|t| Self::ALWAYS_EXPOSE_TOOLS.contains(&t.function.name.as_str()))
+            .cloned()
+            .collect();
+        let rest: Vec<ToolDef> = all
+            .into_iter()
+            .filter(|t| !Self::ALWAYS_EXPOSE_TOOLS.contains(&t.function.name.as_str()))
+            .collect();
+        if rest.is_empty() {
+            tracing::info!(exposed_tools = always.len(), total = total, "prefetch: 仅有常驻工具，直接返回");
+            return always;
         }
-        let mut scored: Vec<(f64, ToolDef)> = all
+        if rest.len() <= Self::EXPOSE_TOOL_CAP.saturating_sub(always.len()) {
+            let mut out = rest;
+            out.extend(always);
+            tracing::info!(exposed_tools = out.len(), total = total, "prefetch: 工具数未超阈值（含常驻），全量暴露");
+            return out;
+        }
+        let cap = Self::EXPOSE_TOOL_CAP.saturating_sub(always.len());
+        let mut scored: Vec<(f64, ToolDef)> = rest
             .into_iter()
             .map(|t| {
                 let s = self.score_tool_relevance(message, &t.function.name, &t.function.description);
@@ -1881,12 +1905,16 @@ impl AgentCore {
             .collect();
         let max_score = scored.iter().map(|(s, _)| *s).fold(0.0f64, f64::max);
         if max_score <= 0.0 {
-            tracing::info!(exposed_tools = total, total = total, "prefetch: 相关性全 0，退回全量暴露");
-            return scored.into_iter().map(|(_, t)| t).collect();
+            tracing::info!(exposed_tools = total, total = total, "prefetch: 相关性全 0，退回全量暴露（含常驻）");
+            let mut out: Vec<ToolDef> = scored.into_iter().map(|(_, t)| t).collect();
+            out.extend(always);
+            return out;
         }
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let top: Vec<ToolDef> = scored.into_iter().take(Self::EXPOSE_TOOL_CAP).map(|(_, t)| t).collect();
-        tracing::info!(exposed_tools = top.len(), total = total, "prefetch: 按 task_context 选暴露工具子集");
+        let always_len = always.len();
+        let mut top: Vec<ToolDef> = scored.into_iter().take(cap).map(|(_, t)| t).collect();
+        top.extend(always);
+        tracing::info!(exposed_tools = top.len(), total = total, always = always_len, "prefetch: 按 task_context 选暴露工具子集（含常驻诊断工具）");
         top
     }
 
@@ -4013,9 +4041,15 @@ impl AgentCore {
 - ❌ 不能导出数据到外部
 - ❌ 不能泄露敏感信息（密码、API Key）
 - ✅ 查询类直接执行，不需要确认
-- ✅ 改数据前要确认，确认后直接执行
+        - ✅ 改数据前要确认，确认后直接执行
 
-当前时间：{now}
+        ## 对话与确认（重要）
+        - 你收到的每一条消息都是【当前用户】直接发来的，不是其他 Agent 转发的。
+        - 收件箱里"来自其他 Agent 的消息"是独立的协作待办，与用户当前问题分开处理，绝不混为一谈，也不要对用户说"你收到的消息 / 哪个 Agent 发的消息"之类的话。
+        - 如果用户用简短肯定回复（需要 / 好的 / 去吧 / 可以 / 行 / 对 / 确认 / 查吧），且上一轮你提出了某个操作或查询建议，则视为用户已同意，直接执行该建议（调用相应工具），不要反问、不要重复确认。
+        - 当用户问"为什么 X 停止 / 为什么没变化 / 出错了 / 怎么回事"时，必须先调用相关诊断工具（如 system_ops 的 status / logs）查实情（进程状态、最近日志、错误码），再基于事实给原因；严禁只回"检查日志 / 重启服务"这类空建议。
+
+        当前时间：{now}
 "#,
                 agent = self.config.identity.agent_id,
                 now = now,
