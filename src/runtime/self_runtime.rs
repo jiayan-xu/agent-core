@@ -17,6 +17,8 @@ pub struct Persona {
     pub ns_full_path: Option<String>,
     /// 该分身专属 LLM（None = 圆桌/ tick 时回退到全局 client）
     pub llm: Option<LlmClient>,
+    /// 是否仅拥有者 / admin 可见（私有分身）。默认 false = 公开。
+    pub is_private: bool,
 }
 
 /// 分身运行时的 tick 状态

@@ -1334,11 +1334,15 @@ fn main() {
                                             pc.tool_allowlist.clone(),
                                             pc.memory_namespace.clone(),
                                             pc.llm.clone(),
+                                            false,
                                         );
                                         for goal in &pc.goals {
                                             let _ = a.push_persona_goal(&pc.id, goal);
                                         }
                                     }
+                                    // 启动恢复：分身私有属性 + 圆桌会议记录（跨重启不丢）
+                                    a.load_personas_from_disk();
+                                    a.load_meetings_from_disk();
                                 }
                             }
                             // A2: 启动白龙马 TICK 心跳（空闲 20min / 抢占 / 600s watchdog）
@@ -1530,6 +1534,8 @@ fn main() {
                 .route("/api/session/persona", post(handle_session_persona_bind))
                 .route("/api/documents/archive", post(handle_documents_archive))
                 .route("/api/roundtable", post(handle_panel_discuss))
+                .route("/api/meetings", get(handle_meetings_list))
+                .route("/api/meetings/{id}", delete(handle_meeting_delete))
                 .route("/api/evolve", post(handle_code_evolve))
                 .route("/api/meta-evolution/run", post(handle_meta_evolution_run))
                 .route("/api/meta-evolution/status", get(handle_meta_evolution_status))
@@ -1713,9 +1719,14 @@ async fn handle_admin_consolidate(
 
 /// Phase 3：运行时创建分身
 async fn handle_persona_create(
+    headers: axum::http::HeaderMap,
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
+    let (caller, _) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let v = match body {
         Some(Json(v)) => v,
         None => return (axum::http::StatusCode::BAD_REQUEST, "missing body").into_response(),
@@ -1725,7 +1736,9 @@ async fn handle_persona_create(
         _ => return (axum::http::StatusCode::BAD_REQUEST, "persona_id required").into_response(),
     };
     let display_name = v.get("display_name").and_then(|x| x.as_str()).unwrap_or(&persona_id).to_string();
-    let owner_user_id = v.get("owner_user_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    // owner 一律由鉴权身份推导，不信任请求体（防越权声明他人身份）
+    let owner_user_id = caller.clone();
+    let is_private = v.get("is_private").and_then(|x| x.as_bool()).unwrap_or(false);
     let tool_allowlist: Vec<String> = v
         .get("tool_allowlist")
         .and_then(|x| x.as_array())
@@ -1739,16 +1752,25 @@ async fn handle_persona_create(
     let Some(ref agent) = *g else {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
     };
-    match agent.create_persona(&persona_id, &display_name, &owner_user_id, tool_allowlist, memory_namespace, llm) {
-        Ok(()) => Json(serde_json::json!({"ok": true, "persona_id": persona_id})).into_response(),
+    match agent.create_persona(&persona_id, &display_name, &owner_user_id, tool_allowlist, memory_namespace, llm, is_private) {
+        Ok(()) => {
+            agent.save_personas();
+            Json(serde_json::json!({"ok": true, "persona_id": persona_id, "owner_user_id": owner_user_id, "is_private": is_private})).into_response()
+        }
         Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
     }
 }
 
-/// Phase 3：列出所有分身
+/// Phase 3：列出分身（仅返回调用者可见的：公开 / 拥有者 / admin）
 async fn handle_persona_list(
+    headers: axum::http::HeaderMap,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
+    let (caller, _) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let admin = is_admin(&headers, &st).await;
     let g = st.agent.lock().await;
     let Some(ref agent) = *g else {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
@@ -1756,6 +1778,7 @@ async fn handle_persona_list(
     let list: Vec<serde_json::Value> = agent
         .list_personas()
         .iter()
+        .filter(|p| !p.is_private || admin || p.owner_user_id == caller)
         .map(|p| {
             serde_json::json!({
                 "persona_id": p.persona_id,
@@ -1763,23 +1786,39 @@ async fn handle_persona_list(
                 "owner_user_id": p.owner_user_id,
                 "tool_allowlist": p.tool_allowlist,
                 "memory_namespace": p.memory_namespace,
+                "is_private": p.is_private,
             })
         })
         .collect();
     Json(serde_json::json!({"personas": list})).into_response()
 }
 
-/// Phase 3：删除分身
+/// Phase 3：删除分身（私有分身仅拥有者 / admin 可删）
 async fn handle_persona_delete(
+    headers: axum::http::HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
+    let (caller, _) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let admin = is_admin(&headers, &st).await;
     let g = st.agent.lock().await;
     let Some(ref agent) = *g else {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
     };
+    // 私有分身：非拥有者 / 非 admin 一律隐藏（404 不泄露存在）
+    if let Some(p) = agent.persona_by_id(&id) {
+        if p.is_private && !admin && p.owner_user_id != caller {
+            return (axum::http::StatusCode::NOT_FOUND, "persona not found").into_response();
+        }
+    }
     match agent.remove_persona(&id) {
-        Ok(()) => Json(serde_json::json!({"ok": true, "removed": id})).into_response(),
+        Ok(()) => {
+            agent.save_personas();
+            Json(serde_json::json!({"ok": true, "removed": id})).into_response()
+        }
         Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
     }
 }
@@ -1829,16 +1868,28 @@ async fn handle_persona_goal_push(
     }
 }
 
-/// Phase 4：查询单分身详情（含目标栈）
+/// Phase 4：查询单分身详情（含目标栈；私有分身仅拥有者 / admin 可见）
 async fn handle_persona_get(
+    headers: axum::http::HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
+    let (caller, _) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let admin = is_admin(&headers, &st).await;
     let g = st.agent.lock().await;
     let Some(ref agent) = *g else {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
     };
-    let p = agent.get_persona(&id);
+    let p = match agent.persona_by_id(&id) {
+        Some(p) => p,
+        None => return (axum::http::StatusCode::NOT_FOUND, "persona not found").into_response(),
+    };
+    if p.is_private && !admin && p.owner_user_id != caller {
+        return (axum::http::StatusCode::NOT_FOUND, "persona not found").into_response();
+    }
     let goals = agent.get_persona_goals(&id);
     Json(serde_json::json!({
         "persona_id": p.persona_id,
@@ -1846,6 +1897,7 @@ async fn handle_persona_get(
         "owner_user_id": p.owner_user_id,
         "tool_allowlist": p.tool_allowlist,
         "memory_namespace": p.memory_namespace,
+        "is_private": p.is_private,
         "goals": goals,
     })).into_response()
 }
@@ -1857,9 +1909,14 @@ async fn handle_persona_get(
 /// 结论最佳努力写入 Memoria（调用者自身 ns）。LLM 分配由 `AgentCore::persona_stance`
 /// 完成：配置/圆桌池自动轮询到多个 provider，做到真多 LLM。
 async fn handle_panel_discuss(
+    headers: axum::http::HeaderMap,
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
+    let (caller, _) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let v = match body {
         Some(Json(v)) => v,
         None => return (axum::http::StatusCode::BAD_REQUEST, "missing body").into_response(),
@@ -1880,12 +1937,36 @@ async fn handle_panel_discuss(
                 .collect::<Vec<_>>()
         })
         .filter(|v| !v.is_empty());
-    let g = st.agent.lock().await;
-    let has_agent = g.is_some();
-    drop(g);
+    // 圆桌默认私有（仅拥有者 / admin 可见）；显式 visibility=public 才公开
+    let is_private = !(v
+        .get("visibility")
+        .and_then(|x| x.as_str())
+        .map(|s| s == "public")
+        .unwrap_or(false));
+
+    // 计算实际参与者（用于会议记录），并预建会议记录（status=running）
+    let g0 = st.agent.lock().await;
+    let has_agent = g0.is_some();
+    let mut participants: Vec<String> = Vec::new();
+    if let Some(ref agent) = *g0 {
+        let mut personas = agent.list_personas();
+        personas.sort_by(|a, b| a.persona_id.cmp(&b.persona_id));
+        if let Some(ids) = &selected_ids {
+            personas.retain(|p| ids.contains(&p.persona_id));
+        }
+        participants = personas.iter().map(|p| p.persona_id.clone()).collect();
+    }
+    drop(g0);
     if !has_agent {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
     }
+    let meeting_id = {
+        let g = st.agent.lock().await;
+        match &*g {
+            Some(ref agent) => agent.create_meeting(&topic, &caller, participants.clone(), is_private),
+            None => String::new(),
+        }
+    };
 
     let st_clone = st.clone();
     let (tx, rx): (
@@ -1897,6 +1978,7 @@ async fn handle_panel_discuss(
     let chair_c = chair.clone();
     let session_c = session_id.to_string();
     let sel_c = selected_ids;
+    let meeting_id_c = meeting_id.clone();
     tokio::spawn(async move {
         let g = st_clone.agent.lock().await;
         let Some(ref agent) = *g else {
@@ -1926,6 +2008,10 @@ async fn handle_panel_discuss(
         let _ = tx.send(Ok(SseEvent::default().event("consensus").data(
             serde_json::json!({ "consensus": consensus }).to_string(),
         )));
+        // 回填会议记录（共识 + done）
+        if !meeting_id_c.is_empty() {
+            agent.finish_meeting(&meeting_id_c, &consensus);
+        }
         // 最佳努力写入 Memoria（调用者自身 ns）
         let stances_text = stances
             .iter()
@@ -1952,6 +2038,60 @@ async fn handle_panel_discuss(
     });
 
     Sse::new(UnboundedReceiverStream::new(rx)).into_response()
+}
+
+/// Phase 6 增强：列出调用者可见的圆桌会议（私有仅拥有者 / admin 可见）
+async fn handle_meetings_list(
+    headers: axum::http::HeaderMap,
+    State(st): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let (caller, _) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let admin = is_admin(&headers, &st).await;
+    let g = st.agent.lock().await;
+    let Some(ref agent) = *g else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+    };
+    let list = agent.list_meetings(&caller, admin);
+    let items: Vec<serde_json::Value> = list
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "topic": m.topic,
+                "owner_user_id": m.owner_user_id,
+                "participant_personas": m.participant_personas,
+                "is_private": m.is_private,
+                "created_at": m.created_at,
+                "status": m.status,
+                "consensus": m.consensus,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "meetings": items })).into_response()
+}
+
+/// Phase 6 增强：删除圆桌会议（私有仅拥有者 / admin 可删）
+async fn handle_meeting_delete(
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(st): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let (caller, _) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let admin = is_admin(&headers, &st).await;
+    let g = st.agent.lock().await;
+    let Some(ref agent) = *g else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+    };
+    match agent.remove_meeting(&id, &caller, admin) {
+        Ok(()) => Json(serde_json::json!({"ok": true, "removed": id})).into_response(),
+        Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
 }
 
 /// Phase 7：进化任务并发守卫（Drop 时复位，确保任何退出路径都释放锁）

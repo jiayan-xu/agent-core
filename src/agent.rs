@@ -224,6 +224,8 @@ pub struct AgentCore {
     pub local_resources: crate::resources::SharedResourceSnapshot,
     /// 多分身容器（Phase 1）：persona_id → Persona；默认含 "default" 分身
     pub personas: std::sync::Mutex<std::collections::HashMap<String, crate::runtime::self_runtime::Persona>>,
+    /// 圆桌会议记录（Phase 6 增强）：默认私有，仅拥有者 / admin 可见；持久化到 cwd/meetings.json
+    pub meetings: std::sync::Mutex<Vec<Meeting>>,
     /// Phase 2：会话 → 分身 绑定（分身级工具白名单接线）
     pub session_personas: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// Phase 2：分身 tick 调度器注册表（真实 tick 由 AgentCore 驱动，避免循环依赖）
@@ -285,6 +287,21 @@ pub struct RoundtableResult {
     pub stances: Vec<(String, String)>,
     /// 主席收敛结论
     pub consensus: String,
+}
+
+/// 圆桌会议记录（Phase 6 增强）：默认私有，仅拥有者 / admin 可见；持久化到 cwd/meetings.json
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Meeting {
+    pub id: String,
+    pub topic: String,
+    pub owner_user_id: String,
+    pub participant_personas: Vec<String>,
+    pub is_private: bool,
+    /// RFC3339 创建时间
+    pub created_at: String,
+    /// "running" | "done"
+    pub status: String,
+    pub consensus: Option<String>,
 }
 
 impl AgentCore {
@@ -380,6 +397,7 @@ impl AgentCore {
             badge_token: config.identity.badge_token.clone(),
             ns_full_path: config.identity.ns_full_path.clone(),
             llm: None,
+            is_private: false,
         };
         let routed_llm = RoutedLlm::from_config(&config.llm);
         // HY3 1.3：三大项热路径接线（默认 OFF；仅 features 开关开启才持有控制器）
@@ -445,6 +463,7 @@ impl AgentCore {
                 m.insert("default".to_string(), default_persona);
                 m
             }),
+            meetings: std::sync::Mutex::new(Vec::new()),
             session_personas: std::sync::Mutex::new(std::collections::HashMap::new()),
             tick_scheduler: crate::scheduler::tick_scheduler::TickScheduler::default(),
             approval_gate,
@@ -480,6 +499,7 @@ impl AgentCore {
             badge_token: self.config.identity.badge_token.clone(),
             ns_full_path: self.config.identity.ns_full_path.clone(),
             llm: None,
+            is_private: false,
         })
     }
 
@@ -559,6 +579,7 @@ impl AgentCore {
         tool_allowlist: Vec<String>,
         memory_namespace: String,
         llm: Option<LlmConfig>,
+        is_private: bool,
     ) -> Result<(), String> {
         if persona_id == "default" {
             return Err("default 分身不可重建".to_string());
@@ -574,6 +595,7 @@ impl AgentCore {
             badge_token: self.config.identity.badge_token.clone(),
             ns_full_path: self.config.identity.ns_full_path.clone(),
             llm: llm_client,
+            is_private,
         };
         let mut m = self.personas.lock().unwrap_or_else(|p| p.into_inner());
         m.insert(persona_id.to_string(), persona.clone());
@@ -598,6 +620,235 @@ impl AgentCore {
         drop(m);
         self.tick_scheduler.unregister(persona_id);
         Ok(())
+    }
+
+    /// 取分身（Option 版，用于存在性 / 私有判断）
+    pub fn persona_by_id(&self, id: &str) -> Option<crate::runtime::self_runtime::Persona> {
+        let m = self.personas.lock().unwrap_or_else(|p| p.into_inner());
+        m.get(id).cloned()
+    }
+
+    /// 分身持久化：把当前全部分身（含 is_private/owner）落盘 cwd/personas.json。
+    /// 重启后由 load_personas_from_disk 恢复私有属性；toml 配置的分身以 toml 为准，
+    /// 仅用 JSON 覆盖其 is_private/owner_user_id（保留专属 LLM 等配置）。
+    pub fn save_personas(&self) {
+        let cwd = match std::env::current_dir() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let path = cwd.join("personas.json");
+        let m = self.personas.lock().unwrap_or_else(|p| p.into_inner());
+        let arr: Vec<serde_json::Value> = m
+            .values()
+            .map(|p| {
+                serde_json::json!({
+                    "persona_id": p.persona_id,
+                    "display_name": p.display_name,
+                    "owner_user_id": p.owner_user_id,
+                    "tool_allowlist": p.tool_allowlist,
+                    "memory_namespace": p.memory_namespace,
+                    "is_private": p.is_private,
+                })
+            })
+            .collect();
+        drop(m);
+        if let Ok(s) = serde_json::to_string_pretty(&serde_json::json!({ "personas": arr })) {
+            let tmp = path.with_extension("tmp");
+            if std::fs::write(&tmp, &s).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+
+    /// 启动时从 personas.json 恢复私有属性（不覆盖 toml 的专属 LLM / 展示名等）
+    pub fn load_personas_from_disk(&self) {
+        let cwd = match std::env::current_dir() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let path = cwd.join("personas.json");
+        let s = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let v = match serde_json::from_str::<serde_json::Value>(&s) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let arr = match v.get("personas").and_then(|x| x.as_array()) {
+            Some(a) => a,
+            None => return,
+        };
+        let mut m = self.personas.lock().unwrap_or_else(|p| p.into_inner());
+        for item in arr {
+            let id = match item.get("persona_id").and_then(|x| x.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => continue,
+            };
+            let is_private = item.get("is_private").and_then(|x| x.as_bool()).unwrap_or(false);
+            let owner = item
+                .get("owner_user_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if let Some(existing) = m.get_mut(&id) {
+                existing.is_private = is_private;
+                if !owner.is_empty() {
+                    existing.owner_user_id = owner;
+                }
+            } else {
+                let display = item
+                    .get("display_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or(&id)
+                    .to_string();
+                let allowlist: Vec<String> = item
+                    .get("tool_allowlist")
+                    .and_then(|x| x.as_array())
+                    .map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                let ns = item
+                    .get("memory_namespace")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                m.insert(
+                    id.clone(),
+                    crate::runtime::self_runtime::Persona {
+                        persona_id: id,
+                        display_name: display,
+                        owner_user_id: owner,
+                        workspace_dir: None,
+                        tool_allowlist: allowlist,
+                        memory_namespace: ns,
+                        badge_token: self.config.identity.badge_token.clone(),
+                        ns_full_path: self.config.identity.ns_full_path.clone(),
+                        llm: None,
+                        is_private,
+                    },
+                );
+            }
+        }
+        drop(m);
+    }
+
+    /// 创建一条会议记录（默认私有），返回会议 id
+    pub fn create_meeting(
+        &self,
+        topic: &str,
+        owner: &str,
+        participants: Vec<String>,
+        is_private: bool,
+    ) -> String {
+        let id = format!("mtg_{}", chrono::Utc::now().timestamp_millis());
+        let meeting = Meeting {
+            id: id.clone(),
+            topic: topic.to_string(),
+            owner_user_id: owner.to_string(),
+            participant_personas: participants,
+            is_private,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status: "running".to_string(),
+            consensus: None,
+        };
+        self.meetings
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(meeting);
+        self.save_meetings();
+        id
+    }
+
+    /// 圆桌收敛完成后回填共识并标记 done
+    pub fn finish_meeting(&self, id: &str, consensus: &str) {
+        {
+            let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(m) = v.iter_mut().find(|m| m.id == id) {
+                m.status = "done".to_string();
+                m.consensus = Some(consensus.to_string());
+            }
+        }
+        self.save_meetings();
+    }
+
+    /// 列出调用者可见的会议：公开 或 拥有者 或 admin
+    pub fn list_meetings(&self, caller: &str, is_admin: bool) -> Vec<Meeting> {
+        let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out: Vec<Meeting> = v
+            .iter()
+            .filter(|m| !m.is_private || is_admin || m.owner_user_id == caller)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        out
+    }
+
+    /// 删除会议（私有且非拥有者 / 非 admin 则拒）
+    pub fn remove_meeting(&self, id: &str, caller: &str, is_admin: bool) -> Result<(), String> {
+        let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+        let pos = v.iter().position(|m| m.id == id);
+        match pos {
+            Some(i) => {
+                let m = &v[i];
+                if m.is_private && !is_admin && m.owner_user_id != caller {
+                    return Err("无权删除该会议".to_string());
+                }
+                v.remove(i);
+                drop(v);
+                self.save_meetings();
+                Ok(())
+            }
+            None => Err("会议不存在".to_string()),
+        }
+    }
+
+    /// 会议持久化：落盘 cwd/meetings.json（原子写）
+    pub fn save_meetings(&self) {
+        let cwd = match std::env::current_dir() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let path = cwd.join("meetings.json");
+        let s = {
+            let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+            let payload = serde_json::json!({ "meetings": v.iter().collect::<Vec<_>>() });
+            match serde_json::to_string_pretty(&payload) {
+                Ok(s) => s,
+                Err(_) => return,
+            }
+        };
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &s).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    /// 启动时从 meetings.json 恢复会议记录
+    pub fn load_meetings_from_disk(&self) {
+        let cwd = match std::env::current_dir() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let path = cwd.join("meetings.json");
+        let s = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let v = match serde_json::from_str::<serde_json::Value>(&s) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let arr = match v.get("meetings").and_then(|x| x.as_array()) {
+            Some(a) => a,
+            None => return,
+        };
+        let mut loaded: Vec<Meeting> = Vec::new();
+        for item in arr {
+            if let Ok(m) = serde_json::from_value::<Meeting>(item.clone()) {
+                loaded.push(m);
+            }
+        }
+        *self.meetings.lock().unwrap_or_else(|p| p.into_inner()) = loaded;
     }
 
     /// Phase 4：给分身压入一个目标（驱动真实 tick）
