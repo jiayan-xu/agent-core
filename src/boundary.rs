@@ -1040,6 +1040,16 @@ impl ToolClassifier {
     /// 批量注册（从 MCP tools/list 结果中自动学习分类）
     pub fn register_from_tools(&mut self, tools: &[(String, String)]) {
         for (name, _desc) in tools {
+            // Memoria 具名工具：优先精确分类，避免 memory_* 落入 unknown 黄线
+            if let Some(level) = classify_memoria_tool(name) {
+                self.register(name, level);
+                continue;
+            }
+            // 运维状态查询工具：纯只读，直接归 read，避免被 unknown 黄线触发「执行」确认闸
+            if name == "system_ops" {
+                self.register(name, "read");
+                continue;
+            }
             let lower = name.to_lowercase();
             // SQL 查询类工具（execute_sql / query_* 等，仅 SELECT）一律按只读处理，
             // 排除明显的写操作前缀（update_/insert_/delete_/create_）
