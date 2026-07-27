@@ -1,12 +1,14 @@
 //! LLM 客户端 — 兼容 DeepSeek / OpenAI API（支持流式）
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use futures::future::join_all;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio::sync::Semaphore;
 
 /// SSE 流式事件
 #[derive(Debug, Clone, Serialize)]
@@ -958,6 +960,23 @@ impl std::fmt::Debug for LlmClient {
     }
 }
 
+/// LLM 上游并发信号量：解除 agent 全局锁后，20+ 并发 chat 会并行打 provider，
+/// 易触发 RPM 限流（HTTP 429）。用 module 级 Semaphore 限制同时在途的上游 HTTP 请求数，
+/// 默认 16，可用环境变量 AGENT_LLM_MAX_CONCURRENCY 覆盖。
+/// 在 LlmClient::chat / chat_stream_single 的叶子 HTTP（.send().await）前 acquire_owned，
+/// permit 跨 await 持有、作用域结束自动释放；Best-of-N 内部 fan-out 的多次调用各自占一个 permit。
+static LLM_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+
+fn llm_semaphore() -> &'static Semaphore {
+    LLM_SEMAPHORE.get_or_init(|| {
+        let n: usize = std::env::var("AGENT_LLM_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(16);
+        Semaphore::new(n.max(1))
+    })
+}
+
 impl LlmClient {
     pub fn new(config: LlmConfig) -> Self {
         let client = Client::builder()
@@ -1010,6 +1029,11 @@ impl LlmClient {
             // 3 次重试：0s, 1s, 2s 退避
             let max_retries = if idx == 0 { 3 } else { 1 }; // 主 Provider 重试 3 次，备用只试 1 次
             for attempt in 0..max_retries {
+                // 限流上游并发，防 RPM/429：在叶子 HTTP 前占一个 permit
+                let _permit = llm_semaphore()
+                    .acquire()
+                    .await
+                    .expect("llm semaphore closed");
                 let resp_result = self
                     .client
                     .post(&url)
@@ -1184,6 +1208,11 @@ impl LlmClient {
         // DeepSeek 专用：禁用 thinking 输出（避免中文乱码）
         body["extra_body"] = serde_json::json!({"thinking": {"type": "disabled"}});
 
+        // 限流上游并发，防 RPM/429：在叶子 HTTP 前占一个 permit
+        let _permit = llm_semaphore()
+            .acquire()
+            .await
+            .expect("llm semaphore closed");
         let resp = self
             .client
             .post(&url)

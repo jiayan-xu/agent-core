@@ -76,10 +76,18 @@ pub struct NsQuotaStore {
 
 impl NsQuotaStore {
     pub fn new() -> Self {
+        let mut default_policy = NsQuotaPolicy::default();
+        // 允许通过环境变量覆盖默认并发会话上限：默认 8（保护单命名空间不被打爆），
+        // 设为更大值（如 32）可支撑同一命名空间 20+ 并发。其余配额维度同理可扩展。
+        if let Ok(v) = std::env::var("AGENT_MAX_CONCURRENT_SESSIONS") {
+            if let Ok(n) = v.parse::<u32>() {
+                default_policy.max_concurrent_sessions = n.max(1);
+            }
+        }
         NsQuotaStore {
             policies: HashMap::new(),
             usage: HashMap::new(),
-            default_policy: NsQuotaPolicy::default(),
+            default_policy,
         }
     }
 

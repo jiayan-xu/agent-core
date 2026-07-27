@@ -587,7 +587,9 @@ fn peer_in_company(namespace: &str) -> bool {
 
 struct AppState {
     config: Mutex<Config>,
-    agent: Mutex<Option<AgentCore>>,
+    /// 用 Arc 包装：chat/consolidate 等 handler 克隆 Arc 后立即释放全局锁，
+    /// 使 LLM 往返在锁外并发执行（解除单点串行瓶颈）。
+    agent: Mutex<Option<Arc<AgentCore>>>,
     #[allow(dead_code)]
     config_path: String,
     /// 身份认证缓存 (agent_id → (badge_token, expires_at))
@@ -664,6 +666,70 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// 写 `/health.dream` 摘要。`touch_ymd=true` 时同步夜间去重游标（manual/nightly）；
+/// tick/hydrate 必须 `false`，以免挡住当日低峰 meta_evolution。
+async fn record_dream_health(
+    state: &AppState,
+    trigger: &str,
+    results: Vec<serde_json::Value>,
+    touch_ymd: bool,
+) {
+    let now_local = Local::now();
+    let ymd = now_local.format("%Y-%m-%d").to_string();
+    let summary = serde_json::json!({
+        "status": "ok",
+        "trigger": trigger,
+        "ymd": ymd,
+        "at": now_local.to_rfc3339(),
+        "results": results,
+    });
+    if touch_ymd {
+        *state.consolidate_last_ymd.lock().await = ymd;
+    }
+    *state.consolidate_last.lock().await = summary;
+}
+
+/// 启动时从 Memoria dream_state 回填 health（仅当仍为 never）。
+async fn hydrate_dream_health_from_memoria(state: &AppState) {
+    let still_never = {
+        let g = state.consolidate_last.lock().await;
+        g.get("status").and_then(|s| s.as_str()) == Some("never")
+    };
+    if !still_never {
+        return;
+    }
+    let guard = state.agent.lock().await;
+    let Some(agent) = guard.as_ref() else { return };
+    let default_ns = format!("agent/{}", agent.config.identity.agent_id);
+    let ns_list: Vec<String> = std::env::var("CONSOLIDATE_NAMESPACES")
+        .unwrap_or_else(|_| default_ns.clone())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut results = Vec::new();
+    for ns in &ns_list {
+        match agent.peek_dream_consolidate(ns).await {
+            Some(v) => {
+                results.push(serde_json::json!({
+                    "ns": ns,
+                    "last_run": v.get("last_run").cloned().unwrap_or(serde_json::Value::Null),
+                    "cursor_ts": v.get("cursor_ts").cloned().unwrap_or(serde_json::Value::Null),
+                    "runs": v.get("runs").cloned().unwrap_or(serde_json::Value::Null),
+                }));
+            }
+            None => {
+                results.push(serde_json::json!({"ns": ns, "error": "dream_state_get failed"}));
+            }
+        }
+    }
+    drop(guard);
+    if results.iter().any(|r| r.get("last_run").is_some()) {
+        tracing::info!(target: "consciousness", "hydrate /health.dream from memoria dream_state");
+        record_dream_health(state, "hydrate", results, false).await;
+    }
+}
+
 impl Consciousness {
     fn new(state: Arc<AppState>) -> Arc<Self> {
         Arc::new(Self {
@@ -683,22 +749,30 @@ impl Consciousness {
         // 白龙马 A2 深化：自适应节奏（env 可配，默认向后兼容）
         // - AGENT_TICK_IDLE_SEC：无近期活动时空闲节奏（默认 1200s=20min）
         // - AGENT_TICK_ACTIVE_WINDOW_SEC：用户活动窗口（默认 600s）；窗口内下一跳缩到 min(idle, 120s)
+        // - AGENT_TICK_BOOTSTRAP_SEC：启动后首跳（默认 15s），让 dream health 尽快离开 never
         // - 活跃期下限 120s：避免对话密集时 tick 过频挤占响应
         let idle_sec: u64 = env_parse("AGENT_TICK_IDLE_SEC", 1200);
         let active_window_sec: u64 = env_parse("AGENT_TICK_ACTIVE_WINDOW_SEC", 600);
+        let bootstrap_sec: u64 = env_parse("AGENT_TICK_BOOTSTRAP_SEC", 15);
         let fast_sec: u64 = 120;
+        let mut bootstrapped = false;
         tracing::info!(
             target: "consciousness",
-            idle_sec, active_window_sec, fast_sec,
+            idle_sec, active_window_sec, fast_sec, bootstrap_sec,
             "consciousness: TICK 循环启动（自适应节奏 / 抢占 / 600s watchdog）"
         );
         loop {
-            // 计算下一跳：最近有用户活动 → 加速；否则按 idle 节奏
-            let since = now_unix_secs().saturating_sub(self.last_activity_secs.load(Ordering::SeqCst));
-            let next_sec = if since < active_window_sec {
-                idle_sec.min(fast_sec)
+            // 计算下一跳：首跳 bootstrap；其后最近有用户活动 → 加速；否则按 idle 节奏
+            let next_sec = if !bootstrapped {
+                bootstrapped = true;
+                bootstrap_sec.max(1)
             } else {
-                idle_sec
+                let since = now_unix_secs().saturating_sub(self.last_activity_secs.load(Ordering::SeqCst));
+                if since < active_window_sec {
+                    idle_sec.min(fast_sec)
+                } else {
+                    idle_sec
+                }
             };
             let sleep = tokio::time::sleep(Duration::from_secs(next_sec));
             tokio::select! {
@@ -764,6 +838,7 @@ impl Consciousness {
         }
         let per_tick: usize = env_parse("AGENT_CONSOLIDATE_PER_TICK", 1).clamp(1, ns_list.len());
         let mut out = Vec::with_capacity(per_tick);
+        let mut results_json: Vec<serde_json::Value> = Vec::with_capacity(per_tick);
         for _ in 0..per_tick {
             let idx = {
                 let mut c = state.consolidate_cursor.lock().await;
@@ -777,14 +852,20 @@ impl Consciousness {
             let res = tokio::time::timeout(Duration::from_secs(300), agent.consolidate(ns)).await;
             match res {
                 Ok(summary) => {
-                    let summary = format!("consolidate[{}]: {}", ns, summary);
-                    tracing::info!(target: "consciousness", "{}", summary);
-                    out.push(BackgroundEvent::new("consolidate", summary));
+                    let line = format!("consolidate[{}]: {}", ns, summary);
+                    tracing::info!(target: "consciousness", "{}", line);
+                    results_json.push(serde_json::json!({"ns": ns, "result": summary}));
+                    out.push(BackgroundEvent::new("consolidate", line));
                 }
                 Err(_) => {
                     tracing::warn!(target: "consciousness_watchdog", ns = %ns, "A4: consolidate 超时(>300s)跳过");
+                    results_json.push(serde_json::json!({"ns": ns, "result": "timeout"}));
                 }
             }
+        }
+        // 回写 /health.dream（不碰 consolidate_last_ymd，避免挡掉夜间 meta_evolution）
+        if !results_json.is_empty() {
+            record_dream_health(state, "tick", results_json, false).await;
         }
         out
     }
@@ -1239,7 +1320,7 @@ fn main() {
                                 "✓ Agent 已就绪（{}@{}）",
                                 reg_config.agent_id, reg_config.server
                             );
-                            *reg_state.agent.lock().await = Some(agent);
+                            *reg_state.agent.lock().await = Some(Arc::new(agent));
                             // Phase 5：从 agent.toml [[personas]] 配置表加载并联分身（default 已在 AgentCore::new 注册）
                             {
                                 let g = reg_state.agent.lock().await;
@@ -1264,6 +1345,9 @@ fn main() {
                             let cons = Consciousness::new(reg_state.clone());
                             tokio::spawn(cons.clone().run());
                             *reg_state.consciousness.lock().await = Some(cons);
+                            // 启动回填 /health.dream：避免进程重启后假象 status=never
+                            // agent 已就绪，同步回填（失败不阻断）；TICK 稍后还会再写 trigger=tick
+                            hydrate_dream_health_from_memoria(&reg_state).await;
                         }
                         Err(e) => {
                             println!("! Agent 初始化失败: {}（可在设置页重试）", e);
@@ -1348,14 +1432,7 @@ fn main() {
                             let me_val = agent.run_meta_evolution(&default_ns).await;
                             tracing::info!(target: "consciousness", "meta_evolution(nightly): {}", me_val);
                             results.push(serde_json::json!({"ns": default_ns, "meta_evolution": me_val}));
-                            *patrol_state.consolidate_last_ymd.lock().await = ymd.clone();
-                            *patrol_state.consolidate_last.lock().await = serde_json::json!({
-                                "status": "ok",
-                                "trigger": "nightly",
-                                "ymd": ymd,
-                                "at": now_local.to_rfc3339(),
-                                "results": results,
-                            });
+                            record_dream_health(&patrol_state, "nightly", results, true).await;
                         }
                         // 每轮检查 dashboard agent_worker 健康（端口 8011）
                         let agent_ok = reqwest::get("http://127.0.0.1:8011/health")
@@ -1445,6 +1522,7 @@ fn main() {
                 .route("/api/collab/send", post(handle_collab_send))
                 .route("/api/collab/approval", post(handle_collab_approval))
                 .route("/api/collab/peers", get(handle_collab_peers))
+                .route("/api/memory/feedback", post(handle_memory_feedback))
                 .route("/v1/chat/completions", post(handle_v1_chat))
                 .route("/api/persona", post(handle_persona_create).get(handle_persona_list))
                 .route("/api/persona/{id}", delete(handle_persona_delete).get(handle_persona_get))
@@ -1581,8 +1659,12 @@ async fn handle_admin_consolidate(
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
-    let agent_guard = st.agent.lock().await;
-    let Some(ref agent) = *agent_guard else {
+    // 解串行：克隆 Arc 后释放全局锁，consolidate() 循环在锁外执行
+    let agent = {
+        let g = st.agent.lock().await;
+        g.as_ref().map(|a| a.clone())
+    };
+    let Some(agent) = agent else {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": "agent 尚未就绪"})),
@@ -1624,18 +1706,8 @@ async fn handle_admin_consolidate(
     } else {
         results.push(serde_json::json!({"ns": default_ns, "meta_evolution": "skipped"}));
     }
-    drop(agent_guard);
-    let now_local = Local::now();
-    let ymd = now_local.format("%Y-%m-%d").to_string();
-    let summary = serde_json::json!({
-        "status": "ok",
-        "trigger": "manual",
-        "ymd": ymd,
-        "at": now_local.to_rfc3339(),
-        "results": results,
-    });
-    *st.consolidate_last_ymd.lock().await = ymd;
-    *st.consolidate_last.lock().await = summary.clone();
+    record_dream_health(&st, "manual", results.clone(), true).await;
+    let summary = st.consolidate_last.lock().await.clone();
     Json(summary).into_response()
 }
 
@@ -1864,15 +1936,17 @@ async fn handle_panel_discuss(
             "[roundtable] topic={}\nconsensus={}\n---\n{}",
             topic_c, consensus, stances_text
         );
+        // Profile/dynamic 主源读 memories(category=decision)；勿再写 category=roundtable
         let args = serde_json::json!({
             "content": content,
-            "tags": ["roundtable"],
-            "category": "roundtable",
+            "tags": ["decision", "roundtable"],
+            "category": "decision",
             "confidence": 80,
+            "importance": 5,
             "namespace": ns,
         });
         if agent.mcp.call_json("memory_remember", &args).await.is_ok() {
-            tracing::info!(ns = %ns, "roundtable 结论已写入 Memoria");
+            tracing::info!(ns = %ns, "roundtable 共识已写入 Memoria(category=decision)");
         }
         let _ = tx.send(Ok(SseEvent::default().event("done").data("")));
     });
@@ -2271,7 +2345,7 @@ async fn handle_save_config(
     let cfg = st.config.lock().await.clone();
     match build_agent(&resolve_config_for_runtime(&cfg), st.local_resources.clone(), st.metrics.clone()).await {
         Ok(agent) => {
-            *st.agent.lock().await = Some(agent);
+            *st.agent.lock().await = Some(Arc::new(agent));
             Json(SetupResponse {
                 ok: true,
                 error: None,
@@ -2295,8 +2369,12 @@ async fn handle_chat(
     if let Some(ref c) = *st.consciousness.lock().await {
         c.interrupt();
     }
-    let agent_guard = st.agent.lock().await;
-    if let Some(ref agent) = *agent_guard {
+    // 解串行：克隆 Arc 后立即释放全局锁，chat() 在锁外并发执行
+    let agent = {
+        let g = st.agent.lock().await;
+        g.as_ref().map(|a| a.clone())
+    };
+    if let Some(agent) = agent {
         let start = std::time::Instant::now();
         let reply = agent
             .chat(
@@ -2348,8 +2426,12 @@ async fn handle_chat_stream(
         let agent_id = ctx.agent_id.clone();
         let allowed_ns = ctx.allowed_ns.clone();
         tokio::spawn(async move {
-            let guard = st_clone.agent.lock().await;
-            if let Some(ref agent) = *guard {
+            // 解串行：克隆 Arc 后释放锁，chat() 并发执行
+            let agent = {
+                let g = st_clone.agent.lock().await;
+                g.as_ref().map(|a| a.clone())
+            };
+            if let Some(agent) = agent {
                 let start = std::time::Instant::now();
                 let reply = agent.chat(&msg, &agent_id, &sid, &allowed_ns).await;
                 st_clone
@@ -2525,6 +2607,91 @@ async fn handle_collab_inbox(
         "page_size": page_size,
     }))
     .into_response()
+}
+
+/// 观点/肯定评价落盘（POST /api/memory/feedback）
+///
+/// body:
+/// - `kind`: `preference` | `decision` | `affirm`（affirm→preference+pref）
+/// - `content`: 正文（必填）
+/// - `tag`: 可选 hard_rule|pref|style（仅 preference）
+/// - `namespace`: 可选；默认 `agent/{x-agent-id}`
+async fn handle_memory_feedback(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
+) -> axum::response::Response {
+    let (agent_id, _allowed_ns) = match authenticate(&headers, &st).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let kind = body
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("affirm")
+        .trim();
+    let content = body
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if content.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "content 必填"})),
+        )
+            .into_response();
+    }
+    let (category, default_tag) = match kind {
+        "decision" => ("decision", "decision"),
+        "preference" | "affirm" => ("preference", "pref"),
+        other => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": format!("kind 须为 preference|decision|affirm，收到 {}", other)
+                })),
+            )
+                .into_response();
+        }
+    };
+    let tag = body
+        .get("tag")
+        .and_then(|v| v.as_str())
+        .unwrap_or(default_tag);
+    let ns = body
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("agent/{}", agent_id));
+
+    let guard = st.agent.lock().await;
+    let Some(ref agent) = *guard else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "agent 尚未就绪"})),
+        )
+            .into_response();
+    };
+    match agent
+        .remember_opinion(&ns, content, category, &[tag], 5)
+        .await
+    {
+        Ok(id) => axum::Json(serde_json::json!({
+            "ok": true,
+            "id": id,
+            "namespace": ns,
+            "category": category,
+            "tag": tag,
+        }))
+        .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
 }
 
 /// 协作发送（POST /api/collab/send）
