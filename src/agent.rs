@@ -1211,7 +1211,14 @@ impl AgentCore {
 
             // ── 新会话 ──
             SessionState::New => {
-                if boundary::TaskConfirmationGate::requires_confirmation(message) {
+                // 工程师闭环 / 显式 dry_run：跳过「方向对吗」复述闸，直接进工具路径
+                // （否则「不要真写」会命中 task_keywords 的「写」被误拦）
+                let skip_confirm = crate::dept_ops::is_engineer_intent(message)
+                    || message.contains("dry_run")
+                    || (crate::dept_ops::is_ops_investigate_intent(message)
+                        && (message.contains("先取证") || message.contains("不要空嘴")));
+                if !skip_confirm && boundary::TaskConfirmationGate::requires_confirmation(message)
+                {
                     self.checkpoint_awaiting(session_id, message).await;
                     return self
                         .rephrase_and_confirm(message, user_id, session_id, allowed_ns)
@@ -1237,6 +1244,13 @@ impl AgentCore {
         allowed_ns: &[String],
         trace_id: &str,
     ) -> String {
+        let engineer_intent = crate::dept_ops::is_engineer_intent(message);
+        tracing::info!(
+            engineer_intent,
+            ops_intent = crate::dept_ops::is_ops_investigate_intent(message),
+            "dept_ops intent gate"
+        );
+
         // ── HY3 1.3：MultiAgent Compose（子 agent 派发，非 Meta RSI）──
         // features.multiagent=false 或任务非 Hard 或分解空 → 返回 None，走原路径
         if let Some(result) = self
@@ -1247,12 +1261,24 @@ impl AgentCore {
         }
 
         // ── 0. 组合路由路径：多 Skill 分解 + 按序执行 ──
-        if self.config.enable_compositional_routing {
+        // 工程师改码意图：跳过 composer，直接进 LLM+常驻工具闭环（避免规划器空嘴作文）
+        if self.config.enable_compositional_routing && !engineer_intent {
+            let mut ns_buf = allowed_ns.to_vec();
+            crate::dept_ops::enrich_allowed_ns(&mut ns_buf);
+            let allowed_ns = ns_buf.as_slice();
             let tools = self.fetch_tools_filtered(allowed_ns).await;
             if !tools.is_empty() {
                 // P1-1: 续跑优先——已有进行中计划则直接复用，不重新分解（崩溃恢复场景）
                 let plan_opt = if let Some(p) = self.in_progress_plan.lock().await.clone() {
-                    Some(p)
+                    // 运维意图 + 旧演戏计划：作废，迫使重新分解或走 LLM 直调
+                    if crate::dept_ops::is_dept_grounded_intent(message)
+                        && crate::dept_ops::is_theater_plan(&p)
+                    {
+                        *self.in_progress_plan.lock().await = None;
+                        None
+                    } else {
+                        Some(p)
+                    }
                 } else {
                     // HY3 1.3：LATS 挂载点扩展 —— composer 多步规划也注入 LATS 提示，
                     // 扩大生产触发面（原仅非 composer 路径在 maybe_lats_expand 展开）。
@@ -1265,7 +1291,19 @@ impl AgentCore {
                         None => message.to_string(),
                     };
                     match crate::composer::decompose(&self.llm, &plan_input, &tools).await {
-                        Ok(plan) if plan.steps.len() > 1 => Some(plan),
+                        Ok(plan) if plan.steps.len() > 1 => {
+                            if crate::dept_ops::is_dept_grounded_intent(message)
+                                && crate::dept_ops::is_theater_plan(&plan)
+                            {
+                                tracing::warn!(
+                                    target: "dept_ops",
+                                    "拒绝运维演戏计划，降级 LLM 直调部门工具"
+                                );
+                                None
+                            } else {
+                                Some(plan)
+                            }
+                        }
                         _ => None,
                     }
                 };
@@ -2116,9 +2154,17 @@ impl AgentCore {
     // ── A1: 白龙马 ACI 请求前上下文预取（工具子集选择，只选 schema 不调工具）──
     const EXPOSE_TOOL_CAP: usize = 12;
 
-    /// 始终暴露给 LLM 的关键工具（不论相关性打分），确保诊断/运维类能力不被 top-K 过滤掉。
-    /// 例：system_ops 是“为什么 X 停止/出错了”类问题的唯一事实来源，必须常驻 schema。
-    const ALWAYS_EXPOSE_TOOLS: &[&str] = &["system_ops"];
+    /// 始终暴露给 LLM 的关键工具（不论相关性打分），确保诊断/运维/工程师类能力不被 top-K 过滤掉。
+    const ALWAYS_EXPOSE_TOOLS: &[&str] = &[
+        "system_ops",
+        "code_reader",
+        "edit_code",
+        "verify_code",
+        "organize_folders",
+        "query_entrance",
+        "check_media_files",
+        "query_today",
+    ];
 
     fn prefetch_tokens(s: &str) -> Vec<String> {
         let s = s.to_lowercase();
@@ -2206,6 +2252,11 @@ impl AgentCore {
         allowed_ns: &[String],
         trace_id: &str,
     ) -> String {
+        // P0：本部门工具包 ns enrichment（与鉴权侧双保险）
+        let mut ns_owned = allowed_ns.to_vec();
+        crate::dept_ops::enrich_allowed_ns(&mut ns_owned);
+        let allowed_ns = ns_owned.as_slice();
+
         // 从 Memoria 取可用工具列表（A1: 白龙马 ACI 请求前按 task_context 选暴露子集）
         let tools = self.select_exposed_tools(raw_message, allowed_ns).await;
         // P1-4: 构建工具名 → JSON Schema 映射，用于参数校验
@@ -2306,6 +2357,12 @@ impl AgentCore {
 
             // 无工具调用 → LLM 直接回复
             if response.tool_calls.is_empty() {
+                // P0 证据门禁：运维意图未取证 → 拒绝空嘴根因/方案
+                if crate::dept_ops::is_dept_grounded_intent(raw_message) && !did_work {
+                    let refuse = crate::dept_ops::refuse_ungrounded_ops_reply(raw_message);
+                    self.save_to_history(session_id, raw_message, &refuse).await;
+                    return refuse;
+                }
                 let mut reply = response.text;
                 // HY3 TTC：终答自一致性 + verifier-guided 精炼
                 // （features.ttc=false 时 self.ttc=None → 原路径零改动）
@@ -2516,7 +2573,44 @@ impl AgentCore {
                         return reply;
                     }
 
-                    // 黄线（未知工具、权限递减等）：走确认流程
+                    // 黄线（未知工具、权限递减、dept 写操作等）
+                    // HumanInLoop：与危险工具一致走 dashboard 审批台（真人兜底），不走 a2a。
+                    if self.config.human_approval {
+                        let aid = self
+                            .approval_manager
+                            .create_request(
+                                &tc.name,
+                                &tc.arguments,
+                                &check.reason,
+                                "dashboard-admin",
+                                &self.config.identity.agent_id,
+                            )
+                            .await;
+                        self.audit_logger
+                            .approval_event(
+                                "created",
+                                &self.config.identity.agent_id,
+                                &tc.name,
+                                &check.reason,
+                                trace_id,
+                                Some(session_id),
+                            )
+                            .await;
+                        let pa = PendingAction {
+                            tool_name: tc.name.clone(),
+                            arguments: tc.arguments.clone(),
+                            description: check.reason.clone(),
+                            approval_id: Some(aid.clone()),
+                        };
+                        self.checkpoint_pending_approval(session_id, &aid, &pa)
+                            .await;
+                        let reply = format!(
+                            "AWAITING_APPROVAL:工具「{}」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续——{}",
+                            tc.name, check.reason
+                        );
+                        self.save_to_history(session_id, raw_message, &reply).await;
+                        return reply;
+                    }
                     if let Some(approver_id) = &self.config.approver_id {
                         let aid = self
                             .approval_manager
@@ -2654,9 +2748,21 @@ impl AgentCore {
         }
 
         // 轮数耗尽，最后让 LLM 总结
+        if crate::dept_ops::is_dept_grounded_intent(raw_message) && !did_work {
+            let refuse = crate::dept_ops::refuse_ungrounded_ops_reply(raw_message);
+            self.save_to_history(session_id, raw_message, &refuse).await;
+            return refuse;
+        }
         messages.push(Message {
             role: "user".to_string(),
-            content: Some("请总结你刚才查到的结果，直接回复用户。不要调用工具。".to_string()),
+            content: Some(
+                if did_work {
+                    "请基于刚才工具返回的事实总结结果，直接回复用户。不要调用工具，不要编造未在工具结果中出现的原因。"
+                        .to_string()
+                } else {
+                    "请总结你刚才查到的结果，直接回复用户。不要调用工具。".to_string()
+                },
+            ),
             tool_calls: None,
             tool_call_id: None,
         });
@@ -3430,7 +3536,7 @@ impl AgentCore {
             }
         }
 
-        // 2. Memoria 特有工具走第一个源
+        // 2. Memoria 特有工具走第一个源（含 Bridge 编排：勿误路由到 dashboard）
         let memoria_tools = [
             "memory_search",
             "memory_search_v2",
@@ -3440,13 +3546,36 @@ impl AgentCore {
             "memory_profile",
             "memory_context",
             "memory_recall",
+            "memory_user_prefs",
+            "memory_recent_decisions",
+            "memory_health",
+            "memory_quota_status",
+            "memory_fetch_unconsolidated",
+            "memory_graph",
+            "dream_state_get",
+            "dream_state_update",
             "a2a_send",
             "a2a_recv",
+            "auto_route",
+            "cross_agent_query",
+            "continue_task",
+            "reasonix_dispatch",
+            "system_status",
             "register_agent",
+            "register_user",
+            "login_user",
             "audit_query",
             "db_stats",
+            "get_allowed_ns",
+            "entity_search",
+            "entity_upsert",
+            "entity_add_mention",
+            "entity_add_edge",
             "skill_market_list_installed",
             "skill_market_search",
+            "skill_market_info",
+            "skill_market_publish",
+            "skill_market_install",
             "agent_list",
             "agent_revoke",
         ];
@@ -3454,8 +3583,14 @@ impl AgentCore {
             return &self.mcp;
         }
 
-        // 3. 非 memory_ 开头的工具，尝试找第一个非 Memoria 源
-        if !tool_name.starts_with("memory_") && !tool_name.starts_with("db_") {
+        // 3. 非 memory_/编排 工具，尝试找第一个非 Memoria 源（dashboard skills）
+        if !tool_name.starts_with("memory_")
+            && !tool_name.starts_with("db_")
+            && !tool_name.starts_with("dream_")
+            && !tool_name.starts_with("entity_")
+            && !tool_name.starts_with("a2a_")
+            && !tool_name.starts_with("skill_market_")
+        {
             if self.mcp_sources.len() > 1 {
                 return &self.mcp_sources[1].client;
             }
@@ -3647,6 +3782,15 @@ impl AgentCore {
                 }
             }
         }
+
+        // Memoria NamespaceArg 工具：LLM/Composer 常漏传 namespace → -32002。
+        // 由引擎注入调用者主 ns（allowed_ns 首个非 *；否则 identity.ns()）。
+        Self::inject_namespace_arg(
+            tool_name,
+            &mut call_args,
+            allowed_ns,
+            &self.config.identity.ns(),
+        );
 
         // ── A2 文件级 checkpoint：WRITE/dangerous 工具执行前快照其 path 参数指向的现有文件 ──
         let fc_level = {
@@ -4052,12 +4196,73 @@ impl AgentCore {
             || granted.starts_with(&format!("{}/", target))
     }
 
+    /// Memoria 侧 `NsPolicy::NamespaceArg`（及同类）工具缺 namespace 时自动补齐。
+    /// Bridge 工具（auto_route 等）为 `NsPolicy::None`，补了也不影响门控。
+    fn inject_namespace_arg(
+        tool_name: &str,
+        args: &mut serde_json::Value,
+        allowed_ns: &[String],
+        identity_ns: &str,
+    ) {
+        let has_ns = args
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if has_ns {
+            return;
+        }
+        if !Self::tool_accepts_namespace(tool_name) {
+            return;
+        }
+        let ns = allowed_ns
+            .iter()
+            .map(|s| s.as_str())
+            .find(|s| !s.is_empty() && *s != "*")
+            .unwrap_or(identity_ns);
+        if ns.is_empty() || ns == "*" {
+            return;
+        }
+        if let Some(obj) = args.as_object_mut() {
+            obj.insert("namespace".to_string(), serde_json::json!(ns));
+            tracing::debug!(tool = %tool_name, namespace = %ns, "inject namespace for memoria tool");
+        }
+    }
+
+    /// 是否应自动注入 namespace（Memoria 记忆/实体/编排类；dashboard 业务技能不注入）。
+    fn tool_accepts_namespace(tool_name: &str) -> bool {
+        tool_name.starts_with("memory_")
+            || tool_name.starts_with("dream_")
+            || tool_name.starts_with("entity_")
+            || tool_name.starts_with("a2a_")
+            || tool_name.starts_with("skill_market_")
+            || matches!(
+                tool_name,
+                "auto_route"
+                    | "cross_agent_query"
+                    | "continue_task"
+                    | "reasonix_dispatch"
+                    | "system_status"
+                    | "audit_query"
+                    | "db_stats"
+                    | "get_allowed_ns"
+                    | "memory"
+                    | "register_agent"
+                    | "register_user"
+                    | "login_user"
+            )
+    }
+
     /// 仅返回调用者 `allowed_ns` 可见的 MCP 工具（按命名空间门控）。
     ///
     /// 规则：
     /// - 源未声明 `namespace` → 视为全局工具，人人可见；
     /// - 源声明了 `namespace` → 仅当 `allowed_ns` 中存在与其构成包含关系的授权 ns 时可见。
     pub async fn fetch_tools_filtered(&self, allowed_ns: &[String]) -> Vec<ToolDef> {
+        let mut ns_owned = allowed_ns.to_vec();
+        crate::dept_ops::enrich_allowed_ns(&mut ns_owned);
+        let allowed_ns = ns_owned.as_slice();
+
         let mut all_tools: Vec<ToolDef> = Vec::new();
         let mut seen_names = std::collections::HashSet::new();
 
@@ -4413,6 +4618,9 @@ impl AgentCore {
              - 你是固废智能运营台助手。用户问\"系统最近有什么问题 / 服务运行状态 / 是否正常 / 有什么异常\"时，默认指【固废运营系统】（dashboard/snmis/联单识别/manifest/视频服务/nvr 等），直接用 `system_ops` 查实情并据实回答；不要把它理解成\"agent 框架/各 Agent 连接状态\"，也不要去查 `audit_query`（那是操作审计日志，不是业务系统运行状态，除非用户明确要查审计）；简单状态查询直接调工具回答，不要进入多步规划、不要甩「执行计划」等 JSON 让用户确认。\n\
              - 系统服务状态【只以 system_ops 工具实时返回为准】。若用户质疑某服务状态（如说\"X 明明在跑\"），必须重新调用 system_ops 核实后再回答，不得仅凭用户语气、记忆或猜测改写工具返回的事实——工具说在跑就是在跑，工具说停止就是停止。\n",
         );
+
+        // P0：固废本部门运维纪律（证据门禁 + 作业剧本）
+        prompt.push_str(crate::dept_ops::ops_playbook_prompt());
 
         if !knowledge.is_empty() {
             prompt.push_str("## 记忆档案\n");

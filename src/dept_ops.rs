@@ -1,0 +1,238 @@
+//! 固废本部门运维能力（P0）：工具包可见性 + 证据门禁 + 作业剧本 + 失败不许空嘴。
+//!
+//! 目标：在 `org/cs-pufa-2nd-thermal/dept/gufei` 权限内，PFAiX 先取证再下结论，
+//! 而不是用 auto_route / 空嘴分析冒充运维。
+
+use crate::composer::ExecutionPlan;
+
+/// 公司根 ns（dashboard 技能树挂在此下）
+pub const ORG_NS: &str = "org/cs-pufa-2nd-thermal";
+/// 固废部门工具包 ns（与 agent.toml [[mcp_source]] dashboard.namespace 对齐）
+pub const DEPT_TOOLKIT_NS: &str = "org/cs-pufa-2nd-thermal/dept/gufei";
+
+/// 是否关闭部门工具包自动 enrichment（默认开启；`DEPT_TOOLKIT_ENRICH=0` 关闭）
+pub fn dept_toolkit_enrich_enabled() -> bool {
+    std::env::var("DEPT_TOOLKIT_ENRICH")
+        .map(|v| {
+            let t = v.trim();
+            !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+        })
+        .unwrap_or(true)
+}
+
+/// 为调用者补齐本部门工具包 ns，使 dashboard 固废技能必可见。
+/// 已有 `*` 超管不改；可用 `DEPT_TOOLKIT_ENRICH=0` 关闭。
+pub fn enrich_allowed_ns(allowed: &mut Vec<String>) {
+    if !dept_toolkit_enrich_enabled() {
+        return;
+    }
+    if allowed.iter().any(|n| n == "*") {
+        return;
+    }
+    if !allowed.iter().any(|n| n == ORG_NS || n.starts_with(&format!("{ORG_NS}/"))) {
+        allowed.push(ORG_NS.to_string());
+    }
+    if !allowed
+        .iter()
+        .any(|n| n == DEPT_TOOLKIT_NS || n.starts_with(&format!("{DEPT_TOOLKIT_NS}/")))
+    {
+        allowed.push(DEPT_TOOLKIT_NS.to_string());
+    }
+}
+
+/// 是否为「必须先取证」的固废现场/整理类意图
+pub fn is_ops_investigate_intent(message: &str) -> bool {
+    const KEYS: &[&str] = &[
+        "联单",
+        "整理",
+        "文件夹",
+        "归档",
+        "放入",
+        "放错",
+        "归类",
+        "目录",
+        "理文",
+        "organize",
+        "manifest",
+        "archive",
+        "未识别",
+        "自动整理",
+    ];
+    KEYS.iter().any(|k| message.contains(k))
+}
+
+/// 是否为「本部门工程师改码」意图
+pub fn is_engineer_intent(message: &str) -> bool {
+    const KEYS: &[&str] = &[
+        "改代码",
+        "改码",
+        "修bug",
+        "修 Bug",
+        "修BUG",
+        "报错",
+        "traceback",
+        "Traceback",
+        "修复",
+        "改 skill",
+        "改skill",
+        "edit_code",
+        "verify_code",
+        "代码里",
+        "源码",
+        "refactor",
+        "编译失败",
+        "语法错误",
+    ];
+    KEYS.iter().any(|k| message.contains(k))
+}
+
+/// 运维或工程师意图（证据门禁 / 拒演戏计划）
+pub fn is_dept_grounded_intent(message: &str) -> bool {
+    is_ops_investigate_intent(message) || is_engineer_intent(message)
+}
+
+/// 纯编排/跨 agent「演戏」工具——不能当作固废现场取证
+pub fn is_theater_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "auto_route"
+            | "cross_agent_query"
+            | "a2a_send"
+            | "a2a_recv"
+            | "continue_task"
+            | "reasonix_dispatch"
+            | "system_status"
+            | "agent_list"
+    )
+}
+
+/// 计划是否整单都是演戏工具（对运维意图应拒绝）
+pub fn is_theater_plan(plan: &ExecutionPlan) -> bool {
+    !plan.steps.is_empty() && plan.steps.iter().all(|s| is_theater_tool(&s.tool))
+}
+
+/// 注入 system prompt 的本部门运维纪律
+pub fn ops_playbook_prompt() -> &'static str {
+    r#"
+
+## 固废本部门运维纪律（P0，强制）
+你在本部门（固废）权限内是**现场运维 Agent**，不是只会查库写报告的玩具。
+
+### 证据门禁
+涉及联单 / 文件夹整理 / 归档 /「放错、没放入」时：
+1. **必须先取证**：调用目录/整理/进厂/媒体类工具（如 `organize_folders`、`check_media_files`、`query_entrance`、`query_today`、`archive_ops` 等清单内真实工具）
+2. **禁止**在未拿到工具返回前输出「根因分析 / 修复方案 / 车牌OCR猜测」
+3. **禁止**用 `auto_route` / `cross_agent_query` / A2A 代替本部门 dashboard 技能
+4. 工具失败时：只报告失败原因与下一步可调工具，**禁止编造**业务故事
+
+### 标准作业剧本
+1. `query_today` / `query_entrance` 查进厂/联单记录（数据侧）
+2. `check_media_files` / `organize_folders(dry_run=true)` 查目录现状（文件侧）
+3. 对比差异（有文件无记录 / 有记录无文件 / 车牌不一致）
+4. 必要时 `code_reader` 读整理相关 skill 源码定位逻辑
+5. 真实整理（`organize_folders` 无 dry_run）须经用户确认 / HumanInLoop 审批后再执行
+
+### 失败纪律
+- 调不通工具 ≠ 可以空嘴交差
+- 没有 tool 结果就说「可能 OCR 错了」属于违规
+
+## 固废本部门工程师纪律（P0，强制）
+你在本部门权限内也是**可控闭环工程师 Agent**（不是只会查库的玩具）。
+
+### 改码闭环（必须按序）
+1. `code_reader` 读相关源码/搜关键词，先搞清现状
+2. `edit_code(dry_run=true)` 出预览，把拟改摘要给用户
+3. 用户确认后：`edit_code(dry_run=false)`（会触发 HumanInLoop 审批台）
+4. 写入后立刻 `verify_code`（.py→py_compile；agent-core .rs→cargo check）
+5. 据实验证结果汇报；失败则读错误再改，禁止空嘴说「应该好了」
+
+### 工程师红线
+- **禁止**用 `auto_route` / A2A 代替本部门 `edit_code`/`verify_code`
+- **禁止**通用 shell；只能用白名单校验工具
+- **禁止**改 `.env` / 密钥 / `*.db`
+- 允许仓仅：dashboard / agent-core / agent-base
+"#
+}
+
+/// Composer 规划器附加规则（运维意图）
+pub fn composer_ops_rules() -> &'static str {
+    r#"
+- 【固废运维强制】用户提到联单/整理/文件夹/归档/放入/理文时：
+  - 禁止整单只用 auto_route / cross_agent_query / a2a_*
+  - 必须优先使用 dashboard 固废技能：organize_folders、check_media_files、query_entrance、query_today、archive_ops、ocr_manifest 等（以可用工具列表为准）
+  - 第一步必须是取证（查目录或查进厂），不能先「路由到某个 Agent」
+  - 若列表里没有整理类工具，返回单步说明「当前身份看不到部门整理技能」，不要编造计划
+- 【固废工程师强制】用户提到改代码/修bug/报错/源码时：
+  - 步骤必须含 code_reader → edit_code(dry_run=true) →（确认后）edit_code → verify_code
+  - 禁止整单只用 auto_route / cross_agent_query
+  - 禁止 invent 不存在的 exec_shell / run_command
+"#
+}
+
+/// 未取证却试图下结论时的拒答
+pub fn refuse_ungrounded_ops_reply(message: &str) -> String {
+    if is_engineer_intent(message) {
+        return format!(
+            "⚠️ 未走改码闭环，拒绝空嘴交差。\n\
+             涉及改代码/修 bug 时，必须先 code_reader 取证，再 edit_code(dry_run) 预览，\
+             经确认与审批后写入，并用 verify_code 校验。\n\
+             \n原始需求：{}",
+            message.chars().take(200).collect::<String>()
+        );
+    }
+    format!(
+        "⚠️ 未取证，拒绝空嘴分析。\n\
+         涉及联单/文件夹整理时，必须先调用本部门工具查当日目录与进厂记录，再给结论。\n\
+         请直接再说一次需求，或回复「继续」让我执行取证；可用工具包括 organize_folders / query_entrance / check_media_files 等。\n\
+         \n原始需求：{}",
+        message.chars().take(200).collect::<String>()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::composer::{ExecutionPlan, StepPlan};
+
+    #[test]
+    fn enrich_adds_org_and_dept() {
+        let mut ns = vec!["agent/user".to_string()];
+        enrich_allowed_ns(&mut ns);
+        assert!(ns.iter().any(|n| n == ORG_NS));
+        assert!(ns.iter().any(|n| n == DEPT_TOOLKIT_NS));
+    }
+
+    #[test]
+    fn enrich_skips_star() {
+        let mut ns = vec!["*".to_string()];
+        enrich_allowed_ns(&mut ns);
+        assert_eq!(ns, vec!["*"]);
+    }
+
+    #[test]
+    fn ops_intent_and_theater() {
+        assert!(is_ops_investigate_intent("7月26日理文联单整理放错文件夹"));
+        assert!(!is_ops_investigate_intent("今天进厂多少车"));
+        let plan = ExecutionPlan {
+            steps: vec![
+                StepPlan {
+                    step_id: 1,
+                    description: "route".into(),
+                    tool: "auto_route".into(),
+                    arguments: serde_json::json!({}),
+                    depends_on: vec![],
+                },
+                StepPlan {
+                    step_id: 2,
+                    description: "ask".into(),
+                    tool: "cross_agent_query".into(),
+                    arguments: serde_json::json!({}),
+                    depends_on: vec![1],
+                },
+            ],
+        };
+        assert!(is_theater_plan(&plan));
+        assert!(is_engineer_intent("请改代码修这个 skill 的报错"));
+        assert!(is_dept_grounded_intent("traceback 修bug"));
+    }
+}

@@ -61,6 +61,11 @@ pub async fn decompose(
 - 确保 JSON 合法，不要有多余文字"#,
     );
 
+    let mut system_prompt = system_prompt;
+    if crate::dept_ops::is_dept_grounded_intent(query) {
+        system_prompt.push_str(crate::dept_ops::composer_ops_rules());
+    }
+
     let msgs = vec![
         Message {
             role: "system".to_string(),
@@ -102,6 +107,14 @@ pub async fn decompose(
                 step.step_id, step.tool
             ));
         }
+    }
+
+    // 固废运维意图：拒绝整单 auto_route/cross_agent 演戏计划，降级到 LLM 直调部门工具
+    if crate::dept_ops::is_dept_grounded_intent(query) && crate::dept_ops::is_theater_plan(&plan)
+    {
+        return Err(
+            "运维意图禁止纯 auto_route/cross_agent 计划，应使用本部门整理/查询技能".into(),
+        );
     }
 
     Ok(plan)

@@ -36,6 +36,7 @@ impl HarnessStore {
         let db_path = path.to_string();
         let mut store = HarnessStore { conn, db_path };
         store.init_schema()?;
+        store.ensure_dept_ops_seeds();
         Ok(store)
     }
 
@@ -52,6 +53,7 @@ impl HarnessStore {
             db_path: String::new(),
         };
         store.init_schema()?;
+        store.ensure_dept_ops_seeds();
         Ok(store)
     }
 
@@ -85,6 +87,66 @@ impl HarnessStore {
             )
             .map_err(|e| format!("init schema: {}", e))?;
         Ok(())
+    }
+
+    /// 固化固废联单取证 + 工程师改码 harness（只读/dry_run；幂等按 name）。
+    fn ensure_dept_ops_seeds(&mut self) {
+        let lian_exists: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM harnesses WHERE name = ?1",
+                params!["gufei_lian_dan_evidence"],
+                |r| r.get::<_, i64>(0).map(|n| n > 0),
+            )
+            .unwrap_or(false);
+        if !lian_exists {
+            let trigger = serde_json::json!({"query": "联单整理"});
+            let steps = serde_json::json!([
+                {"tool": "query_today", "args": {}},
+                {"tool": "check_media_files", "args": {}},
+                {"tool": "organize_folders", "args": {"dry_run": true}}
+            ]);
+            if let Ok(id) = self.save(
+                "gufei_lian_dan_evidence",
+                &trigger,
+                &steps,
+                "evidence_before_write",
+                None,
+            ) {
+                let _ = self.conn.execute(
+                    "UPDATE harnesses SET confidence = 0.85 WHERE id = ?1",
+                    params![id],
+                );
+            }
+        }
+
+        let eng_exists: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM harnesses WHERE name = ?1",
+                params!["gufei_code_fix_loop"],
+                |r| r.get::<_, i64>(0).map(|n| n > 0),
+            )
+            .unwrap_or(false);
+        if !eng_exists {
+            let trigger = serde_json::json!({"query": "改代码修bug"});
+            let steps = serde_json::json!([
+                {"tool": "code_reader", "args": {"action": "search", "pattern": "TODO"}},
+                {"tool": "edit_code", "args": {"filepath": "skills/code_edit_skill.py", "instructions": "noop preview", "dry_run": true}}
+            ]);
+            if let Ok(id) = self.save(
+                "gufei_code_fix_loop",
+                &trigger,
+                &steps,
+                "verify_after_edit",
+                None,
+            ) {
+                let _ = self.conn.execute(
+                    "UPDATE harnesses SET confidence = 0.8 WHERE id = ?1",
+                    params![id],
+                );
+            }
+        }
     }
 
     // ── CRUD ───────────────────────────────────────
@@ -529,6 +591,16 @@ mod tests {
 
     fn test_store() -> HarnessStore {
         HarnessStore::open_memory().unwrap()
+    }
+
+    #[test]
+    fn seeds_gufei_lian_dan_evidence() {
+        let store = test_store();
+        let all = store.list_all(true).unwrap();
+        assert!(
+            all.iter().any(|h| h.name == "gufei_lian_dan_evidence"),
+            "应自动 seed 联单取证 harness"
+        );
     }
 
     #[test]

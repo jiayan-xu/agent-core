@@ -862,6 +862,13 @@ impl ComplianceBoundary {
             if tool_level == "dangerous" || self.is_dangerous_floor(tool_name) {
                 return ToolCheck::yellow(&format!("{} 需要审批，请等待审批人确认", tool_name));
             }
+            // 固废整理/归档写操作：非 dry_run 时走黄线（可控写改）
+            if needs_dept_ops_write_approval(tool_name, args) {
+                return ToolCheck::yellow(&format!(
+                    "{} 会改动现场文件，请确认后执行（可先 dry_run=true 预览）",
+                    tool_name
+                ));
+            }
         }
 
         // ── ① 权限递减（使用 user_role + parent_permission）──
@@ -983,6 +990,7 @@ impl ToolClassifier {
             "query_archive_log",
             "system_ops",
             "code_reader",
+            "verify_code",
             "summarize_url",
             "read_docx",
             "read_xlsx",
@@ -1017,6 +1025,7 @@ impl ToolClassifier {
             "generate_month_log",
             "archive_operate",
             "organize_folders",
+            "edit_code",
             // PR4 Phase A 演化：写回 evolved_context / 回滚演化（Memoria 哑存储写操作）
             "memory_evolve",
             "evolution_rollback",
@@ -1077,6 +1086,14 @@ impl ToolClassifier {
                 self.register(name, "read");
                 continue;
             }
+            if name == "verify_code" || name == "code_reader" {
+                self.register(name, "read");
+                continue;
+            }
+            if name == "edit_code" {
+                self.register(name, "write");
+                continue;
+            }
             let lower = name.to_lowercase();
             // SQL 查询类工具（execute_sql / query_* 等，仅 SELECT）一律按只读处理，
             // 排除明显的写操作前缀（update_/insert_/delete_/create_）
@@ -1114,6 +1131,10 @@ impl ToolClassifier {
     }
 
     pub fn classify(&self, tool_name: &str) -> &'static str {
+        // 具名 Memoria/编排工具优先（避免仅靠 HashSet 内置表漏网 → unknown 黄线）
+        if let Some(level) = classify_memoria_tool(tool_name) {
+            return level;
+        }
         if self.read_tools.contains(tool_name) {
             return "read";
         }
@@ -1128,6 +1149,40 @@ impl ToolClassifier {
         }
         "unknown"
     }
+}
+
+/// 固废部门写文件类工具：非 dry_run 时需要人工确认（HumanInLoop 黄线）。
+fn needs_dept_ops_write_approval(tool_name: &str, args: &serde_json::Value) -> bool {
+    const OPS_WRITE: &[&str] = &[
+        "organize_folders",
+        "archive_operate",
+        "archive_manifest",
+        "create_archive",
+        "archive_ops",
+        "edit_code",
+    ];
+    if !OPS_WRITE.iter().any(|t| *t == tool_name) {
+        return false;
+    }
+    // dry_run=true → 只预览，不拦
+    if args
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    // action=preview/status/list 等只读子命令不拦
+    if let Some(action) = args.get("action").and_then(|v| v.as_str()) {
+        let a = action.to_ascii_lowercase();
+        if matches!(
+            a.as_str(),
+            "preview" | "status" | "list" | "check" | "dry_run" | "query"
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 /// 判断工具是否「危险」（落入红线/高危前缀）。
@@ -1149,6 +1204,7 @@ pub fn is_dangerous_tool(name: &str) -> bool {
 /// Memoria MCP 工具分级（精确名）。`None` = 非具名 Memoria 工具，走通用前缀启发式。
 fn classify_memoria_tool(name: &str) -> Option<&'static str> {
     match name {
+        // ── 只读检索 / 状态 ──
         "memory_search"
         | "memory_search_v2"
         | "memory_recall"
@@ -1158,36 +1214,53 @@ fn classify_memoria_tool(name: &str) -> Option<&'static str> {
         | "memory_recent_decisions"
         | "memory_health"
         | "memory_quota_status"
+        | "memory_fetch_unconsolidated"
+        | "memory_backup_list"
+        | "memory_dedup_chain"
+        | "memory_graph"
         | "dream_state_get"
         | "db_stats"
         | "audit_query"
         | "entity_search"
-        | "memory_graph"
         | "get_allowed_ns"
         | "agent_list"
+        | "system_status"
         | "skill_market_list_installed"
         | "skill_market_search"
-        | "skill_market_info" => Some("read"),
+        | "skill_market_info"
+        | "auto_route" => Some("read"),
+        // ── 常规写 / 编排（Write 权限即可，不进人工审批台）──
         "memory_remember"
         | "memory"
         | "memory_observe"
         | "dream_state_update"
         | "memory_evolve"
+        | "memory_evolve_auto"
         | "evolution_rollback"
         | "entity_upsert"
         | "entity_add_mention"
         | "entity_add_edge"
         | "a2a_send"
         | "a2a_recv"
+        | "cross_agent_query"
+        | "continue_task"
+        | "reasonix_dispatch"
         | "register_agent"
+        | "register_user"
+        | "login_user"
         | "skill_market_publish"
-        | "skill_market_install" => Some("write"),
+        | "skill_market_install"
+        | "memory_backup" => Some("write"),
+        // ── 危险 / 破坏性（仍走 dashboard-admin）──
         "memory_merge"
         | "memory_decay"
         | "memory_import"
         | "memory_export"
+        | "memory_maintenance_normalize"
+        | "memory_migration_manifest"
         | "batch_delete_memories"
-        | "agent_revoke" => Some("dangerous"),
+        | "agent_revoke"
+        | "agent_registry_cleanup" => Some("dangerous"),
         _ => None,
     }
 }
@@ -1274,8 +1347,15 @@ mod read_only_tests {
         let c = ToolClassifier::new();
         assert_eq!(c.classify("memory_recall"), "read");
         assert_eq!(c.classify("memory_search_v2"), "read");
+        assert_eq!(c.classify("auto_route"), "read");
+        assert_eq!(c.classify("cross_agent_query"), "write");
+        assert_eq!(c.classify("reasonix_dispatch"), "write");
+        assert_eq!(c.classify("continue_task"), "write");
+        assert_eq!(c.classify("system_status"), "read");
         assert_eq!(c.classify("memory_remember"), "write");
         assert_eq!(c.classify("memory_merge"), "dangerous");
+        assert!(is_read_only_tool("auto_route"));
+        assert!(!is_read_only_tool("cross_agent_query"));
         assert!(!is_read_only_tool("memory_remember"));
         assert!(!is_read_only_tool("memory_merge"));
     }
@@ -1470,6 +1550,30 @@ mod tests {
         assert_eq!(level, PermissionLevel::Read);
         assert!(chain.check_escalation("child", &PermissionLevel::Read));
         assert!(!chain.check_escalation("child", &PermissionLevel::Write));
+    }
+
+    #[test]
+    fn dept_ops_write_needs_approval_unless_dry_run() {
+        assert!(needs_dept_ops_write_approval(
+            "organize_folders",
+            &serde_json::json!({})
+        ));
+        assert!(!needs_dept_ops_write_approval(
+            "organize_folders",
+            &serde_json::json!({"dry_run": true})
+        ));
+        assert!(!needs_dept_ops_write_approval(
+            "query_today",
+            &serde_json::json!({})
+        ));
+        assert!(!needs_dept_ops_write_approval(
+            "edit_code",
+            &serde_json::json!({"dry_run": true})
+        ));
+        assert!(needs_dept_ops_write_approval(
+            "edit_code",
+            &serde_json::json!({"filepath": "x.py", "instructions": "fix"})
+        ));
     }
 
     #[test]

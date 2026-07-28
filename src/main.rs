@@ -219,6 +219,43 @@ fn env_memoria_jarvis_badge(admin_fallback: &str) -> String {
     }
 }
 
+/// Memoria 代理管理客户端：`X-Agent-Id` 必须与 badge 配对。
+///
+/// 禁止 `agent.toml agent_id="user"` + `MEMORIA_JARVIS_BADGE`（一律 -32001）。
+/// - 显式 `MEMORIA_JARVIS_BADGE` → `jarvis` + 该 badge（permission=admin，可代理 register_*）
+/// - 否则 → `admin` + `MEMORIA_ADMIN_KEY`
+fn memoria_proxy_client(server: &str, admin_fallback: &str) -> McpClient {
+    if let Ok(badge) = std::env::var("MEMORIA_JARVIS_BADGE") {
+        if !badge.is_empty() {
+            return McpClient::new(server, "jarvis", &badge);
+        }
+    }
+    let admin_key = env_memoria_admin_key(admin_fallback);
+    McpClient::new(server, "admin", &admin_key)
+}
+
+/// 审计 / observe 写入客户端：`admin` 身份只接受 `MEMORIA_ADMIN_KEY`。
+fn memoria_audit_client(server: &str, admin_fallback: &str) -> McpClient {
+    let admin_key = env_memoria_admin_key(admin_fallback);
+    if !admin_key.is_empty() {
+        return McpClient::new(server, "admin", &admin_key);
+    }
+    memoria_proxy_client(server, admin_fallback)
+}
+
+/// 从 Memoria `register_agent` 响应提取 badge_token（兼容对象 / 字符串两种格式）。
+fn extract_register_badge(text: &serde_json::Value) -> Option<String> {
+    text.get("badge").and_then(|x| {
+        if let Some(s) = x.as_str() {
+            Some(s.to_string())
+        } else {
+            x.get("badge_token")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+        }
+    })
+}
+
 fn default_port() -> u16 {
     9753
 }
@@ -990,23 +1027,29 @@ async fn authenticate(
         return Err(unauthorized("请先通过 /api/register 注册身份"));
     };
 
-    // 鉴权密钥：显式 x-agent-key 优先；legacy usertag 回退用 dashboard badge
-    // （安装实例自身没有独立 key，由 agent-core 以 jarvis 身份代为在 Memoria 注册）。
+    // 鉴权密钥：显式 x-agent-key 优先；legacy usertag 优先用 auth_cache 中注册返回的 badge，
+    // 禁止长期拿 jarvis badge 冒充安装实例身份（get_allowed_ns 会 -32001）。
     let cfg_admin = st.config.lock().await.memoria_admin_key.clone();
     let admin_key = env_memoria_admin_key(&cfg_admin);
-    let jarvis_badge = env_memoria_jarvis_badge(&cfg_admin);
+    let cached_badge = {
+        let cache = st.auth_cache.lock().await;
+        cache.get(&agent_id).map(|(b, _)| b.clone())
+    };
     let agent_key = if !from_usertag {
         headers
             .get("x-agent-key")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string()
+    } else if let Some(b) = cached_badge.clone() {
+        b
     } else {
-        jarvis_badge.clone()
+        // 首次 usertag：尚无 cache，先用空 key 走注册分支（勿用 jarvis 冒充）
+        String::new()
     };
-    let (server, actor) = {
+    let server = {
         let cfg = st.config.lock().await;
-        (cfg.server.clone(), cfg.agent_id.clone())
+        cfg.server.clone()
     };
     let mut allowed_ns: Vec<String> = {
         let cache = st.ns_cache.lock().await;
@@ -1048,9 +1091,9 @@ async fn authenticate(
             // 同一 namespace 字段，Memoria `get_allowed_ns` 会按逗号拆分回传，从而
             // 后续请求（缓存失效后重查）仍同时持有这两个 ns，不会因回读而丢失 dashboard。
             let install_ns = format!("agent/{},org/cs-pufa-2nd-thermal", agent_id);
-            // 身份 = jarvis + 专属 badge；admin_key 仅作 register 参数
-            let reg = McpClient::new(&server, &actor, &jarvis_badge);
-            let _ = reg
+            // 身份 = jarvis/admin 配对客户端；admin_key 仅作 register 参数
+            let reg = memoria_proxy_client(&server, &cfg_admin);
+            if let Ok(text) = reg
                 .call_json(
                     "register_agent",
                     &serde_json::json!({
@@ -1060,7 +1103,15 @@ async fn authenticate(
                         "namespace": &install_ns
                     }),
                 )
-                .await;
+                .await
+            {
+                if let Some(b) = extract_register_badge(&text) {
+                    st.auth_cache
+                        .lock()
+                        .await
+                        .insert(agent_id.clone(), (b, std::time::Instant::now()));
+                }
+            }
             allowed_ns = vec![
                 format!("agent/{}", agent_id),
                 "org/cs-pufa-2nd-thermal".to_string(),
@@ -1073,8 +1124,8 @@ async fn authenticate(
         // 请求生效，不开匿名建号。注：会为登录态 agent 重建无口令注册，单组织
         // 内网可接受；若需严格口令边界，删除此块即可回滚。
         if allowed_ns.is_empty() && !admin_key.is_empty() && !from_usertag {
-            let reg = McpClient::new(&server, &actor, &jarvis_badge);
-            let _ = reg
+            let reg = memoria_proxy_client(&server, &cfg_admin);
+            if let Ok(text) = reg
                 .call_json(
                     "register_agent",
                     &serde_json::json!({
@@ -1084,7 +1135,16 @@ async fn authenticate(
                         "namespace": &format!("agent/{},org/cs-pufa-2nd-thermal", agent_id)
                     }),
                 )
-                .await;
+                .await
+            {
+                if let Some(b) = extract_register_badge(&text) {
+                    // 自愈后写入 cache；客户端旧 key 仍可能漂移，但下轮 usertag/同 id 可用
+                    st.auth_cache
+                        .lock()
+                        .await
+                        .insert(agent_id.clone(), (b, std::time::Instant::now()));
+                }
+            }
             // 与 legacy 安装实例自动开户保持一致：注册成功后直接授权该 agent 的
             // 命名空间，不依赖 register 返回值（register 仅用于恢复 Memoria 注册，
             // 授权由下方 allowed_ns 兜底，确保登录态 badge 漂移时不再 401）。
@@ -1103,6 +1163,8 @@ async fn authenticate(
             // 不向外部暴露内部错误细节（R6）
             return Err(unauthorized("身份校验失败，请稍后重试"));
         }
+        // P0：固废本部门工具包 ns  enrichment，保证 dashboard 技能可见
+        agent_core::dept_ops::enrich_allowed_ns(&mut allowed_ns);
         st.ns_cache.lock().await.insert(
             agent_id.clone(),
             (allowed_ns.clone(), std::time::Instant::now()),
@@ -1372,8 +1434,9 @@ fn main() {
                     insight_cycle += 1;
                     let agent_guard = patrol_state.agent.lock().await;
                     if let Some(ref agent) = *agent_guard {
-                        // 系统巡检使用 Agent 自身命名空间作为 allowed_ns（无 namespace 的 MCP 源不受影响）
-                        let agent_ns = vec![agent.config.identity.ns()];
+                        // 巡检须覆盖 dashboard 部门 ns（system_ops 挂在 dept/gufei）
+                        let mut agent_ns = vec![agent.config.identity.ns()];
+                        agent_core::dept_ops::enrich_allowed_ns(&mut agent_ns);
                         let tasks = [("system_ops", serde_json::json!({"action": "status"}))];
                         for (tool, args) in &tasks {
                             match agent.call_tool_routed(tool, "default", args, &agent_ns, "").await {
@@ -1663,8 +1726,16 @@ async fn handle_health(State(st): State<Arc<AppState>>) -> Json<serde_json::Valu
 /// 手动触发 Dream 巩固（鉴权路由）。body 可选 `{ "namespaces": ["agent/xxx"] }`。
 async fn handle_admin_consolidate(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
+    if !is_admin(&headers, &st).await {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "需要 admin 权限"})),
+        )
+            .into_response();
+    }
     // 解串行：克隆 Arc 后释放全局锁，consolidate() 循环在锁外执行
     let agent = {
         let g = st.agent.lock().await;
@@ -2600,7 +2671,11 @@ async fn handle_chat_stream(
 }
 
 /// 获取会话列表
-async fn handle_sessions(State(_st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+async fn handle_sessions(
+    State(_st): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+) -> Json<serde_json::Value> {
+    let allowed_ns = ctx.allowed_ns.clone();
     let db_path = std::env::current_dir()
         .unwrap_or_default()
         .join("harness.db")
@@ -2611,22 +2686,27 @@ async fn handle_sessions(State(_st): State<Arc<AppState>>) -> Json<serde_json::V
         let mut result = Vec::new();
         if let Ok(conn) = rusqlite::Connection::open(&db_path) {
             if let Ok(mut stmt) = conn.prepare(
-                "SELECT session_id, role, content, created_at FROM chat_history WHERE id IN (
+                "SELECT session_id, namespace, role, content, created_at FROM chat_history WHERE id IN (
                     SELECT MIN(id) FROM chat_history GROUP BY session_id
                 ) AND role = 'user' ORDER BY id DESC LIMIT 50",
             ) {
                 if let Ok(rows) = stmt.query_map([], |row| {
                     let sid: String = row.get(0)?;
+                    let ns: String = row.get(1)?;
                     let content: String = row.get(2)?;
                     let created: String = row.get(3)?;
-                    Ok((sid, content, created))
+                    Ok((sid, ns, content, created))
                 }) {
                     for row in rows.flatten() {
-                        let summary = row.1.chars().take(40).collect::<String>();
+                        // C2 修复：仅返回调用方命名空间覆盖的会话，防跨 agent 泄露
+                        if !caller_ns_covers(&allowed_ns, &row.1) {
+                            continue;
+                        }
+                        let summary = row.2.chars().take(40).collect::<String>();
                         result.push(serde_json::json!({
                             "session_id": row.0,
                             "summary": summary,
-                            "created_at": row.2,
+                            "created_at": row.3,
                         }));
                     }
                 }
@@ -3419,8 +3499,10 @@ async fn handle_collab_peers(
 /// 加载指定会话的历史
 async fn handle_session_load(
     State(_st): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
+    let allowed_ns = ctx.allowed_ns.clone();
     let db_path = {
         std::env::current_dir()
             .unwrap_or_default()
@@ -3433,10 +3515,27 @@ async fn handle_session_load(
     let messages = tokio::task::spawn_blocking(move || {
         let mut result = Vec::new();
         if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+            // C2 修复：校验会话归属，仅当调用方命名空间覆盖该会话时才返回
+            let owned = {
+                let mut flag = false;
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT DISTINCT namespace FROM chat_history WHERE session_id=?1",
+                ) {
+                    if let Ok(rows) = stmt.query_map(rusqlite::params![&sid], |row| {
+                        row.get::<_, String>(0)
+                    }) {
+                        flag = rows.flatten().any(|ns| caller_ns_covers(&allowed_ns, &ns));
+                    }
+                }
+                flag
+            };
+            if !owned {
+                return result;
+            }
             if let Ok(mut stmt) = conn.prepare(
                 "SELECT role, content, created_at FROM chat_history WHERE session_id=?1 ORDER BY id ASC"
             ) {
-                if let Ok(rows) = stmt.query_map(rusqlite::params![sid], |row| {
+                if let Ok(rows) = stmt.query_map(rusqlite::params![&sid], |row| {
                     let role: String = row.get(0)?;
                     let content: String = row.get(1)?;
                     let created: String = row.get(2)?;
@@ -3460,8 +3559,10 @@ async fn handle_session_load(
 
 /// 删除指定会话
 async fn handle_session_delete(
+    Extension(ctx): Extension<AuthContext>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
+    let allowed_ns = ctx.allowed_ns.clone();
     let db_path = std::env::current_dir()
         .unwrap_or_default()
         .join("harness.db")
@@ -3471,9 +3572,26 @@ async fn handle_session_delete(
 
     let deleted = tokio::task::spawn_blocking(move || {
         if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+            // C2 修复：校验会话归属，仅当调用方命名空间覆盖该会话时才允许删除
+            let owned = {
+                let mut flag = false;
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT DISTINCT namespace FROM chat_history WHERE session_id=?1",
+                ) {
+                    if let Ok(rows) = stmt.query_map(rusqlite::params![&sid], |row| {
+                        row.get::<_, String>(0)
+                    }) {
+                        flag = rows.flatten().any(|ns| caller_ns_covers(&allowed_ns, &ns));
+                    }
+                }
+                flag
+            };
+            if !owned {
+                return 0;
+            }
             if let Ok(cnt) = conn.execute(
                 "DELETE FROM chat_history WHERE session_id=?1",
-                rusqlite::params![sid],
+                rusqlite::params![&sid],
             ) {
                 return cnt;
             }
@@ -3487,7 +3605,17 @@ async fn handle_session_delete(
 }
 
 /// P1-5：查询当前降级收缩状态（Kill switch / 各 MCP 源健康 / 模式）
-async fn handle_admin_degrade(State(st): State<Arc<AppState>>) -> axum::response::Response {
+async fn handle_admin_degrade(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if !is_admin(&headers, &st).await {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "需要 admin 权限"})),
+        )
+            .into_response();
+    }
     let guard = st.agent.lock().await;
     if let Some(ref agent) = *guard {
         Json(agent.degrade_status()).into_response()
@@ -3504,8 +3632,16 @@ struct KillSwitchRequest {
 
 async fn handle_admin_killswitch(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<KillSwitchRequest>,
 ) -> axum::response::Response {
+    if !is_admin(&headers, &st).await {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "需要 admin 权限"})),
+        )
+            .into_response();
+    }
     let guard = st.agent.lock().await;
     if let Some(ref agent) = *guard {
         agent.set_kill_switch(req.enabled);
@@ -3529,7 +3665,17 @@ async fn handle_metrics(State(st): State<Arc<AppState>>) -> axum::response::Resp
 }
 
 /// P2-1：查询配额（管理员视角，与 /api/metrics 的 quota 段一致）
-async fn handle_admin_quota_get(State(st): State<Arc<AppState>>) -> axum::response::Response {
+async fn handle_admin_quota_get(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if !is_admin(&headers, &st).await {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "需要 admin 权限"})),
+        )
+            .into_response();
+    }
     let guard = st.agent.lock().await;
     if let Some(ref agent) = *guard {
         Json(agent.quota_status()).into_response()
@@ -3552,8 +3698,16 @@ struct QuotaPolicyUpdate {
 
 async fn handle_admin_quota_put(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<QuotaPolicyUpdate>,
 ) -> axum::response::Response {
+    if !is_admin(&headers, &st).await {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "需要 admin 权限"})),
+        )
+            .into_response();
+    }
     let guard = st.agent.lock().await;
     if let Some(ref agent) = *guard {
         let mut policy = {
@@ -3598,8 +3752,16 @@ struct AuditQuery {
 
 async fn handle_admin_audit(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(q): axum::extract::Query<AuditQuery>,
 ) -> axum::response::Response {
+    if !is_admin(&headers, &st).await {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "需要 admin 权限"})),
+        )
+            .into_response();
+    }
     let guard = st.agent.lock().await;
     if let Some(ref agent) = *guard {
         let limit = q.limit.unwrap_or(50).min(500);
@@ -3625,8 +3787,16 @@ struct HarnessActivate {
 
 async fn handle_admin_harness_activate(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<HarnessActivate>,
 ) -> axum::response::Response {
+    if !is_admin(&headers, &st).await {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "需要 admin 权限"})),
+        )
+            .into_response();
+    }
     let guard = st.agent.lock().await;
     if let Some(ref agent) = *guard {
         let ok = agent.harness.lock().await.activate(req.id);
@@ -4115,17 +4285,16 @@ async fn handle_register(
     // 先生成一个本地兜底 token；若 Memoria 注册成功，会用 Memoria 实际返回的 badge 覆盖（P0 修复：必须一致，否则客户端 key 与 Memoria 存值不符导致鉴权失败）
     let mut badge_token = format!("sk-{:x}", rand::thread_rng().gen::<u128>());
 
-    // 注册到 Memoria — admin_key 作参数；身份用 jarvis 专属 badge
+    // 注册到 Memoria — admin_key 作参数；MCP 身份用 jarvis/admin 配对客户端
     let cfg_admin = st.config.lock().await.memoria_admin_key.clone();
     let admin_key = env_memoria_admin_key(&cfg_admin);
-    let jarvis_badge = env_memoria_jarvis_badge(&cfg_admin);
-    // P0 修复：以 jarvis 身份（专属 badge，permission=admin）代理注册，
-    // 而非字面 "admin"（DB 中持有过期 key，会导致 Memoria require_admin 401）。
-    let (actor, server) = {
+    // P0 修复：以 jarvis（或 admin）配对身份代理注册，
+    // 禁止 cfg.agent_id="user" + jarvis badge（Memoria -32001）。
+    let server = {
         let cfg = st.config.lock().await;
-        (cfg.agent_id.clone(), cfg.server.clone())
+        cfg.server.clone()
     };
-    let mcp = McpClient::new(&server, &actor, &jarvis_badge);
+    let mcp = memoria_proxy_client(&server, &cfg_admin);
     // P0 修复：Memoria 的 register_agent 会自行生成 badge 并在响应里返回；
     // 必须用它作为后续鉴权 key，否则客户端拿本地随机 token 与 Memoria 存值对不上 → -32001。
     let memoria_ok = if admin_key.is_empty() {
@@ -4144,17 +4313,8 @@ async fn handle_register(
             .await
         {
             Ok(text) => {
-                // Memoria register_agent 返回 {"status":"registered","badge":<AgentBadge对象 或 字符串>}
-                // 其中 badge.badge_token 才是后续鉴权用的 key 字符串；兼容 badge 直接是字符串的旧格式。
-                let badge_str = text.get("badge").and_then(|x| {
-                    if x.is_string() {
-                        x.as_str()
-                    } else {
-                        x.get("badge_token").and_then(|t| t.as_str())
-                    }
-                });
-                if let Some(b) = badge_str {
-                    badge_token = b.to_string();
+                if let Some(b) = extract_register_badge(&text) {
+                    badge_token = b;
                     true
                 } else {
                     false
@@ -4173,12 +4333,8 @@ async fn handle_register(
         );
     }
 
-    // 审计日志：记录身份注册
-    // P0 修复：审计写入 Memoria 走 memory_observe（admin-only），必须用 "admin" 身份 + admin badge。
-    // 原用注册者自身 actor（如 user/jarvis）+ jarvis_badge，Memoria 一律 -32001 → 审计静默丢失
-    // （audit.rs:215 用 `let _ =` 吞错）。与 firehose 修复（agent.rs:2397/2461）同范式：
-    // badge = MEMORIA_JARVIS_BADGE || MEMORIA_ADMIN_KEY。
-    let audit = AuditLogger::new(McpClient::new(&server, "admin", &jarvis_badge));
+    // 审计日志：记录身份注册（admin + ADMIN_KEY，禁止 admin + jarvis badge）
+    let audit = AuditLogger::new(memoria_audit_client(&server, &cfg_admin));
     audit
         .log_identity(
             &agent_id,
@@ -4272,13 +4428,13 @@ async fn handle_register_user(
     } else {
         default_ns.clone()
     };
-    // 以 jarvis + MEMORIA_JARVIS_BADGE 调 Memoria（permission=admin），
+    // 以 jarvis/admin 配对客户端调 Memoria（permission=admin），
     // 可代理 register_user/login_user；不得与 MEMORIA_ADMIN_KEY 同 token。
-    let (actor, server) = {
+    let server = {
         let cfg = st.config.lock().await;
-        (cfg.agent_id.clone(), cfg.server.clone())
+        cfg.server.clone()
     };
-    let mcp = McpClient::new(&server, &actor, &jarvis_badge);
+    let mcp = memoria_proxy_client(&server, &cfg_admin);
     match mcp
         .call_json(
             "register_user",
@@ -4359,13 +4515,13 @@ async fn handle_login(
             error: Some("服务未就绪，请稍后重试".to_string()),
         });
     }
-    // P0 修复：以 jarvis + 专属 badge 代理登录，
-    // 而非字面 "admin"（DB 中过期 key 会导致 require_admin 401）。
-    let (actor, server) = {
+    // P0 修复：以 jarvis/admin 配对客户端代理登录，
+    // 禁止 cfg.agent_id="user" + jarvis badge。
+    let server = {
         let cfg = st.config.lock().await;
-        (cfg.agent_id.clone(), cfg.server.clone())
+        cfg.server.clone()
     };
-    let mcp = McpClient::new(&server, &actor, &jarvis_badge);
+    let mcp = memoria_proxy_client(&server, &cfg_admin);
     match mcp
         .call_json(
             "login_user",
@@ -4450,8 +4606,11 @@ async fn build_agent(
         config.api_key.clone()
     };
 
-    let mcp = McpClient::new(&config.server, &config.agent_id, &badge_token);
-    let _ = mcp
+    // 以 jarvis/admin 配对身份代理注册本机 agent；成功则采用返回的 badge 作为运行时身份。
+    // 禁止 agent_id="user" + jarvis badge（Memoria -32001，启动注册会静默失败）。
+    let proxy = memoria_proxy_client(&config.server, &admin_key);
+    let mut runtime_badge = badge_token.clone();
+    if let Ok(text) = proxy
         .call_json(
             "register_agent",
             &serde_json::json!({
@@ -4461,7 +4620,12 @@ async fn build_agent(
                 "namespace": format!("agent/{}", config.agent_id),
             }),
         )
-        .await;
+        .await
+    {
+        if let Some(b) = extract_register_badge(&text) {
+            runtime_badge = b;
+        }
+    }
 
     // P2-C: 从 agent_id 解析多租户命名空间（handle_register 格式：{company}_{department}_{name}）
     let ns_full_path = {
@@ -4479,7 +4643,7 @@ async fn build_agent(
     let identity = AgentIdentity {
         agent_id: config.agent_id.clone(),
         namespace: format!("agent/{}", config.agent_id),
-        badge_token: badge_token.clone(),
+        badge_token: runtime_badge.clone(),
         ns_full_path,
         persona_id: None,
         owner_user_id: None,

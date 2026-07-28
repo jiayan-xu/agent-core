@@ -170,8 +170,29 @@ function toggleSidebar() {
   sb.classList.toggle('open');
 }
 
+// C5 修复：对 marked 输出做白名单净化，防 LLM 输出中的 XSS（<script>/on*=/javascript:）
+function sanitizeHtml(html) {
+  const tpl = document.createElement('template');
+  tpl.innerHTML = html;
+  tpl.content.querySelectorAll('*').forEach(el => {
+    for (const a of Array.from(el.attributes)) {
+      if (/^on/i.test(a.name)) el.removeAttribute(a.name);
+    }
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'script' || tag === 'iframe' || tag === 'object' || tag === 'embed' || tag === 'link' || tag === 'style') {
+      el.remove();
+    }
+    const href = el.getAttribute('href');
+    if (href && /^\s*(javascript|data|vbscript):/i.test(href)) el.removeAttribute('href');
+    const src = el.getAttribute('src');
+    if (src && /^\s*(javascript|data|vbscript):/i.test(src)) el.removeAttribute('src');
+  });
+  return tpl.innerHTML;
+}
+
 function renderMd(text) {
   let html = marked.parse(text);
+  html = sanitizeHtml(html);
   document.querySelectorAll('pre code').forEach(b => {
     try { hljs.highlightElement(b); } catch(e) {}
   });
@@ -216,22 +237,26 @@ function addWait() {
 function rmWait() { const w = $('wait-msg'); if (w) w.remove(); }
 
 async function doRegister() {
-  const name = .value.trim();
-  const dept = .value.trim();
-  const company = .value.trim();
-  const errEl = ;
+  const name = $('r-name').value.trim();
+  const dept = $('r-dept').value.trim();
+  const company = $('r-company').value.trim();
+  const errEl = $('r-error');
   if (!name || !dept) { errEl.textContent = "请填写姓名和部门"; errEl.style.display = "block"; return; }
-  errEl.style.display = "none"; .disabled = true; .textContent = "注册中...";
+  errEl.style.display = "none";
+  const btn = $('r-btn');
+  btn.disabled = true; btn.textContent = "注册中...";
   try {
     const r = await fetch("/api/register", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({name, department: dept, company}) });
     const d = await r.json();
     if (d.ok) {
       localStorage.setItem("agent_id", d.agent_id);
       localStorage.setItem("badge_token", d.badge_token);
-      .style.display = "none"; .style.display = "flex"; .focus();
+      $('register').style.display = "none";
+      $('chat').style.display = "flex";
+      $('input').focus();
     } else { errEl.textContent = d.error || "注册失败"; errEl.style.display = "block"; }
   } catch(e) { errEl.textContent = "连接失败: " + e.message; errEl.style.display = "block"; }
-  .disabled = false; .textContent = "注册并开始使用";
+  btn.disabled = false; btn.textContent = "注册并开始使用";
 }
 
 async function chat() {
