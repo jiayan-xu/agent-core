@@ -171,7 +171,11 @@ pub struct StdioMcpClient {
 
 /// 子进程状态
 struct ChildProcess {
-    inner: Child,
+    /// 用 Option 便于在通信时临时取出所有权（移入阻塞线程）后再归还
+    inner: Option<Child>,
+    /// 子进程 pid，用于超时远程 kill（spawn_blocking 闭包持有 Child 所有权时，
+    /// 外部无法访问，只能凭 pid 杀）
+    pid: u32,
     /// 读取就绪信号后的缓冲区（第一行 stdout 是就绪信号）
     ready: bool,
 }
@@ -188,11 +192,66 @@ fn read_line_flexible(reader: &mut impl BufRead) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// 在阻塞线程中执行一轮 stdio 通信（同步 I/O）。
+/// 返回 `(结果, 新的 ready 状态)`，供 `communicate` 在超时重启后归还子进程。
+fn do_communicate(
+    child: &mut Child,
+    ready: bool,
+    req_str: &str,
+) -> (Result<String, String>, bool) {
+    // 首次启动：读取就绪信号行
+    if !ready {
+        let mut reader = BufReader::new(child.stdout.as_mut().unwrap());
+        if let Err(e) = read_line_flexible(&mut reader) {
+            return (Err(e), false);
+        }
+    }
+    // 发送请求
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        let mut line = req_str.to_string();
+        line.push('\n');
+        if let Err(e) = stdin.write_all(line.as_bytes()).and_then(|_| stdin.flush()) {
+            return (Err(format!("write stdin: {}", e)), ready);
+        }
+    }
+    // 读取响应
+    let stdout = child.stdout.as_mut().unwrap();
+    let mut reader = BufReader::new(stdout);
+    match read_line_flexible(&mut reader) {
+        Ok(resp) if !resp.is_empty() => (Ok(resp), true),
+        Ok(_) => (Err("MCP server closed stdout".to_string()), ready),
+        Err(e) => (Err(e), ready),
+    }
+}
+
+/// 跨平台按 pid 强杀进程（含子进程树）。
+///
+/// 用于 MCP stdio 通信超时场景：`spawn_blocking` 闭包持有 `Child` 所有权，
+/// 外部无法调用 `Child::kill()`，只能凭 pid 远程终止。Windows 用 `taskkill /T /F`
+/// 杀整棵树，类 Unix 用 `kill -9`。
+#[cfg(windows)]
+fn kill_pid(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output();
+}
+
+#[cfg(not(windows))]
+fn kill_pid(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .output();
+}
+
 impl StdioMcpClient {
     pub fn new(command: &str, args: &[String]) -> Self {
+        let child = spawn_process(command, args);
+        let pid = child.id();
         StdioMcpClient {
             child: tokio::sync::Mutex::new(ChildProcess {
-                inner: spawn_process(command, args),
+                inner: Some(child),
+                pid,
                 ready: false,
             }),
             command: command.to_string(),
@@ -202,41 +261,68 @@ impl StdioMcpClient {
     }
 
     /// 发送 JSON-RPC 请求，返回响应
+    ///
+    /// 修复 C13：原实现在持有 async 锁的情况下做同步 I/O，且 `read_line_flexible`
+    /// 无超时 —— 子进程挂起（未退出但不再输出）时会永久阻塞调用线程并锁死整个 client。
+    /// 现改为：同步 I/O 在 `spawn_blocking` 中执行，外层用 `tokio::time::timeout`
+    /// 包裹；超时即 kill 卡住的子进程（关闭其 stdout 管道，使阻塞的 read 返回），
+    /// 然后重启，解除死锁。
     async fn communicate(&self, request: &serde_json::Value) -> Result<serde_json::Value, String> {
         let mut guard = self.child.lock().await;
 
-        // 检查进程是否存活，死了就重启
-        if guard.inner.try_wait().ok().flatten().is_some() {
-            guard.inner = spawn_process(&self.command, &self.args);
+        // 检查进程是否存活，退出则重启
+        let exited = match guard.inner.as_mut() {
+            Some(c) => c.try_wait().ok().flatten().is_some(),
+            None => true,
+        };
+        if exited {
+            let c = spawn_process(&self.command, &self.args);
+            guard.pid = c.id();
+            guard.inner = Some(c);
             guard.ready = false;
         }
 
-        // 读取就绪信号（首次启动时）
-        if !guard.ready {
-            let mut reader = BufReader::new(guard.inner.stdout.as_mut().unwrap());
-            let ready_line = read_line_flexible(&mut reader)?;
-            let _ = ready_line;
-            guard.ready = true;
-            // 把 reader 丢回去 — 用完后 drop
-        }
+        // 取出子进程所有权移入阻塞线程（避免同步 I/O 卡死 async runtime）
+        let mut child = guard.inner.take().expect("child present after spawn");
+        let ready = guard.ready;
+        let req_str =
+            serde_json::to_string(request).map_err(|e| format!("serialize: {}", e))?;
+        let cmd = self.command.clone();
+        let args = self.args.clone();
+        let pid = guard.pid;
 
-        // 发送请求
-        let stdin = guard.inner.stdin.as_mut().unwrap();
-        let mut line = serde_json::to_string(request).map_err(|e| format!("serialize: {}", e))?;
-        line.push('\n');
-        stdin
-            .write_all(line.as_bytes())
-            .map_err(|e| format!("write stdin: {}", e))?;
-        stdin.flush().map_err(|e| format!("flush stdin: {}", e))?;
+        let handle = tokio::task::spawn_blocking(move || {
+            let (res, new_ready) = do_communicate(&mut child, ready, &req_str);
+            (res, child, new_ready)
+        });
 
-        // 读取响应
-        let stdout = guard.inner.stdout.as_mut().unwrap();
-        let mut reader = BufReader::new(stdout);
-        let resp_line = read_line_flexible(&mut reader)?;
-        if resp_line.is_empty() {
-            return Err("MCP server closed stdout".to_string());
+        match tokio::time::timeout(Duration::from_secs(30), handle).await {
+            Ok(Ok((res, child_back, new_ready))) => {
+                guard.pid = child_back.id();
+                guard.inner = Some(child_back);
+                guard.ready = new_ready;
+                let line = res?;
+                serde_json::from_str(line.trim()).map_err(|e| format!("parse JSON: {}", e))
+            }
+            Ok(Err(join_err)) => {
+                // 阻塞线程内部 I/O 失败
+                let c = spawn_process(&cmd, &args);
+                guard.pid = c.id();
+                guard.inner = Some(c);
+                guard.ready = false;
+                Err(format!("MCP 通信线程错误: {}", join_err))
+            }
+            Err(_elapsed) => {
+                // 超时：凭 pid 远程 kill 卡住的子进程（关闭其 stdout 管道，使阻塞的
+                // read 返回），随后重启，解除死锁。旧进程由 taskkill/kill 回收，无泄漏。
+                kill_pid(pid);
+                let c = spawn_process(&cmd, &args);
+                guard.pid = c.id();
+                guard.inner = Some(c);
+                guard.ready = false;
+                Err("MCP stdio 通信超时（已重启子进程）".to_string())
+            }
         }
-        serde_json::from_str(resp_line.trim()).map_err(|e| format!("parse JSON: {}", e))
     }
 
     pub async fn call(&self, tool: &str, args: &serde_json::Value) -> Result<String, String> {

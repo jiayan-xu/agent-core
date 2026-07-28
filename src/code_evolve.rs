@@ -230,6 +230,13 @@ fn norm_sig(s: &str) -> String {
 }
 
 /// 启发式受限模式（防御纵深，非安全保证）
+/// 代码进化引擎的最后防线：检测危险 token。
+///
+/// 修复 C10：原实现为纯子串匹配，可用大小写（`Command` vs `command`）、
+/// 空白插入（`std :: process`）等方式绕过。现先对输入做归一化
+/// （转小写 + 移除所有空白字符），再与同样小写化的黑名单比对，
+/// 挡住大小写与空白插入两类绕过。注：完整的 AST 级分析成本过高，
+/// 归一化子串匹配作为务实增强，配合治理层红线（is_governance）形成纵深防御。
 fn contains_blocked(s: &str) -> bool {
     const BLOCKED: &[&str] = &[
         "unsafe",
@@ -243,19 +250,25 @@ fn contains_blocked(s: &str) -> bool {
         "std::io",
         "fs::write",
         "fs::read",
-        "File::open",
-        "File::create",
+        "file::open",
+        "file::create",
         "include!",
         "include_str!",
         "require!",
-        "Command",
+        "command",
         "exec",
         "spawn",
         "socket",
         "net::",
         "process::",
     ];
-    BLOCKED.iter().any(|b| s.contains(b))
+    // 归一化：转小写 + 去除所有空白（空格/tab/换行/回车）
+    let norm: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
+    BLOCKED.iter().any(|b| norm.contains(&b.to_lowercase()))
 }
 
 /// 运行 cargo test，返回 (通过?, BENCH_MS, 日志尾)

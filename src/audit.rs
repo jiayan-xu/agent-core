@@ -489,6 +489,10 @@ fn now_ts() -> String {
 }
 
 /// 敏感字段脱敏（自由文本）
+///
+/// 修复 C9：原实现仅脱敏首个匹配且长 hex 密钥脱敏被注释掉，导致审计日志可能残存明文密钥。
+/// 现改为：① 对文本中所有 `key="..."` / `key: "..."` 形式的敏感值全局替换；
+///        ② 额外脱敏连续 >=32 位的十六进制串（典型 API key / token 形态）。
 pub fn redact(text: &str) -> String {
     const SENSITIVE_KEYS: &[&str] = &[
         "admin_key",
@@ -498,29 +502,75 @@ pub fn redact(text: &str) -> String {
         "password",
         "secret",
         "authorization",
+        "access_key",
+        "private_key",
+        "x-api-key",
     ];
     let mut out = text.to_string();
+    // ① 键值对形式：key="..." / key: "..." —— 全局替换所有出现
     for key in SENSITIVE_KEYS {
-        // 形如 key="..." / key: "..." 的键值对，脱敏其值
-        let pat = format!("{}", key);
-        if let Some(idx) = out.to_lowercase().find(&pat) {
-            // 找后续引号包裹的值
-            let rest = &out[idx..];
-            if let Some(q1) = rest[pat.len()..].find('"') {
-                let after = &rest[pat.len() + q1 + 1..];
-                if let Some(q2) = after.find('"') {
-                    let val = &after[..q2];
-                    if !val.is_empty() {
-                        let from = idx + pat.len() + q1 + 1;
-                        let to = from + q2;
-                        out.replace_range(from..to, "***");
-                    }
-                }
+        let pat = key.to_lowercase();
+        let mut from = 0usize;
+        loop {
+            let lower = out[from..].to_lowercase();
+            let idx = match lower.find(&pat) {
+                Some(i) => i,
+                None => break,
+            };
+            let abs = from + idx;
+            let rest = &out[abs + pat.len()..];
+            let q1 = match rest.find('"') {
+                Some(i) => i,
+                None => break,
+            };
+            let after = &rest[q1 + 1..];
+            let q2 = match after.find('"') {
+                Some(i) => i,
+                None => break,
+            };
+            let val_start = abs + pat.len() + q1 + 1;
+            out.replace_range(val_start..val_start + q2, "***");
+            // 替换后游标推进到新位置（"***" 长度为 3），避免越界/漏检
+            from = val_start + 3;
+            if from >= out.len() {
+                break;
             }
         }
     }
-    // 脱敏长十六进制密钥（>=16 位 hex）
-    out
+    // ② 长十六进制密钥（>=32 位连续 hex）脱敏
+    let chars: Vec<char> = out.chars().collect();
+    let mut masked = String::with_capacity(out.len());
+    let mut i = 0usize;
+    let mut run_start: Option<usize> = None;
+    while i < chars.len() {
+        if chars[i].is_ascii_hexdigit() {
+            if run_start.is_none() {
+                run_start = Some(i);
+            }
+            i += 1;
+        } else {
+            if let Some(s) = run_start {
+                let len = i - s;
+                if len >= 32 {
+                    masked.push_str("***");
+                } else {
+                    masked.extend(&chars[s..i]);
+                }
+                run_start = None;
+            }
+            masked.push(chars[i]);
+            i += 1;
+        }
+    }
+    if let Some(s) = run_start {
+        let len = i - s;
+        if len >= 32 {
+            masked.push_str("***");
+        } else {
+            masked.extend(&chars[s..i]);
+        }
+    }
+    masked
 }
 
 /// 参数摘要：限制长度 + 排除敏感字段

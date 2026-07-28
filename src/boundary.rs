@@ -424,6 +424,25 @@ fn normalize(p: &Path) -> PathBuf {
     })
 }
 
+/// 参数级路径穿越检测（修复 C7）。
+///
+/// 原实现仅 `contains("../") || contains("..\\")`，可被 URL 编码（`%2e%2e%2f`、
+/// `%2e%2e%5c`、`..%2f`）绕过。这里先对常见编码做一次反转义，再判定。
+/// 注意：真正的文件系统路径访问走 `extract_path_arg` → `ExecutionSandbox::check`
+/// → `normalize()` 规范化 + 前缀比对，本函数仅作为参数层的纵深防御补充。
+fn has_path_traversal(s: &str) -> bool {
+    if s.contains("../") || s.contains("..\\") {
+        return true;
+    }
+    // 反转义常见百分号编码后再判定（大小写不敏感）
+    let dec = s
+        .replace("%2e", ".")
+        .replace("%2f", "/")
+        .replace("%5c", "\\")
+        .to_lowercase();
+    dec.contains("../") || dec.contains("..\\") || dec.contains("%2e%2e")
+}
+
 /// 从工具参数中抽取显式文件路径参数做门闸（命令型参数 command/code/sql 不含路径，不抽）
 fn extract_path_arg(args: &serde_json::Value) -> Option<&Path> {
     const KEYS: &[&str] = &[
@@ -769,7 +788,7 @@ impl ComplianceBoundary {
                     {
                         return Some(ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key)));
                     }
-                    if s.contains("../") || s.contains("..\\") {
+                    if has_path_traversal(s) {
                         return Some(ToolCheck::red(&format!("参数安全检查：{} 含路径穿越", key)));
                     }
                     if is_sql_query_param(tool_name, key) && !is_select_only(s) {
@@ -910,7 +929,7 @@ impl ComplianceBoundary {
                         return ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key));
                     }
                     // 路径穿越检测
-                    if s.contains("../") || s.contains("..\\") {
+                    if has_path_traversal(s) {
                         return ToolCheck::red(&format!("参数安全检查：{} 含路径穿越", key));
                     }
                     // P1-6 修复：SQL 只读强制（正向 SELECT-only 校验，替代仅靠负向 blocklist）

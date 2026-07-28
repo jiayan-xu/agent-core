@@ -272,14 +272,19 @@ impl SessionManager {
         let a_msg = assistant_reply.to_string();
         let _ = tokio::task::spawn_blocking(move || {
             if let Ok(conn) = rusqlite::Connection::open(&db) {
-                conn.execute(
-                    "INSERT INTO chat_history (session_id, namespace, role, content, created_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-                    rusqlite::params![sid, ns, "user", u_msg],
-                ).ok();
-                conn.execute(
-                    "INSERT INTO chat_history (session_id, namespace, role, content, created_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-                    rusqlite::params![sid, ns, "assistant", a_msg],
-                ).ok();
+                // C12 修复：两条 INSERT 包入同一事务，保证 user+assistant 成对写入，
+                // 避免崩溃时只落一半导致会话记录残缺。
+                if let Ok(tx) = conn.unchecked_transaction() {
+                    let _ = tx.execute(
+                        "INSERT INTO chat_history (session_id, namespace, role, content, created_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                        rusqlite::params![sid, ns, "user", u_msg],
+                    );
+                    let _ = tx.execute(
+                        "INSERT INTO chat_history (session_id, namespace, role, content, created_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                        rusqlite::params![sid, ns, "assistant", a_msg],
+                    );
+                    let _ = tx.commit();
+                }
             }
         }).await;
     }
