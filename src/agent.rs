@@ -56,6 +56,46 @@ fn memoria_maintenance_client(memoria_url: &str, fallback: &McpClient) -> McpCli
     fallback.clone()
 }
 
+/// 编辑距离（Levenshtein），用于工具名模糊纠错。工具名均较短，O(n*m) 可接受。
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (n, m) = (a.len(), b.len());
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut prev: Vec<usize> = (0..=m).collect();
+    let mut cur = vec![0usize; m + 1];
+    for i in 1..=n {
+        cur[0] = i;
+        for j in 1..=m {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1)
+                .min(cur[j - 1] + 1)
+                .min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[m]
+}
+
+/// 在候选名中找出与 target 编辑距离最小者（无候选返回 None）。
+fn fuzzy_closest<'a>(candidates: &[&'a String], target: &str) -> Option<(&'a String, usize)> {
+    let mut best: Option<(&'a String, usize)> = None;
+    for c in candidates {
+        let d = levenshtein(target, c);
+        match best {
+            None => best = Some((c, d)),
+            Some((_, bd)) if d < bd => best = Some((c, d)),
+            _ => {}
+        }
+    }
+    best
+}
+
 /// Agent 身份
 #[derive(Debug, Clone)]
 pub struct AgentIdentity {
@@ -1536,7 +1576,7 @@ impl AgentCore {
         // SAD 核心：注入可用工具信息，让 LLM 复述时对齐能力
         if !tools.is_empty() {
             system_prompt.push_str("\n\n## 可用工具\n你可以使用以下工具来完成请求。复述时请结合工具来描述你的执行方案：\n");
-            for t in tools.iter().take(15) {
+            for t in tools.iter() {
                 let desc: String = t.function.description.chars().take(100).collect();
                 system_prompt.push_str(&format!("- `{}`: {}\n", t.function.name, desc));
             }
@@ -2152,7 +2192,7 @@ impl AgentCore {
 
     /// LLM 调用循环（支持多轮 tool calling）
     // ── A1: 白龙马 ACI 请求前上下文预取（工具子集选择，只选 schema 不调工具）──
-    const EXPOSE_TOOL_CAP: usize = 12;
+    const EXPOSE_TOOL_CAP: usize = 512; // 抬升：原 12 致模型仅见~12工具；本 ns ~45-98 工具需全量暴露
 
     /// 始终暴露给 LLM 的关键工具（不论相关性打分），确保诊断/运维/工程师类能力不被 top-K 过滤掉。
     const ALWAYS_EXPOSE_TOOLS: &[&str] = &[
@@ -2274,7 +2314,7 @@ impl AgentCore {
                 if let Some(ref mut content) = sys_msg.content {
                     let mut extra =
                         String::from("\n\n## 当前真实可用工具（调用时务必使用以下名称）\n");
-                    for t in tools.iter().take(20) {
+                    for t in tools.iter() {
                         let desc: String = t.function.description.chars().take(120).collect();
                         extra.push_str(&format!("- `{}`: {}\n", t.function.name, desc));
                     }
@@ -3639,6 +3679,152 @@ impl AgentCore {
         self.find_mcp_for_tool(tool_name).await
     }
 
+    // ─────────────────────────────────────────────────────────────
+    // 工具名校验 + 自动纠错中间件（消灭 LLM"必须猜对工具名"的体感）
+    // ─────────────────────────────────────────────────────────────
+
+    /// 工具名纠错容错阈值：短名只允许 1 处编辑距离，长名允许 2 处。
+    fn correction_threshold(tool_name: &str) -> usize {
+        if tool_name.len() <= 4 {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// 约定式确定性路由名（无需查注册表即可路由到正确 MCP 源）：
+    /// memory_/db_/dream_/entity_/a2a_/skill_market_ 前缀 + "memory" 别名。
+    fn is_routable_by_convention(tool_name: &str) -> bool {
+        tool_name == "memory"
+            || tool_name.starts_with("memory_")
+            || tool_name.starts_with("db_")
+            || tool_name.starts_with("dream_")
+            || tool_name.starts_with("entity_")
+            || tool_name.starts_with("a2a_")
+            || tool_name.starts_with("skill_market_")
+    }
+
+    /// 强制刷新工具路由缓存：向所有 MCP 源 list_tools，重建 tool_route_cache 与分类器。
+    /// 返回当前全部已知工具名（含源索引去重前的全集）。
+    /// 供纠错中间件在缓存冷启动 / 缓存未命中时兜底——LLM 可能拼对名字但缓存尚未就绪。
+    async fn refresh_tool_routes(&self) -> Vec<String> {
+        let mut discovered: Vec<(String, usize)> = Vec::new();
+        let mut descs: Vec<(String, String)> = Vec::new();
+        for (idx, source) in self.mcp_sources.iter().enumerate() {
+            if let Ok(tools) = source.client.list_tools().await {
+                for (name, desc, _) in &tools {
+                    discovered.push((name.clone(), idx));
+                    descs.push((name.clone(), desc.clone()));
+                }
+            }
+        }
+        if !discovered.is_empty() {
+            {
+                let mut cache = self.tool_route_cache.lock().await;
+                for (name, idx) in &discovered {
+                    cache.insert(name.clone(), *idx);
+                }
+            }
+            let boundary = self.boundary.lock().await;
+            boundary.learn_tools(&descs);
+        }
+        discovered.into_iter().map(|(n, _)| n).collect()
+    }
+
+    /// 在给定前缀的已注册工具名中找最近似者（前缀内拼写纠错，如 memory_searh → memory_search）。
+    async fn fuzzy_within_prefix(&self, tool_name: &str) -> Option<String> {
+        let prefix = if tool_name == "memory" {
+            "memory_"
+        } else if tool_name.starts_with("memory_") {
+            "memory_"
+        } else if tool_name.starts_with("db_") {
+            "db_"
+        } else if tool_name.starts_with("dream_") {
+            "dream_"
+        } else if tool_name.starts_with("entity_") {
+            "entity_"
+        } else if tool_name.starts_with("a2a_") {
+            "a2a_"
+        } else if tool_name.starts_with("skill_market_") {
+            "skill_market_"
+        } else {
+            return None;
+        };
+        let cache = self.tool_route_cache.lock().await;
+        let candidates: Vec<&String> = cache.keys().filter(|k| k.starts_with(prefix)).collect();
+        if let Some((best, dist)) = fuzzy_closest(&candidates, tool_name) {
+            if dist <= Self::correction_threshold(tool_name) {
+                return Some(best.clone());
+            }
+        }
+        None
+    }
+
+    /// 工具名校验 + 模糊纠错中间件。
+    ///
+    /// 返回：
+    /// - `Ok(name)`：精确命中，或模糊匹配阈值内已自动纠错（name 为真实注册名）；
+    /// - `Err(msg)`：无近似名 → 返回清晰可读错误（含最近候选），绝不把 MCP 层晦涩报错甩给用户。
+    ///
+    /// 设计要点：不破坏现有前缀源路由；约定前缀名确定性放行（仅做前缀内拼写纠错），
+    /// 非约定名（dashboard 业务技能）走"刷新→模糊匹配→清晰错误"三段式。
+    async fn resolve_tool_name_middleware(&self, tool_name: &str) -> Result<String, String> {
+        // 1. 精确命中（已注册）
+        {
+            let cache = self.tool_route_cache.lock().await;
+            if cache.contains_key(tool_name) {
+                return Ok(tool_name.to_string());
+            }
+        }
+
+        // 2. 约定前缀路由：确定性路由到正确源，不模糊替换；
+        //    但若前缀内拼错（如 memory_searh），尝试前缀内纠错。
+        if Self::is_routable_by_convention(tool_name) {
+            if let Some(corrected) = self.fuzzy_within_prefix(tool_name).await {
+                tracing::warn!(
+                    "[TOOL-FIX] 工具名『{}』未命中，前缀内自动纠错→『{}』",
+                    tool_name,
+                    corrected
+                );
+                return Ok(corrected);
+            }
+            return Ok(tool_name.to_string());
+        }
+
+        // 3. 非约定名（dashboard 业务技能等）：缓存未命中则强制刷新一次，再模糊纠错
+        let _ = self.refresh_tool_routes().await;
+        {
+            let cache = self.tool_route_cache.lock().await;
+            if cache.contains_key(tool_name) {
+                return Ok(tool_name.to_string());
+            }
+            let candidates: Vec<&String> = cache.keys().collect();
+            if let Some((best, dist)) = fuzzy_closest(&candidates, tool_name) {
+                let max_dist = Self::correction_threshold(tool_name);
+                if dist <= max_dist {
+                    tracing::warn!(
+                        "[TOOL-FIX] 工具名『{}』未命中，自动纠错→『{}』(编辑距离 {})",
+                        tool_name,
+                        best,
+                        dist
+                    );
+                    return Ok(best.clone());
+                }
+                // 有候选但距离过大：视为无关名，给清晰错误（含最近候选）
+                return Err(format!(
+                    "⚠️ 未找到工具『{}』。已注册工具中最相近的是『{}』（编辑距离 {}，超过容错阈值 {}）。请核对工具名，或用 /tools 查看完整清单。",
+                    tool_name, best, dist, max_dist
+                ));
+            }
+        }
+
+        // 4. 注册表为空（极异常）：清晰报错
+        Err(format!(
+            "⚠️ 当前未注册任何工具，无法解析『{}』。请检查 MCP 源连接。",
+            tool_name
+        ))
+    }
+
     /// 路由到正确的 MCP 源执行工具调用
     /// P0 修复：执行期再次按 allowed_ns 校验工具所属 MCP 源命名空间，
     /// 防止工具发现期被隐藏的工具在调用期被 LLM / prompt 注入点名执行。
@@ -3651,6 +3837,16 @@ impl AgentCore {
         allowed_ns: &[String],
         trace_id: &str,
     ) -> Result<String, String> {
+        // ── 工具名校验 + 自动纠错中间件：消灭 LLM"必须猜对工具名"的体感 ──
+        // 先用实时注册表校验；未命中则强制刷新 + 模糊匹配自动纠错；
+        // 毫无近似才返回清晰错误，绝不把 MCP 层晦涩报错甩给用户。
+        let resolved_tool: String = match self.resolve_tool_name_middleware(tool_name).await {
+            Ok(t) => t,
+            Err(e) => return Err(e),
+        };
+        // &String 可自动解引用为 &str，后续所有 tool_name 引用无需改动
+        let tool_name = &resolved_tool;
+
         // ── Phase 1+2：分身级工具白名单（真实 persona_id 来自会话；缺省 "default"） ──
         if let Err(e) = self.check_persona_tool(persona_id, tool_name) {
             return Err(e);
@@ -5486,3 +5682,52 @@ impl AgentCore {
 fn now_secs() -> f64 {
     harness::now_secs()
 }
+
+#[cfg(test)]
+mod tool_fix_tests {
+    use super::*;
+
+    #[test]
+    fn test_levenshtein_basic() {
+        assert_eq!(levenshtein("memory_search", "memory_searh"), 1);
+        assert_eq!(levenshtein("sync_whitelist", "sync_whilelist"), 1);
+        assert_eq!(levenshtein("query_plate", "query_plate"), 0);
+        assert_eq!(levenshtein("abc", "xyz"), 3);
+        assert_eq!(levenshtein("", "ab"), 2);
+    }
+
+    #[test]
+    fn test_correction_threshold() {
+        assert_eq!(AgentCore::correction_threshold("db"), 1);
+        assert_eq!(AgentCore::correction_threshold("db_stats"), 2);
+        assert_eq!(AgentCore::correction_threshold("memory_search_v2"), 2);
+    }
+
+    #[test]
+    fn test_is_routable_by_convention() {
+        assert!(AgentCore::is_routable_by_convention("memory_search"));
+        assert!(AgentCore::is_routable_by_convention("memory"));
+        assert!(AgentCore::is_routable_by_convention("db_stats"));
+        assert!(AgentCore::is_routable_by_convention("dream_state_get"));
+        assert!(!AgentCore::is_routable_by_convention("sync_whitelist_plates"));
+        assert!(!AgentCore::is_routable_by_convention("query_plate"));
+    }
+
+    #[test]
+    fn test_fuzzy_closest() {
+        let cand: Vec<String> = vec![
+            "memory_search".into(),
+            "memory_remember".into(),
+            "db_stats".into(),
+        ];
+        let refs: Vec<&String> = cand.iter().collect();
+        let (best, dist) = fuzzy_closest(&refs, "memory_searh").unwrap();
+        assert_eq!(best.as_str(), "memory_search");
+        assert_eq!(dist, 1);
+
+        // 无候选返回 None
+        let empty: Vec<&String> = vec![];
+        assert!(fuzzy_closest(&empty, "anything").is_none());
+    }
+}
+
