@@ -3819,11 +3819,40 @@ struct V1ChatRequest {
     #[allow(dead_code)]
     stream: Option<bool>,
 }
+
+/// OpenAI content 可能是 string，也可能是 [{type,text}, ...] 多段
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum V1Content {
+    Text(String),
+    Parts(Vec<V1ContentPart>),
+}
+
+#[derive(Deserialize)]
+struct V1ContentPart {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+impl V1Content {
+    fn as_text(&self) -> String {
+        match self {
+            V1Content::Text(s) => s.clone(),
+            V1Content::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| p.text.as_ref())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct V1Message {
     #[allow(dead_code)]
     role: String,
-    content: Option<String>,
+    content: Option<V1Content>,
 }
 
 async fn handle_v1_chat(
@@ -3882,12 +3911,13 @@ async fn handle_v1_chat(
         }
         // 只取最后一条 user 消息。Jan 会带上完整 history；若把 assistant 自我介绍也 join
         // 进 user_text，模型容易反复只回身份介绍、不调工具。
+        // content 兼容 string / 多段 parts（AI SDK 多模态时发数组）。
         let user_text: String = req
             .messages
             .iter()
             .rev()
             .find(|m| m.role.eq_ignore_ascii_case("user"))
-            .and_then(|m| m.content.clone())
+            .and_then(|m| m.content.as_ref().map(|c| c.as_text()))
             .unwrap_or_default()
             .chars()
             .take(32768)
