@@ -55,6 +55,11 @@ const HARD_DANGEROUS: &[&str] = &[
     "manage_whitelist",
     "edit_code",
     "sync_exception_correction",
+    // 双轨：受控写（无论分类器如何，强制危险地板 → L2 黄线）
+    "cw_write", // 轨一：受控改库写
+    "repo_ws_write", // 轨二：白名单仓写
+    "repo_ws_diff", // 轨二：白名单仓改动
+    "controlled_db_write", // dashboard 受控写执行器（参数化落库，backend）
     // memoria 路由危险工具（写操作 / 演化 / 身份）
     "memory_merge",
     "memory_dedup_chain",

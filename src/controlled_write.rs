@@ -47,6 +47,10 @@ pub enum VerifyStrategy {
     LocalFsWrite,
     /// edit_code：结果须含自动 verify_code 成功标记
     EditCodeVerified,
+    /// 受控改库写（cw_write）：回读用参数化 SELECT 核验列值
+    DbWrite,
+    /// 本机白名单仓写（repo_ws_write / repo_ws_diff）：回读用文件内容比对
+    RepoWsWrite,
     /// 写回执须含字段标记（如 updated_db），且不含 error 键
     WriteResultMarkers {
         needle: &'static str,
@@ -88,6 +92,21 @@ pub static CONTROLLED_WRITES: &[ControlledWriteSpec] = &[
         tool: "edit_code",
         label: "部门改码",
         strategy: VerifyStrategy::EditCodeVerified,
+    },
+    ControlledWriteSpec {
+        tool: "cw_write",
+        label: "受控改库写",
+        strategy: VerifyStrategy::DbWrite,
+    },
+    ControlledWriteSpec {
+        tool: "repo_ws_write",
+        label: "白名单仓写",
+        strategy: VerifyStrategy::RepoWsWrite,
+    },
+    ControlledWriteSpec {
+        tool: "repo_ws_diff",
+        label: "白名单仓改动",
+        strategy: VerifyStrategy::RepoWsWrite,
     },
     ControlledWriteSpec {
         tool: "sync_exception_correction",
@@ -133,6 +152,7 @@ pub enum PostVerifyPlan {
     /// 执行只读 SQL（模板已固定，params 已消毒）
     ReadSql {
         sql: String,
+        params: Vec<String>,
         expected: String,
         label: String,
     },
@@ -163,6 +183,8 @@ pub fn plan_post_verify(
             anti_needle: "【自动 verify_code 失败】".into(),
             label: spec.label.to_string(),
         },
+        VerifyStrategy::DbWrite => plan_db_write(spec, args),
+        VerifyStrategy::RepoWsWrite => plan_repo_ws(spec, args, write_result),
         VerifyStrategy::WriteResultMarkers {
             needle,
             anti_needle,
@@ -217,6 +239,7 @@ fn plan_whitelist_sync(
             );
             PostVerifyPlan::ReadSql {
                 sql,
+                params: vec![],
                 // 接受 removed / enabled=0；若行消失也由 match 失败再靠写回执
                 expected: "removed".into(),
                 label: format!("{} 软删 {}", spec.label, plate),
@@ -229,6 +252,7 @@ fn plan_whitelist_sync(
             );
             PostVerifyPlan::ReadSql {
                 sql,
+                params: vec![],
                 expected: plate.clone(),
                 label: format!("{} 新增 {}", spec.label, plate),
             }
@@ -256,6 +280,7 @@ fn plan_whitelist_sync(
             };
             PostVerifyPlan::ReadSql {
                 sql,
+                params: vec![],
                 expected: needle,
                 label,
             }
@@ -286,8 +311,82 @@ fn plan_whitelist_waste(spec: &ControlledWriteSpec, args: &serde_json::Value) ->
     );
     PostVerifyPlan::ReadSql {
         sql,
+        params: vec![],
         expected: waste,
         label: format!("{} {} 固废种类", spec.label, plate),
+    }
+}
+
+/// 受控改库写（cw_write）回读计划：用参数化 SELECT 核验目标列已落地。
+fn plan_db_write(spec: &ControlledWriteSpec, args: &serde_json::Value) -> PostVerifyPlan {
+    let table = match args.get("table").and_then(|v| v.as_str()) {
+        Some(t) if crate::db_write::is_allowed_table(t) => t.to_string(),
+        _ => return PostVerifyPlan::Skip("cw_write 缺合法表".into()),
+    };
+    let column = match args.get("column").and_then(|v| v.as_str()) {
+        Some(c) if crate::db_write::is_allowed_column(c) => c.to_string(),
+        _ => return PostVerifyPlan::Skip("cw_write 缺合法列".into()),
+    };
+    let value = args
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let where_column = args
+        .get("where_column")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let where_value = args
+        .get("where_value")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let (sql, params) = if !where_column.is_empty() {
+        (
+            format!("SELECT {} FROM {} WHERE {} = ?", column, table, where_column),
+            vec![where_value],
+        )
+    } else {
+        // 无 where：回读该列是否存在目标值（仅允许白名单列，杜绝拼接）
+        (format!("SELECT {} FROM {}", column, table), vec![])
+    };
+    PostVerifyPlan::ReadSql {
+        sql,
+        params,
+        expected: value,
+        label: format!("{} 校验 {}.{}", spec.label, table, column),
+    }
+}
+
+/// 本机白名单仓写（repo_ws_write / repo_ws_diff）回读计划：独立重读文件内容比对。
+fn plan_repo_ws(
+    spec: &ControlledWriteSpec,
+    args: &serde_json::Value,
+    write_result: &str,
+) -> PostVerifyPlan {
+    // 优先用写回执中的已解析绝对路径，否则用参数 path
+    let path = serde_json::from_str::<serde_json::Value>(write_result)
+        .ok()
+        .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(|s| s.to_string()))
+        .or_else(|| {
+            args.get("path")
+                .and_then(|p| p.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
+    let expected = args
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    if path.is_empty() || expected.is_empty() {
+        return PostVerifyPlan::Skip("repo_ws 缺 path/content".into());
+    }
+    PostVerifyPlan::ReadFile {
+        path,
+        expected,
+        label: spec.label.to_string(),
     }
 }
 
@@ -521,5 +620,45 @@ mod tests {
             r#"{"success":true,"count":3}"#,
         );
         assert!(matches!(samples, PostVerifyPlan::ContainsInWriteResult { .. }));
+    }
+
+    #[test]
+    fn db_write_and_repo_ws_plans() {
+        let db = plan_post_verify(
+            "cw_write",
+            &serde_json::json!({
+                "table": "vehicle_whitelist",
+                "column": "company_name",
+                "value": "佳士能环境",
+                "where_column": "license_plate",
+                "where_value": "苏EZQ117"
+            }),
+            "{}",
+        );
+        match db {
+            PostVerifyPlan::ReadSql { sql, params, expected, .. } => {
+                assert!(sql.contains("WHERE license_plate = ?"));
+                assert!(!sql.contains("苏EZQ117"));
+                assert_eq!(params, vec!["苏EZQ117".to_string()]);
+                assert_eq!(expected, "佳士能环境");
+            }
+            other => panic!("{:?}", other),
+        }
+
+        let repo = plan_post_verify(
+            "repo_ws_write",
+            &serde_json::json!({
+                "path": "/repo/foo.txt",
+                "content": "hello"
+            }),
+            r#"{"success":true,"path":"/repo/foo.txt"}"#,
+        );
+        match repo {
+            PostVerifyPlan::ReadFile { path, expected, .. } => {
+                assert_eq!(path, "/repo/foo.txt");
+                assert_eq!(expected, "hello");
+            }
+            other => panic!("{:?}", other),
+        }
     }
 }

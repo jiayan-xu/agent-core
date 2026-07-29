@@ -38,3 +38,5 @@ pub mod dept_ops; // 固废本部门运维：工具包可见 + 证据门禁 + �
 pub mod v1_compat; // OpenAI /v1/chat 入参折叠（保留 system）
 pub mod controlled_write; // 受控写「写后回读」协议骨架
 pub mod local_fs; // 本仓沙箱读写文件铁轨（不依赖 dashboard MCP）
+pub mod db_write; // 双轨·轨一：受控改库扳手（cw_select / cw_write）
+pub mod repo_ws; // 双轨·轨二：本机白名单仓库编辑（repo_ws_*）

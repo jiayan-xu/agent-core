@@ -1765,6 +1765,10 @@ impl AgentCore {
                 | "local_fs_read"
                 | "local_fs_list"
                 | "local_fs_stat"
+                | "cw_select"
+                | "repo_ws_read"
+                | "repo_ws_list"
+                | "repo_ws_stat"
         )
     }
 
@@ -4638,7 +4642,7 @@ impl AgentCore {
             ) {
                 if w.is_pass() {
                     let plan = plan_post_verify(tool_name, args, write_result);
-                    if let PostVerifyPlan::ReadSql { sql, expected, label } = plan {
+                    if let PostVerifyPlan::ReadSql { sql, expected, label, .. } = plan {
                         match self
                             .call_tool_routed(
                                 "execute_sql",
@@ -4701,14 +4705,24 @@ impl AgentCore {
             },
             PostVerifyPlan::ReadSql {
                 sql,
+                params,
                 expected,
                 label,
             } => {
+                let mut sql_args = serde_json::json!({ "sql": sql });
+                if !params.is_empty() {
+                    sql_args["params"] = serde_json::Value::Array(
+                        params
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    );
+                }
                 match self
                     .call_tool_routed(
                         "execute_sql",
                         "default",
-                        &serde_json::json!({ "sql": sql }),
+                        &sql_args,
                         allowed_ns,
                         "",
                     )
@@ -4733,6 +4747,32 @@ impl AgentCore {
                 expected,
                 label: _,
             } => {
+                // 优先用 repo_ws 读回（若路径落在白名单仓内且 repo_ws 启用）
+                if crate::repo_ws::is_enabled()
+                    && crate::repo_ws::owns_resolved_path(std::path::Path::new(&path))
+                {
+                    return match crate::repo_ws::execute(
+                        crate::repo_ws::TOOL_READ,
+                        &serde_json::json!({ "path": path }),
+                    ) {
+                        Ok(raw) => {
+                            let content = serde_json::from_str::<serde_json::Value>(&raw)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("content")
+                                        .and_then(|c| c.as_str())
+                                        .map(|s| s.to_string())
+                                })
+                                .unwrap_or_default();
+                            crate::controlled_write::verify_file_writeback(
+                                &path, &expected, &content,
+                            )
+                        }
+                        Err(e) => VerifyOutcome::Fail {
+                            detail: format!("仓库文件回读失败：{}", e),
+                        },
+                    };
+                }
                 if !crate::local_fs::is_enabled() {
                     return VerifyOutcome::Skip {
                         reason: "local_fs 未启用，跳过文件回读".into(),
@@ -5016,6 +5056,12 @@ impl AgentCore {
         if crate::local_fs::is_local_fs_tool(tool_name) {
             return Ok(tool_name.to_string());
         }
+        if crate::db_write::is_db_write_tool(tool_name) {
+            return Ok(tool_name.to_string());
+        }
+        if crate::repo_ws::is_repo_ws_tool(tool_name) {
+            return Ok(tool_name.to_string());
+        }
         // 1. 精确命中（已注册）
         {
             let cache = self.tool_route_cache.lock().await;
@@ -5182,6 +5228,100 @@ impl AgentCore {
                 Ok(_) => tracing::info!(tool = %tool_name, "local_fs tool ok"),
                 Err(e) => tracing::warn!(tool = %tool_name, err = %e, "local_fs tool err"),
             }
+            return result;
+        }
+
+        // ── 双轨·轨一 受控改库扳手：默认关闭；启用后 cw_write 须过 hard_guards ──
+        if crate::db_write::is_db_write_tool(tool_name) {
+            if !crate::db_write::is_enabled() {
+                return Err(
+                    "db_write 未启用（权限生存线：须显式 AGENT_DB_WRITE=1）".into(),
+                );
+            }
+            // hard_guards 兜底（kill switch / safe mode 等）；审批黄线由上游 chat handler 施加
+            if let Some(blocked) = {
+                let boundary = self.boundary.lock().await;
+                boundary.hard_guards_only(tool_name, &args, Some(allowed_ns))
+            } {
+                return Err(format!("⛔ {}", blocked.reason));
+            }
+            match tool_name.as_str() {
+                crate::db_write::TOOL_SELECT => {
+                    let (sql, params) = match crate::db_write::build_select(&args) {
+                        Ok(v) => v,
+                        Err(e) => return Err(format!("cw_select 构造失败: {}", e)),
+                    };
+                    let mut ea = serde_json::json!({ "sql": sql });
+                    if !params.is_empty() {
+                        ea["params"] = serde_json::Value::Array(
+                            params.into_iter().map(serde_json::Value::String).collect(),
+                        );
+                    }
+                    return Box::pin(
+                        self.call_tool_routed("execute_sql", persona_id, &ea, allowed_ns, trace_id),
+                    )
+                    .await;
+                }
+                crate::db_write::TOOL_WRITE => {
+                    let validated = match crate::db_write::validate_write_args(&args) {
+                        Ok(v) => v,
+                        Err(e) => return Err(format!("cw_write 校验失败: {}", e)),
+                    };
+                    return Box::pin(self.call_tool_routed(
+                        "controlled_db_write",
+                        persona_id,
+                        &validated,
+                        allowed_ns,
+                        trace_id,
+                    ))
+                    .await;
+                }
+                _ => return Err(format!("未知 db_write 工具: {}", tool_name)),
+            }
+        }
+
+        // ── 双轨·轨二 本机白名单仓库编辑：默认关闭；启用后写工具须过 hard_guards ──
+        if crate::repo_ws::is_repo_ws_tool(tool_name) {
+            if !crate::repo_ws::is_enabled() {
+                return Err(
+                    "repo_ws 未启用（权限生存线：须显式 AGENT_REPO_WS=1）".into(),
+                );
+            }
+            // 写/改工具：解析到仓内绝对路径，再过 hard_guards（相对路径会误判越界）
+            if tool_name == crate::repo_ws::TOOL_WRITE || tool_name == crate::repo_ws::TOOL_DIFF {
+                let mut call_args = args.clone();
+                if let Some(p) = call_args.get("path").and_then(|v| v.as_str()) {
+                    if !p.is_empty() {
+                        match crate::repo_ws::resolve_safe_path(p) {
+                            Ok(abs) => {
+                                if let Some(obj) = call_args.as_object_mut() {
+                                    obj.insert(
+                                        "path".into(),
+                                        serde_json::Value::String(
+                                            abs.to_string_lossy().into_owned(),
+                                        ),
+                                    );
+                                }
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+                if let Some(blocked) = {
+                    let boundary = self.boundary.lock().await;
+                    boundary.hard_guards_only(tool_name, &call_args, Some(allowed_ns))
+                } {
+                    return Err(format!("⛔ {}", blocked.reason));
+                }
+                let result = crate::repo_ws::execute(tool_name, &call_args);
+                match &result {
+                    Ok(_) => tracing::info!(tool = %tool_name, "repo_ws tool ok"),
+                    Err(e) => tracing::warn!(tool = %tool_name, err = %e, "repo_ws tool err"),
+                }
+                return result;
+            }
+            // 读工具：直接执行（execute 内部再做沙箱解析）
+            let result = crate::repo_ws::execute(tool_name, &args);
             return result;
         }
 
@@ -5860,6 +6000,36 @@ impl AgentCore {
             boundary.learn_tools(&names);
         }
 
+        // 双轨·轨一 受控改库扳手：仅当 AGENT_DB_WRITE=1 时暴露
+        if crate::db_write::is_enabled() {
+            for t in crate::db_write::tool_defs() {
+                if seen_names.insert(t.function.name.clone()) {
+                    all_tools.push(t);
+                }
+            }
+            let boundary = self.boundary.lock().await;
+            let names: Vec<(String, String)> = crate::db_write::tool_defs()
+                .into_iter()
+                .map(|t| (t.function.name, t.function.description))
+                .collect();
+            boundary.learn_tools(&names);
+        }
+
+        // 双轨·轨二 本机白名单仓库编辑：仅当 AGENT_REPO_WS=1 时暴露
+        if crate::repo_ws::is_enabled() {
+            for t in crate::repo_ws::tool_defs() {
+                if seen_names.insert(t.function.name.clone()) {
+                    all_tools.push(t);
+                }
+            }
+            let boundary = self.boundary.lock().await;
+            let names: Vec<(String, String)> = crate::repo_ws::tool_defs()
+                .into_iter()
+                .map(|t| (t.function.name, t.function.description))
+                .collect();
+            boundary.learn_tools(&names);
+        }
+
         if all_tools.is_empty() {
             tracing::warn!("命名空间过滤后无可用 MCP 工具，使用 fallback");
             return Self::fallback_tools();
@@ -6181,6 +6351,9 @@ impl AgentCore {
         prompt.push_str(crate::dept_ops::ops_playbook_prompt());
         // WorkBuddy 铁轨：本仓沙箱文件工具
         prompt.push_str(crate::local_fs::system_hint());
+        // 双轨：受控改库扳手 + 本机白名单仓库编辑
+        prompt.push_str(crate::db_write::system_hint());
+        prompt.push_str(crate::repo_ws::system_hint());
 
         if !knowledge.is_empty() {
             prompt.push_str("## 记忆档案\n");
