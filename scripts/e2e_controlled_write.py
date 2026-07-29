@@ -58,6 +58,8 @@ UNIT_FILTERS = (
     "v1_compat",
     "controlled_write",
     "controlled_writes_are_approval_gated",
+    "approval_store",
+    "test_sqlite_authority_survives_reopen",
 )
 
 

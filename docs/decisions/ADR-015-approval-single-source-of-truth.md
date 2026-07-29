@@ -125,13 +125,13 @@ ApprovalRecord {
 
 ### P0 — 设计冻结（本 ADR）
 - [x] 方案 A 裁决
-- [ ] 实现前再确认：同库异表 vs `approvals.db`（默认建议 **同库异表**，少一个文件句柄）
+- [x] 实现前确认：同库异表（挂 `checkpoints.db`）
 
 ### P1 — 存储与双写
-- [ ] `ApprovalStore`（rusqlite）+ 单测
-- [ ] `ApprovalManager` 背后切 store；JSON 双写开关 `APPROVAL_DUAL_WRITE=1`（迁移默认开）
-- [ ] 启动回填 JSON → SQLite
-- [ ] 验收：杀进程重启后 pending 仍在；批准后仅本 session「确认」可执行
+- [x] `ApprovalStore`（rusqlite）+ 单测
+- [x] `ApprovalManager` 背后切 store；JSON 双写开关 `APPROVAL_DUAL_WRITE`（默认开；`=0` 关）
+- [x] 启动回填 JSON → SQLite；`APPROVAL_SQLITE=0` 可回退 JSON-only
+- [ ] 验收：杀进程重启后 pending 仍在；批准后仅本 session「确认」可执行（P2 收紧 session 执行）
 
 ### P2 — 切主与瘦 checkpoint
 - [ ] checkpoint `PendingApproval` payload 仅 `approval_id`

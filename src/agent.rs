@@ -489,8 +489,31 @@ impl AgentCore {
             audit_logger: AuditLogger::new(mcp_for_audit),
             tool_route_cache: tokio::sync::Mutex::new(HashMap::new()),
             namespace_registry: std::sync::Mutex::new(NamespaceRegistry::new()),
-            // L2：审批持久化（跨重启不丢）。落 cwd/approvals.json，原子写。
-            approval_manager: ApprovalManager::new_with_store(Some(cwd.join("approvals.json"))),
+            // L2 + TASK-652：审批权威表挂 checkpoints.db 同库异表；JSON 双写（APPROVAL_DUAL_WRITE 默认开）
+            approval_manager: {
+                let cp_path = cwd.join("checkpoints.db");
+                let sqlite = if std::env::var("APPROVAL_SQLITE")
+                    .unwrap_or_else(|_| "1".into())
+                    != "0"
+                {
+                    crate::approval_store::ApprovalStore::open(&cp_path.to_string_lossy())
+                        .map_err(|e| {
+                            tracing::warn!("[APPROVAL-SQLITE] open failed, JSON-only: {}", e);
+                            e
+                        })
+                        .ok()
+                } else {
+                    None
+                };
+                let dual = std::env::var("APPROVAL_DUAL_WRITE")
+                    .unwrap_or_else(|_| "1".into())
+                    != "0";
+                ApprovalManager::new_with_persistence(
+                    Some(cwd.join("approvals.json")),
+                    sqlite,
+                    dual,
+                )
+            },
             checkpoint_store: Arc::new(tokio::sync::Mutex::new(checkpoint)),
             in_progress_plan: Arc::new(Mutex::new(None)),
             in_progress_step_results: Arc::new(Mutex::new(HashMap::new())),
@@ -1828,12 +1851,13 @@ impl AgentCore {
     ) -> String {
         let aid = self
             .approval_manager
-            .create_request(
+            .create_request_for_session(
                 tool_name,
                 &args,
                 &reason,
                 "dashboard-admin",
                 &self.config.identity.agent_id,
+                session_id,
             )
             .await;
         let pa = PendingAction {
@@ -3387,12 +3411,13 @@ impl AgentCore {
                         if self.config.human_approval {
                             let aid = self
                                 .approval_manager
-                                .create_request(
+                                .create_request_for_session(
                                     &tc.name,
                                     &tc.arguments,
                                     &check.reason,
                                     "dashboard-admin", // 固定标识，由 dashboard 审批台经 HTTP 回执
                                     &self.config.identity.agent_id,
+                                    session_id,
                                 )
                                 .await;
                             // P2-2: 审批创建事件（带 trace_id）
@@ -3425,12 +3450,13 @@ impl AgentCore {
                         if let Some(approver_id) = &self.config.approver_id {
                             let aid = self
                                 .approval_manager
-                                .create_request(
+                                .create_request_for_session(
                                     &tc.name,
                                     &tc.arguments,
                                     &check.reason,
                                     approver_id,
                                     &self.config.identity.agent_id,
+                                    session_id,
                                 )
                                 .await;
                             let msg = serde_json::json!({
@@ -3498,12 +3524,13 @@ impl AgentCore {
                     if self.config.human_approval {
                         let aid = self
                             .approval_manager
-                            .create_request(
+                            .create_request_for_session(
                                 &tc.name,
                                 &tc.arguments,
                                 &check.reason,
                                 "dashboard-admin",
                                 &self.config.identity.agent_id,
+                                session_id,
                             )
                             .await;
                         self.audit_logger
@@ -3534,12 +3561,13 @@ impl AgentCore {
                     if let Some(approver_id) = &self.config.approver_id {
                         let aid = self
                             .approval_manager
-                            .create_request(
+                            .create_request_for_session(
                                 &tc.name,
                                 &tc.arguments,
                                 &check.reason,
                                 approver_id,
                                 &self.config.identity.agent_id,
+                                session_id,
                             )
                             .await;
                         let msg = serde_json::json!({

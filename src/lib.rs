@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod approval;
+pub mod approval_store; // TASK-652：审批权威表（checkpoints.db 同库异表）
 pub mod resources;
 pub mod audit;
 pub mod boundary;

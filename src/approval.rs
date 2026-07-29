@@ -2,12 +2,17 @@
 //!
 //! 当 Agent 触发 YELLOW 级别工具且配置了审批人时，
 //! 通过 A2A 向审批人发送审批请求，等待审批结果后再执行。
+//!
+//! TASK-652 / ADR-015：权威持久化迁 SQLite（`checkpoints.db` 同库异表 `approvals`）；
+//! JSON（`approvals.json`）P1 双写，读优先 SQLite，miss 回填。
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
+
+use crate::approval_store::{ApprovalRecord, ApprovalRecordStatus, ApprovalStore};
 
 /// C1b: 审批态记忆 TTL（秒）
 /// - 已批准：默认 1h（非 24h，避免长时间挂起的批准被遗忘，过期需重批）
@@ -43,6 +48,13 @@ pub struct PendingApproval {
     /// 由 host 在创建请求时计算，审批响应必须回显同一指纹，
     /// 否则视为「操作被偷换」而拒绝（防模型自我批准 / 审批-执行错位）。
     pub operation_hash: String,
+    /// TASK-652：绑定会话；旧 JSON 回填缺省 `legacy`
+    #[serde(default = "default_session_id")]
+    pub session_id: String,
+}
+
+fn default_session_id() -> String {
+    "legacy".to_string()
 }
 
 /// 审批请求（通过 A2A 发送）
@@ -72,14 +84,18 @@ pub struct ApprovalResponse {
 /// 审批管理器
 ///
 /// 跟踪发出去的审批请求和收到的审批结果。
-/// L2：支持 JSON 文件持久化（store_path），使人工审批跨 agent-core 重启不丢。
+/// L2 + TASK-652：SQLite 权威表 + 可选 JSON 双写。
 pub struct ApprovalManager {
     /// 发出去的待审批请求（approval_id → PendingApproval）
     outgoing: Mutex<HashMap<String, PendingApproval>>,
     /// 收到的审批结果（approval_id → ApprovalResponse）
     responses: Mutex<HashMap<String, ApprovalResponse>>,
-    /// 持久化路径（None = 仅内存，不落盘）
+    /// JSON 双写路径（None = 不写 JSON）
     store_path: Option<std::path::PathBuf>,
+    /// 是否双写 JSON（迁移期默认 true）
+    dual_write_json: bool,
+    /// SQLite 权威存储（同库异表）
+    sqlite: Option<Arc<StdMutex<ApprovalStore>>>,
     /// C1b: 审批态内存记忆（同步可读，供 check_tool 快查，绕过 async Mutex）。
     /// key 形如 `pending:{tool}@{agent}` / `approved:{tool}@{agent}@{op_hash}` / `rejected:{tool}@{agent}`
     /// value = 过期时间戳（unix secs）；TTL 过期由查询时惰性清除。不落盘（短生命周期）。
@@ -89,44 +105,190 @@ pub struct ApprovalManager {
 impl ApprovalManager {
     /// 内存模式（测试 / 无持久化需求）
     pub fn new() -> Self {
-        Self::new_with_store(None)
+        Self::new_with_persistence(None, None, false)
     }
 
-    /// 带持久化的审批管理器：启动即从 store_path 反序列化恢复 pending / responses，
-    /// 使人工审批跨 agent-core 重启不丢（用户可能重启后才回到审批台点批准）。
+    /// 仅 JSON（兼容旧调用）
     pub fn new_with_store(store_path: Option<std::path::PathBuf>) -> Self {
+        Self::new_with_persistence(store_path.clone(), None, store_path.is_some())
+    }
+
+    /// TASK-652：JSON 路径 + SQLite store + 双写开关。
+    /// 启动：先加载 SQLite 活跃行 → 再加载 JSON 并回填缺失项到 SQLite。
+    pub fn new_with_persistence(
+        store_path: Option<std::path::PathBuf>,
+        sqlite: Option<ApprovalStore>,
+        dual_write_json: bool,
+    ) -> Self {
+        let sqlite = sqlite.map(|s| Arc::new(StdMutex::new(s)));
         let mut outgoing: HashMap<String, PendingApproval> = HashMap::new();
         let mut responses: HashMap<String, ApprovalResponse> = HashMap::new();
+
+        if let Some(ref sq) = sqlite {
+            if let Ok(guard) = sq.lock() {
+                for rec in guard.list_active() {
+                    Self::hydrate_from_record(&mut outgoing, &mut responses, &rec);
+                }
+            }
+        }
+
         if let Some(path) = &store_path {
             if let Ok(s) = std::fs::read_to_string(path) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
                     if let Some(arr) = v.get("outgoing").and_then(|x| x.as_array()) {
                         for item in arr {
                             if let Ok(p) = serde_json::from_value::<PendingApproval>(item.clone()) {
-                                outgoing.insert(p.approval_id.clone(), p);
+                                let id = p.approval_id.clone();
+                                if !outgoing.contains_key(&id) {
+                                    if let Some(ref sq) = sqlite {
+                                        if let Ok(guard) = sq.lock() {
+                                            let _ = guard.upsert(&Self::pending_to_record(
+                                                &p,
+                                                ApprovalRecordStatus::Pending,
+                                                None,
+                                                None,
+                                            ));
+                                        }
+                                    }
+                                    outgoing.insert(id, p);
+                                }
                             }
                         }
                     }
                     if let Some(arr) = v.get("responses").and_then(|x| x.as_array()) {
                         for item in arr {
-                            if let Ok(r) = serde_json::from_value::<ApprovalResponse>(item.clone()) {
-                                responses.insert(r.approval_id.clone(), r);
+                            if let Ok(r) =
+                                serde_json::from_value::<ApprovalResponse>(item.clone())
+                            {
+                                let id = r.approval_id.clone();
+                                if !responses.contains_key(&id) {
+                                    if let Some(ref sq) = sqlite {
+                                        if let Ok(guard) = sq.lock() {
+                                            if let Some(mut rec) = guard.get(&id) {
+                                                let status = if r.approved {
+                                                    ApprovalRecordStatus::Approved
+                                                } else {
+                                                    ApprovalRecordStatus::Denied
+                                                };
+                                                rec.status = status;
+                                                rec.decided_at = Some(now_secs());
+                                                rec.decision_reason = r.reason.clone();
+                                                rec.response_json =
+                                                    serde_json::to_string(&r).ok();
+                                                let _ = guard.upsert(&rec);
+                                            }
+                                        }
+                                    }
+                                    responses.insert(id, r);
+                                }
                             }
                         }
                     }
                 }
             }
         }
+
+        let dual = dual_write_json && store_path.is_some();
         ApprovalManager {
             outgoing: Mutex::new(outgoing),
             responses: Mutex::new(responses),
             store_path,
+            dual_write_json: dual,
+            sqlite,
             memory: StdMutex::new(HashMap::new()),
         }
     }
 
-    /// 原子落盘：先写 .tmp 再 rename。序列化在持锁块内完成（Value 拥有数据，离开块即释放锁）。
+    fn hydrate_from_record(
+        outgoing: &mut HashMap<String, PendingApproval>,
+        responses: &mut HashMap<String, ApprovalResponse>,
+        rec: &ApprovalRecord,
+    ) {
+        let args: serde_json::Value =
+            serde_json::from_str(&rec.arguments_json).unwrap_or(serde_json::json!({}));
+        if matches!(
+            rec.status,
+            ApprovalRecordStatus::Pending
+                | ApprovalRecordStatus::Approved
+                | ApprovalRecordStatus::Denied
+        ) {
+            outgoing.insert(
+                rec.approval_id.clone(),
+                PendingApproval {
+                    approval_id: rec.approval_id.clone(),
+                    tool_name: rec.tool_name.clone(),
+                    arguments: args,
+                    description: rec.description.clone(),
+                    approver_id: rec.approver_id.clone(),
+                    requester_id: rec.requester_id.clone(),
+                    status: ApprovalStatus::Pending,
+                    created_at: rec.created_at,
+                    operation_hash: rec.operation_hash.clone(),
+                    session_id: rec.session_id.clone(),
+                },
+            );
+        }
+        if let Some(rj) = &rec.response_json {
+            if let Ok(r) = serde_json::from_str::<ApprovalResponse>(rj) {
+                responses.insert(rec.approval_id.clone(), r);
+            }
+        }
+    }
+
+    fn pending_to_record(
+        p: &PendingApproval,
+        status: ApprovalRecordStatus,
+        decided_at: Option<f64>,
+        response: Option<&ApprovalResponse>,
+    ) -> ApprovalRecord {
+        ApprovalRecord {
+            approval_id: p.approval_id.clone(),
+            session_id: if p.session_id.is_empty() {
+                "legacy".into()
+            } else {
+                p.session_id.clone()
+            },
+            agent_id: p.requester_id.clone(),
+            tool_name: p.tool_name.clone(),
+            arguments_json: serde_json::to_string(&p.arguments).unwrap_or_else(|_| "{}".into()),
+            description: p.description.clone(),
+            operation_hash: p.operation_hash.clone(),
+            approver_id: p.approver_id.clone(),
+            requester_id: p.requester_id.clone(),
+            status,
+            created_at: p.created_at,
+            decided_at,
+            consumed_at: None,
+            decision_reason: response.and_then(|r| r.reason.clone()),
+            response_json: response.and_then(|r| serde_json::to_string(r).ok()),
+        }
+    }
+
+    fn sqlite_upsert(&self, rec: &ApprovalRecord) {
+        if let Some(ref sq) = self.sqlite {
+            if let Ok(guard) = sq.lock() {
+                if let Err(e) = guard.upsert(rec) {
+                    tracing::warn!("[APPROVAL-SQLITE] upsert failed: {}", e);
+                }
+            }
+        }
+    }
+
+    fn sqlite_consume(&self, approval_id: &str) {
+        if let Some(ref sq) = self.sqlite {
+            if let Ok(guard) = sq.lock() {
+                if let Err(e) = guard.mark_consumed(approval_id, now_secs()) {
+                    tracing::warn!("[APPROVAL-SQLITE] consume failed: {}", e);
+                }
+            }
+        }
+    }
+
+    /// 原子落盘 JSON（仅 dual_write_json）
     async fn persist(&self) {
+        if !self.dual_write_json {
+            return;
+        }
         if let Some(path) = &self.store_path {
             let payload = {
                 let outgoing = self.outgoing.lock().await;
@@ -145,7 +307,7 @@ impl ApprovalManager {
         }
     }
 
-    /// 创建审批请求（存入 outgoing，等待审批）
+    /// 兼容旧签名：session_id = legacy
     pub async fn create_request(
         &self,
         tool_name: &str,
@@ -153,6 +315,27 @@ impl ApprovalManager {
         description: &str,
         approver_id: &str,
         requester_id: &str,
+    ) -> String {
+        self.create_request_for_session(
+            tool_name,
+            arguments,
+            description,
+            approver_id,
+            requester_id,
+            "legacy",
+        )
+        .await
+    }
+
+    /// 创建审批请求（绑定 session，写入 SQLite 权威表）
+    pub async fn create_request_for_session(
+        &self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        description: &str,
+        approver_id: &str,
+        requester_id: &str,
+        session_id: &str,
     ) -> String {
         // C1b 防重复建单：同 tool+requester 已有 pending → 复用既有 id，不重复造单。
         if crate::approval::is_pending_sync(self, tool_name, requester_id) {
@@ -173,24 +356,34 @@ impl ApprovalManager {
             tool_name
         );
         let now = now_secs();
-        // Phase A: host 计算操作指纹（防后续审批-执行错位 / 模型自我批准）
         let operation_hash = compute_operation_hash(tool_name, arguments);
+        let session_id = if session_id.trim().is_empty() {
+            "legacy".to_string()
+        } else {
+            session_id.to_string()
+        };
+
+        let pending = PendingApproval {
+            approval_id: approval_id.clone(),
+            tool_name: tool_name.to_string(),
+            arguments: arguments.clone(),
+            description: description.to_string(),
+            approver_id: approver_id.to_string(),
+            requester_id: requester_id.to_string(),
+            status: ApprovalStatus::Pending,
+            created_at: now,
+            operation_hash,
+            session_id,
+        };
+        self.sqlite_upsert(&Self::pending_to_record(
+            &pending,
+            ApprovalRecordStatus::Pending,
+            None,
+            None,
+        ));
 
         let mut outgoing = self.outgoing.lock().await;
-        outgoing.insert(
-            approval_id.clone(),
-            PendingApproval {
-                approval_id: approval_id.clone(),
-                tool_name: tool_name.to_string(),
-                arguments: arguments.clone(),
-                description: description.to_string(),
-                approver_id: approver_id.to_string(),
-                requester_id: requester_id.to_string(),
-                status: ApprovalStatus::Pending,
-                created_at: now,
-                operation_hash,
-            },
-        );
+        outgoing.insert(approval_id.clone(), pending);
         drop(outgoing);
         // C1b: 记录 pending 记忆（供 is_pending_sync 防重复建单）
         if let Ok(mut mem) = self.memory.lock() {
@@ -207,8 +400,6 @@ impl ApprovalManager {
     /// 记录收到的审批响应
     ///
     /// C1c: 兜底校验 `operation_hash` 防偷换（defense-in-depth）。
-    /// 即便 HTTP 台（main.rs:2916）与 A2A 中继（main.rs:2803）已校验，
-    /// 任何调用方到此仍拦一道错配；错配或 pending 不存在则拒绝插入。
     /// C1b: 写入后同步更新审批态记忆（approved 含 op_hash / rejected 短 TTL）。
     pub async fn record_response(&self, response: ApprovalResponse) {
         let approved = response.approved;
@@ -233,11 +424,22 @@ impl ApprovalManager {
         }
 
         let mut responses = self.responses.lock().await;
-        responses.insert(approval_id.clone(), response);
+        responses.insert(approval_id.clone(), response.clone());
         drop(responses);
 
-        // C1b: 更新审批态记忆
+        // C1b: 更新审批态记忆 + SQLite
         if let Some(p) = self.get_pending(&approval_id).await {
+            let status = if approved {
+                ApprovalRecordStatus::Approved
+            } else {
+                ApprovalRecordStatus::Denied
+            };
+            self.sqlite_upsert(&Self::pending_to_record(
+                &p,
+                status,
+                Some(now_secs()),
+                Some(&response),
+            ));
             if let Ok(mut mem) = self.memory.lock() {
                 let now = now_secs();
                 // 移除 pending 标记（已 resolve）
@@ -294,8 +496,6 @@ impl ApprovalManager {
 
     /// P0 修复：返回「pending 仍在 + 已收到 approved 响应」的项——执行侧应消费的就绪集。
     /// 与 `list_pending`（排除任何 response）互补：list_pending 给审批台看，本函数给执行侧用。
-    /// 原 `execute_approved_request` 走 `list_pending` + `is_approved` 形成死路（list_pending 已排除有 response 的项，
-    /// 故 is_approved 永为 None → 批准后执行路径恒空）。本函数修复该断路。
     pub async fn list_approved_ready(&self) -> Vec<PendingApproval> {
         let outgoing = self.outgoing.lock().await;
         let responses = self.responses.lock().await;
@@ -309,10 +509,20 @@ impl ApprovalManager {
             .collect()
     }
 
-    /// 移除已完成的审批项
+    /// TASK-652 预留：按 session 取就绪项（P2 执行侧切主）
+    pub async fn list_approved_ready_for_session(&self, session_id: &str) -> Vec<PendingApproval> {
+        self.list_approved_ready()
+            .await
+            .into_iter()
+            .filter(|a| a.session_id == session_id)
+            .collect()
+    }
+
+    /// 移除已完成的审批项（SQLite 标 Consumed）
     pub async fn remove(&self, approval_id: &str) {
         self.outgoing.lock().await.remove(approval_id);
         self.responses.lock().await.remove(approval_id);
+        self.sqlite_consume(approval_id);
         self.persist().await;
     }
 
@@ -719,6 +929,7 @@ mod tests {
             status: ApprovalStatus::Pending,
             created_at: 1000.0,
             operation_hash: "op_hash_456".to_string(),
+            session_id: "s1".to_string(),
         };
         let json = am.build_a2a_request(&approval, "agent/agent-001/dept/运营部");
         assert_eq!(json["type"], "approval_request");
@@ -870,5 +1081,47 @@ mod tests {
         // 模拟「执行成功」路径：remove
         am.remove(&aid).await;
         assert_eq!(am.list_approved_ready().await.len(), 0, "成功路径必须移除");
+    }
+
+    /// TASK-652 P1：SQLite 同库权威表跨 reopen 存活；JSON 双写可选。
+    #[tokio::test]
+    async fn test_sqlite_authority_survives_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "appr_auth_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_string_lossy().to_string();
+        {
+            let store = ApprovalStore::open(&p).unwrap();
+            let am = ApprovalManager::new_with_persistence(None, Some(store), false);
+            let aid = am
+                .create_request_for_session(
+                    "manage_samples",
+                    &serde_json::json!({"action": "sync"}),
+                    "取样同步",
+                    "dashboard-admin",
+                    "agent-001",
+                    "sess/demo",
+                )
+                .await;
+            let hash = am.get_pending(&aid).await.unwrap().operation_hash;
+            am.record_response(ApprovalResponse {
+                r#type: "approval_response".to_string(),
+                approval_id: aid.clone(),
+                approved: true,
+                reason: None,
+                approver_id: "dashboard-admin".to_string(),
+                operation_hash: hash,
+            })
+            .await;
+            assert_eq!(am.list_approved_ready_for_session("sess/demo").await.len(), 1);
+        }
+        // reopen
+        let store2 = ApprovalStore::open(&p).unwrap();
+        let am2 = ApprovalManager::new_with_persistence(None, Some(store2), false);
+        assert_eq!(am2.list_approved_ready().await.len(), 1);
+        assert_eq!(am2.list_approved_ready_for_session("sess/demo").await.len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 }
