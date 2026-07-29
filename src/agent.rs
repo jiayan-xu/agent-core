@@ -1154,6 +1154,8 @@ impl AgentCore {
         // ── 0a. 工具级确认（现有）：pending_actions 中的操作等待确认 ──
         if is_confirm(trimmed) {
             if let Some(mut action) = self.session_manager.take_pending_action(session_id).await {
+                // 任务 652 前置修复：捕获 approval_id，供执行后消费审批项（防残留被全局扫描重执行）
+                let approval_id_opt = action.approval_id.clone();
                 // L2 安全修复：若待确认操作需人工审批，必须先获得审批人批准，防用户自批绕过
                 if let Some(aid) = &action.approval_id {
                     match self.approval_manager.check_response(aid).await {
@@ -1208,24 +1210,37 @@ impl AgentCore {
                         obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
                     }
                 }
-                let result = match self
+                let exec_res = self
                     .call_tool_routed(&action.tool_name, &self.persona_for_session(session_id), &action.arguments, allowed_ns, &trace_id)
-                    .await
-                {
-                    Ok(text) => text,
+                    .await;
+                let desc = action.description.chars().take(120).collect::<String>();
+                let result_text = match &exec_res {
+                    Ok(t) => t.clone(),
                     Err(e) => format!("执行失败: {}", e),
                 };
-                let desc = action.description.chars().take(120).collect::<String>();
-                let result_short = result.chars().take(300).collect::<String>();
-                let reply = format!(
-                    "✅ 操作已执行成功！\n\n操作内容：{}\n\n{}",
-                    desc, result_short
-                );
+                let result_short = result_text.chars().take(300).collect::<String>();
+                // 任务 649：按工具真实返回如实上报，杜绝「假成功」
+                let (_executed, honest_prefix) = Self::classify_tool_execution(&exec_res);
+                let reply = match honest_prefix {
+                    Some(prefix) => format!(
+                        "{}\n\n操作内容：{}\n\n{}",
+                        prefix, desc, result_short
+                    ),
+                    None => format!(
+                        "✅ 操作已执行成功！\n\n操作内容：{}\n\n{}",
+                        desc, result_short
+                    ),
+                };
                 let ns = self.caller_ns(session_id);
                 let db_path = self.harness.lock().await.db_path();
                 self.session_manager
                     .save_to_history(session_id, &ns, &db_path, message, &reply)
                     .await;
+                // 任务 652 前置修复：确认执行后消费对应审批项，防止 approval_manager 残留
+                // 被后续会话 execute_approved_request（line ~1583 全局扫描）反复重执行（幽灵触发）。
+                if let Some(aid) = approval_id_opt {
+                    self.approval_manager.remove(&aid).await;
+                }
                 return reply;
             }
         }
@@ -3915,35 +3930,84 @@ impl AgentCore {
                 .call_tool_routed(&approval.tool_name, "default", &exec_args, allowed_ns, "")
                 .await;
             let desc = approval.description.chars().take(120).collect::<String>();
-            let reply = match &exec_result {
-                Ok(text) => {
-                    let result_short = text.chars().take(300).collect::<String>();
-                    format!(
-                        "✅ 审批通过！操作已执行。\n\n操作内容：{}\n审批人：{}\n\n{}",
-                        desc, approval.approver_id, result_short
-                    )
-                }
-                Err(e) => format!(
-                    "⚠️ 审批已批准，但工具执行失败：{}（审批项保留待查，审计链不丢）",
-                    e
+            // 任务 649：按工具真实返回如实上报，杜绝「假成功」
+            let (executed, honest_prefix) = Self::classify_tool_execution(&exec_result);
+            let result_short = match &exec_result {
+                Ok(t) => t.chars().take(300).collect::<String>(),
+                Err(e) => e.chars().take(300).collect::<String>(),
+            };
+            let reply = match honest_prefix {
+                Some(prefix) => format!(
+                    "{}\n\n操作内容：{}\n审批人：{}\n\n{}",
+                    prefix, desc, approval.approver_id, result_short
+                ),
+                None => format!(
+                    "✅ 审批通过！操作已执行。\n\n操作内容：{}\n审批人：{}\n\n{}",
+                    desc, approval.approver_id, result_short
                 ),
             };
-            // 审计日志（成功/失败都记调用，但标记实际结果）
+            // 审计日志（成功/失败都记调用，但标记实际是否写入 DB）
             self.audit_logger
                 .log_tool_call(
                     &self.config.identity.agent_id,
                     &approval.tool_name,
                     &approval.arguments,
-                    exec_result.is_ok(),
+                    executed,
                 )
                 .await;
-            // P1-1 修复：仅执行成功才 remove，失败保留审批项供人工复查（避免误删审计链/漏掉未生效的写）。
+            // P1-1 + 任务 649：移除条件保持「工具调用未抛错（Ok）即移除」。
+            // 受控写失败多为确定性错误（如车牌不存在），移除后用户重新发指令即可，
+            // 避免把失败审批留在审批台、每次新对话都被 execute_approved_request 反复重执行（幽灵触发）。
+            // 真正的传输错误（Err）才保留供人工重试。审计已用 executed 如实标记 DB 是否实际写入。
             if exec_result.is_ok() {
                 self.approval_manager.remove(&approval.approval_id).await;
             }
             return Some(reply);
         }
         None
+    }
+
+    /// 任务 649：把工具返回的 Result 诚实分类，避免把「require_confirm / error」包装成「✅ 成功」。
+    /// 返回 (executed, honest_note)：
+    /// - executed=true 表示 DB 实际发生写入（工具返回 success:true）；
+    /// - honest_note=Some(prefix) 时，reply 应以该前缀如实上报，而非直接标成功；
+    /// - honest_note=None 时，才使用「✅ 操作已执行成功」的常规成功文案。
+    /// 对非结构化返回（无 success/require_confirm/error 字段的纯文本工具）保守视为成功，保持旧行为。
+    fn classify_tool_execution(result: &Result<String, String>) -> (bool, Option<String>) {
+        match result {
+            Err(e) => (false, Some(format!("⚠️ 工具执行失败：{}", e))),
+            Ok(text) => {
+                let v = serde_json::from_str::<serde_json::Value>(text).ok();
+                let (success, require_confirm, error_opt) = match v {
+                    Some(ref j)
+                        if j.get("success").is_some()
+                            || j.get("require_confirm").is_some()
+                            || j.get("error").is_some() =>
+                    {
+                        (
+                            j.get("success").and_then(|x| x.as_bool()).unwrap_or(false),
+                            j.get("require_confirm").and_then(|x| x.as_bool()).unwrap_or(false),
+                            j.get("error").and_then(|x| x.as_str()).map(|s| s.to_string()),
+                        )
+                    }
+                    _ => return (true, None), // 非结构化返回：按旧逻辑视为成功
+                };
+                if success {
+                    (true, None)
+                } else if require_confirm {
+                    (
+                        false,
+                        Some(
+                            "ℹ️ 操作未真正执行：工具返回 require_confirm（疑似缺少二次确认参数 confirmed=true）。请重新发起审批或确认以写入。".to_string(),
+                        ),
+                    )
+                } else if let Some(err) = error_opt {
+                    (false, Some(format!("⚠️ 操作未执行：{}", err)))
+                } else {
+                    (false, Some("ℹ️ 操作未确认已执行（工具未返回成功标志）。".to_string()))
+                }
+            }
+        }
     }
 
     /// 查找能处理该工具的 MCP 源
