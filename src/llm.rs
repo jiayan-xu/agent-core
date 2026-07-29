@@ -903,6 +903,269 @@ pub struct LlmResponse {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// DeepSeek DSML 工具调用文本泄露解析（task 650）。
+///
+/// 部分模型（尤其 DeepSeek V3/R1）会把 tool call 写成 content 里的 DSML 标记，
+/// 而 `choices[].message.tool_calls` 为空。若不回填，agent 循环会把整段 markup
+/// 当最终回复，工具永不执行。
+///
+/// 支持官方形态（全角 `｜`）与 ASCII `|` 变体：
+/// ```text
+/// <｜DSML｜tool_calls>
+///   <｜DSML｜invoke name="sync_whitelist_plates">
+///     <｜DSML｜parameter name="action" string="true">update_company</｜DSML｜parameter>
+///   </｜DSML｜invoke>
+/// </｜DSML｜tool_calls>
+/// ```
+/// 也兼容根标签 `function_calls`。
+///
+/// 返回 `(剥离 DSML 后的可见文本, 解析出的 ToolCall 列表)`。无 DSML 时原样返回文本与空列表。
+pub fn parse_dsml_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    if text.is_empty() || !text_looks_like_dsml(text) {
+        return (text.to_string(), Vec::new());
+    }
+
+    let block_pairs: &[(&str, &str)] = &[
+        ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>"),
+        ("<｜DSML｜function_calls>", "</｜DSML｜function_calls>"),
+        ("<|DSML|tool_calls>", "</|DSML|tool_calls>"),
+        ("<|DSML|function_calls>", "</|DSML|function_calls>"),
+    ];
+
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut clean = text.to_string();
+
+    for &(open, close) in block_pairs {
+        while let Some(start) = clean.find(open) {
+            let after_open = start + open.len();
+            let end = match clean[after_open..].find(close) {
+                Some(rel) => after_open + rel,
+                None => {
+                    // 未闭合：尽量从 open 之后解析 invoke，再删掉到文末
+                    let parsed = parse_dsml_invokes(&clean[after_open..]);
+                    tool_calls.extend(parsed);
+                    clean.truncate(start);
+                    break;
+                }
+            };
+            let inner = &clean[after_open..end];
+            tool_calls.extend(parse_dsml_invokes(inner));
+            let after_close = end + close.len();
+            clean = format!("{}{}", &clean[..start], &clean[after_close..]);
+        }
+    }
+
+    // 若模型只吐出 invoke 而未包 tool_calls 根标签，仍尝试回收
+    if tool_calls.is_empty() {
+        tool_calls = parse_dsml_invokes(&clean);
+        if !tool_calls.is_empty() {
+            clean = strip_all_dsml_tags(&clean);
+        }
+    } else {
+        clean = strip_all_dsml_tags(&clean);
+    }
+
+    let clean = clean.trim().to_string();
+    (clean, tool_calls)
+}
+
+fn text_looks_like_dsml(text: &str) -> bool {
+    text.contains("｜DSML｜") || text.contains("|DSML|")
+}
+
+fn strip_all_dsml_tags(text: &str) -> String {
+    // 粗剥：去掉仍残留的 DSML 起止标签（含未识别的变体）
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '<' {
+            let rest: String = chars[i..].iter().collect();
+            let is_dsml = rest.starts_with("<｜DSML｜")
+                || rest.starts_with("</｜DSML｜")
+                || rest.starts_with("<|DSML|")
+                || rest.starts_with("</|DSML|");
+            if is_dsml {
+                if let Some(rel) = rest.find('>') {
+                    i += rel + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn parse_dsml_invokes(block: &str) -> Vec<ToolCall> {
+    let invoke_opens = ["<｜DSML｜invoke ", "<|DSML|invoke "];
+    let invoke_closes = ["</｜DSML｜invoke>", "</|DSML|invoke>"];
+
+    let mut calls = Vec::new();
+    let mut search_from = 0;
+    let mut idx = 0u32;
+
+    while search_from < block.len() {
+        let rel = invoke_opens
+            .iter()
+            .filter_map(|o| block[search_from..].find(o).map(|p| (p, *o)))
+            .min_by_key(|(p, _)| *p);
+        let Some((rel_start, open)) = rel else {
+            break;
+        };
+        let open_at = search_from + rel_start;
+        let after_open_kw = open_at + open.len();
+        // open 形如 `name="foo">` 或 `name='foo'>`
+        let name_start = match block[after_open_kw..].find("name=") {
+            Some(p) => after_open_kw + p + "name=".len(),
+            None => {
+                search_from = after_open_kw;
+                continue;
+            }
+        };
+        let (name, after_name) = match parse_quoted_attr(&block[name_start..]) {
+            Some((n, consumed)) => (n, name_start + consumed),
+            None => {
+                search_from = name_start;
+                continue;
+            }
+        };
+        let tag_end = match block[after_name..].find('>') {
+            Some(p) => after_name + p + 1,
+            None => break,
+        };
+
+        let close_rel = invoke_closes
+            .iter()
+            .filter_map(|c| block[tag_end..].find(c).map(|p| (p, c.len())))
+            .min_by_key(|(p, _)| *p);
+        let (inner, next_from) = match close_rel {
+            Some((rel, clen)) => {
+                let close_at = tag_end + rel;
+                (&block[tag_end..close_at], close_at + clen)
+            }
+            None => (&block[tag_end..], block.len()),
+        };
+
+        let arguments = parse_dsml_parameters(inner);
+        idx += 1;
+        calls.push(ToolCall {
+            id: format!("dsml_call_{}", idx),
+            name,
+            arguments,
+        });
+        search_from = next_from;
+    }
+    calls
+}
+
+/// 解析 ` "value" ` / `'value'`，返回 (值, 从原切片起点算起的消费字节数含前导空白)。
+fn parse_quoted_attr(s: &str) -> Option<(String, usize)> {
+    let trimmed = s.trim_start();
+    let leading = s.len() - trimmed.len();
+    let bytes = trimmed.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let quote = bytes[0];
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let rest = &trimmed[1..];
+    let end = rest.find(quote as char)?;
+    let val = rest[..end].to_string();
+    Some((val, leading + 1 + end + 1))
+}
+
+fn parse_dsml_parameters(inner: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    let param_opens = ["<｜DSML｜parameter ", "<|DSML|parameter "];
+    let param_closes = ["</｜DSML｜parameter>", "</|DSML|parameter>"];
+
+    let mut search_from = 0;
+    while search_from < inner.len() {
+        let rel = param_opens
+            .iter()
+            .filter_map(|o| inner[search_from..].find(o).map(|p| (p, *o)))
+            .min_by_key(|(p, _)| *p);
+        let Some((rel_start, open)) = rel else {
+            break;
+        };
+        let open_at = search_from + rel_start;
+        let after_open = open_at + open.len();
+
+        // attributes: name="..." [string="true|false"]
+        let name_pos = match inner[after_open..].find("name=") {
+            Some(p) => after_open + p + "name=".len(),
+            None => {
+                search_from = after_open;
+                continue;
+            }
+        };
+        let (pname, after_name) = match parse_quoted_attr(&inner[name_pos..]) {
+            Some(x) => (x.0, name_pos + x.1),
+            None => {
+                search_from = name_pos;
+                continue;
+            }
+        };
+
+        let mut is_string = true;
+        if let Some(sp) = inner[after_name..].find("string=") {
+            let sp = after_name + sp + "string=".len();
+            if let Some((sv, _)) = parse_quoted_attr(&inner[sp..]) {
+                is_string = sv != "false";
+            }
+        }
+
+        let tag_end = match inner[after_name..].find('>') {
+            Some(p) => after_name + p + 1,
+            None => break,
+        };
+        let close_rel = param_closes
+            .iter()
+            .filter_map(|c| inner[tag_end..].find(c).map(|p| (p, c.len())))
+            .min_by_key(|(p, _)| *p);
+        let (raw_val, next_from) = match close_rel {
+            Some((rel, clen)) => {
+                let close_at = tag_end + rel;
+                (inner[tag_end..close_at].to_string(), close_at + clen)
+            }
+            None => (inner[tag_end..].to_string(), inner.len()),
+        };
+
+        let value = if is_string {
+            serde_json::Value::String(raw_val)
+        } else {
+            serde_json::from_str::<serde_json::Value>(raw_val.trim())
+                .unwrap_or(serde_json::Value::String(raw_val))
+        };
+        map.insert(pname, value);
+        search_from = next_from;
+    }
+
+    serde_json::Value::Object(map)
+}
+
+/// 若响应文本含 DSML 且 structured tool_calls 为空，则回填；始终剥离 DSML 可见文本。
+pub fn apply_dsml_fallback(mut resp: LlmResponse) -> LlmResponse {
+    if !text_looks_like_dsml(&resp.text) {
+        return resp;
+    }
+    let (clean, parsed) = parse_dsml_tool_calls(&resp.text);
+    resp.text = clean;
+    if resp.tool_calls.is_empty() && !parsed.is_empty() {
+        tracing::info!(
+            count = parsed.len(),
+            names = ?parsed.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            "DSML tool_calls recovered from content (task 650)"
+        );
+        resp.tool_calls = parsed;
+    }
+    resp
+}
+
 /// LLM 消息
 #[derive(Debug, Clone, Serialize)]
 pub struct Message {
@@ -1104,7 +1367,8 @@ impl LlmClient {
                             tracing::info!(failover_to = %model, provider_index = idx, "LLM provider failover（主 Provider 失败）");
                         }
 
-                        return Ok(LlmResponse { text, tool_calls });
+                        // task 650：DeepSeek DSML 文本泄露 → 回填 structured tool_calls
+                        return Ok(apply_dsml_fallback(LlmResponse { text, tool_calls }));
                     }
                     Err(e) => {
                         let msg = format!("连接失败: {}", e);
@@ -1516,5 +1780,86 @@ mod eval_tests {
         assert_eq!(parse_judge_score("SCORE: 8.5"), 8.5);
         assert_eq!(parse_judge_score("满分 10 分"), 10.0); // 完整 token，非首字符 1
         assert_eq!(parse_judge_score("无数字"), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod dsml_tests {
+    use super::*;
+
+    fn sample_dsml_fullwidth() -> String {
+        [
+            "先查一下再改。",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"sync_whitelist_plates\">",
+            "<｜DSML｜parameter name=\"action\" string=\"true\">update_company</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"plate\" string=\"true\">苏EZQ117</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"company_name\" string=\"true\">佳士能环境工程有限公司</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"confirmed\" string=\"false\">true</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn parse_official_dsml_tool_calls() {
+        let (clean, calls) = parse_dsml_tool_calls(&sample_dsml_fullwidth());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "sync_whitelist_plates");
+        assert_eq!(calls[0].arguments["action"], "update_company");
+        assert_eq!(calls[0].arguments["plate"], "苏EZQ117");
+        assert_eq!(calls[0].arguments["company_name"], "佳士能环境工程有限公司");
+        assert_eq!(calls[0].arguments["confirmed"], true);
+        assert!(!clean.contains("DSML"));
+        assert!(clean.contains("先查一下再改"));
+    }
+
+    #[test]
+    fn parse_ascii_dsml_function_calls() {
+        let text = concat!(
+            "<|DSML|function_calls>",
+            "<|DSML|invoke name=\"memory_search\">",
+            "<|DSML|parameter name=\"query\" string=\"true\">白名单</|DSML|parameter>",
+            "<|DSML|parameter name=\"top_k\" string=\"false\">5</|DSML|parameter>",
+            "</|DSML|invoke>",
+            "</|DSML|function_calls>",
+        );
+        let (clean, calls) = parse_dsml_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "memory_search");
+        assert_eq!(calls[0].arguments["query"], "白名单");
+        assert_eq!(calls[0].arguments["top_k"], 5);
+        assert!(clean.is_empty());
+    }
+
+    #[test]
+    fn apply_fallback_only_when_structured_empty() {
+        let text = sample_dsml_fullwidth();
+        let filled = apply_dsml_fallback(LlmResponse {
+            text: text.clone(),
+            tool_calls: vec![],
+        });
+        assert_eq!(filled.tool_calls.len(), 1);
+        assert!(!filled.text.contains("DSML"));
+
+        let keep = apply_dsml_fallback(LlmResponse {
+            text,
+            tool_calls: vec![ToolCall {
+                id: "tc_1".into(),
+                name: "already_there".into(),
+                arguments: serde_json::json!({}),
+            }],
+        });
+        assert_eq!(keep.tool_calls.len(), 1);
+        assert_eq!(keep.tool_calls[0].name, "already_there");
+        assert!(!keep.text.contains("DSML"));
+    }
+
+    #[test]
+    fn no_dsml_passthrough() {
+        let (clean, calls) = parse_dsml_tool_calls("普通回复，无工具调用");
+        assert!(calls.is_empty());
+        assert_eq!(clean, "普通回复，无工具调用");
     }
 }

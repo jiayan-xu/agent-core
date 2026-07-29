@@ -6188,3 +6188,58 @@ mod tool_fix_tests {
     }
 }
 
+#[cfg(test)]
+mod whitelist_preroute_tests {
+    use super::*;
+
+    #[test]
+    fn extract_update_company_rename() {
+        let msg = "把白名单里车牌苏EZQ117的公司名统一为「佳士能环境工程有限公司」";
+        let (plate, company) = AgentCore::extract_whitelist_update(msg).expect("should match");
+        assert_eq!(plate, "苏EZQ117");
+        assert_eq!(company, "佳士能环境工程有限公司");
+    }
+
+    #[test]
+    fn extract_update_rejects_non_write() {
+        assert!(AgentCore::extract_whitelist_update("查询白名单里苏EZQ117的公司名").is_none());
+        assert!(AgentCore::extract_whitelist_update("今天天气怎么样").is_none());
+    }
+
+    #[test]
+    fn extract_add_new_vehicle() {
+        let msg = "把「佳士能」的新车苏EZQ999添加到白名单";
+        let (plate, company) = AgentCore::extract_whitelist_add(msg).expect("should match");
+        assert_eq!(plate, "苏EZQ999");
+        assert!(company.contains("佳士能"));
+    }
+
+    #[test]
+    fn extract_add_defers_to_update_when_rename_verbs() {
+        let msg = "把白名单车牌苏EZQ117公司名改为「佳士能环境」";
+        assert!(AgentCore::extract_whitelist_add(msg).is_none());
+        assert!(AgentCore::extract_whitelist_update(msg).is_some());
+    }
+
+    #[test]
+    fn classify_tool_execution_honest() {
+        let ok = Ok(r#"{"success":true}"#.to_string());
+        assert_eq!(AgentCore::classify_tool_execution(&ok), (true, None));
+
+        let need = Ok(r#"{"success":false,"require_confirm":true}"#.to_string());
+        let (executed, note) = AgentCore::classify_tool_execution(&need);
+        assert!(!executed);
+        assert!(note.unwrap().contains("require_confirm"));
+
+        let err = Ok(r#"{"success":false,"error":"plate not found"}"#.to_string());
+        let (executed, note) = AgentCore::classify_tool_execution(&err);
+        assert!(!executed);
+        assert!(note.unwrap().contains("plate not found"));
+
+        let transport = Err("timeout".to_string());
+        let (executed, note) = AgentCore::classify_tool_execution(&transport);
+        assert!(!executed);
+        assert!(note.unwrap().contains("timeout"));
+    }
+}
+
