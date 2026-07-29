@@ -282,6 +282,35 @@ def run_live() -> None:
     r_rm = call_chat(msg_rm, sid + "/rm")
     assert_approval_path("remove", reply_text(r_rm), "苏E2ET99")
 
+    # 短确认写意图：上文含 suggested_fix → 须进审批，禁止假成功
+    sid_sc = sid + "/short_confirm"
+    seed = (
+        '诊断备忘 suggested_fix: {"canonical_company_name":"佳士能（常熟）环境科技有限公司",'
+        '"plates_to_update":["苏EZQ117"],"operation":"update_company"}'
+    )
+    _ = call_chat(seed, sid_sc)
+    r_sc = call_chat("确认统一为全称", sid_sc)
+    reply_sc = reply_text(r_sc)
+    print(f"  [short_confirm] reply[:240]={reply_sc[:240]!r}")
+    if "AWAITING_APPROVAL" not in reply_sc and "awaiting_approval" not in reply_sc.lower():
+        # 失败闭合也可接受（无上下文时明示未写）；不可假成功
+        if "未执行任何写操作" in reply_sc:
+            print("  [short_confirm] OK (fail-closed, no durable context)")
+        else:
+            print("FAIL: 短确认须进审批或明示未写，禁止假成功", file=sys.stderr)
+            sys.exit(1)
+    else:
+        if "sync_whitelist_plates" not in reply_sc:
+            print("FAIL: 短确认期望 sync_whitelist_plates", file=sys.stderr)
+            sys.exit(1)
+        if PLATE not in reply_sc:
+            print(f"FAIL: 短确认期望还原车牌 {PLATE}", file=sys.stderr)
+            sys.exit(1)
+        if "操作已执行成功" in reply_sc and "diagnose_data_gap" in reply_sc:
+            print("FAIL: 短确认假成功（只读 diagnose）", file=sys.stderr)
+            sys.exit(1)
+        print("  [short_confirm] OK")
+
     msg_q = f"查询白名单里{PLATE}的公司名是什么"
     reply3 = reply_text(call_chat(msg_q, sid + "/q"))
     print(f"  [query] reply[:200]={reply3[:200]!r}")

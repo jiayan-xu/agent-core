@@ -1151,6 +1151,24 @@ impl AgentCore {
             return reply.to_string();
         }
 
+        // ── 0a0. 短确认写意图（假成功根治）：「确认统一为全称」等无车牌短句 ──
+        // 不走 pending_action / 复述回放 / 话题切换，直接进 execute_chat 做历史还原→受控写闸门。
+        if Self::is_whitelist_rename_confirm(trimmed) {
+            self.session_manager
+                .set_state(session_id, SessionState::Confirmed)
+                .await;
+            return self
+                .execute_chat(
+                    message,
+                    user_id,
+                    session_id,
+                    allowed_ns,
+                    &trace_id,
+                    external_history.clone(),
+                )
+                .await;
+        }
+
         // ── 0a. 工具级确认（现有）：pending_actions 中的操作等待确认 ──
         if is_confirm(trimmed) {
             if let Some(mut action) = self.session_manager.take_pending_action(session_id).await {
@@ -1342,6 +1360,131 @@ impl AgentCore {
             return None;
         }
         Some((plate, company))
+    }
+
+    /// 用户以短句同意「统一简称→全称 / 改公司名」——消息里常无车牌，须从历史还原。
+    fn is_whitelist_rename_confirm(message: &str) -> bool {
+        let m = message.trim();
+        if m.is_empty() || m.chars().count() > 48 {
+            return false;
+        }
+        let confirmish = ["确认", "同意", "可以", "好的", "确定", "执行", "需要", "行"]
+            .iter()
+            .any(|w| m.contains(*w));
+        let renameish = ["统一", "全称", "改名", "公司名", "简称", "规范名"]
+            .iter()
+            .any(|w| m.contains(*w));
+        confirmish && renameish
+    }
+
+    /// 从会话文本还原 (车牌, 目标公司名)：优先 diagnose `suggested_fix` JSON，其次自然语言。
+    fn recover_whitelist_update_from_context(message: &str, history_blob: &str) -> Option<(String, String)> {
+        if let Some(pair) = Self::extract_whitelist_update(message) {
+            return Some(pair);
+        }
+        let blob = format!("{}\n{}", history_blob, message);
+        if let Some(pair) = Self::parse_suggested_fix_update(&blob) {
+            return Some(pair);
+        }
+        // 自然语言：历史里出现的车牌 + 最长「…有限公司」候选
+        let plate = Self::extract_plate(&blob).or_else(|| Self::extract_plate_spaced(&blob))?;
+        let company = Self::extract_canonical_company_candidate(&blob)?;
+        Some((plate, company))
+    }
+
+    /// 解析 diagnose_data_gap 返回的 suggested_fix 片段。
+    fn parse_suggested_fix_update(blob: &str) -> Option<(String, String)> {
+        let company = Self::extract_json_string_field(blob, "canonical_company_name")?;
+        if company.chars().count() < 2 {
+            return None;
+        }
+        // plates_to_update 数组优先；否则全文首个车牌
+        let plate = if let Some(arr_start) = blob.find("plates_to_update") {
+            let slice = &blob[arr_start..];
+            Self::extract_plate(slice).or_else(|| Self::extract_plate_spaced(slice))
+        } else {
+            None
+        }
+        .or_else(|| Self::extract_plate(blob))
+        .or_else(|| Self::extract_plate_spaced(blob))?;
+        Some((plate, company))
+    }
+
+    fn extract_json_string_field(blob: &str, key: &str) -> Option<String> {
+        let needle = format!("\"{}\"", key);
+        let idx = blob.find(&needle)?;
+        let after = &blob[idx + needle.len()..];
+        let colon = after.find(':')?;
+        let rest = after[colon + 1..].trim_start();
+        let rest = rest.strip_prefix('"')?;
+        let end = rest.find('"')?;
+        let s = rest[..end].trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    /// 从文本挑最长、像规范全称的公司名（含「有限公司」优先）。
+    fn extract_canonical_company_candidate(blob: &str) -> Option<String> {
+        let mut cands: Vec<String> = Vec::new();
+        for (o, cl) in [('「', '」'), ('“', '”'), ('"', '"')] {
+            let chars: Vec<char> = blob.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                if chars[i] == o {
+                    if let Some(j) = chars[i + 1..].iter().position(|&c| c == cl) {
+                        let s: String = chars[i + 1..i + 1 + j].iter().collect();
+                        let s = s.trim().to_string();
+                        if s.chars().count() >= 4 {
+                            cands.push(s);
+                        }
+                        i += 1 + j;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+        // 无引号时：扫「…有限公司」短窗
+        let chars: Vec<char> = blob.chars().collect();
+        let marker: Vec<char> = "有限公司".chars().collect();
+        for i in 0..chars.len() {
+            if i + marker.len() <= chars.len() && chars[i..i + marker.len()] == marker[..] {
+                let start = i.saturating_sub(24);
+                let s: String = chars[start..i + marker.len()].iter().collect();
+                let s = s
+                    .trim_matches(|c: char| {
+                        c.is_whitespace()
+                            || matches!(c, '：' | ':' | '，' | ',' | '。' | '（' | '(' | ')' | '）')
+                    })
+                    .to_string();
+                if s.chars().count() >= 4 {
+                    cands.push(s);
+                }
+            }
+        }
+        cands.sort_by_key(|s| std::cmp::Reverse(s.chars().count()));
+        cands.into_iter().find(|s| {
+            s.contains("公司")
+                && !s.contains("白名单")
+                && !s.contains("数据")
+                && !s.contains("suggested")
+        })
+    }
+
+    fn history_content_blob(history: &[Message]) -> String {
+        let mut out = String::new();
+        for m in history.iter().rev().take(30) {
+            if let Some(c) = &m.content {
+                if !c.is_empty() {
+                    out.push_str(c);
+                    out.push('\n');
+                }
+            }
+        }
+        out
     }
 
     /// 抽取中文车牌（省简称1字 + 大写字母1 + 4~6位字母数字），如 苏EZQ117。
@@ -1703,6 +1846,45 @@ impl AgentCore {
                 .save_to_history(session_id, &ns, &db_path, message, &reply)
                 .await;
             return reply;
+        }
+
+        // ── 短确认写意图：从历史还原车牌/全称 → 受控写闸门（禁止只读工具假成功）──
+        if Self::is_whitelist_rename_confirm(message) {
+            let history = self.load_history(session_id).await;
+            let blob = Self::history_content_blob(&history);
+            if let Some((plate, company)) =
+                Self::recover_whitelist_update_from_context(message, &blob)
+            {
+                if self.config.human_approval {
+                    let reason = format!(
+                        "白名单受控写：修改车牌 {} 的公司名为「{}」（短确认自上文还原，需人工审批）",
+                        plate, company
+                    );
+                    let args = serde_json::json!({
+                        "action": "update_company",
+                        "plate": plate,
+                        "company_name": company,
+                        "reason": reason,
+                        "confirmed": false
+                    });
+                    return self
+                        .submit_controlled_write_approval(
+                            session_id,
+                            message,
+                            "sync_whitelist_plates",
+                            args,
+                            reason,
+                        )
+                        .await;
+                }
+            } else {
+                let reply = "ℹ️ 未执行任何写操作：短确认「统一/全称」未能从上文还原车牌与目标公司名。\
+请明确发送例如：把白名单里车牌苏EZQ117的公司名统一为「佳士能（常熟）环境科技有限公司」。\
+（只读诊断工具不能代替受控写。）"
+                    .to_string();
+                self.save_to_history(session_id, message, &reply).await;
+                return reply;
+            }
         }
 
         // ── 确定性预路由：白名单公司名变更 → 直接构造受控写审批闸门 ──
@@ -6653,6 +6835,42 @@ mod whitelist_preroute_tests {
         let plate = AgentCore::extract_whitelist_remove("从白名单删除车牌苏EZQ117").expect("match");
         assert_eq!(plate, "苏EZQ117");
         assert!(AgentCore::extract_whitelist_remove("查询白名单苏EZQ117").is_none());
+    }
+
+    #[test]
+    fn rename_confirm_detects_short_phrases() {
+        assert!(AgentCore::is_whitelist_rename_confirm("确认统一为全称"));
+        assert!(AgentCore::is_whitelist_rename_confirm("同意改成规范名"));
+        assert!(AgentCore::is_whitelist_rename_confirm("好的，统一简称"));
+        assert!(!AgentCore::is_whitelist_rename_confirm("确认"));
+        assert!(!AgentCore::is_whitelist_rename_confirm("查询白名单"));
+        assert!(!AgentCore::is_whitelist_rename_confirm("今天天气怎么样"));
+    }
+
+    #[test]
+    fn recover_from_suggested_fix_json() {
+        let blob = r#"{
+          "suggested_fix": {
+            "tool": "sync_whitelist_plates",
+            "operation": "update_company",
+            "canonical_company_name": "佳士能（常熟）环境科技有限公司",
+            "plates_to_update": ["苏EZQ117", "苏E2ET01"]
+          }
+        }"#;
+        let (plate, company) =
+            AgentCore::recover_whitelist_update_from_context("确认统一为全称", blob)
+                .expect("recover");
+        assert_eq!(plate, "苏EZQ117");
+        assert!(company.contains("佳士能"));
+        assert!(company.contains("有限公司"));
+    }
+
+    #[test]
+    fn recover_fails_closed_without_context() {
+        assert!(
+            AgentCore::recover_whitelist_update_from_context("确认统一为全称", "无关闲聊")
+                .is_none()
+        );
     }
 
     #[test]
