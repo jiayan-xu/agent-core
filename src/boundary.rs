@@ -1649,6 +1649,25 @@ mod tests {
         ));
     }
 
+    /// 受控写注册表内每个工具必须能被审批地板拦住（HARD_DANGEROUS 或 dept_ops 黄线）。
+    /// 防止「进了注册表却可静默落盘」。
+    #[test]
+    fn controlled_writes_are_approval_gated() {
+        for spec in crate::controlled_write::CONTROLLED_WRITES {
+            let hard = HARD_DANGEROUS.contains(&spec.tool);
+            let dept = needs_dept_ops_write_approval(spec.tool, &serde_json::json!({}))
+                || needs_dept_ops_write_approval(
+                    spec.tool,
+                    &serde_json::json!({"action": "sync"}),
+                );
+            assert!(
+                hard || dept,
+                "受控写工具 {} 未挂审批地板（既非 HARD_DANGEROUS 也不走 dept_ops 黄线）",
+                spec.tool
+            );
+        }
+    }
+
     #[test]
     fn test_permission_descent() {
         let mut chain = PermissionChain::new();
