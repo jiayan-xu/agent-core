@@ -388,14 +388,14 @@ def run_full() -> None:
         sys.exit(1)
     approve_item(item)
 
-    exec_reply = reply_text(call_chat("确认", sid + "/confirm"))
+    exec_reply = reply_text(call_chat("确认", sid + "/upd"))
     safe_print(f"  [execute] reply[:360]={exec_reply[:360]!r}")
     if "回读校验通过" not in exec_reply:
         print("FAIL: 期望「回读校验通过」", file=sys.stderr)
         sys.exit(1)
     print("  [execute+verify] OK")
 
-    # 还原
+    # 还原（同会话前缀，确认须与建单 session 一致 — TASK-652 P2）
     msg_r = f"把白名单里车牌{PLATE}的公司名统一为「{restore}」"
     r_rest = call_chat(msg_r, sid + "/restore")
     assert_approval_path("restore_gate", reply_text(r_rest), PLATE)
@@ -407,7 +407,7 @@ def run_full() -> None:
         print("FAIL: 还原审批项缺失", file=sys.stderr)
         sys.exit(1)
     approve_item(item2)
-    rest_reply = reply_text(call_chat("确认", sid + "/restore_confirm"))
+    rest_reply = reply_text(call_chat("确认", sid + "/restore"))
     safe_print(f"  [restore exec] reply[:240]={rest_reply[:240]!r}")
     if "回读校验通过" not in rest_reply:
         print("WARN: 还原回读未明确通过，请人工核对白名单", file=sys.stderr)

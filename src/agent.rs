@@ -506,7 +506,7 @@ impl AgentCore {
                     None
                 };
                 let dual = std::env::var("APPROVAL_DUAL_WRITE")
-                    .unwrap_or_else(|_| "1".into())
+                    .unwrap_or_else(|_| "0".into())
                     != "0";
                 ApprovalManager::new_with_persistence(
                     Some(cwd.join("approvals.json")),
@@ -1250,6 +1250,13 @@ impl AgentCore {
                     if obj.contains_key("confirmed") {
                         obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
                     }
+                    if action.tool_name == "sync_exception_correction" {
+                        obj.insert("dry_run".to_string(), serde_json::Value::Bool(false));
+                    }
+                    if action.tool_name == "manage_samples" {
+                        obj.insert("action".to_string(), serde_json::json!("sync"));
+                        obj.insert("dry_run".to_string(), serde_json::Value::Bool(false));
+                    }
                 }
                 let exec_res = self
                     .call_tool_routed(&action.tool_name, &self.persona_for_session(session_id), &action.arguments, allowed_ns, &trace_id)
@@ -1261,7 +1268,7 @@ impl AgentCore {
                 };
                 let result_short = result_text.chars().take(300).collect::<String>();
                 // 任务 649：按工具真实返回如实上报，杜绝「假成功」
-                let (_executed, honest_prefix) = Self::classify_tool_execution(&exec_res);
+                let (executed, honest_prefix) = Self::classify_tool_execution(&exec_res);
                 let reply = match honest_prefix {
                     Some(prefix) => format!(
                         "{}\n\n操作内容：{}\n\n{}",
@@ -1271,6 +1278,20 @@ impl AgentCore {
                         "✅ 操作已执行成功！\n\n操作内容：{}\n\n{}",
                         desc, result_short
                     ),
+                };
+                // TASK-652 P2：同会话确认路径也跑受控写回读（与 execute_approved_request 对齐）
+                let reply = if executed {
+                    let verify = self
+                        .run_controlled_post_verify(
+                            &action.tool_name,
+                            &action.arguments,
+                            &result_short,
+                            allowed_ns,
+                        )
+                        .await;
+                    format!("{}{}", reply, verify.as_reply_suffix())
+                } else {
+                    reply
                 };
                 let ns = self.caller_ns(session_id);
                 let db_path = self.harness.lock().await.db_path();
@@ -1282,6 +1303,9 @@ impl AgentCore {
                 if let Some(aid) = approval_id_opt {
                     self.approval_manager.remove(&aid).await;
                 }
+                // 审批消费后清 checkpoint 终态，避免恢复出空 pending
+                self.checkpoint_terminal(session_id, CheckpointState::Done)
+                    .await;
                 return reply;
             }
         }
@@ -2735,7 +2759,8 @@ impl AgentCore {
         );
     }
 
-    /// 记录待审批：含 approval_id 与工具意图
+    /// 记录待审批：仅存 approval_id（TASK-652 P2：细节以 ApprovalStore 为权威）
+    /// 同时写入会话 pending_action，使同会话「确认」可走 take_pending_action。
     async fn checkpoint_pending_approval(
         &self,
         session_id: &str,
@@ -2745,11 +2770,6 @@ impl AgentCore {
         let agent_id = self.config.identity.agent_id.clone();
         let payload = serde_json::json!({
             "approval_id": approval_id,
-            "pending_action": {
-                "tool_name": action.tool_name,
-                "arguments": action.arguments,
-                "description": action.description,
-            }
         });
         self.metrics.inc_checkpoint_save();
         let _ = self.checkpoint_store.lock().await.save(
@@ -2758,6 +2778,13 @@ impl AgentCore {
             CheckpointState::PendingApproval,
             &payload,
         );
+        let mut pa = action.clone();
+        if pa.approval_id.is_none() {
+            pa.approval_id = Some(approval_id.to_string());
+        }
+        self.session_manager
+            .set_pending_action(session_id, pa)
+            .await;
     }
 
     /// 终态（Done / Failed）：保留 checkpoint 供审计关联
@@ -2784,11 +2811,8 @@ impl AgentCore {
 
     /// 从持久化 checkpoint 恢复控制面状态到内存（chat 入口调用）。
     ///
-    /// 审计无关核心见 `crate::checkpoint_recovery::apply_checkpoint_recovery`：
-    /// 计数（恢复尝试 / 按状态分桶 / 成功）+ 内存重建（session 状态 /
-    /// in_progress_plan / in_progress_step_results）在那里完成，且可被纯内存
-    /// e2e 集成测试覆盖（无需构造完整 AgentCore / Memoria 网络）。
-    /// 本方法只补 Memoria 审计日志（checkpoint_resume 写 Memoria）。
+    /// 审计无关核心见 `crate::checkpoint_recovery::apply_checkpoint_recovery`。
+    /// TASK-652 P2：PendingApproval 仅存 approval_id 时，从 ApprovalManager/SQLite 回填 PendingAction。
     async fn restore_checkpoint(&self, session_id: &str) {
         let state = crate::checkpoint_recovery::apply_checkpoint_recovery(
             session_id,
@@ -2799,10 +2823,45 @@ impl AgentCore {
             &self.in_progress_step_results,
         )
         .await;
+        if matches!(state, Some(CheckpointState::PendingApproval)) {
+            self.hydrate_approval_pending_from_authority(session_id)
+                .await;
+        }
         if let Some(st) = state {
             let state_str = st.as_str();
             self.audit_logger
                 .checkpoint_resume(&self.config.identity.agent_id, session_id, state_str, "")
+                .await;
+        }
+    }
+
+    /// TASK-652：用权威审批表回填会话 pending_action（checkpoint 已瘦身为仅 approval_id）。
+    async fn hydrate_approval_pending_from_authority(&self, session_id: &str) {
+        let aid = {
+            let guard = self.checkpoint_store.lock().await;
+            guard
+                .load(session_id)
+                .and_then(|cp| {
+                    cp.payload
+                        .get("approval_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+        };
+        let Some(aid) = aid else {
+            return;
+        };
+        if let Some(pending) = self.approval_manager.get_pending(&aid).await {
+            self.session_manager
+                .set_pending_action(
+                    session_id,
+                    PendingAction {
+                        tool_name: pending.tool_name,
+                        arguments: pending.arguments,
+                        description: pending.description,
+                        approval_id: Some(aid),
+                    },
+                )
                 .await;
         }
     }
@@ -4412,16 +4471,37 @@ impl AgentCore {
         }
     }
 
-    /// 执行审批通过的请求
-    /// 检查所有「已就绪」（pending 仍在 + 已批准）的审批项，执行工具并返回结果
+    /// 执行审批通过的请求（TASK-652 P2：仅执行本 session 绑定的就绪项，防跨会话幽灵抢跑）
     async fn execute_approved_request(
         &self,
-        _session_id: &str,
+        session_id: &str,
         allowed_ns: &[String],
     ) -> Option<String> {
-        // P0 修复：改用 list_approved_ready —— 原 list_pending + is_approved 形成死路
-        // （list_pending 已排除有 response 的项，批准后执行路径恒空）。
-        let ready_list = self.approval_manager.list_approved_ready().await;
+        let mut ready_list = self
+            .approval_manager
+            .list_approved_ready_for_session(session_id)
+            .await;
+        // 兼容：旧单 session_id=legacy，但本会话 checkpoint 仍指向该 approval_id
+        if ready_list.is_empty() {
+            let aid = {
+                let guard = self.checkpoint_store.lock().await;
+                guard.load(session_id).and_then(|cp| {
+                    cp.payload
+                        .get("approval_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+            };
+            if let Some(aid) = aid {
+                ready_list = self
+                    .approval_manager
+                    .list_approved_ready()
+                    .await
+                    .into_iter()
+                    .filter(|a| a.approval_id == aid)
+                    .collect();
+            }
+        }
         for approval in &ready_list {
             // C1c #1: 执行期 operation_hash 重算比对（防错配 / 偷换）
             let expected =

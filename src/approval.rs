@@ -1124,4 +1124,33 @@ mod tests {
         assert_eq!(am2.list_approved_ready_for_session("sess/demo").await.len(), 1);
         let _ = std::fs::remove_file(&path);
     }
+
+    /// TASK-652 P2：跨 session 不得抢跑他人已批准项
+    #[tokio::test]
+    async fn test_ready_is_session_scoped() {
+        let am = ApprovalManager::new();
+        let aid_a = am
+            .create_request_for_session(
+                "sync_whitelist_plates",
+                &serde_json::json!({"action": "add", "plate": "苏A"}),
+                "a",
+                "admin",
+                "agent-001",
+                "sess/A",
+            )
+            .await;
+        let hash_a = am.get_pending(&aid_a).await.unwrap().operation_hash;
+        am.record_response(ApprovalResponse {
+            r#type: "approval_response".to_string(),
+            approval_id: aid_a.clone(),
+            approved: true,
+            reason: None,
+            approver_id: "admin".to_string(),
+            operation_hash: hash_a,
+        })
+        .await;
+        assert_eq!(am.list_approved_ready_for_session("sess/A").await.len(), 1);
+        assert_eq!(am.list_approved_ready_for_session("sess/B").await.len(), 0);
+        assert_eq!(am.list_approved_ready().await.len(), 1);
+    }
 }

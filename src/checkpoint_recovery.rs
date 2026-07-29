@@ -62,14 +62,14 @@ pub async fn apply_checkpoint_recovery(
                 .await;
         }
         CheckpointState::PendingApproval => {
-            // 恢复待审批意图（审批结果需重新等待，但工具意图保留以便日志关联）
+            // TASK-652 P2：权威在 ApprovalStore；checkpoint 可仅含 approval_id。
+            // 旧 payload 仍可能带 pending_action（兼容恢复）。
+            let approval_id = cp
+                .payload
+                .get("approval_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             if let Some(pa) = cp.payload.get("pending_action") {
-                // 一并恢复关联的审批请求 ID，使跨重启后审批台回执仍能解阻塞续跑门
-                let approval_id = cp
-                    .payload
-                    .get("approval_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
                 let action = PendingAction {
                     tool_name: pa
                         .get("tool_name")
@@ -82,9 +82,22 @@ pub async fn apply_checkpoint_recovery(
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_string(),
-                    approval_id,
+                    approval_id: approval_id.clone(),
                 };
                 session_manager.set_pending_action(session_id, action).await;
+            } else if let Some(aid) = approval_id {
+                // 瘦 payload：占位，AgentCore::hydrate_approval_pending_from_authority 再回填
+                session_manager
+                    .set_pending_action(
+                        session_id,
+                        PendingAction {
+                            tool_name: String::new(),
+                            arguments: serde_json::json!({}),
+                            description: String::new(),
+                            approval_id: Some(aid),
+                        },
+                    )
+                    .await;
             }
             session_manager
                 .set_state(session_id, SessionState::AwaitingConfirmation)

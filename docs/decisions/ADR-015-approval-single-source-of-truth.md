@@ -129,15 +129,15 @@ ApprovalRecord {
 
 ### P1 — 存储与双写
 - [x] `ApprovalStore`（rusqlite）+ 单测
-- [x] `ApprovalManager` 背后切 store；JSON 双写开关 `APPROVAL_DUAL_WRITE`（默认开；`=0` 关）
+- [x] `ApprovalManager` 背后切 store；JSON 双写开关 `APPROVAL_DUAL_WRITE`（**P2 起默认关**；`=1` 可开）
 - [x] 启动回填 JSON → SQLite；`APPROVAL_SQLITE=0` 可回退 JSON-only
-- [ ] 验收：杀进程重启后 pending 仍在；批准后仅本 session「确认」可执行（P2 收紧 session 执行）
+- [x] 创建绑 `session_id`（`create_request_for_session`）
 
 ### P2 — 切主与瘦 checkpoint
-- [ ] checkpoint `PendingApproval` payload 仅 `approval_id`
-- [ ] `execute_approved_request` 按 `session_id` 取 ready
-- [ ] 关闭 JSON 主读；e2e：孤儿/幽灵用例改为「权威表状态机」断言
-- [ ] 验收：`e2e_controlled_write.py --live` / `--full` 全绿；人为删 JSON 不影响已迁移项
+- [x] checkpoint `PendingApproval` payload 仅 `approval_id`
+- [x] `execute_approved_request` 按 `session_id` 取 ready（legacy 经 checkpoint 指针对账兼容）
+- [x] JSON 双写默认关闭；读仍优先 SQLite，启动可回填旧 JSON
+- [x] 验收：`e2e_controlled_write.py --live` / `--full` 全绿
 
 ### P3 — 退役
 - [ ] 移除 JSON 持久化（或只读导入 CLI）
