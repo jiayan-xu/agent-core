@@ -1053,8 +1053,16 @@ impl ToolClassifier {
             "entity_upsert",
             "entity_add_mention",
             "entity_add_edge",
+            "local_fs_write",
         ] {
             c.write_tools.insert(t.to_string());
+        }
+        for t in [
+            "local_fs_read",
+            "local_fs_list",
+            "local_fs_stat",
+        ] {
+            c.read_tools.insert(t.to_string());
         }
         for t in [
             "delete_entrance_record",
@@ -1107,6 +1115,14 @@ impl ToolClassifier {
                 continue;
             }
             if name == "edit_code" {
+                self.register(name, "write");
+                continue;
+            }
+            if name == "local_fs_read" || name == "local_fs_list" || name == "local_fs_stat" {
+                self.register(name, "read");
+                continue;
+            }
+            if name == "local_fs_write" {
                 self.register(name, "write");
                 continue;
             }

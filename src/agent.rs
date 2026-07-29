@@ -4350,6 +4350,10 @@ impl AgentCore {
     /// 设计要点：不破坏现有前缀源路由；约定前缀名确定性放行（仅做前缀内拼写纠错），
     /// 非约定名（dashboard 业务技能）走"刷新→模糊匹配→清晰错误"三段式。
     async fn resolve_tool_name_middleware(&self, tool_name: &str) -> Result<String, String> {
+        // 0. 本仓内置工具：不依赖 MCP 注册表
+        if crate::local_fs::is_local_fs_tool(tool_name) {
+            return Ok(tool_name.to_string());
+        }
         // 1. 精确命中（已注册）
         {
             let cache = self.tool_route_cache.lock().await;
@@ -4468,6 +4472,19 @@ impl AgentCore {
                 "⚠️ 命名空间『{}』工具调用已达当日轮次上限：{}。请于次日或联系管理员提升配额。",
                 quota_ns, e
             ));
+        }
+
+        // ── 本仓沙箱 FS：不经 MCP，直接本地执行 ──
+        if crate::local_fs::is_local_fs_tool(tool_name) {
+            let result = crate::local_fs::execute(tool_name, args);
+            match &result {
+                Ok(t) => {
+                    tracing::info!(tool = %tool_name, "local_fs tool ok");
+                    let _ = t;
+                }
+                Err(e) => tracing::warn!(tool = %tool_name, err = %e, "local_fs tool err"),
+            }
+            return result;
         }
 
         // 解析工具所属 MCP 源
@@ -5130,6 +5147,21 @@ impl AgentCore {
         let visible: Vec<&str> = all_tools.iter().map(|t| t.function.name.as_str()).collect();
         tracing::info!(allowed_ns = ?allowed_ns, visible_tools = ?visible, "e2e_fetch_tools_filtered");
 
+        // 本仓沙箱 FS 工具始终暴露（不依赖 MCP）
+        for t in crate::local_fs::tool_defs() {
+            if seen_names.insert(t.function.name.clone()) {
+                all_tools.push(t);
+            }
+        }
+        {
+            let boundary = self.boundary.lock().await;
+            let names: Vec<(String, String)> = crate::local_fs::tool_defs()
+                .into_iter()
+                .map(|t| (t.function.name, t.function.description))
+                .collect();
+            boundary.learn_tools(&names);
+        }
+
         if all_tools.is_empty() {
             tracing::warn!("命名空间过滤后无可用 MCP 工具，使用 fallback");
             return Self::fallback_tools();
@@ -5449,6 +5481,8 @@ impl AgentCore {
 
         // P0：固废本部门运维纪律（证据门禁 + 作业剧本）
         prompt.push_str(crate::dept_ops::ops_playbook_prompt());
+        // WorkBuddy 铁轨：本仓沙箱文件工具
+        prompt.push_str(crate::local_fs::system_hint());
 
         if !knowledge.is_empty() {
             prompt.push_str("## 记忆档案\n");

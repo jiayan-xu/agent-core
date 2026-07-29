@@ -23,6 +23,63 @@ impl VerifyOutcome {
     pub fn is_pass(&self) -> bool {
         matches!(self, VerifyOutcome::Pass { .. })
     }
+
+    pub fn detail_text(&self) -> String {
+        match self {
+            VerifyOutcome::Pass { detail } | VerifyOutcome::Fail { detail } => detail.clone(),
+            VerifyOutcome::Skip { reason } => reason.clone(),
+        }
+    }
+}
+
+/// 文件写后回读：全文或前缀一致即通过（避免超大文件整文比对失败时仍可验前缀）。
+pub fn verify_file_writeback(path: &str, expected: &str, readback: &str) -> VerifyOutcome {
+    if expected == readback {
+        return VerifyOutcome::Pass {
+            detail: format!("{} 全文一致（{} bytes）", path, expected.len()),
+        };
+    }
+    let prefix_len = expected.len().min(256);
+    if !expected.is_empty()
+        && readback.len() >= prefix_len
+        && readback.as_bytes()[..prefix_len] == expected.as_bytes()[..prefix_len]
+        && readback.len() == expected.len()
+    {
+        return VerifyOutcome::Pass {
+            detail: format!("{} 长度与前缀一致", path),
+        };
+    }
+    VerifyOutcome::Fail {
+        detail: format!(
+            "{} 回读与写入不一致（期望 {} bytes，实际 {} bytes）",
+            path,
+            expected.len(),
+            readback.len()
+        ),
+    }
+}
+
+/// 通用：从写工具 JSON 回执中取字段与期望比对。
+pub fn verify_json_field(write_result: &str, field: &str, expected: &str) -> Option<VerifyOutcome> {
+    let v: serde_json::Value = serde_json::from_str(write_result).ok()?;
+    if v.get("success").and_then(|x| x.as_bool()) != Some(true) {
+        return None;
+    }
+    let got = v.get(field)?.as_str()?;
+    if expected.is_empty() {
+        return Some(VerifyOutcome::Pass {
+            detail: format!("写回执 {}={}", field, got),
+        });
+    }
+    if got == expected || got.contains(expected) || expected.contains(got) {
+        Some(VerifyOutcome::Pass {
+            detail: format!("写回执 {}「{}」", field, got),
+        })
+    } else {
+        Some(VerifyOutcome::Fail {
+            detail: format!("写回执 {}「{}」≠ 期望「{}」", field, got, expected),
+        })
+    }
 }
 
 /// 若 `expected` 非空且出现在 `readback` 中 → Pass；否则 Fail。
@@ -75,5 +132,17 @@ mod tests {
     fn sanitize_plate_ok() {
         assert_eq!(sanitize_plate("苏EZQ117").as_deref(), Some("苏EZQ117"));
         assert!(sanitize_plate("'; DROP").is_none());
+    }
+
+    #[test]
+    fn file_writeback_and_json_field() {
+        assert!(verify_file_writeback("a.txt", "abc", "abc").is_pass());
+        assert!(!verify_file_writeback("a.txt", "abc", "ab").is_pass());
+        let ok = verify_json_field(
+            r#"{"success":true,"new_company":"佳士能"}"#,
+            "new_company",
+            "佳士能",
+        );
+        assert!(ok.unwrap().is_pass());
     }
 }

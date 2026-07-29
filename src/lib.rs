@@ -36,3 +36,4 @@ pub mod pref_write; // 偏好/决策落盘约定 + 用户强触发启发式
 pub mod dept_ops; // 固废本部门运维：工具包可见 + 证据门禁 + 作业剧本
 pub mod v1_compat; // OpenAI /v1/chat 入参折叠（保留 system）
 pub mod controlled_write; // 受控写「写后回读」协议骨架
+pub mod local_fs; // 本仓沙箱读写文件铁轨（不依赖 dashboard MCP）
