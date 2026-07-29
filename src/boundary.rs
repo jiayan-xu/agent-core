@@ -733,13 +733,15 @@ impl ComplianceBoundary {
     /// C1c: 精简治理守卫（审批后执行前重跑）。
     ///
     /// 仅含「失败即红」的底线：kill_switch / safe_mode / 治理层 / 沙箱 / 出域 / SQL·路径参数。
-    /// 刻意跳过：供应链白名单（已批准=信任静态白名单）、权限链、黄线重弹。
+    /// 刻意跳过：供应链白名单（已批准=信任静态白名单）、权限链、黄线重弹，
+    /// 以及「跨 namespace 聚合」守卫（该守卫已在 `check_tool` 前置阶段触发审批，
+    /// 一旦 ADMIN 批准即视为已授权，执行侧不再重复拦截——避免已批准项被自身守卫死锁）。
     /// 与 `call_tool_routed` 已有的 kill_switch 守卫重复，属 defense-in-depth（执行侧再卡一道）。
     pub fn hard_guards_only(
         &self,
         tool_name: &str,
         args: &serde_json::Value,
-        namespaces: Option<&[String]>,
+        _namespaces: Option<&[String]>,
     ) -> Option<ToolCheck> {
         if !self.kill_switch.is_alive() {
             return Some(ToolCheck::red("系统已终止，拒绝所有操作"));
@@ -766,12 +768,7 @@ impl ComplianceBoundary {
         if !export.allow {
             return Some(export);
         }
-        if let Some(ns) = namespaces {
-            let cross = DataExfiltrationGuard::check_cross_ns(ns);
-            if !cross.allow {
-                return Some(cross);
-            }
-        }
+        // 注：跨 namespace 聚合守卫已在前置 check_tool 触发审批，批准后不再重检（见函数文档）。
         if let Some(obj) = args.as_object() {
             for (key, val) in obj {
                 if let Some(s) = val.as_str() {

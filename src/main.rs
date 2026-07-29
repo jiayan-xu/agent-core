@@ -3191,14 +3191,23 @@ async fn handle_collab_approval(
             )
                 .into_response();
         }
-        let resp_env = serde_json::json!({
-            "type": "approval_response",
-            "approval_id": approval_id,
-            "approved": decision_ok,
-            "reason": body.reason.clone(),
-            "approver_id": agent_id,
-        });
-        agent.collab_send_raw(&requester, &resp_env).await
+        if is_local {
+            // 本地 L2 待批项：无 A2A requester，仅 record_response 解阻塞执行侧
+            Ok(String::new())
+        } else {
+            // P0-1 修复：A2A 回传 requester 的 approval_response 必须携带 operation_hash，
+            // 否则 requester 侧 record_response（C1c 校验）会因缺 hash 解析失败 / 指纹错配而拒批，
+            // 导致跨实例人工审批死锁。此处回显 pending 的真实指纹（expected_hash 已在上方校验一致）。
+            let resp_env = serde_json::json!({
+                "type": "approval_response",
+                "approval_id": approval_id,
+                "approved": decision_ok,
+                "reason": body.reason.clone(),
+                "approver_id": agent_id,
+                "operation_hash": expected_hash,
+            });
+            agent.collab_send_raw(&requester, &resp_env).await
+        }
     } else {
         Err("agent 尚未就绪".to_string())
     };

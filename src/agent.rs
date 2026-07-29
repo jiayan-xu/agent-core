@@ -3533,29 +3533,42 @@ impl AgentCore {
                 return Some(format!("⛔ 执行被安全底线拦截：{}", blocked.reason));
             }
             // 审批通过，执行工具（已通过精简治理守卫）
-            let result = match self
-                .call_tool_routed(&approval.tool_name, "default", &approval.arguments, allowed_ns, "")
-                .await
-            {
-                Ok(text) => text,
-                Err(e) => format!("执行失败: {}", e),
-            };
+            // C1c #3: 已批准 = 确认。注入 confirmed=true，满足受控写技能（如 sync_whitelist_plates）
+            // 的二次确认红线，使「人工批准」成为执行的充分授权；否则重跑会因缺 confirmed 仅返回预览而不写库。
+            let mut exec_args = approval.arguments.clone();
+            if let Some(obj) = exec_args.as_object_mut() {
+                obj.insert("confirmed".to_string(), serde_json::json!(true));
+            }
+            let exec_result = self
+                .call_tool_routed(&approval.tool_name, "default", &exec_args, allowed_ns, "")
+                .await;
             let desc = approval.description.chars().take(120).collect::<String>();
-            let result_short = result.chars().take(300).collect::<String>();
-            let reply = format!(
-                "✅ 审批通过！操作已执行。\n\n操作内容：{}\n审批人：{}\n\n{}",
-                desc, approval.approver_id, result_short
-            );
-            // 审计日志
+            let reply = match &exec_result {
+                Ok(text) => {
+                    let result_short = text.chars().take(300).collect::<String>();
+                    format!(
+                        "✅ 审批通过！操作已执行。\n\n操作内容：{}\n审批人：{}\n\n{}",
+                        desc, approval.approver_id, result_short
+                    )
+                }
+                Err(e) => format!(
+                    "⚠️ 审批已批准，但工具执行失败：{}（审批项保留待查，审计链不丢）",
+                    e
+                ),
+            };
+            // 审计日志（成功/失败都记调用，但标记实际结果）
             self.audit_logger
                 .log_tool_call(
                     &self.config.identity.agent_id,
                     &approval.tool_name,
                     &approval.arguments,
-                    true,
+                    exec_result.is_ok(),
                 )
                 .await;
-            self.approval_manager.remove(&approval.approval_id).await;
+            // P1-1 修复：仅执行成功才 remove，失败保留审批项供人工复查（避免误删审计链/漏掉未生效的写）。
+            if exec_result.is_ok() {
+                self.approval_manager.remove(&approval.approval_id).await;
+            }
             return Some(reply);
         }
         None

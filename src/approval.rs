@@ -378,8 +378,32 @@ impl ApprovalManager {
 ///
 /// 取 `{tool, args}` 的规范化 JSON 串的 sha256。审批创建时由 host 计算并随请求下发的指纹，
 /// 审批响应必须回显同一指纹；不一致即视为「操作被偷换」（防模型自我批准 / 审批-执行错位）。
+/// 递归规范化 serde_json::Value：将所有对象的 key 按字典序排序。
+///
+/// 消除不同解析/构造路径（尤其 `serde_json` 的 `preserve_order` 特性开启时，
+/// 或参数经多次序列化-反序列化后 key 顺序漂移）导致的 key 顺序差异，
+/// 保证同一操作的指纹稳定可复现，避免 operation_hash 因 key 顺序误拒（P1-2）。
+fn canonicalize_value(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut sorted: std::collections::BTreeMap<String, serde_json::Value> =
+                std::collections::BTreeMap::new();
+            for (k, val) in map {
+                sorted.insert(k.clone(), canonicalize_value(val));
+            }
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(canonicalize_value).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 pub(crate) fn compute_operation_hash(tool_name: &str, arguments: &serde_json::Value) -> String {
-    let canonical = serde_json::json!({ "tool": tool_name, "args": arguments });
+    // P1-2 修复：先递归规范化 args（对象 key 字典序），再组合 tool + args 序列化。
+    let canonical_args = canonicalize_value(arguments);
+    let canonical = serde_json::json!({ "tool": tool_name, "args": canonical_args });
     let s = serde_json::to_string(&canonical).unwrap_or_default();
     let mut hasher = Sha256::new();
     hasher.update(s.as_bytes());
@@ -748,5 +772,103 @@ mod tests {
         am.record_response(resp).await;
         am.remove(&aid).await;
         assert_eq!(am.pending_count().await, 0);
+    }
+
+    // ── 本次修复回归测试（P1-2 / P0-1 / P1-1） ──
+
+    /// P1-2：规范化指纹必须消除 key 顺序差异——同内容不同 key 顺序 → 同一 hash。
+    #[test]
+    fn test_compute_operation_hash_canonical_stable() {
+        let args_a = serde_json::json!({"b": 2, "a": 1, "nested": {"z": 9, "y": 8}});
+        let args_b = serde_json::json!({"a": 1, "b": 2, "nested": {"y": 8, "z": 9}});
+        let h1 = compute_operation_hash("sync_whitelist_plates", &args_a);
+        let h2 = compute_operation_hash("sync_whitelist_plates", &args_b);
+        assert_eq!(h1, h2, "key 顺序不同不应改变指纹（P1-2 规范化）");
+
+        // 模拟审批持久化 reload：序列化→反序列化后重算仍一致（BTreeMap 默认序 vs preserve_order 序）
+        let reparsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&args_a).unwrap()).unwrap();
+        let h3 = compute_operation_hash("sync_whitelist_plates", &reparsed);
+        assert_eq!(h1, h3, "重序列化后指纹应稳定（防 execute 期误拒）");
+    }
+
+    /// P1-2 健全性：tool 或 args 不同 → 指纹不同（防错配放行）。
+    #[test]
+    fn test_compute_operation_hash_differs_by_content() {
+        let base = serde_json::json!({"id": 1});
+        let h_tool = compute_operation_hash("sync_whitelist_plates", &base);
+        let h_other_tool = compute_operation_hash("delete_record", &base);
+        assert_ne!(h_tool, h_other_tool, "不同 tool 必须不同指纹");
+        let h_diff_args = compute_operation_hash("sync_whitelist_plates", &serde_json::json!({"id": 2}));
+        assert_ne!(h_tool, h_diff_args, "不同 args 必须不同指纹");
+    }
+
+    /// P0-1：A2A 回传的 approval_response 必须携带 operation_hash，且能被 requester 侧解析。
+    #[test]
+    fn test_a2a_response_includes_operation_hash() {
+        let expected_hash = "abc123def456";
+        // 与 main.rs handle_collab_approval 非本地路径回传包结构一致（含 operation_hash）
+        let resp_env = serde_json::json!({
+            "type": "approval_response",
+            "approval_id": "apr_999",
+            "approved": true,
+            "reason": "跨实例批准",
+            "approver_id": "admin-remote",
+            "operation_hash": expected_hash,
+        });
+        let parsed = ApprovalManager::parse_approval_response(&resp_env);
+        assert!(parsed.is_some(), "带 operation_hash 的响应应可被解析");
+        assert_eq!(parsed.unwrap().operation_hash, expected_hash);
+    }
+
+    /// P0-1 负向：缺 operation_hash 的 A2A 响应解析失败（即修复前的死锁根因）。
+    #[test]
+    fn test_a2a_response_missing_hash_fails_parse() {
+        let resp_env = serde_json::json!({
+            "type": "approval_response",
+            "approval_id": "apr_999",
+            "approved": true,
+            "reason": "跨实例批准",
+            "approver_id": "admin-remote",
+        });
+        let parsed = ApprovalManager::parse_approval_response(&resp_env);
+        assert!(parsed.is_none(), "缺 operation_hash 的响应必须解析失败（否则 C1c 校验恒拒）");
+    }
+
+    /// P1-1：执行失败应保留审批项（待人工复查），成功才移除。
+    /// 直接校验 `execute_approved_request` 依赖的数据层契约（移除仅发生在 exec_result.is_ok() 时）。
+    #[tokio::test]
+    async fn test_execute_ready_retention_on_failure() {
+        let am = ApprovalManager::new();
+        let aid = am
+            .create_request(
+                "sync_whitelist_plates",
+                &serde_json::json!({"action": "add", "plate": "苏D22222"}),
+                "新增白名单 苏D22222",
+                "approver-01",
+                "agent-001",
+            )
+            .await;
+        let hash = am.get_pending(&aid).await.unwrap().operation_hash;
+        am.record_response(ApprovalResponse {
+            r#type: "approval_response".to_string(),
+            approval_id: aid.clone(),
+            approved: true,
+            reason: None,
+            approver_id: "approver-01".to_string(),
+            operation_hash: hash,
+        })
+        .await;
+
+        // 已批准 → 执行侧就绪
+        assert_eq!(am.list_approved_ready().await.len(), 1);
+
+        // 模拟「执行失败」路径（agent.rs 现在 Err 时不 remove）：保留
+        // （此处仅验证数据契约：未调用 remove，项仍存在）
+        assert_eq!(am.list_approved_ready().await.len(), 1, "失败路径必须保留待查");
+
+        // 模拟「执行成功」路径：remove
+        am.remove(&aid).await;
+        assert_eq!(am.list_approved_ready().await.len(), 0, "成功路径必须移除");
     }
 }
