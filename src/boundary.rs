@@ -48,6 +48,8 @@ const HARD_DANGEROUS: &[&str] = &[
     "batch_delete_memories",
     "delete_record",
     "shutdown_server",
+    // 本仓沙箱写文件：必须走黄线/审批，禁止当普通 write 静默落盘
+    "local_fs_write",
     // memoria 路由危险工具（写操作 / 演化 / 身份）
     "memory_merge",
     "memory_dedup_chain",
@@ -313,6 +315,10 @@ impl ExecutionSandbox {
         "exec_sql_raw",
         "exec_python",
         "run_script",
+        "local_fs_read",
+        "local_fs_write",
+        "local_fs_list",
+        "local_fs_stat",
     ];
     const REQUIRES_REVIEW: &'static [&'static str] = &["delete_", "batch_", "shutdown_"];
 
@@ -1053,7 +1059,6 @@ impl ToolClassifier {
             "entity_upsert",
             "entity_add_mention",
             "entity_add_edge",
-            "local_fs_write",
         ] {
             c.write_tools.insert(t.to_string());
         }
@@ -1073,6 +1078,7 @@ impl ToolClassifier {
             "memory_decay",
             "memory_import",
             "memory_export",
+            "local_fs_write",
         ] {
             c.dangerous_tools.insert(t.to_string());
         }
@@ -1123,7 +1129,7 @@ impl ToolClassifier {
                 continue;
             }
             if name == "local_fs_write" {
-                self.register(name, "write");
+                self.register(name, "dangerous");
                 continue;
             }
             let lower = name.to_lowercase();

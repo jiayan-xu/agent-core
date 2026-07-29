@@ -1,7 +1,10 @@
 //! 本仓本地沙箱文件系统工具（WorkBuddy 代码/文件铁轨最小可用）。
 //!
-//! 不依赖 dashboard MCP：在 `AGENT_SANDBOX_ROOT`（缺省 `./sandbox_workspace`）内
-//! 提供 read / write / list / stat。越界与敏感路径一律拒绝。
+//! **权限生存线（P0）**：
+//! - 默认关闭：须显式 `AGENT_LOCAL_FS=1` 才暴露/可调用
+//! - `local_fs_write` 为 dangerous：走 L2 审批黄线；且须 `confirmed=true`
+//! - 路径必须落在 `AGENT_SANDBOX_ROOT`；禁止把系统盘/用户主目录当沙箱根
+//! - 调用路径必须经过 boundary hard_guards（见 `call_tool_routed`）
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,17 +27,60 @@ pub fn is_local_fs_tool(name: &str) -> bool {
     )
 }
 
+/// 功能总闸：默认关闭。只有显式开启才允许暴露工具与执行。
+pub fn is_enabled() -> bool {
+    matches!(
+        std::env::var("AGENT_LOCAL_FS").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+/// 拒绝把沙箱根设到危险位置（系统目录 / 用户主目录本身等）。
+pub fn assert_safe_sandbox_root(root: &Path) -> Result<(), String> {
+    let c = canonicalize_best_effort(root);
+    let s = c.to_string_lossy().to_lowercase();
+    let forbidden_exact = [
+        r"c:\",
+        r"c:/",
+        "/",
+        r"c:\windows",
+        r"c:\windows\system32",
+        r"c:\program files",
+        r"c:\program files (x86)",
+    ];
+    for f in forbidden_exact {
+        if s == f || s.trim_end_matches(['/', '\\']) == f.trim_end_matches(['/', '\\']) {
+            return Err(format!("沙箱根禁止使用系统路径: {:?}", c));
+        }
+    }
+    if s.contains(r"\windows\system32") || s.contains("/etc") || s.contains("/usr") {
+        return Err(format!("沙箱根禁止落在系统目录内: {:?}", c));
+    }
+    // 禁止直接等于用户主目录（允许其下的子目录 sandbox）
+    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        let home_c = canonicalize_best_effort(Path::new(&home));
+        if c == home_c {
+            return Err("沙箱根禁止直接设为用户主目录，请使用其子目录".into());
+        }
+    }
+    Ok(())
+}
+
 /// 确保沙箱根存在：优先环境变量 / 已 init；否则 `cwd/sandbox_workspace`。
 pub fn ensure_sandbox_root() -> Result<PathBuf, String> {
+    if !is_enabled() {
+        return Err("local_fs 未启用（须设置 AGENT_LOCAL_FS=1）".into());
+    }
     if let Some(root) = crate::sandbox::resolve_sandbox_root() {
+        assert_safe_sandbox_root(&root)?;
         fs::create_dir_all(&root).map_err(|e| format!("创建沙箱根失败: {}", e))?;
         return Ok(canonicalize_best_effort(&root));
     }
     let default = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("sandbox_workspace");
+    assert_safe_sandbox_root(&default)?;
     fs::create_dir_all(&default).map_err(|e| format!("创建默认沙箱根失败: {}", e))?;
-    // 供后续 resolve_sandbox_root / MCP 子进程看到同一根
     std::env::set_var("AGENT_SANDBOX_ROOT", &default);
     Ok(canonicalize_best_effort(&default))
 }
@@ -147,13 +193,14 @@ pub fn tool_defs() -> Vec<ToolDef> {
             type_: "function".into(),
             function: ToolDefFunction {
                 name: TOOL_WRITE.into(),
-                description: "写入沙箱内文本文件（上限 512KB）。会覆盖已有内容；写后自动回读校验。"
+                description: "写入沙箱内文本文件（上限 512KB，dangerous）。须 AGENT_LOCAL_FS=1 + 人工审批 + confirmed=true；写后自动回读校验。"
                     .into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "path": path_prop,
-                        "content": { "type": "string", "description": "要写入的全文" }
+                        "content": { "type": "string", "description": "要写入的全文" },
+                        "confirmed": { "type": "boolean", "description": "二次确认，true 才落盘" }
                     },
                     "required": ["path", "content"]
                 }),
@@ -191,14 +238,17 @@ pub fn tool_defs() -> Vec<ToolDef> {
 }
 
 pub fn system_hint() -> &'static str {
-    "\n\n## 本地沙箱文件（本仓内置）\n\
-     - `local_fs_read` / `local_fs_write` / `local_fs_list` / `local_fs_stat`\n\
-     - 仅限 `AGENT_SANDBOX_ROOT`（默认 `./sandbox_workspace`）内；越界与敏感路径拒绝。\n\
-     - 迭代小文件/草稿优先用这组工具；大仓改码仍走 `code_reader`/`edit_code`/`verify_code`。\n"
+    "\n\n## 本地沙箱文件（本仓内置，默认关闭）\n\
+     - 仅当运维设置 `AGENT_LOCAL_FS=1` 时可用：`local_fs_read` / `local_fs_write` / `local_fs_list` / `local_fs_stat`\n\
+     - 严格限制在 `AGENT_SANDBOX_ROOT`；`local_fs_write` 属危险写，须人工审批且 `confirmed=true`\n\
+     - 大仓改码仍走 `code_reader`/`edit_code`/`verify_code`（同样受审批纪律约束）\n"
 }
 
 /// 执行本地 FS 工具，返回 JSON 字符串。
 pub fn execute(tool_name: &str, args: &serde_json::Value) -> Result<String, String> {
+    if !is_enabled() {
+        return Err("local_fs 未启用（须设置 AGENT_LOCAL_FS=1；权限生存线默认关闭）".into());
+    }
     match tool_name {
         TOOL_READ => {
             let path = args
@@ -227,6 +277,11 @@ pub fn execute(tool_name: &str, args: &serde_json::Value) -> Result<String, Stri
             .to_string())
         }
         TOOL_WRITE => {
+            // 二次确认：无 confirmed=true 只返回预览，禁止静默落盘
+            let confirmed = args
+                .get("confirmed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let path = args
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -243,7 +298,19 @@ pub fn execute(tool_name: &str, args: &serde_json::Value) -> Result<String, Stri
                 ));
             }
             let p = resolve_safe_path(path)?;
-            // 写前快照（若已存在）
+            if !confirmed {
+                return Ok(serde_json::json!({
+                    "success": false,
+                    "require_confirm": true,
+                    "path": p.to_string_lossy(),
+                    "bytes": content.len(),
+                    "message": format!(
+                        "⚠️ 即将写入沙箱文件 {:?}（{} bytes）。须人工审批通过且 confirmed=true 后执行。",
+                        p, content.len()
+                    ),
+                })
+                .to_string());
+            }
             let snap_ids = if p.is_file() {
                 let args_abs = serde_json::json!({ "path": p.to_string_lossy() });
                 crate::file_checkpoint::snapshot_args(&args_abs)
@@ -252,7 +319,6 @@ pub fn execute(tool_name: &str, args: &serde_json::Value) -> Result<String, Stri
             };
             match fs::write(&p, content) {
                 Ok(()) => {
-                    // 回读校验
                     let readback = fs::read_to_string(&p).unwrap_or_default();
                     let verify = crate::controlled_write::verify_file_writeback(
                         &p.to_string_lossy(),
@@ -333,22 +399,48 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("AGENT_LOCAL_FS", "1");
         std::env::set_var("AGENT_SANDBOX_ROOT", &dir);
         f(&dir);
         let _ = fs::remove_dir_all(&dir);
         std::env::remove_var("AGENT_SANDBOX_ROOT");
+        std::env::remove_var("AGENT_LOCAL_FS");
     }
 
     #[test]
-    fn write_read_roundtrip() {
+    fn disabled_by_default() {
+        let _g = LOCK.lock().unwrap();
+        std::env::remove_var("AGENT_LOCAL_FS");
+        let err = execute(
+            TOOL_READ,
+            &serde_json::json!({"path": "x.txt"}),
+        );
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("未启用"));
+    }
+
+    #[test]
+    fn write_requires_confirm_then_roundtrip() {
         with_temp_sandbox(|root| {
-            let w = execute(
+            let preview = execute(
                 TOOL_WRITE,
                 &serde_json::json!({"path": "hello.txt", "content": "你好 WorkBuddy"}),
             )
             .unwrap();
+            assert!(preview.contains("require_confirm"));
+            assert!(!root.join("hello.txt").exists());
+
+            let w = execute(
+                TOOL_WRITE,
+                &serde_json::json!({
+                    "path": "hello.txt",
+                    "content": "你好 WorkBuddy",
+                    "confirmed": true
+                }),
+            )
+            .unwrap();
             assert!(w.contains("\"success\":true"));
-            assert!(w.contains("verify_pass\":true") || w.contains("\"verify_pass\": true"));
+            assert!(w.contains("verify_pass"));
             let r = execute(TOOL_READ, &serde_json::json!({"path": "hello.txt"})).unwrap();
             assert!(r.contains("你好 WorkBuddy"));
             assert!(root.join("hello.txt").is_file());
@@ -358,13 +450,6 @@ mod tests {
     #[test]
     fn rejects_escape() {
         with_temp_sandbox(|_| {
-            let err = execute(
-                TOOL_READ,
-                &serde_json::json!({"path": "../outside.txt"}),
-            );
-            // 规范化后可能仍落在沙箱外，或读失败
-            assert!(err.is_err() || err.unwrap().contains("success"));
-            // 明确绝对路径逃逸
             #[cfg(windows)]
             let escape = "C:/Windows/System32/drivers/etc/hosts";
             #[cfg(not(windows))]

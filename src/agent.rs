@@ -4474,14 +4474,50 @@ impl AgentCore {
             ));
         }
 
-        // ── 本仓沙箱 FS：不经 MCP，直接本地执行 ──
+        // ── 本仓沙箱 FS：默认关闭；启用后仍必须过 hard_guards，禁止绕过 boundary ──
         if crate::local_fs::is_local_fs_tool(tool_name) {
-            let result = crate::local_fs::execute(tool_name, args);
-            match &result {
-                Ok(t) => {
-                    tracing::info!(tool = %tool_name, "local_fs tool ok");
-                    let _ = t;
+            if !crate::local_fs::is_enabled() {
+                return Err(
+                    "local_fs 未启用（权限生存线：须显式 AGENT_LOCAL_FS=1）".into(),
+                );
+            }
+            // 先解析到沙箱内绝对路径，再过 hard_guards（相对路径会误判越界）
+            let mut call_args = args.clone();
+            let path_key = if tool_name == crate::local_fs::TOOL_LIST {
+                call_args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".")
+                    .to_string()
+            } else {
+                call_args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            if !path_key.is_empty() {
+                match crate::local_fs::resolve_safe_path(&path_key) {
+                    Ok(abs) => {
+                        if let Some(obj) = call_args.as_object_mut() {
+                            obj.insert(
+                                "path".into(),
+                                serde_json::Value::String(abs.to_string_lossy().into_owned()),
+                            );
+                        }
+                    }
+                    Err(e) => return Err(e),
                 }
+            }
+            if let Some(blocked) = {
+                let boundary = self.boundary.lock().await;
+                boundary.hard_guards_only(tool_name, &call_args, Some(allowed_ns))
+            } {
+                return Err(format!("⛔ {}", blocked.reason));
+            }
+            let result = crate::local_fs::execute(tool_name, &call_args);
+            match &result {
+                Ok(_) => tracing::info!(tool = %tool_name, "local_fs tool ok"),
                 Err(e) => tracing::warn!(tool = %tool_name, err = %e, "local_fs tool err"),
             }
             return result;
@@ -5147,13 +5183,13 @@ impl AgentCore {
         let visible: Vec<&str> = all_tools.iter().map(|t| t.function.name.as_str()).collect();
         tracing::info!(allowed_ns = ?allowed_ns, visible_tools = ?visible, "e2e_fetch_tools_filtered");
 
-        // 本仓沙箱 FS 工具始终暴露（不依赖 MCP）
-        for t in crate::local_fs::tool_defs() {
-            if seen_names.insert(t.function.name.clone()) {
-                all_tools.push(t);
+        // 本仓沙箱 FS：仅当 AGENT_LOCAL_FS=1 时暴露（默认关闭 = 权限生存线）
+        if crate::local_fs::is_enabled() {
+            for t in crate::local_fs::tool_defs() {
+                if seen_names.insert(t.function.name.clone()) {
+                    all_tools.push(t);
+                }
             }
-        }
-        {
             let boundary = self.boundary.lock().await;
             let names: Vec<(String, String)> = crate::local_fs::tool_defs()
                 .into_iter()

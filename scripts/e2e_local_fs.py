@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""本仓 local_fs 冒烟（不依赖 dashboard MCP）。
+"""本仓 local_fs 冒烟。
 
-通过 /api/chat 让 agent 使用沙箱读写；也可用 Rust 单测覆盖核心路径。
-
-环境：AGENT_CORE_URL / E2E_AGENT_KEY|MEMORIA_ADMIN_KEY
+权限生存线：默认关闭。live 需 AGENT_LOCAL_FS=1 + 审批链路。
+离线单测不依赖该开关（测试内自启）。
 """
 from __future__ import annotations
 
