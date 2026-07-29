@@ -37,4 +37,4 @@ W2（P1）前，agent-core 的「对话进度」只存在于内存（`chat_histo
 ## Future Work
 - 异步批量写降低延迟。
 - Checkpoint 与 Memoria `dream_state` 打通，实现跨进程/跨 agent 的恢复。
-- **审批与 checkpoint 双真相源统一**：见 [ADR-015 / TASK-652](ADR-015-approval-single-source-of-truth.md)（审批权威迁 SQLite，checkpoint 仅保留 `approval_id`）。
+- ~~审批与 checkpoint 双真相源统一~~ → **已落地**：[ADR-015 / TASK-652](ADR-015-approval-single-source-of-truth.md) Accepted（`approvals` 同库异表；checkpoint 仅 `approval_id`；JSON 只读回填）。

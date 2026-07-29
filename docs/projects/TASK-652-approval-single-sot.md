@@ -2,22 +2,20 @@
 
 | 字段 | 内容 |
 |------|------|
-| 状态 | **P2 已落地 / P3 待开** |
+| 状态 | **Accepted / P0–P3 已落地** |
 | ADR | [ADR-015](../decisions/ADR-015-approval-single-source-of-truth.md) |
 | 库形态 | **同库异表**（`checkpoints.db` → 表 `approvals`） |
-| 优先级 | P1（不挡当前受控写运营；继续扩写工具前建议完成 P3 退役 JSON） |
-| 优先级 | P1（不挡当前受控写运营；继续扩写工具前建议完成 P1–P2） |
-| 建议开工条件 | 受控写总闸连续绿；业务无紧急写需求窗口 |
+| 优先级 | 已完成；后续只做运维与回归 |
 
 ## 一句话
 
-把 `checkpoints.db` 与 `approvals.json` 的双真相源收成 **SQLite 审批权威表**；checkpoint 只挂 `approval_id`。
+把 `checkpoints.db` 与 `approvals.json` 的双真相源收成 **SQLite 审批权威表**；checkpoint 只挂 `approval_id`。`approvals.json` 仅启动只读回填，运行时不再写入。
 
-## 为何现在立项
+## 为何立项（已兑现）
 
-急性假成功 / 孤儿 / 幽灵已补丁化，但每加一条受控写都会再碰「两边不一致」。结构债该立项，而不是再堆 if。
+急性假成功 / 孤儿 / 幽灵已补丁化；结构债用方案 A 收口，避免每加一条受控写再碰双 SoT。
 
-## 不做
+## 不做（边界仍有效）
 
 - 不改审批台产品交互
 - 不放开写权限
@@ -25,12 +23,12 @@
 
 ## 分期
 
-见 ADR-015「分期与验收」。默认实现顺序 **P1 → P2 → P3**；开工前口头确认「同库异表」。
+见 ADR-015「分期与验收」—— **P1 / P2 / P3 均已勾选**。
 
 ## 验收总门
 
 ```bash
 python scripts/e2e_controlled_write.py --live
 E2E_ALLOW_WRITE=1 python scripts/e2e_controlled_write.py --full
-# 另：杀进程重启后，已 pending 的审批台项仍可见且可批准执行
+# 另：杀进程重启后，已 pending 的审批台项仍可见且可批准执行（权威在 SQLite）
 ```

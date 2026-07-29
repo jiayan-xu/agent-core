@@ -3,8 +3,8 @@
 //! 当 Agent 触发 YELLOW 级别工具且配置了审批人时，
 //! 通过 A2A 向审批人发送审批请求，等待审批结果后再执行。
 //!
-//! TASK-652 / ADR-015：权威持久化迁 SQLite（`checkpoints.db` 同库异表 `approvals`）；
-//! JSON（`approvals.json`）P1 双写，读优先 SQLite，miss 回填。
+//! TASK-652 / ADR-015：**审批权威 = SQLite**（`checkpoints.db` 同库异表 `approvals`）。
+//! 旧 `approvals.json` 仅启动时只读回填，不再写入。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -84,16 +84,12 @@ pub struct ApprovalResponse {
 /// 审批管理器
 ///
 /// 跟踪发出去的审批请求和收到的审批结果。
-/// L2 + TASK-652：SQLite 权威表 + 可选 JSON 双写。
+/// TASK-652 P3：仅 SQLite 权威落盘；legacy JSON 只读导入。
 pub struct ApprovalManager {
     /// 发出去的待审批请求（approval_id → PendingApproval）
     outgoing: Mutex<HashMap<String, PendingApproval>>,
     /// 收到的审批结果（approval_id → ApprovalResponse）
     responses: Mutex<HashMap<String, ApprovalResponse>>,
-    /// JSON 双写路径（None = 不写 JSON）
-    store_path: Option<std::path::PathBuf>,
-    /// 是否双写 JSON（迁移期默认 true）
-    dual_write_json: bool,
     /// SQLite 权威存储（同库异表）
     sqlite: Option<Arc<StdMutex<ApprovalStore>>>,
     /// C1b: 审批态内存记忆（同步可读，供 check_tool 快查，绕过 async Mutex）。
@@ -105,20 +101,32 @@ pub struct ApprovalManager {
 impl ApprovalManager {
     /// 内存模式（测试 / 无持久化需求）
     pub fn new() -> Self {
-        Self::new_with_persistence(None, None, false)
+        Self::new_with_sqlite(None, None)
     }
 
-    /// 仅 JSON（兼容旧调用）
-    pub fn new_with_store(store_path: Option<std::path::PathBuf>) -> Self {
-        Self::new_with_persistence(store_path.clone(), None, store_path.is_some())
+    /// 兼容旧名：把 legacy JSON **只读导入**内存（不落盘）。生产请用 `new_with_sqlite`。
+    pub fn new_with_store(legacy_json: Option<std::path::PathBuf>) -> Self {
+        Self::new_with_sqlite(None, legacy_json)
     }
 
-    /// TASK-652：JSON 路径 + SQLite store + 双写开关。
-    /// 启动：先加载 SQLite 活跃行 → 再加载 JSON 并回填缺失项到 SQLite。
+    /// 兼容 P1/P2 签名：`dual_write_json` 已退役，传入 true 仅打 warn。
     pub fn new_with_persistence(
-        store_path: Option<std::path::PathBuf>,
+        legacy_json: Option<std::path::PathBuf>,
         sqlite: Option<ApprovalStore>,
         dual_write_json: bool,
+    ) -> Self {
+        if dual_write_json {
+            tracing::warn!(
+                "[APPROVAL] APPROVAL_DUAL_WRITE / dual_write_json 已在 TASK-652 P3 退役，忽略"
+            );
+        }
+        Self::new_with_sqlite(sqlite, legacy_json)
+    }
+
+    /// TASK-652 P3：SQLite 权威 + 可选 legacy JSON 只读回填。
+    pub fn new_with_sqlite(
+        sqlite: Option<ApprovalStore>,
+        legacy_json: Option<std::path::PathBuf>,
     ) -> Self {
         let sqlite = sqlite.map(|s| Arc::new(StdMutex::new(s)));
         let mut outgoing: HashMap<String, PendingApproval> = HashMap::new();
@@ -132,71 +140,93 @@ impl ApprovalManager {
             }
         }
 
-        if let Some(path) = &store_path {
-            if let Ok(s) = std::fs::read_to_string(path) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                    if let Some(arr) = v.get("outgoing").and_then(|x| x.as_array()) {
-                        for item in arr {
-                            if let Ok(p) = serde_json::from_value::<PendingApproval>(item.clone()) {
-                                let id = p.approval_id.clone();
-                                if !outgoing.contains_key(&id) {
-                                    if let Some(ref sq) = sqlite {
-                                        if let Ok(guard) = sq.lock() {
-                                            let _ = guard.upsert(&Self::pending_to_record(
-                                                &p,
-                                                ApprovalRecordStatus::Pending,
-                                                None,
-                                                None,
-                                            ));
-                                        }
-                                    }
-                                    outgoing.insert(id, p);
-                                }
+        if let Some(path) = &legacy_json {
+            let imported = Self::import_legacy_json(
+                path,
+                &sqlite,
+                &mut outgoing,
+                &mut responses,
+            );
+            if imported > 0 {
+                tracing::info!(
+                    "[APPROVAL] imported {} legacy item(s) from {} (read-only; file not written)",
+                    imported,
+                    path.display()
+                );
+            }
+        }
+
+        ApprovalManager {
+            outgoing: Mutex::new(outgoing),
+            responses: Mutex::new(responses),
+            sqlite,
+            memory: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    /// 启动时只读导入旧 approvals.json → 内存，并 upsert 进 SQLite（若有）。
+    fn import_legacy_json(
+        path: &std::path::Path,
+        sqlite: &Option<Arc<StdMutex<ApprovalStore>>>,
+        outgoing: &mut HashMap<String, PendingApproval>,
+        responses: &mut HashMap<String, ApprovalResponse>,
+    ) -> usize {
+        let Ok(s) = std::fs::read_to_string(path) else {
+            return 0;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+            return 0;
+        };
+        let mut n = 0usize;
+        if let Some(arr) = v.get("outgoing").and_then(|x| x.as_array()) {
+            for item in arr {
+                if let Ok(p) = serde_json::from_value::<PendingApproval>(item.clone()) {
+                    let id = p.approval_id.clone();
+                    if !outgoing.contains_key(&id) {
+                        if let Some(ref sq) = sqlite {
+                            if let Ok(guard) = sq.lock() {
+                                let _ = guard.upsert(&Self::pending_to_record(
+                                    &p,
+                                    ApprovalRecordStatus::Pending,
+                                    None,
+                                    None,
+                                ));
                             }
                         }
-                    }
-                    if let Some(arr) = v.get("responses").and_then(|x| x.as_array()) {
-                        for item in arr {
-                            if let Ok(r) =
-                                serde_json::from_value::<ApprovalResponse>(item.clone())
-                            {
-                                let id = r.approval_id.clone();
-                                if !responses.contains_key(&id) {
-                                    if let Some(ref sq) = sqlite {
-                                        if let Ok(guard) = sq.lock() {
-                                            if let Some(mut rec) = guard.get(&id) {
-                                                let status = if r.approved {
-                                                    ApprovalRecordStatus::Approved
-                                                } else {
-                                                    ApprovalRecordStatus::Denied
-                                                };
-                                                rec.status = status;
-                                                rec.decided_at = Some(now_secs());
-                                                rec.decision_reason = r.reason.clone();
-                                                rec.response_json =
-                                                    serde_json::to_string(&r).ok();
-                                                let _ = guard.upsert(&rec);
-                                            }
-                                        }
-                                    }
-                                    responses.insert(id, r);
-                                }
-                            }
-                        }
+                        outgoing.insert(id, p);
+                        n += 1;
                     }
                 }
             }
         }
-
-        let dual = dual_write_json && store_path.is_some();
-        ApprovalManager {
-            outgoing: Mutex::new(outgoing),
-            responses: Mutex::new(responses),
-            store_path,
-            dual_write_json: dual,
-            sqlite,
-            memory: StdMutex::new(HashMap::new()),
+        if let Some(arr) = v.get("responses").and_then(|x| x.as_array()) {
+            for item in arr {
+                if let Ok(r) = serde_json::from_value::<ApprovalResponse>(item.clone()) {
+                    let id = r.approval_id.clone();
+                    if !responses.contains_key(&id) {
+                        if let Some(ref sq) = sqlite {
+                            if let Ok(guard) = sq.lock() {
+                                if let Some(mut rec) = guard.get(&id) {
+                                    let status = if r.approved {
+                                        ApprovalRecordStatus::Approved
+                                    } else {
+                                        ApprovalRecordStatus::Denied
+                                    };
+                                    rec.status = status;
+                                    rec.decided_at = Some(now_secs());
+                                    rec.decision_reason = r.reason.clone();
+                                    rec.response_json = serde_json::to_string(&r).ok();
+                                    let _ = guard.upsert(&rec);
+                                }
+                            }
+                        }
+                        responses.insert(id, r);
+                        n += 1;
+                    }
+                }
+            }
         }
+        n
     }
 
     fn hydrate_from_record(
@@ -279,29 +309,6 @@ impl ApprovalManager {
             if let Ok(guard) = sq.lock() {
                 if let Err(e) = guard.mark_consumed(approval_id, now_secs()) {
                     tracing::warn!("[APPROVAL-SQLITE] consume failed: {}", e);
-                }
-            }
-        }
-    }
-
-    /// 原子落盘 JSON（仅 dual_write_json）
-    async fn persist(&self) {
-        if !self.dual_write_json {
-            return;
-        }
-        if let Some(path) = &self.store_path {
-            let payload = {
-                let outgoing = self.outgoing.lock().await;
-                let responses = self.responses.lock().await;
-                serde_json::json!({
-                    "outgoing": outgoing.values().collect::<Vec<_>>(),
-                    "responses": responses.values().collect::<Vec<_>>(),
-                })
-            };
-            if let Ok(s) = serde_json::to_string_pretty(&payload) {
-                let tmp = path.with_extension("tmp");
-                if std::fs::write(&tmp, &s).is_ok() {
-                    let _ = std::fs::rename(&tmp, path);
                 }
             }
         }
@@ -392,7 +399,6 @@ impl ApprovalManager {
                 now + PENDING_TTL,
             );
         }
-        self.persist().await;
 
         approval_id
     }
@@ -460,7 +466,6 @@ impl ApprovalManager {
                 }
             }
         }
-        self.persist().await;
     }
 
     /// 检查审批是否已完成
@@ -523,7 +528,6 @@ impl ApprovalManager {
         self.outgoing.lock().await.remove(approval_id);
         self.responses.lock().await.remove(approval_id);
         self.sqlite_consume(approval_id);
-        self.persist().await;
     }
 
     /// pending 数量
@@ -1083,7 +1087,68 @@ mod tests {
         assert_eq!(am.list_approved_ready().await.len(), 0, "成功路径必须移除");
     }
 
-    /// TASK-652 P1：SQLite 同库权威表跨 reopen 存活；JSON 双写可选。
+    /// TASK-652 P3：create/record/remove 不得再写 approvals.json
+    #[tokio::test]
+    async fn test_legacy_json_is_read_only_no_write() {
+        let dir = std::env::temp_dir().join(format!("appr_p3_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let json_path = dir.join("approvals.json");
+        let db_path = dir.join("checkpoints.db");
+        let legacy = serde_json::json!({
+            "outgoing": [{
+                "approval_id": "legacy-aid-1",
+                "tool_name": "manage_samples",
+                "arguments": {"action": "sync"},
+                "description": "legacy",
+                "approver_id": "admin",
+                "requester_id": "agent-001",
+                "status": "Pending",
+                "created_at": 1.0,
+                "operation_hash": "deadbeef",
+                "session_id": "legacy"
+            }],
+            "responses": []
+        });
+        std::fs::write(&json_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+        let before = std::fs::metadata(&json_path).unwrap().modified().unwrap();
+
+        let store = ApprovalStore::open(&db_path.to_string_lossy()).unwrap();
+        let am = ApprovalManager::new_with_sqlite(Some(store), Some(json_path.clone()));
+        assert!(am.get_pending("legacy-aid-1").await.is_some());
+
+        let aid = am
+            .create_request_for_session(
+                "local_fs",
+                &serde_json::json!({"op": "write"}),
+                "写文件",
+                "admin",
+                "agent-001",
+                "sess/p3",
+            )
+            .await;
+        let hash = am.get_pending(&aid).await.unwrap().operation_hash;
+        am.record_response(ApprovalResponse {
+            r#type: "approval_response".to_string(),
+            approval_id: aid.clone(),
+            approved: true,
+            reason: None,
+            approver_id: "admin".to_string(),
+            operation_hash: hash,
+        })
+        .await;
+        am.remove(&aid).await;
+
+        let after = std::fs::metadata(&json_path).unwrap().modified().unwrap();
+        assert_eq!(before, after, "P3 退役后不得写回 approvals.json");
+        let body = std::fs::read_to_string(&json_path).unwrap();
+        assert!(
+            !body.contains(&aid),
+            "JSON 文件内容不得被运行时改写"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TASK-652 P1：SQLite 同库权威表跨 reopen 存活。
     #[tokio::test]
     async fn test_sqlite_authority_survives_reopen() {
         let path = std::env::temp_dir().join(format!(
@@ -1094,7 +1159,7 @@ mod tests {
         let p = path.to_string_lossy().to_string();
         {
             let store = ApprovalStore::open(&p).unwrap();
-            let am = ApprovalManager::new_with_persistence(None, Some(store), false);
+            let am = ApprovalManager::new_with_sqlite(Some(store), None);
             let aid = am
                 .create_request_for_session(
                     "manage_samples",
@@ -1119,7 +1184,7 @@ mod tests {
         }
         // reopen
         let store2 = ApprovalStore::open(&p).unwrap();
-        let am2 = ApprovalManager::new_with_persistence(None, Some(store2), false);
+        let am2 = ApprovalManager::new_with_sqlite(Some(store2), None);
         assert_eq!(am2.list_approved_ready().await.len(), 1);
         assert_eq!(am2.list_approved_ready_for_session("sess/demo").await.len(), 1);
         let _ = std::fs::remove_file(&path);

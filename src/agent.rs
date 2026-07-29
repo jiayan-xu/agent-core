@@ -489,7 +489,7 @@ impl AgentCore {
             audit_logger: AuditLogger::new(mcp_for_audit),
             tool_route_cache: tokio::sync::Mutex::new(HashMap::new()),
             namespace_registry: std::sync::Mutex::new(NamespaceRegistry::new()),
-            // L2 + TASK-652：审批权威表挂 checkpoints.db 同库异表；JSON 双写（APPROVAL_DUAL_WRITE 默认开）
+            // L2 + TASK-652 P3：审批权威表挂 checkpoints.db；legacy approvals.json 只读回填
             approval_manager: {
                 let cp_path = cwd.join("checkpoints.db");
                 let sqlite = if std::env::var("APPROVAL_SQLITE")
@@ -498,20 +498,23 @@ impl AgentCore {
                 {
                     crate::approval_store::ApprovalStore::open(&cp_path.to_string_lossy())
                         .map_err(|e| {
-                            tracing::warn!("[APPROVAL-SQLITE] open failed, JSON-only: {}", e);
+                            tracing::warn!("[APPROVAL-SQLITE] open failed: {}", e);
                             e
                         })
                         .ok()
                 } else {
+                    tracing::warn!("[APPROVAL-SQLITE] disabled via APPROVAL_SQLITE=0");
                     None
                 };
-                let dual = std::env::var("APPROVAL_DUAL_WRITE")
-                    .unwrap_or_else(|_| "0".into())
-                    != "0";
-                ApprovalManager::new_with_persistence(
-                    Some(cwd.join("approvals.json")),
+                if std::env::var("APPROVAL_DUAL_WRITE").ok().as_deref() == Some("1") {
+                    tracing::warn!(
+                        "[APPROVAL] APPROVAL_DUAL_WRITE=1 ignored (retired in TASK-652 P3)"
+                    );
+                }
+                let legacy = cwd.join("approvals.json");
+                ApprovalManager::new_with_sqlite(
                     sqlite,
-                    dual,
+                    if legacy.is_file() { Some(legacy) } else { None },
                 )
             },
             checkpoint_store: Arc::new(tokio::sync::Mutex::new(checkpoint)),
