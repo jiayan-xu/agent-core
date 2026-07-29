@@ -50,6 +50,10 @@ const HARD_DANGEROUS: &[&str] = &[
     "shutdown_server",
     // 本仓沙箱写文件：必须走黄线/审批，禁止当普通 write 静默落盘
     "local_fs_write",
+    // 白名单/改码写：无论分类器如何，强制危险地板 → L2 黄线
+    "sync_whitelist_plates",
+    "manage_whitelist",
+    "edit_code",
     // memoria 路由危险工具（写操作 / 演化 / 身份）
     "memory_merge",
     "memory_dedup_chain",
@@ -1079,6 +1083,9 @@ impl ToolClassifier {
             "memory_import",
             "memory_export",
             "local_fs_write",
+            "sync_whitelist_plates",
+            "manage_whitelist",
+            "edit_code",
         ] {
             c.dangerous_tools.insert(t.to_string());
         }

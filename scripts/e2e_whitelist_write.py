@@ -139,13 +139,15 @@ def reply_text(r: dict) -> str:
     return str(reply)
 
 
-def assert_approval_path(label: str, reply: str, expect_plate: str) -> None:
+def assert_approval_path(
+    label: str, reply: str, expect_plate: str, expect_tool: str = "sync_whitelist_plates"
+) -> None:
     print(f"  [{label}] reply[:240]={reply[:240]!r}")
     if "AWAITING_APPROVAL" not in reply and "awaiting_approval" not in reply.lower():
         print("FAIL: 期望 AWAITING_APPROVAL", file=sys.stderr)
         sys.exit(1)
-    if "sync_whitelist_plates" not in reply:
-        print("FAIL: 期望工具 sync_whitelist_plates", file=sys.stderr)
+    if expect_tool not in reply:
+        print(f"FAIL: 期望工具 {expect_tool}", file=sys.stderr)
         sys.exit(1)
     if expect_plate and expect_plate not in reply:
         print(f"FAIL: 期望回复含车牌 {expect_plate}", file=sys.stderr)
@@ -271,6 +273,14 @@ def run_live() -> None:
     msg_add = "把「佳士能」的新车苏E2ET01添加到白名单"
     r2 = call_chat(msg_add, sid + "/add")
     assert_approval_path("add", reply_text(r2), "苏E2ET01")
+
+    msg_waste = f"把白名单车牌{PLATE}的固废种类改为「农林垃圾」"
+    r_w = call_chat(msg_waste, sid + "/waste")
+    assert_approval_path("update_waste_type", reply_text(r_w), PLATE, "manage_whitelist")
+
+    msg_rm = "从白名单删除车牌苏E2ET99"
+    r_rm = call_chat(msg_rm, sid + "/rm")
+    assert_approval_path("remove", reply_text(r_rm), "苏E2ET99")
 
     msg_q = f"查询白名单里{PLATE}的公司名是什么"
     reply3 = reply_text(call_chat(msg_q, sid + "/q"))

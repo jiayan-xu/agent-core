@@ -1468,6 +1468,115 @@ impl AgentCore {
         Some((plate, company))
     }
 
+    /// 识别「从白名单删除/移出/作废」意图 → (车牌)。
+    fn extract_whitelist_remove(message: &str) -> Option<String> {
+        let rem_verbs = ["删除", "移除", "移出", "去掉", "作废", "注销", "软删", "踢出"];
+        let has_rem = rem_verbs.iter().any(|v| message.contains(*v));
+        let has_ctx = message.contains("白名单") || message.contains("车牌");
+        if !(has_rem && has_ctx) {
+            return None;
+        }
+        // 与改公司名 / 加车互斥
+        if message.contains("公司名") || message.contains("固废") || message.contains("废物类型") {
+            return None;
+        }
+        let add_verbs = ["添加", "新增", "登记", "录入"];
+        if add_verbs.iter().any(|v| message.contains(*v)) {
+            return None;
+        }
+        Self::extract_plate(message).or_else(|| Self::extract_plate_spaced(message))
+    }
+
+    /// 识别「修改白名单固废种类」意图 → (车牌, 固废种类)。
+    fn extract_whitelist_waste_type(message: &str) -> Option<(String, String)> {
+        let has_ctx = message.contains("白名单") || message.contains("车牌");
+        let has_waste = message.contains("固废")
+            || message.contains("废物类型")
+            || message.contains("废物种类")
+            || message.contains("waste");
+        let verbs = ["改为", "改成", "更新为", "变更为", "设为", "调整为", "换成"];
+        let has_verb = verbs.iter().any(|v| message.contains(*v));
+        if !(has_ctx && has_waste && has_verb) {
+            return None;
+        }
+        let plate = Self::extract_plate(message).or_else(|| Self::extract_plate_spaced(message))?;
+        let waste = Self::extract_waste_type(message)?;
+        if waste.is_empty() {
+            return None;
+        }
+        Some((plate, waste))
+    }
+
+    /// 抽取固废种类：优先引号；否则取变更动词后的内容。
+    fn extract_waste_type(msg: &str) -> Option<String> {
+        for (o, cl) in [('「', '」'), ('“', '”'), ('‘', '’')] {
+            if let Some(s) = Self::extract_between(msg, o, cl) {
+                let s = crate::controlled_write::sanitize_waste_type(&s);
+                if s.chars().count() >= 2 {
+                    return Some(s);
+                }
+            }
+        }
+        let markers = ["更新为", "变更为", "调整为", "改为", "改成", "设为", "换成"];
+        let mut best: Option<(usize, &str)> = None;
+        for m in markers {
+            if let Some(p) = msg.rfind(m) {
+                best = match best {
+                    Some((bp, _)) if p > bp => Some((p, m)),
+                    Some(x) => Some(x),
+                    None => Some((p, m)),
+                };
+            }
+        }
+        if let Some((pos, mk)) = best {
+            if let Some(rest) = msg[pos..].strip_prefix(mk) {
+                let s: String = rest
+                    .chars()
+                    .take_while(|c| !matches!(c, '。' | '！' | '？' | '\n' | '\r' | '，' | ','))
+                    .collect();
+                let s = crate::controlled_write::sanitize_waste_type(s.trim());
+                if s.chars().count() >= 2 {
+                    return Some(s);
+                }
+            }
+        }
+        None
+    }
+
+    /// L2 受控写统一入口：创建审批 + checkpoint + AWAITING_APPROVAL 文案（权限生存线）。
+    async fn submit_controlled_write_approval(
+        &self,
+        session_id: &str,
+        user_message: &str,
+        tool_name: &str,
+        args: serde_json::Value,
+        reason: String,
+    ) -> String {
+        let aid = self
+            .approval_manager
+            .create_request(
+                tool_name,
+                &args,
+                &reason,
+                "dashboard-admin",
+                &self.config.identity.agent_id,
+            )
+            .await;
+        let pa = PendingAction {
+            tool_name: tool_name.to_string(),
+            arguments: args,
+            description: reason.clone(),
+            approval_id: Some(aid.clone()),
+        };
+        self.checkpoint_pending_approval(session_id, &aid, &pa).await;
+        let reply = format!(
+            "AWAITING_APPROVAL:工具「{}」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续——{}",
+            tool_name, reason
+        );
+        self.save_to_history(session_id, user_message, &reply).await;
+        reply
+    }
+
     /// 抽取车牌（容忍空格），如「鲁 H736A 7」→「鲁H736A7」。
     fn extract_plate_spaced(msg: &str) -> Option<String> {
         let chars: Vec<char> = msg.chars().collect();
@@ -1611,34 +1720,45 @@ impl AgentCore {
                     "reason": reason,
                     "confirmed": false
                 });
-                let aid = self
-                    .approval_manager
-                    .create_request(
+                return self
+                    .submit_controlled_write_approval(
+                        session_id,
+                        message,
                         "sync_whitelist_plates",
-                        &args,
-                        &reason,
-                        "dashboard-admin",
-                        &self.config.identity.agent_id,
+                        args,
+                        reason,
                     )
                     .await;
-                let pa = PendingAction {
-                    tool_name: "sync_whitelist_plates".to_string(),
-                    arguments: args.clone(),
-                    description: reason.clone(),
-                    approval_id: Some(aid.clone()),
-                };
-                self.checkpoint_pending_approval(session_id, &aid, &pa).await;
-                let reply = format!(
-                    "AWAITING_APPROVAL:工具「sync_whitelist_plates」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续——{}",
-                    reason
+            }
+        }
+
+        // ── 确定性预路由：白名单固废种类变更 → manage_whitelist ──
+        if let Some((plate, waste)) = Self::extract_whitelist_waste_type(message) {
+            if self.config.human_approval {
+                let reason = format!(
+                    "白名单受控写：修改车牌 {} 的固废种类为「{}」（需人工审批）",
+                    plate, waste
                 );
-                self.save_to_history(session_id, message, &reply).await;
-                return reply;
+                let args = serde_json::json!({
+                    "action": "update_waste_type",
+                    "plate": plate,
+                    "waste_type": waste,
+                    "reason": reason,
+                    "confirmed": false
+                });
+                return self
+                    .submit_controlled_write_approval(
+                        session_id,
+                        message,
+                        "manage_whitelist",
+                        args,
+                        reason,
+                    )
+                    .await;
             }
         }
 
         // ── 确定性预路由：白名单「添加新车」→ 直接构造受控写审批闸门 ──
-        // 绕过 LLM 工具调用以 DSML 文本泄露的不确定性（详见 extract_whitelist_add）。
         if let Some((plate, company)) = Self::extract_whitelist_add(message) {
             if self.config.human_approval {
                 let reason = format!(
@@ -1652,29 +1772,40 @@ impl AgentCore {
                     "reason": reason,
                     "confirmed": false
                 });
-                let aid = self
-                    .approval_manager
-                    .create_request(
+                return self
+                    .submit_controlled_write_approval(
+                        session_id,
+                        message,
                         "sync_whitelist_plates",
-                        &args,
-                        &reason,
-                        "dashboard-admin",
-                        &self.config.identity.agent_id,
+                        args,
+                        reason,
                     )
                     .await;
-                let pa = PendingAction {
-                    tool_name: "sync_whitelist_plates".to_string(),
-                    arguments: args.clone(),
-                    description: reason.clone(),
-                    approval_id: Some(aid.clone()),
-                };
-                self.checkpoint_pending_approval(session_id, &aid, &pa).await;
-                let reply = format!(
-                    "AWAITING_APPROVAL:工具「sync_whitelist_plates」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续——{}",
-                    reason
+            }
+        }
+
+        // ── 确定性预路由：白名单软删 → sync_whitelist_plates remove ──
+        if let Some(plate) = Self::extract_whitelist_remove(message) {
+            if self.config.human_approval {
+                let reason = format!(
+                    "白名单受控写：软删除车牌 {}（需人工审批）",
+                    plate
                 );
-                self.save_to_history(session_id, message, &reply).await;
-                return reply;
+                let args = serde_json::json!({
+                    "action": "remove",
+                    "plate": plate,
+                    "reason": reason,
+                    "confirmed": false
+                });
+                return self
+                    .submit_controlled_write_approval(
+                        session_id,
+                        message,
+                        "sync_whitelist_plates",
+                        args,
+                        reason,
+                    )
+                    .await;
             }
         }
 
@@ -4001,10 +4132,23 @@ impl AgentCore {
         }
 
         // 白名单：写回执优先作旁证，再跑 DB
-        if tool_name == "sync_whitelist_plates" {
-            if let Some(w) = verify_json_field(write_result, "new_company", args.get("company_name").and_then(|c| c.as_str()).unwrap_or("")) {
+        if tool_name == "sync_whitelist_plates" || tool_name == "manage_whitelist" {
+            let field = if tool_name == "manage_whitelist" {
+                "waste_type"
+            } else {
+                "new_company"
+            };
+            let expect_arg = if tool_name == "manage_whitelist" {
+                "waste_type"
+            } else {
+                "company_name"
+            };
+            if let Some(w) = verify_json_field(
+                write_result,
+                field,
+                args.get(expect_arg).and_then(|c| c.as_str()).unwrap_or(""),
+            ) {
                 if w.is_pass() {
-                    // 仍尝试 DB；失败不推翻写回执，但注明
                     let plan = plan_post_verify(tool_name, args, write_result);
                     if let PostVerifyPlan::ReadSql { sql, expected, label } = plan {
                         match self
@@ -4048,6 +4192,25 @@ impl AgentCore {
                     detail: format!("{}：写回执缺少可核对字段 {}", label, result_field),
                 },
             ),
+            PostVerifyPlan::ContainsInWriteResult {
+                needle,
+                anti_needle,
+                label,
+            } => {
+                if !anti_needle.is_empty() && write_result.contains(&anti_needle) {
+                    VerifyOutcome::Fail {
+                        detail: format!("{}：检测到失败标记「{}」", label, anti_needle),
+                    }
+                } else if write_result.contains(&needle) {
+                    VerifyOutcome::Pass {
+                        detail: format!("{}：写回执含「{}」", label, needle),
+                    }
+                } else {
+                    VerifyOutcome::Fail {
+                        detail: format!("{}：写回执缺少「{}」", label, needle),
+                    }
+                }
+            },
             PostVerifyPlan::ReadSql {
                 sql,
                 expected,
@@ -6475,6 +6638,21 @@ mod whitelist_preroute_tests {
         let msg = "把白名单车牌苏EZQ117公司名改为「佳士能环境」";
         assert!(AgentCore::extract_whitelist_add(msg).is_none());
         assert!(AgentCore::extract_whitelist_update(msg).is_some());
+    }
+
+    #[test]
+    fn extract_waste_type_update() {
+        let msg = "把白名单车牌苏EZQ117的固废种类改为「农林垃圾」";
+        let (plate, waste) = AgentCore::extract_whitelist_waste_type(msg).expect("match");
+        assert_eq!(plate, "苏EZQ117");
+        assert!(waste.contains("农林"));
+    }
+
+    #[test]
+    fn extract_remove_soft_delete() {
+        let plate = AgentCore::extract_whitelist_remove("从白名单删除车牌苏EZQ117").expect("match");
+        assert_eq!(plate, "苏EZQ117");
+        assert!(AgentCore::extract_whitelist_remove("查询白名单苏EZQ117").is_none());
     }
 
     #[test]
