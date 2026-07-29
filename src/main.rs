@@ -4042,45 +4042,40 @@ async fn handle_v1_chat(
             }))
             .into_response();
         }
-        // 只取最后一条 user 消息。Jan 会带上完整 history；若把 assistant 自我介绍也 join
-        // 进 user_text，模型容易反复只回身份介绍、不调工具。
-        // content 兼容 string / 多段 parts（AI SDK 多模态时发数组）。
-        let user_text: String = req
+        // 折叠 OpenAI messages：保留 system（缀到 user），history 仅 user/assistant。
+        // 不再静默丢弃 system（Jan 附件/指令常放 system）。
+        let pairs: Vec<(String, String)> = req
             .messages
             .iter()
-            .rev()
-            .find(|m| m.role.eq_ignore_ascii_case("user"))
-            .and_then(|m| m.content.as_ref().map(|c| c.as_text()))
-            .unwrap_or_default()
-            .chars()
-            .take(32768)
+            .filter_map(|m| {
+                m.content
+                    .as_ref()
+                    .map(|c| (m.role.clone(), c.as_text()))
+            })
             .collect();
+        let folded = agent_core::v1_compat::fold_v1_messages(&pairs);
+        let user_text = folded.user_message;
         if user_text.trim().is_empty() {
             "请输入消息".to_string()
         } else {
-            // RC1 修复（2026-07-29）：直接用 jan 在 req.messages 中维护的完整历史，
-            // 不再依赖自身 DB 历史 + 可能不稳的 session_id，根治「会话内失忆」。
-            let external_history: Vec<(String, String)> = req
-                .messages
-                .iter()
-                .rev()
-                .skip(1) // 跳过当前这条（已是 user_text）
-                .rev()
-                .filter(|m| m.role.eq_ignore_ascii_case("user") || m.role.eq_ignore_ascii_case("assistant"))
-                .filter_map(|m| {
-                    m.content
-                        .as_ref()
-                        .map(|c| c.as_text())
-                        .map(|t| (m.role.clone(), t))
-                })
-                .collect();
+            if !folded.system_ctx.is_empty() {
+                tracing::info!(
+                    system_chars = folded.system_ctx.chars().count(),
+                    "v1_chat: folded client system into user message"
+                );
+            }
+            let external_history = if folded.history.is_empty() {
+                None
+            } else {
+                Some(folded.history)
+            };
             agent
                 .chat(
                     &user_text,
                     &ctx.agent_id,
                     &session_id,
                     &ctx.allowed_ns,
-                    Some(external_history),
+                    external_history,
                 )
                 .await
         }

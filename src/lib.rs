@@ -34,3 +34,5 @@ pub mod evolution_audit; // HY3 1.3 收口：记忆自进化生产证据审计�
 pub mod intake_filter; // 摄入侧治本过滤：测试命名空间隔离 / A2A 回执丢弃 / 对话实质筛选
 pub mod pref_write; // 偏好/决策落盘约定 + 用户强触发启发式
 pub mod dept_ops; // 固废本部门运维：工具包可见 + 证据门禁 + 作业剧本
+pub mod v1_compat; // OpenAI /v1/chat 入参折叠（保留 system）
+pub mod controlled_write; // 受控写「写后回读」协议骨架

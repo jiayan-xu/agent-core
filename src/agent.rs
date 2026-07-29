@@ -3946,6 +3946,15 @@ impl AgentCore {
                     desc, approval.approver_id, result_short
                 ),
             };
+            // 写后回读：白名单受控写成功后立刻核对关键字段，杜绝「假成功」停在工具 JSON
+            let reply = if executed && approval.tool_name == "sync_whitelist_plates" {
+                let verify = self
+                    .verify_whitelist_write(&exec_args, &result_short, allowed_ns)
+                    .await;
+                format!("{}{}", reply, verify.as_reply_suffix())
+            } else {
+                reply
+            };
             // 审计日志（成功/失败都记调用，但标记实际是否写入 DB）
             self.audit_logger
                 .log_tool_call(
@@ -3965,6 +3974,129 @@ impl AgentCore {
             return Some(reply);
         }
         None
+    }
+
+    /// 白名单写后回读：优先 DB 只读核对；只读不可用时回退到写工具回执中的 new_company。
+    async fn verify_whitelist_write(
+        &self,
+        args: &serde_json::Value,
+        write_result: &str,
+        allowed_ns: &[String],
+    ) -> crate::controlled_write::VerifyOutcome {
+        use crate::controlled_write::{match_expected_in_readback, sanitize_plate, VerifyOutcome};
+        let plate = match args.get("plate").and_then(|p| p.as_str()).and_then(sanitize_plate) {
+            Some(p) => p,
+            None => {
+                return VerifyOutcome::Skip {
+                    reason: "缺少合法车牌，无法回读".into(),
+                };
+            }
+        };
+        let expected = args
+            .get("company_name")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        let action = args
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or("");
+
+        // 1) 写工具回执（new_company）——最快证据
+        let from_write = || -> Option<VerifyOutcome> {
+            let v: serde_json::Value = serde_json::from_str(write_result).ok()?;
+            if v.get("success").and_then(|x| x.as_bool()) != Some(true) {
+                return None;
+            }
+            if let Some(nc) = v.get("new_company").and_then(|x| x.as_str()) {
+                if !expected.is_empty()
+                    && (nc == expected || nc.contains(&expected) || expected.contains(nc))
+                {
+                    return Some(VerifyOutcome::Pass {
+                        detail: format!("写工具回执 new_company「{}」", nc),
+                    });
+                }
+            }
+            if action == "add" || expected.is_empty() {
+                if v.get("updated").and_then(|x| x.as_bool()) == Some(true)
+                    || v.get("added").and_then(|x| x.as_bool()) == Some(true)
+                {
+                    return Some(VerifyOutcome::Pass {
+                        detail: "写工具回执 success=true".into(),
+                    });
+                }
+            }
+            None
+        };
+
+        // 2) DB 只读回读
+        let sql = format!(
+            "SELECT license_plate, company_name FROM vehicle_whitelist WHERE license_plate = '{}'",
+            plate
+        );
+        let readback = match self
+            .call_tool_routed(
+                "execute_sql",
+                "default",
+                &serde_json::json!({ "sql": sql }),
+                allowed_ns,
+                "",
+            )
+            .await
+        {
+            Ok(t) => Some(t),
+            Err(_) => self
+                .call_tool_routed(
+                    "fuzzy_match_plate",
+                    "default",
+                    &serde_json::json!({ "plate": plate }),
+                    allowed_ns,
+                    "",
+                )
+                .await
+                .ok(),
+        };
+
+        if let Some(ref rb) = readback {
+            let label = if !expected.is_empty() {
+                format!("白名单 {} 公司名", plate)
+            } else {
+                format!("白名单车牌 {}", plate)
+            };
+            let needle = if !expected.is_empty() {
+                expected.as_str()
+            } else {
+                plate.as_str()
+            };
+            let db_outcome = match_expected_in_readback(&label, needle, rb);
+            if db_outcome.is_pass() {
+                return db_outcome;
+            }
+            // DB 回读未命中时，若写回执已证明成功，仍以写回执为准并注明 DB 摘录
+            if let Some(w) = from_write() {
+                if w.is_pass() {
+                    return VerifyOutcome::Pass {
+                        detail: format!(
+                            "{}；DB 回读未命中期望（摘录：{}）",
+                            match w {
+                                VerifyOutcome::Pass { detail } => detail,
+                                _ => String::new(),
+                            },
+                            rb.chars().take(120).collect::<String>()
+                        ),
+                    };
+                }
+            }
+            return db_outcome;
+        }
+
+        // 3) 只读工具都不可用 → 回退写回执
+        if let Some(w) = from_write() {
+            return w;
+        }
+        VerifyOutcome::Fail {
+            detail: "只读回读工具不可用，且写回执无法证明 new_company".into(),
+        }
     }
 
     /// 任务 649：把工具返回的 Result 诚实分类，避免把「require_confirm / error」包装成「✅ 成功」。
@@ -4546,6 +4678,49 @@ impl AgentCore {
             );
             crate::file_checkpoint::restore_many(&fc_snapshots);
         }
+
+        // 代码铁轨：edit_code 真写入成功后强制 verify_code（dry_run 预览跳过）
+        if tool_name == "edit_code" {
+            if let Ok(ref edit_out) = result {
+                let dry = call_args
+                    .get("dry_run")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !dry {
+                    let path = call_args
+                        .get("filepath")
+                        .or_else(|| call_args.get("path"))
+                        .or_else(|| call_args.get("file"))
+                        .and_then(|v| v.as_str());
+                    if let Some(path) = path {
+                        let verify_args = serde_json::json!({ "filepath": path });
+                        match Box::pin(self.call_tool_routed(
+                            "verify_code",
+                            persona_id,
+                            &verify_args,
+                            allowed_ns,
+                            trace_id,
+                        ))
+                        .await
+                        {
+                            Ok(v) => {
+                                return Ok(format!(
+                                    "{}\n\n【自动 verify_code】\n{}",
+                                    edit_out, v
+                                ));
+                            }
+                            Err(e) => {
+                                return Ok(format!(
+                                    "{}\n\n【自动 verify_code 失败】{}",
+                                    edit_out, e
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         result
     }
 
