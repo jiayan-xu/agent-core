@@ -3946,10 +3946,15 @@ impl AgentCore {
                     desc, approval.approver_id, result_short
                 ),
             };
-            // 写后回读：白名单受控写成功后立刻核对关键字段，杜绝「假成功」停在工具 JSON
-            let reply = if executed && approval.tool_name == "sync_whitelist_plates" {
+            // 写后回读：仅对受控写注册表内工具自动核对（未注册 ≠ 放开写权限）
+            let reply = if executed {
                 let verify = self
-                    .verify_whitelist_write(&exec_args, &result_short, allowed_ns)
+                    .run_controlled_post_verify(
+                        &approval.tool_name,
+                        &exec_args,
+                        &result_short,
+                        allowed_ns,
+                    )
                     .await;
                 format!("{}{}", reply, verify.as_reply_suffix())
             } else {
@@ -3976,126 +3981,132 @@ impl AgentCore {
         None
     }
 
-    /// 白名单写后回读：优先 DB 只读核对；只读不可用时回退到写工具回执中的 new_company。
-    async fn verify_whitelist_write(
+    /// 按受控写注册表执行写后回读（SQL 仅用注册模板 + 消毒值）。
+    async fn run_controlled_post_verify(
         &self,
+        tool_name: &str,
         args: &serde_json::Value,
         write_result: &str,
         allowed_ns: &[String],
     ) -> crate::controlled_write::VerifyOutcome {
-        use crate::controlled_write::{match_expected_in_readback, sanitize_plate, VerifyOutcome};
-        let plate = match args.get("plate").and_then(|p| p.as_str()).and_then(sanitize_plate) {
-            Some(p) => p,
-            None => {
-                return VerifyOutcome::Skip {
-                    reason: "缺少合法车牌，无法回读".into(),
-                };
-            }
-        };
-        let expected = args
-            .get("company_name")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
-        let action = args
-            .get("action")
-            .and_then(|a| a.as_str())
-            .unwrap_or("");
-
-        // 1) 写工具回执（new_company）——最快证据
-        let from_write = || -> Option<VerifyOutcome> {
-            let v: serde_json::Value = serde_json::from_str(write_result).ok()?;
-            if v.get("success").and_then(|x| x.as_bool()) != Some(true) {
-                return None;
-            }
-            if let Some(nc) = v.get("new_company").and_then(|x| x.as_str()) {
-                if !expected.is_empty()
-                    && (nc == expected || nc.contains(&expected) || expected.contains(nc))
-                {
-                    return Some(VerifyOutcome::Pass {
-                        detail: format!("写工具回执 new_company「{}」", nc),
-                    });
-                }
-            }
-            if action == "add" || expected.is_empty() {
-                if v.get("updated").and_then(|x| x.as_bool()) == Some(true)
-                    || v.get("added").and_then(|x| x.as_bool()) == Some(true)
-                {
-                    return Some(VerifyOutcome::Pass {
-                        detail: "写工具回执 success=true".into(),
-                    });
-                }
-            }
-            None
+        use crate::controlled_write::{
+            match_expected_in_readback, plan_post_verify, verify_file_writeback, verify_json_field,
+            PostVerifyPlan, VerifyOutcome,
         };
 
-        // 2) DB 只读回读
-        let sql = format!(
-            "SELECT license_plate, company_name FROM vehicle_whitelist WHERE license_plate = '{}'",
-            plate
-        );
-        let readback = match self
-            .call_tool_routed(
-                "execute_sql",
-                "default",
-                &serde_json::json!({ "sql": sql }),
-                allowed_ns,
-                "",
-            )
-            .await
-        {
-            Ok(t) => Some(t),
-            Err(_) => self
-                .call_tool_routed(
-                    "fuzzy_match_plate",
-                    "default",
-                    &serde_json::json!({ "plate": plate }),
-                    allowed_ns,
-                    "",
-                )
-                .await
-                .ok(),
-        };
-
-        if let Some(ref rb) = readback {
-            let label = if !expected.is_empty() {
-                format!("白名单 {} 公司名", plate)
-            } else {
-                format!("白名单车牌 {}", plate)
+        if !crate::controlled_write::is_controlled_write_tool(tool_name) {
+            return VerifyOutcome::Skip {
+                reason: "非受控写注册工具，跳过自动回读".into(),
             };
-            let needle = if !expected.is_empty() {
-                expected.as_str()
-            } else {
-                plate.as_str()
-            };
-            let db_outcome = match_expected_in_readback(&label, needle, rb);
-            if db_outcome.is_pass() {
-                return db_outcome;
-            }
-            // DB 回读未命中时，若写回执已证明成功，仍以写回执为准并注明 DB 摘录
-            if let Some(w) = from_write() {
+        }
+
+        // 白名单：写回执优先作旁证，再跑 DB
+        if tool_name == "sync_whitelist_plates" {
+            if let Some(w) = verify_json_field(write_result, "new_company", args.get("company_name").and_then(|c| c.as_str()).unwrap_or("")) {
                 if w.is_pass() {
-                    return VerifyOutcome::Pass {
-                        detail: format!(
-                            "{}；DB 回读未命中期望（摘录：{}）",
-                            match w {
-                                VerifyOutcome::Pass { detail } => detail,
-                                _ => String::new(),
-                            },
-                            rb.chars().take(120).collect::<String>()
-                        ),
+                    // 仍尝试 DB；失败不推翻写回执，但注明
+                    let plan = plan_post_verify(tool_name, args, write_result);
+                    if let PostVerifyPlan::ReadSql { sql, expected, label } = plan {
+                        match self
+                            .call_tool_routed(
+                                "execute_sql",
+                                "default",
+                                &serde_json::json!({ "sql": sql }),
+                                allowed_ns,
+                                "",
+                            )
+                            .await
+                        {
+                            Ok(rb) => {
+                                let db = match_expected_in_readback(&label, &expected, &rb);
+                                if db.is_pass() {
+                                    return db;
+                                }
+                                return VerifyOutcome::Pass {
+                                    detail: format!(
+                                        "{}；DB 摘录未完全命中（写回执已确认）",
+                                        w.detail_text()
+                                    ),
+                                };
+                            }
+                            Err(_) => return w,
+                        }
+                    }
+                    return w;
+                }
+            }
+        }
+
+        match plan_post_verify(tool_name, args, write_result) {
+            PostVerifyPlan::Skip(reason) => VerifyOutcome::Skip { reason },
+            PostVerifyPlan::FromWriteJson {
+                result_field,
+                expected,
+                label,
+            } => verify_json_field(write_result, &result_field, &expected).unwrap_or(
+                VerifyOutcome::Fail {
+                    detail: format!("{}：写回执缺少可核对字段 {}", label, result_field),
+                },
+            ),
+            PostVerifyPlan::ReadSql {
+                sql,
+                expected,
+                label,
+            } => {
+                match self
+                    .call_tool_routed(
+                        "execute_sql",
+                        "default",
+                        &serde_json::json!({ "sql": sql }),
+                        allowed_ns,
+                        "",
+                    )
+                    .await
+                {
+                    Ok(rb) => match_expected_in_readback(&label, &expected, &rb),
+                    Err(e) => {
+                        // 回退写回执
+                        if let Some(w) =
+                            verify_json_field(write_result, "new_company", &expected)
+                        {
+                            return w;
+                        }
+                        VerifyOutcome::Fail {
+                            detail: format!("回读 SQL 失败：{}", e),
+                        }
+                    }
+                }
+            }
+            PostVerifyPlan::ReadFile {
+                path,
+                expected,
+                label: _,
+            } => {
+                if !crate::local_fs::is_enabled() {
+                    return VerifyOutcome::Skip {
+                        reason: "local_fs 未启用，跳过文件回读".into(),
                     };
                 }
+                match crate::local_fs::execute(
+                    crate::local_fs::TOOL_READ,
+                    &serde_json::json!({ "path": path }),
+                ) {
+                    Ok(raw) => {
+                        let content = serde_json::from_str::<serde_json::Value>(&raw)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("content")
+                                    .and_then(|c| c.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or_default();
+                        verify_file_writeback(&path, &expected, &content)
+                    }
+                    Err(e) => VerifyOutcome::Fail {
+                        detail: format!("文件回读失败：{}", e),
+                    },
+                }
             }
-            return db_outcome;
-        }
-
-        // 3) 只读工具都不可用 → 回退写回执
-        if let Some(w) = from_write() {
-            return w;
-        }
-        VerifyOutcome::Fail {
-            detail: "只读回读工具不可用，且写回执无法证明 new_company".into(),
         }
     }
 
