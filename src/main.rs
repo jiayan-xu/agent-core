@@ -221,16 +221,22 @@ fn env_memoria_jarvis_badge(admin_fallback: &str) -> String {
 
 /// Memoria 代理管理客户端：`X-Agent-Id` 必须与 badge 配对。
 ///
-/// 禁止 `agent.toml agent_id="user"` + `MEMORIA_JARVIS_BADGE`（一律 -32001）。
-/// - 显式 `MEMORIA_JARVIS_BADGE` → `jarvis` + 该 badge（permission=admin，可代理 register_*）
-/// - 否则 → `admin` + `MEMORIA_ADMIN_KEY`
+/// 本函数当前仅用于 `register_agent`（管理操作，需 admin 权限），故**一律以 `admin`
+/// 身份 + `MEMORIA_ADMIN_KEY` 发起**。原因：Memoria 要求身份与密钥严格配对，
+/// `jarvis` 身份配 admin key 会触发 -32001（auth_matrix 实测）；而外部 launcher 常把
+/// `MEMORIA_JARVIS_BADGE` 误设为与 admin key 同值，若此处走 jarvis 分支会让「自动注册 /
+/// 审批代理」等链路静默失败（协作收件箱 502 即此根因）。仅当完全无 admin key 的极端
+/// 情况才回退 jarvis 身份。
 fn memoria_proxy_client(server: &str, admin_fallback: &str) -> McpClient {
+    let admin_key = env_memoria_admin_key(admin_fallback);
+    if !admin_key.is_empty() {
+        return McpClient::new(server, "admin", &admin_key);
+    }
     if let Ok(badge) = std::env::var("MEMORIA_JARVIS_BADGE") {
         if !badge.is_empty() {
             return McpClient::new(server, "jarvis", &badge);
         }
     }
-    let admin_key = env_memoria_admin_key(admin_fallback);
     McpClient::new(server, "admin", &admin_key)
 }
 
@@ -2593,6 +2599,7 @@ async fn handle_chat(
                 &ctx.agent_id,
                 &req.session_id,
                 &ctx.allowed_ns,
+                None,
             )
             .await;
         st.metrics
@@ -2644,7 +2651,7 @@ async fn handle_chat_stream(
             };
             if let Some(agent) = agent {
                 let start = std::time::Instant::now();
-                let reply = agent.chat(&msg, &agent_id, &sid, &allowed_ns).await;
+                let reply = agent.chat(&msg, &agent_id, &sid, &allowed_ns, None).await;
                 st_clone
                     .metrics
                     .record_latency(start.elapsed().as_secs_f64() * 1000.0);
@@ -2722,6 +2729,67 @@ async fn handle_sessions(
 
 /// 协作收件箱（A2A）：拉取调用者身份下的规范化信封，支持 type/scope 过滤与未读计数。
 /// 读操作，沿用 authenticate 中间件（x-agent-id / x-agent-key）。
+/// 解析转发给 Memoria 的有效调用者密钥。
+///
+/// PFAiX legacy 模式仅发 `x-user-tag`（随机安装ID），不携带 `x-agent-key`；
+/// 若此处直接读 `x-agent-key` 头会得到空串，导致 Memoria `a2a_recv` 返回 -32001
+/// （协作收件箱 502）。三级兜底：
+///   1) `auth_cache` 中 `authenticate` 已校验/注册的 badge（legacy 自动注册 / 登录态自愈写入）；
+///   2) 请求头 `x-agent-key`（登录态正常携带，且 `authenticate` 已据此成功鉴权）；
+///   3) 兜底：以 admin 身份确保该 agent 在 Memoria 注册并取回 badge，再缓存复用。
+/// 这样无论 `authenticate` 的注册 badge 是否成功落入 cache，调用方都能拿到可鉴权的密钥。
+async fn resolve_caller_memoria_key(
+    st: &Arc<AppState>,
+    agent_id: &str,
+    headers: &axum::http::HeaderMap,
+) -> String {
+    // 1) 优先用 authenticate 已校验/注册并写入 auth_cache 的 badge
+    {
+        let cache = st.auth_cache.lock().await;
+        if let Some((b, _)) = cache.get(agent_id) {
+            return b.clone();
+        }
+    }
+    // 2) 登录态：请求头携带 x-agent-key
+    if let Some(hk) = headers
+        .get("x-agent-key")
+        .and_then(|v| v.to_str().ok())
+    {
+        if !hk.is_empty() {
+            return hk.to_string();
+        }
+    }
+    // 3) 兜底：admin 身份确保 agent 已在 Memoria 注册并取回 badge
+    let cfg_admin = st.config.lock().await.memoria_admin_key.clone();
+    let admin_key = env_memoria_admin_key(&cfg_admin);
+    if !admin_key.is_empty() {
+        let server = st.config.lock().await.server.clone();
+        let install_ns = format!("agent/{},org/cs-pufa-2nd-thermal", agent_id);
+        let reg = memoria_proxy_client(&server, &cfg_admin);
+        if let Ok(text) = reg
+            .call_json(
+                "register_agent",
+                &serde_json::json!({
+                    "agent_id": agent_id,
+                    "display_name": agent_id,
+                    "admin_key": &admin_key,
+                    "namespace": &install_ns,
+                }),
+            )
+            .await
+        {
+            if let Some(b) = extract_register_badge(&text) {
+                st.auth_cache
+                    .lock()
+                    .await
+                    .insert(agent_id.to_string(), (b.clone(), std::time::Instant::now()));
+                return b;
+            }
+        }
+    }
+    String::new()
+}
+
 async fn handle_collab_inbox(
     State(st): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -2731,11 +2799,9 @@ async fn handle_collab_inbox(
         Ok(a) => a,
         Err(r) => return r,
     };
-    let agent_key = headers
-        .get("x-agent-key")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let agent_key = resolve_caller_memoria_key(&st, &agent_id, &headers).await;
+    // ADMIN 标识：独立头 x-admin-key（避免把 admin_key 塞进 x-agent-key 破坏 a2a badge 鉴权）
+    let is_admin_caller = is_admin_by_admin_key(&headers, &st).await;
 
     // 拉取（持有 agent 锁的模式与 handle_chat 一致）
     let raw = {
@@ -2772,7 +2838,7 @@ async fn handle_collab_inbox(
         .as_deref()
         .map(|s| s.split(',').filter(|x| !x.is_empty()).collect())
         .unwrap_or_default();
-    let filtered: Vec<serde_json::Value> = raw
+    let mut filtered: Vec<serde_json::Value> = raw
         .into_iter()
         .filter(|m| {
             let t = m["type"].as_str().unwrap_or("");
@@ -2780,6 +2846,43 @@ async fn handle_collab_inbox(
             (types.is_empty() || types.contains(&t)) && (scopes.is_empty() || scopes.contains(&sc))
         })
         .collect();
+
+    // L2 人工审批合并进协作收件箱：ADMIN（x-admin-key）可见本地 ApprovalManager 待批项。
+    // 合成 approval_request 信封（不落 memoria）；审批响应走 handle_collab_approval 的 L2 回退分支。
+    if is_admin_caller {
+        let agent_guard = st.agent.lock().await;
+        if let Some(ref agent) = *agent_guard {
+            for p in agent.approval_manager.list_pending().await {
+                let created_at_str = {
+                    let secs = p.created_at as i64;
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+                        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
+                };
+                filtered.push(serde_json::json!({
+                    "id": p.approval_id,
+                    "type": "approval_request",
+                    "subject": p.description.clone(),
+                    "body": p.description.clone(),
+                    "from_agent": p.requester_id.clone(),
+                    "from_ns": "",
+                    "to_agent": p.approver_id.clone(),
+                    "scope": "agent",
+                    "scope_id": "",
+                    "workspace_id": "",
+                    "thread_id": "",
+                    "payload": {
+                        "approval_id": p.approval_id,
+                        "operation_hash": p.operation_hash,
+                        "tool": p.tool_name,
+                        "reason": p.description.clone(),
+                        "arguments": p.arguments,
+                    },
+                    "created_at": created_at_str,
+                }));
+            }
+        }
+    }
 
     // 未读：与已读游标比较。信封 created_at 有两种常见格式
     // （PFAiX 结构化信封为 ISO `2026-07-13T23:50:00Z`，Memoria 旧消息为
@@ -3114,15 +3217,11 @@ async fn handle_collab_approval(
         Ok(a) => a,
         Err(r) => return r,
     };
-    let agent_key = headers
-        .get("x-agent-key")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let agent_key = resolve_caller_memoria_key(&st, &agent_id, &headers).await;
 
     // 在调用者收件箱中定位该 approval_request
     let agent_guard = st.agent.lock().await;
-    let (requester, approval_id) = if let Some(ref agent) = *agent_guard {
+    let (requester, approval_id, is_local) = if let Some(ref agent) = *agent_guard {
         match agent
             .collab_find_message(&agent_id, &agent_key, &body.id)
             .await
@@ -3142,14 +3241,27 @@ async fn handle_collab_approval(
                     .as_str()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| body.id.clone());
-                (req, aid)
+                (req, aid, false)
             }
             Ok(None) => {
-                return (
-                    axum::http::StatusCode::NOT_FOUND,
-                    axum::Json(serde_json::json!({"error": "收件箱中找不到该审批请求"})),
-                )
-                    .into_response();
+                // 本地 L2 待批项（受控写触发，未推 A2A 收件箱）：仅 admin 可处理
+                if !is_admin_by_admin_key(&headers, &st).await {
+                    return (
+                        axum::http::StatusCode::FORBIDDEN,
+                        axum::Json(serde_json::json!({"error": "需要 admin 权限"})),
+                    )
+                        .into_response();
+                }
+                match agent.approval_manager.get_pending(&body.id).await {
+                    Some(p) => (String::new(), p.approval_id.clone(), true),
+                    None => {
+                        return (
+                            axum::http::StatusCode::NOT_FOUND,
+                            axum::Json(serde_json::json!({"error": "收件箱中找不到该审批请求"})),
+                        )
+                            .into_response();
+                    }
+                }
             }
             Err(e) => {
                 return (
@@ -3277,6 +3389,18 @@ async fn is_admin(headers: &axum::http::HeaderMap, st: &Arc<AppState>) -> bool {
     let admin_key = env_memoria_admin_key(&cfg_admin);
     let key = headers
         .get("x-agent-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    !admin_key.is_empty() && key == admin_key
+}
+
+/// admin 判定（独立头 x-admin-key）：避免把 admin_key 塞进 x-agent-key 破坏 a2a 的 badge 鉴权。
+/// 协作收件箱注入 L2 审批、以及 L2 审批响应回退均用此标识，与日常 a2a badge 鉴权解耦。
+async fn is_admin_by_admin_key(headers: &axum::http::HeaderMap, st: &Arc<AppState>) -> bool {
+    let cfg_admin = st.config.lock().await.memoria_admin_key.clone();
+    let admin_key = env_memoria_admin_key(&cfg_admin);
+    let key = headers
+        .get("x-admin-key")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     !admin_key.is_empty() && key == admin_key
@@ -3934,8 +4058,30 @@ async fn handle_v1_chat(
         if user_text.trim().is_empty() {
             "请输入消息".to_string()
         } else {
+            // RC1 修复（2026-07-29）：直接用 jan 在 req.messages 中维护的完整历史，
+            // 不再依赖自身 DB 历史 + 可能不稳的 session_id，根治「会话内失忆」。
+            let external_history: Vec<(String, String)> = req
+                .messages
+                .iter()
+                .rev()
+                .skip(1) // 跳过当前这条（已是 user_text）
+                .rev()
+                .filter(|m| m.role.eq_ignore_ascii_case("user") || m.role.eq_ignore_ascii_case("assistant"))
+                .filter_map(|m| {
+                    m.content
+                        .as_ref()
+                        .map(|c| c.as_text())
+                        .map(|t| (m.role.clone(), t))
+                })
+                .collect();
             agent
-                .chat(&user_text, &ctx.agent_id, &session_id, &ctx.allowed_ns)
+                .chat(
+                    &user_text,
+                    &ctx.agent_id,
+                    &session_id,
+                    &ctx.allowed_ns,
+                    Some(external_history),
+                )
                 .await
         }
     } else {

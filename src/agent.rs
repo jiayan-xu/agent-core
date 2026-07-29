@@ -1036,6 +1036,7 @@ impl AgentCore {
         user_id: &str,
         session_id: &str,
         allowed_ns: &[String],
+        external_history: Option<Vec<(String, String)>>,
     ) -> String {
         let confirm_words = [
             "确认",
@@ -1152,7 +1153,7 @@ impl AgentCore {
 
         // ── 0a. 工具级确认（现有）：pending_actions 中的操作等待确认 ──
         if is_confirm(trimmed) {
-            if let Some(action) = self.session_manager.take_pending_action(session_id).await {
+            if let Some(mut action) = self.session_manager.take_pending_action(session_id).await {
                 // L2 安全修复：若待确认操作需人工审批，必须先获得审批人批准，防用户自批绕过
                 if let Some(aid) = &action.approval_id {
                     match self.approval_manager.check_response(aid).await {
@@ -1170,6 +1171,26 @@ impl AgentCore {
                             return reply;
                         }
                         None => {
+                            // 孤儿闸门自愈：若审批管理器中根本没有该 approval_id（重启丢失/已被清理），
+                            // 继续"等待审批"是死循环（checkpoint 每次从 checkpoints.db 恢复回内存）。
+                            // → 清除 stale checkpoint 并提示用户重述，避免无限等待。
+                            let gate_exists =
+                                self.approval_manager.get_pending(aid).await.is_some();
+                            if !gate_exists {
+                                tracing::warn!(
+                                    "[APPROVAL-ORPHAN] session={} approval_id={} 在审批管理器中不存在，清除 stale checkpoint",
+                                    session_id, aid
+                                );
+                                self.checkpoint_terminal(session_id, CheckpointState::Failed)
+                                    .await;
+                                let reply = "ℹ️ 之前的操作请求已失效（对应审批单不存在或已被清理），无需再等待。若仍需执行该修改，请重新发送一次指令（例如：把白名单里 车牌XXX 的公司名统一为 XXX）。".to_string();
+                                let ns = self.caller_ns(session_id);
+                                let db_path = self.harness.lock().await.db_path();
+                                self.session_manager
+                                    .save_to_history(session_id, &ns, &db_path, message, &reply)
+                                    .await;
+                                return reply;
+                            }
                             let reply = "⏳ 该操作仍在等待审批人决定，尚未批准，无法执行。".to_string();
                             let ns = self.caller_ns(session_id);
                             let db_path = self.harness.lock().await.db_path();
@@ -1178,6 +1199,13 @@ impl AgentCore {
                                 .await;
                             return reply;
                         }
+                    }
+                }
+                // L2 修复：审批已通过（或无需审批的受控写）→ 执行前注入 confirmed=true，
+                // 否则工具会回 require_confirm 造成「✅ 已执行成功」的假成功（DB 实际未变）。
+                if let Some(obj) = action.arguments.as_object_mut() {
+                    if obj.contains_key("confirmed") {
+                        obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
                     }
                 }
                 let result = match self
@@ -1221,7 +1249,7 @@ impl AgentCore {
                         .unwrap_or_else(|| message.to_string());
                     self.checkpoint_confirmed(session_id).await;
                     return self
-                        .execute_chat(&original, user_id, session_id, allowed_ns, &trace_id)
+                        .execute_chat(&original, user_id, session_id, allowed_ns, &trace_id, external_history.clone())
                         .await;
                 }
                 // P1-2: 计划编辑（当前支持「删除第N步」）
@@ -1245,7 +1273,7 @@ impl AgentCore {
                     }
                 }
                 return self
-                    .execute_chat(message, user_id, session_id, allowed_ns, &trace_id)
+                    .execute_chat(message, user_id, session_id, allowed_ns, &trace_id, external_history.clone())
                     .await;
             }
 
@@ -1269,10 +1297,256 @@ impl AgentCore {
                     .set_state(session_id, SessionState::Confirmed)
                     .await;
                 return self
-                    .execute_chat(message, user_id, session_id, allowed_ns, &trace_id)
+                    .execute_chat(message, user_id, session_id, allowed_ns, &trace_id, external_history.clone())
                     .await;
             }
         }
+    }
+
+    // ── 确定性预路由：白名单公司名变更 ──
+    /// 识别「修改白名单(vehicle_whitelist)中某车牌的公司名」意图，并从消息中抽取
+    /// (车牌, 新公司名)。返回 None 表示非此类意图（交由常规 LLM 路由）。
+    ///
+    /// 为何需要：LLM 规划器在多次实测中顽固把该业务写操作误路由到 memory_remember /
+    /// memory_search_v2（记忆库不是业务数据库，写入不生效也不留审计），导致受控写闸门
+    /// 永不触发。此处用确定性解析绕过 LLM 的工具选择不确定性，保证受控写审批链路稳定。
+    fn extract_whitelist_update(message: &str) -> Option<(String, String)> {
+        let has_target = message.contains("白名单") || message.contains("车牌");
+        let has_company = message.contains("公司名") || message.contains("公司");
+        let verbs = [
+            "改为", "改成", "统一为", "换为", "更新为", "变更为", "改名为", "设成", "调整为",
+            "修改", "更新", "变更",
+        ];
+        let has_verb = verbs.iter().any(|v| message.contains(*v));
+        if !(has_target && has_company && has_verb) {
+            return None;
+        }
+        let plate = Self::extract_plate(message)?;
+        let company = Self::extract_company_name(message)?;
+        if company.is_empty() {
+            return None;
+        }
+        Some((plate, company))
+    }
+
+    /// 抽取中文车牌（省简称1字 + 大写字母1 + 4~6位字母数字），如 苏EZQ117。
+    fn extract_plate(msg: &str) -> Option<String> {
+        let chars: Vec<char> = msg.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if ('\u{4e00}'..='\u{9fff}').contains(&c) && i + 1 < chars.len() {
+                let d = chars[i + 1];
+                if d.is_ascii_uppercase() {
+                    let mut digits = String::new();
+                    let mut j = i + 2;
+                    while j < chars.len() && chars[j].is_ascii_alphanumeric() && digits.chars().count() < 6 {
+                        digits.push(chars[j]);
+                        j += 1;
+                    }
+                    if digits.chars().count() >= 4 {
+                        let mut plate = String::new();
+                        plate.push(c);
+                        plate.push(d);
+                        plate.push_str(&digits);
+                        return Some(plate);
+                    }
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// 抽取新公司名：优先 「X」/“X”/(X) 包围；否则取最后一个变更动词标记之后的内容。
+    fn extract_company_name(msg: &str) -> Option<String> {
+        for (open, close) in [
+            ('「', '」'),
+            ('“', '”'),
+            ('‘', '’'),
+            ('(', ')'),
+        ] {
+            if let Some(s) = Self::extract_between(msg, open, close) {
+                let s = s.trim().to_string();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+        let markers = [
+            "统一为", "改为", "改成", "换为", "更新为", "变为", "改名为", "变更为", "设成",
+        ];
+        let mut best: Option<(usize, &str)> = None;
+        for m in markers {
+            if let Some(p) = msg.rfind(m) {
+                best = match best {
+                    Some((bp, _)) if p > bp => Some((p, m)),
+                    Some(x) => Some(x),
+                    None => Some((p, m)),
+                };
+            }
+        }
+        if let Some((pos, mk)) = best {
+            if let Some(rest) = msg[pos..].strip_prefix(mk) {
+                // 取到句末/换行，而非首个空格：公司名可能紧跟引导词（如「全称 佳士能…」）
+                let mut s: String = rest
+                    .chars()
+                    .take_while(|c| !matches!(c, '。' | '！' | '？' | '\n' | '\r'))
+                    .collect();
+                s = s
+                    .trim()
+                    .trim_matches(|c| {
+                        matches!(c, '「' | '」' | '"' | '“' | '”' | '（' | '）' | '(' | ')')
+                    })
+                    .to_string();
+                // 剥掉引导描述词（全称 / 完整名称 / 完整 等），避免把描述当公司名
+                for prefix in ["全称的", "全称", "完整名称", "完整"] {
+                    if let Some(stripped) = s.strip_prefix(prefix) {
+                        s = stripped.trim().to_string();
+                        break;
+                    }
+                }
+                s = s
+                    .trim_matches(|c| {
+                        matches!(c, '「' | '」' | '"' | '“' | '”' | '（' | '）' | '(' | ')')
+                    })
+                    .trim()
+                    .to_string();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+        None
+    }
+
+    fn extract_between(msg: &str, open: char, close: char) -> Option<String> {
+        let chars: Vec<char> = msg.chars().collect();
+        let so = chars.iter().position(|&c| c == open)?;
+        let rest = &chars[so + 1..];
+        let sc = rest.iter().position(|&c| c == close)?;
+        Some(rest[..sc].iter().collect())
+    }
+
+    /// 识别「添加/登记白名单新车」意图，抽取 (车牌, 公司提示)。
+    /// 公司提示可为简称/全称（skill 经 _resolve_company_name 解析为全称）。
+    fn extract_whitelist_add(message: &str) -> Option<(String, String)> {
+        let add_verbs = ["添加", "新增", "登记", "录入", "加入", "加进", "收录", "补录"];
+        let has_add = add_verbs.iter().any(|v| message.contains(*v));
+        let has_ctx = message.contains("白名单")
+            || message.contains("新车")
+            || message.contains("车牌")
+            || message.contains("车");
+        if !(has_add && has_ctx) {
+            return None;
+        }
+        // 与「改公司名」预路由互斥：含变更动词则交给 update 路径
+        let upd_verbs = ["改为", "改成", "统一为", "换为", "更新为", "变更为", "改名为"];
+        if upd_verbs.iter().any(|v| message.contains(*v)) {
+            return None;
+        }
+        let plate = Self::extract_plate_spaced(message)?;
+        let company = Self::extract_company_for_add(message).unwrap_or_default();
+        if company.is_empty() {
+            return None;
+        }
+        Some((plate, company))
+    }
+
+    /// 抽取车牌（容忍空格），如「鲁 H736A 7」→「鲁H736A7」。
+    fn extract_plate_spaced(msg: &str) -> Option<String> {
+        let chars: Vec<char> = msg.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if ('\u{4e00}'..='\u{9fff}').contains(&c) {
+                // 跳过 CJK 后的空白，找省份字母
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j].is_ascii_uppercase() {
+                    let mut body = String::new();
+                    body.push(chars[j]);
+                    let mut k = j + 1;
+                    while k < chars.len() && body.chars().count() < 6 {
+                        let ch = chars[k];
+                        if ch.is_ascii_alphanumeric() {
+                            body.push(ch);
+                        } else if ch.is_whitespace() {
+                            // 跳过空格
+                        } else {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    if body.chars().count() >= 4 {
+                        let mut plate = String::new();
+                        plate.push(c);
+                        plate.push_str(&body);
+                        return Some(plate);
+                    }
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// 抽取添加新车的公司提示：优先引号，其次「公司是X/属于X」，再次「X的新车/X新车」。
+    fn extract_company_for_add(msg: &str) -> Option<String> {
+        for (o, cl) in [('「', '」'), ('“', '”'), ('‘', '’')] {
+            if let Some(s) = Self::extract_between(msg, o, cl) {
+                let s = s.trim().to_string();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+        for m in ["公司是", "公司为", "属于", "归属", "企业是", "公司：", "公司:"] {
+            if let Some(p) = msg.find(m) {
+                let rest = &msg[p + m.len()..];
+                let s: String = rest
+                    .chars()
+                    .take_while(|c| {
+                        !matches!(c, '，' | '。' | '；' | ',' | '.' | '：' | ':' | ' ' | '、' | '的')
+                    })
+                    .collect();
+                let s = s.trim().to_string();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+        for m in ["的新车", "新车", "的车"] {
+            if let Some(p) = msg.find(m) {
+                let before = &msg[..p];
+                let mut token: Vec<char> = Vec::new();
+                for ch in before.chars().rev() {
+                    if ('\u{4e00}'..='\u{9fff}').contains(&ch) || ch.is_ascii_alphanumeric() {
+                        token.push(ch);
+                    } else {
+                        break;
+                    }
+                }
+                token.reverse();
+                let s: String = token.into_iter().collect();
+                // 剥前导助词（这/个/是/把/给/辆 等）
+                let s: String = s
+                    .trim_start_matches(|c| {
+                        matches!(
+                            c,
+                            '这' | '那' | '个' | '是' | '给' | '把' | '辆' | '一' | '台' | '的' | '又' | '再'
+                        )
+                    })
+                    .to_string();
+                let s = s.trim().to_string();
+                if s.chars().count() >= 2 {
+                    return Some(s);
+                }
+            }
+        }
+        None
     }
 
     /// 已确认会话的执行路径（原 chat() 主体 + Step 前缀）
@@ -1283,6 +1557,7 @@ impl AgentCore {
         session_id: &str,
         allowed_ns: &[String],
         trace_id: &str,
+        external_history: Option<Vec<(String, String)>>,
     ) -> String {
         let engineer_intent = crate::dept_ops::is_engineer_intent(message);
         tracing::info!(
@@ -1290,6 +1565,103 @@ impl AgentCore {
             ops_intent = crate::dept_ops::is_ops_investigate_intent(message),
             "dept_ops intent gate"
         );
+
+        // P2-E（假成功修复）：已批准审批必须在任何早返回路径（maybe_compose / 组合路由）
+        // 之前消费。否则用户「确认」类消息会被 composer 分解为写计划并提前 return，
+        // 导致 execute_approved_request（含 confirmed=true 注入）被插队抢跑、审批永不真正执行、
+        // 工具仅回 require_confirm 预览，LLM 却谎报「操作已执行成功」。
+        // 置于此处：每条用户消息先检查并执行就绪审批，再走后续路由。
+        self.check_approval_responses().await;
+        if let Some(reply) = self.execute_approved_request(session_id, allowed_ns).await {
+            let ns = self.caller_ns(session_id);
+            let db_path = self.harness.lock().await.db_path();
+            self.session_manager
+                .save_to_history(session_id, &ns, &db_path, message, &reply)
+                .await;
+            return reply;
+        }
+
+        // ── 确定性预路由：白名单公司名变更 → 直接构造受控写审批闸门 ──
+        // 绕过 LLM 规划器对 memory 工具的顽固误路由（详见 extract_whitelist_update）。
+        if let Some((plate, company)) = Self::extract_whitelist_update(message) {
+            if self.config.human_approval {
+                let reason = format!(
+                    "白名单受控写：修改车牌 {} 的公司名为「{}」（需人工审批）",
+                    plate, company
+                );
+                let args = serde_json::json!({
+                    "action": "update_company",
+                    "plate": plate,
+                    "company_name": company,
+                    "reason": reason,
+                    "confirmed": false
+                });
+                let aid = self
+                    .approval_manager
+                    .create_request(
+                        "sync_whitelist_plates",
+                        &args,
+                        &reason,
+                        "dashboard-admin",
+                        &self.config.identity.agent_id,
+                    )
+                    .await;
+                let pa = PendingAction {
+                    tool_name: "sync_whitelist_plates".to_string(),
+                    arguments: args.clone(),
+                    description: reason.clone(),
+                    approval_id: Some(aid.clone()),
+                };
+                self.checkpoint_pending_approval(session_id, &aid, &pa).await;
+                let reply = format!(
+                    "AWAITING_APPROVAL:工具「sync_whitelist_plates」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续——{}",
+                    reason
+                );
+                self.save_to_history(session_id, message, &reply).await;
+                return reply;
+            }
+        }
+
+        // ── 确定性预路由：白名单「添加新车」→ 直接构造受控写审批闸门 ──
+        // 绕过 LLM 工具调用以 DSML 文本泄露的不确定性（详见 extract_whitelist_add）。
+        if let Some((plate, company)) = Self::extract_whitelist_add(message) {
+            if self.config.human_approval {
+                let reason = format!(
+                    "白名单受控写：新增车牌 {}（公司「{}」，需人工审批）",
+                    plate, company
+                );
+                let args = serde_json::json!({
+                    "action": "add",
+                    "plate": plate,
+                    "company_name": company,
+                    "reason": reason,
+                    "confirmed": false
+                });
+                let aid = self
+                    .approval_manager
+                    .create_request(
+                        "sync_whitelist_plates",
+                        &args,
+                        &reason,
+                        "dashboard-admin",
+                        &self.config.identity.agent_id,
+                    )
+                    .await;
+                let pa = PendingAction {
+                    tool_name: "sync_whitelist_plates".to_string(),
+                    arguments: args.clone(),
+                    description: reason.clone(),
+                    approval_id: Some(aid.clone()),
+                };
+                self.checkpoint_pending_approval(session_id, &aid, &pa).await;
+                let reply = format!(
+                    "AWAITING_APPROVAL:工具「sync_whitelist_plates」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续——{}",
+                    reason
+                );
+                self.save_to_history(session_id, message, &reply).await;
+                return reply;
+            }
+        }
 
         // ── HY3 1.3：MultiAgent Compose（子 agent 派发，非 Meta RSI）──
         // features.multiagent=false 或任务非 Hard 或分解空 → 返回 None，走原路径
@@ -1432,18 +1804,6 @@ impl AgentCore {
             self.search_memory(message, session_id, allowed_ns),
         );
 
-        // P2-D: 检查审批响应
-        self.check_approval_responses().await;
-        // 如果有审批通过的请求，立即执行
-        if let Some(reply) = self.execute_approved_request(session_id, allowed_ns).await {
-            let ns = self.caller_ns(session_id);
-            let db_path = self.harness.lock().await.db_path();
-            self.session_manager
-                .save_to_history(session_id, &ns, &db_path, message, &reply)
-                .await;
-            return reply;
-        }
-
         let mut knowledge = Vec::new();
         let mut enriched_message = message.to_string();
 
@@ -1491,10 +1851,22 @@ impl AgentCore {
         // ── 3. 加载历史对话 ──
         let ns = self.caller_ns(session_id);
         let db_path = self.harness.lock().await.db_path();
-        let history = self
-            .session_manager
-            .load_history(session_id, &ns, &db_path)
-            .await;
+        // RC1 修复（2026-07-29）：若调用方（jan）已传入完整历史，优先使用，
+        // 不再依赖自身 DB 历史 + 可能不稳的 session_id，根治「会话内失忆」。
+        let history: Vec<Message> = if let Some(ext) = external_history {
+            ext.into_iter()
+                .map(|(role, content)| Message {
+                    role,
+                    content: Some(content),
+                    tool_calls: None,
+                    tool_call_id: None,
+                })
+                .collect()
+        } else {
+            self.session_manager
+                .load_history(session_id, &ns, &db_path)
+                .await
+        };
 
         // ── 4. 构建消息列表 ──
         let mut system_prompt = self.build_system_prompt(&knowledge);
@@ -4826,6 +5198,14 @@ impl AgentCore {
              - 当工具调用因配额限制无法执行时，必须明确告知用户\"当前工具调用配额已用尽，以下为记忆中的历史信息，可能非最新\"，严禁把记忆里的旧日期数据谎称为\"今日/昨日\"最新数据。\n\
              - 你是固废智能运营台助手。用户问\"系统最近有什么问题 / 服务运行状态 / 是否正常 / 有什么异常\"时，默认指【固废运营系统】（dashboard/snmis/联单识别/manifest/视频服务/nvr 等），直接用 `system_ops` 查实情并据实回答；不要把它理解成\"agent 框架/各 Agent 连接状态\"，也不要去查 `audit_query`（那是操作审计日志，不是业务系统运行状态，除非用户明确要查审计）；简单状态查询直接调工具回答，不要进入多步规划、不要甩「执行计划」等 JSON 让用户确认。\n\
              - 系统服务状态【只以 system_ops 工具实时返回为准】。若用户质疑某服务状态（如说\"X 明明在跑\"），必须重新调用 system_ops 核实后再回答，不得仅凭用户语气、记忆或猜测改写工具返回的事实——工具说在跑就是在跑，工具说停止就是停止。\n",
+        );
+
+        // RC2 修复（2026-07-29）：写操作执行纪律 + 会话内实体沿用，杜绝「print bash 不执行 / 重复索要」
+        prompt.push_str(
+            "\n\
+             - 【执行纪律】用户给出完整可执行请求（参数齐全）时，必须【直接调用对应工具】执行，严禁把工具调用写成 `bash ...` 之类的 shell 命令文本甩给用户手动运行——你是能执行工具的 agent，工具由你调。写操作（增删改）按要求先确认：先以 confirmed=false 调用拿预览，再向用户确认；用户确认后立刻以 confirmed=true 重新调用执行。禁止以『需要你提供 XX 才能操作』为由空转或反问。\n\
+             - 【会话连续性】同一会话内，前文已提到的实体（车牌 / 企业 / 日期 / 项目 / 固废种类）本轮依然有效，直接沿用，绝不重复索要或反问『请提供 XX 是多少』。\n\
+             - 【白名单写操作专用工具】用户要求【修改白名单(vehicle_whitelist)中的公司名/车牌/状态】等固废业务数据时，必须且只能调用 `sync_whitelist_plates`(action=add/remove/update_company 等)执行受控写，该工具会自动进入人工审批；严禁改用 memory_remember / memory 等记忆类工具（记忆库不是业务数据库，写入不生效、不留审计），也不要只做查询而不执行修改。\n",
         );
 
         // P0：固废本部门运维纪律（证据门禁 + 作业剧本）

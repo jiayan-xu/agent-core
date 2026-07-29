@@ -585,7 +585,7 @@ fn summarize_args(args: &serde_json::Value) -> String {
         "secret",
     ];
 
-    match args {
+    let s = match args {
         serde_json::Value::Object(map) => {
             let mut clean = serde_json::Map::new();
             for (k, v) in map.iter() {
@@ -595,21 +595,15 @@ fn summarize_args(args: &serde_json::Value) -> String {
                     clean.insert(k.clone(), v.clone());
                 }
             }
-            let s = serde_json::to_string(&clean).unwrap_or_default();
-            if s.len() > MAX_LEN {
-                format!("{}…", &s[..MAX_LEN])
-            } else {
-                s
-            }
+            serde_json::to_string(&clean).unwrap_or_default()
         }
-        _ => {
-            let s = args.to_string();
-            if s.len() > MAX_LEN {
-                format!("{}…", &s[..MAX_LEN])
-            } else {
-                s
-            }
-        }
+        _ => args.to_string(),
+    };
+    // 按「字符」而非「字节」截断，避免中文等多字节 UTF-8 被字节切片切到字符中间导致 panic
+    if s.chars().count() > MAX_LEN {
+        format!("{}…", s.chars().take(MAX_LEN).collect::<String>())
+    } else {
+        s
     }
 }
 
