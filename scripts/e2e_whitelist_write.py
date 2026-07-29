@@ -294,6 +294,18 @@ def run_live() -> None:
         sys.exit(1)
     print("  [exception_sync] OK")
 
+    msg_sm = "把取样记录同步到样品台账"
+    r_sm = call_chat(msg_sm, sid + "/samples")
+    reply_sm = reply_text(r_sm)
+    print(f"  [sample_sync] reply[:240]={reply_sm[:240]!r}")
+    if "AWAITING_APPROVAL" not in reply_sm and "awaiting_approval" not in reply_sm.lower():
+        print("FAIL: 取样同步期望 AWAITING_APPROVAL", file=sys.stderr)
+        sys.exit(1)
+    if "manage_samples" not in reply_sm:
+        print("FAIL: 期望工具 manage_samples", file=sys.stderr)
+        sys.exit(1)
+    print("  [sample_sync] OK")
+
     # 短确认写意图：上文含 suggested_fix → 须进审批，禁止假成功
     sid_sc = sid + "/short_confirm"
     seed = (

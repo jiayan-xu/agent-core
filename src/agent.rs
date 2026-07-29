@@ -1644,6 +1644,21 @@ impl AgentCore {
         (has_sync && has_exc) || m.contains("异常修正同步") || m.contains("同步异常修正")
     }
 
+    /// 识别「同步取样/样品台账」意图（与异常修正同步互斥优先：含「异常」走异常路径）。
+    fn is_sample_sync_intent(message: &str) -> bool {
+        let m = message.trim();
+        if m.contains("dry_run") || m.contains("只预览") || m.contains("先别写") {
+            return false;
+        }
+        // 异常修正优先，避免「同步异常记录到取样」双命中时抢错工具
+        if Self::is_exception_sync_intent(m) && !m.contains("取样") && !m.contains("样品") {
+            return false;
+        }
+        let has_sample = m.contains("取样") || m.contains("样品") || m.contains("样品台账");
+        let has_sync = m.contains("同步") || m.contains("写入台账") || m.contains("生成台账");
+        has_sample && has_sync
+    }
+
     /// 用户话术是否明确要求副作用写（用于只读假成功诚实闸）。
     fn implies_side_effect_write(message: &str) -> bool {
         let signals = [
@@ -1663,6 +1678,9 @@ impl AgentCore {
             "修改白名单",
             "更新白名单",
             "改公司名",
+            "同步取样",
+            "取样台账",
+            "样品台账同步",
         ];
         signals.iter().any(|s| message.contains(*s))
     }
@@ -2118,6 +2136,28 @@ impl AgentCore {
                         session_id,
                         message,
                         "sync_exception_correction",
+                        args,
+                        reason,
+                    )
+                    .await;
+            }
+        }
+
+        // ── 确定性预路由：取样台账同步 → manage_samples(action=sync) ──
+        if Self::is_sample_sync_intent(message) {
+            if self.config.human_approval {
+                let reason =
+                    "取样台账受控写：同步异常记录到样品台账（需人工审批）".to_string();
+                let args = serde_json::json!({
+                    "action": "sync",
+                    "dry_run": false,
+                    "reason": reason,
+                });
+                return self
+                    .submit_controlled_write_approval(
+                        session_id,
+                        message,
+                        "manage_samples",
                         args,
                         reason,
                     )
@@ -4387,6 +4427,10 @@ impl AgentCore {
                 obj.insert("confirmed".to_string(), serde_json::json!(true));
                 // 异常同步：批准后强制实写，避免审批项残留 dry_run=true 只预览
                 if approval.tool_name == "sync_exception_correction" {
+                    obj.insert("dry_run".to_string(), serde_json::json!(false));
+                }
+                if approval.tool_name == "manage_samples" {
+                    obj.insert("action".to_string(), serde_json::json!("sync"));
                     obj.insert("dry_run".to_string(), serde_json::json!(false));
                 }
             }
@@ -6994,6 +7038,16 @@ mod whitelist_preroute_tests {
         assert!(AgentCore::is_exception_sync_intent("异常记录同步一下"));
         assert!(!AgentCore::is_exception_sync_intent("同步异常修正 dry_run"));
         assert!(!AgentCore::is_exception_sync_intent("查询异常记录"));
+    }
+
+    #[test]
+    fn sample_sync_intent() {
+        assert!(AgentCore::is_sample_sync_intent("把取样记录同步到样品台账"));
+        assert!(AgentCore::is_sample_sync_intent("同步取样台账"));
+        assert!(!AgentCore::is_sample_sync_intent("查询取样统计"));
+        assert!(!AgentCore::is_sample_sync_intent("同步取样 dry_run"));
+        // 纯异常同步不应抢取样路径
+        assert!(!AgentCore::is_sample_sync_intent("请同步异常修正到数据库"));
     }
 
     #[test]

@@ -97,6 +97,14 @@ pub static CONTROLLED_WRITES: &[ControlledWriteSpec] = &[
             anti_needle: "\"error\"",
         },
     },
+    ControlledWriteSpec {
+        tool: "manage_samples",
+        label: "取样台账同步",
+        strategy: VerifyStrategy::WriteResultMarkers {
+            needle: "success",
+            anti_needle: "\"success\": false",
+        },
+    },
 ];
 
 pub fn lookup(tool: &str) -> Option<&'static ControlledWriteSpec> {
@@ -507,5 +515,11 @@ mod tests {
             }
             other => panic!("{:?}", other),
         }
+        let samples = plan_post_verify(
+            "manage_samples",
+            &serde_json::json!({"action": "sync"}),
+            r#"{"success":true,"count":3}"#,
+        );
+        assert!(matches!(samples, PostVerifyPlan::ContainsInWriteResult { .. }));
     }
 }

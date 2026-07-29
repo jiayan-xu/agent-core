@@ -1137,6 +1137,11 @@ impl ToolClassifier {
                 self.register(name, "dangerous");
                 continue;
             }
+            if name == "manage_samples" {
+                // sync 写由 needs_dept_ops_write_approval 按 action 黄线；list/stats 可走 write 分类后被 action 放行
+                self.register(name, "write");
+                continue;
+            }
             if name == "local_fs_read" || name == "local_fs_list" || name == "local_fs_stat" {
                 self.register(name, "read");
                 continue;
@@ -1211,6 +1216,7 @@ fn needs_dept_ops_write_approval(tool_name: &str, args: &serde_json::Value) -> b
         "create_archive",
         "archive_ops",
         "edit_code",
+        "manage_samples",
     ];
     if !OPS_WRITE.iter().any(|t| *t == tool_name) {
         return false;
@@ -1223,12 +1229,12 @@ fn needs_dept_ops_write_approval(tool_name: &str, args: &serde_json::Value) -> b
     {
         return false;
     }
-    // action=preview/status/list 等只读子命令不拦
+    // action=preview/status/list/stats 等只读子命令不拦
     if let Some(action) = args.get("action").and_then(|v| v.as_str()) {
         let a = action.to_ascii_lowercase();
         if matches!(
             a.as_str(),
-            "preview" | "status" | "list" | "check" | "dry_run" | "query"
+            "preview" | "status" | "list" | "check" | "dry_run" | "query" | "stats"
         ) {
             return false;
         }
@@ -1624,6 +1630,22 @@ mod tests {
         assert!(needs_dept_ops_write_approval(
             "edit_code",
             &serde_json::json!({"filepath": "x.py", "instructions": "fix"})
+        ));
+        assert!(needs_dept_ops_write_approval(
+            "manage_samples",
+            &serde_json::json!({"action": "sync"})
+        ));
+        assert!(!needs_dept_ops_write_approval(
+            "manage_samples",
+            &serde_json::json!({"action": "list"})
+        ));
+        assert!(!needs_dept_ops_write_approval(
+            "manage_samples",
+            &serde_json::json!({"action": "stats"})
+        ));
+        assert!(!needs_dept_ops_write_approval(
+            "manage_samples",
+            &serde_json::json!({"action": "sync", "dry_run": true})
         ));
     }
 
