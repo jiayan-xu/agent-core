@@ -282,6 +282,18 @@ def run_live() -> None:
     r_rm = call_chat(msg_rm, sid + "/rm")
     assert_approval_path("remove", reply_text(r_rm), "苏E2ET99")
 
+    msg_exc = "请把异常修正同步到数据库和入厂日志"
+    r_exc = call_chat(msg_exc, sid + "/exc")
+    reply_exc = reply_text(r_exc)
+    print(f"  [exception_sync] reply[:240]={reply_exc[:240]!r}")
+    if "AWAITING_APPROVAL" not in reply_exc and "awaiting_approval" not in reply_exc.lower():
+        print("FAIL: 异常同步期望 AWAITING_APPROVAL", file=sys.stderr)
+        sys.exit(1)
+    if "sync_exception_correction" not in reply_exc:
+        print("FAIL: 期望工具 sync_exception_correction", file=sys.stderr)
+        sys.exit(1)
+    print("  [exception_sync] OK")
+
     # 短确认写意图：上文含 suggested_fix → 须进审批，禁止假成功
     sid_sc = sid + "/short_confirm"
     seed = (

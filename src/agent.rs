@@ -1630,6 +1630,119 @@ impl AgentCore {
         Self::extract_plate(message).or_else(|| Self::extract_plate_spaced(message))
     }
 
+    /// 识别「同步异常修正表 → DB/日志」意图（不含 dry_run 预览话术时可进审批）。
+    fn is_exception_sync_intent(message: &str) -> bool {
+        let m = message.trim();
+        if m.contains("dry_run") || m.contains("只预览") || m.contains("先别写") {
+            return false;
+        }
+        let has_sync = m.contains("同步");
+        let has_exc = m.contains("异常修正")
+            || m.contains("异常记录")
+            || m.contains("异常情况")
+            || m.contains("异常表");
+        (has_sync && has_exc) || m.contains("异常修正同步") || m.contains("同步异常修正")
+    }
+
+    /// 用户话术是否明确要求副作用写（用于只读假成功诚实闸）。
+    fn implies_side_effect_write(message: &str) -> bool {
+        let signals = [
+            "统一为",
+            "统一成",
+            "改为",
+            "改成",
+            "换为",
+            "更新为",
+            "添加到白名单",
+            "加到白名单",
+            "删除车牌",
+            "从白名单删除",
+            "同步异常",
+            "异常修正",
+            "异常记录同步",
+            "修改白名单",
+            "更新白名单",
+            "改公司名",
+        ];
+        signals.iter().any(|s| message.contains(*s))
+    }
+
+    fn is_readonly_tool_name(name: &str) -> bool {
+        let n = name.to_lowercase();
+        let prefixes = [
+            "diagnose_",
+            "query_",
+            "get_",
+            "search_",
+            "list_",
+            "check_",
+            "read_",
+            "fuzzy_",
+            "match_",
+            "verify_",
+            "explain_",
+            "review_",
+        ];
+        if prefixes.iter().any(|p| n.starts_with(p)) {
+            return true;
+        }
+        matches!(
+            n.as_str(),
+            "execute_sql"
+                | "memory_search_v2"
+                | "memory_search"
+                | "memory_context"
+                | "system_ops"
+                | "code_reader"
+                | "local_fs_read"
+                | "local_fs_list"
+                | "local_fs_stat"
+        )
+    }
+
+    fn looks_like_false_write_success(reply: &str) -> bool {
+        if reply.contains("AWAITING_APPROVAL")
+            || reply.contains("未执行任何写操作")
+            || reply.contains("awaiting_approval")
+        {
+            return false;
+        }
+        reply.contains("操作已执行成功")
+            || (reply.contains("已执行成功") && reply.contains("操作"))
+            || (reply.contains("✅") && reply.contains("操作已执行"))
+    }
+
+    /// 写意图 + 本轮仅只读工具 + 回复谎称写成功 → 改写为诚实说明。
+    fn honesty_guard_readonly_as_write(
+        message: &str,
+        executed_tools: &[String],
+        reply: &str,
+    ) -> String {
+        if !Self::implies_side_effect_write(message) {
+            return reply.to_string();
+        }
+        if !Self::looks_like_false_write_success(reply) {
+            return reply.to_string();
+        }
+        let only_readonly = executed_tools.is_empty()
+            || executed_tools
+                .iter()
+                .all(|t| Self::is_readonly_tool_name(t));
+        if !only_readonly {
+            return reply.to_string();
+        }
+        let tools = if executed_tools.is_empty() {
+            "（无工具）".to_string()
+        } else {
+            executed_tools.join(", ")
+        };
+        format!(
+            "ℹ️ 未执行任何写操作：本轮仅调用了只读工具 {}，不能把只读结果当成写成功。\
+若需改库请走受控写并经审批。\n\n---\n只读结果原文：\n{}",
+            tools, reply
+        )
+    }
+
     /// 识别「修改白名单固废种类」意图 → (车牌, 固废种类)。
     fn extract_whitelist_waste_type(message: &str) -> Option<(String, String)> {
         let has_ctx = message.contains("白名单") || message.contains("车牌");
@@ -1984,6 +2097,27 @@ impl AgentCore {
                         session_id,
                         message,
                         "sync_whitelist_plates",
+                        args,
+                        reason,
+                    )
+                    .await;
+            }
+        }
+
+        // ── 确定性预路由：异常表修正同步 → sync_exception_correction ──
+        if Self::is_exception_sync_intent(message) {
+            if self.config.human_approval {
+                let reason =
+                    "异常修正同步：将异常情况记录表同步到 DB/入厂日志（需人工审批）".to_string();
+                let args = serde_json::json!({
+                    "dry_run": false,
+                    "reason": reason,
+                });
+                return self
+                    .submit_controlled_write_approval(
+                        session_id,
+                        message,
+                        "sync_exception_correction",
                         args,
                         reason,
                     )
@@ -3047,6 +3181,7 @@ impl AgentCore {
 
         // 本请求是否执行过工具（分身策展记忆门控：只记「做了事」的任务，不记闲聊）
         let mut did_work = false;
+        let mut executed_tools: Vec<String> = Vec::new();
 
         for _round in 0..self.config.max_tool_rounds {
             // P2-1: 日 token 预算预估（请求上下文体量），超限硬拒
@@ -3153,6 +3288,11 @@ impl AgentCore {
                     self.maybe_persona_task_memory(session_id, raw_message, &reply).await;
                 }
                 // 保存到内存缓存
+                let reply = Self::honesty_guard_readonly_as_write(
+                    raw_message,
+                    &executed_tools,
+                    &reply,
+                );
                 self.save_to_history(session_id, raw_message, &reply).await;
                 return reply;
             }
@@ -3426,7 +3566,10 @@ impl AgentCore {
                     .call_tool_routed(&tc.name, &self.persona_for_session(session_id), &tc.arguments, allowed_ns, trace_id)
                     .await
                 {
-                    Ok(text) => text,
+                    Ok(text) => {
+                        executed_tools.push(tc.name.clone());
+                        text
+                    }
                     Err(e) => format!("执行失败: {}", e),
                 };
 
@@ -3509,7 +3652,11 @@ impl AgentCore {
 
         match self.llm.chat(&messages, &[]).await {
             Ok(r) => {
-                let reply = r.text;
+                let reply = Self::honesty_guard_readonly_as_write(
+                    raw_message,
+                    &executed_tools,
+                    &r.text,
+                );
                 // 分身在「执行过工具」的任务完成后，写策展记忆到其专属 ns
                 self.maybe_persona_task_memory(session_id, raw_message, &reply).await;
                 // 保存到内存缓存（工具调用后的总结也需要保存）
@@ -4238,6 +4385,10 @@ impl AgentCore {
             let mut exec_args = approval.arguments.clone();
             if let Some(obj) = exec_args.as_object_mut() {
                 obj.insert("confirmed".to_string(), serde_json::json!(true));
+                // 异常同步：批准后强制实写，避免审批项残留 dry_run=true 只预览
+                if approval.tool_name == "sync_exception_correction" {
+                    obj.insert("dry_run".to_string(), serde_json::json!(false));
+                }
             }
             let exec_result = self
                 .call_tool_routed(&approval.tool_name, "default", &exec_args, allowed_ns, "")
@@ -6835,6 +6986,33 @@ mod whitelist_preroute_tests {
         let plate = AgentCore::extract_whitelist_remove("从白名单删除车牌苏EZQ117").expect("match");
         assert_eq!(plate, "苏EZQ117");
         assert!(AgentCore::extract_whitelist_remove("查询白名单苏EZQ117").is_none());
+    }
+
+    #[test]
+    fn exception_sync_intent() {
+        assert!(AgentCore::is_exception_sync_intent("请同步异常修正到数据库"));
+        assert!(AgentCore::is_exception_sync_intent("异常记录同步一下"));
+        assert!(!AgentCore::is_exception_sync_intent("同步异常修正 dry_run"));
+        assert!(!AgentCore::is_exception_sync_intent("查询异常记录"));
+    }
+
+    #[test]
+    fn honesty_guard_blocks_readonly_fake_success() {
+        let reply = "✅ 操作已执行成功！\n\n操作内容：diagnose_data_gap (...)";
+        let guarded = AgentCore::honesty_guard_readonly_as_write(
+            "确认统一为全称",
+            &["diagnose_data_gap".into()],
+            reply,
+        );
+        assert!(guarded.contains("未执行任何写操作"));
+        assert!(guarded.contains("diagnose_data_gap"));
+        // 真正写工具不拦
+        let ok = AgentCore::honesty_guard_readonly_as_write(
+            "把白名单公司名改为X",
+            &["sync_whitelist_plates".into()],
+            "✅ 操作已执行成功！",
+        );
+        assert!(!ok.contains("未执行任何写操作"));
     }
 
     #[test]

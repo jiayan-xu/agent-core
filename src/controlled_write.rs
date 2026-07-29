@@ -47,6 +47,11 @@ pub enum VerifyStrategy {
     LocalFsWrite,
     /// edit_code：结果须含自动 verify_code 成功标记
     EditCodeVerified,
+    /// 写回执须含字段标记（如 updated_db），且不含 error 键
+    WriteResultMarkers {
+        needle: &'static str,
+        anti_needle: &'static str,
+    },
     /// 仅信任写回执中的字段
     WriteJsonField {
         result_field: &'static str,
@@ -83,6 +88,14 @@ pub static CONTROLLED_WRITES: &[ControlledWriteSpec] = &[
         tool: "edit_code",
         label: "部门改码",
         strategy: VerifyStrategy::EditCodeVerified,
+    },
+    ControlledWriteSpec {
+        tool: "sync_exception_correction",
+        label: "异常修正同步",
+        strategy: VerifyStrategy::WriteResultMarkers {
+            needle: "updated_db",
+            anti_needle: "\"error\"",
+        },
     },
 ];
 
@@ -140,6 +153,14 @@ pub fn plan_post_verify(
         VerifyStrategy::EditCodeVerified => PostVerifyPlan::ContainsInWriteResult {
             needle: "【自动 verify_code】".into(),
             anti_needle: "【自动 verify_code 失败】".into(),
+            label: spec.label.to_string(),
+        },
+        VerifyStrategy::WriteResultMarkers {
+            needle,
+            anti_needle,
+        } => PostVerifyPlan::ContainsInWriteResult {
+            needle: needle.to_string(),
+            anti_needle: anti_needle.to_string(),
             label: spec.label.to_string(),
         },
         VerifyStrategy::WriteJsonField {
@@ -474,5 +495,17 @@ mod tests {
         }
         let edit = plan_post_verify("edit_code", &serde_json::json!({}), "ok\n【自动 verify_code】\nok");
         assert!(matches!(edit, PostVerifyPlan::ContainsInWriteResult { .. }));
+        let exc = plan_post_verify(
+            "sync_exception_correction",
+            &serde_json::json!({"dry_run": false}),
+            r#"{"updated_db":1,"updated_log":1}"#,
+        );
+        match exc {
+            PostVerifyPlan::ContainsInWriteResult { needle, anti_needle, .. } => {
+                assert_eq!(needle, "updated_db");
+                assert!(anti_needle.contains("error"));
+            }
+            other => panic!("{:?}", other),
+        }
     }
 }

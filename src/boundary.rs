@@ -54,6 +54,7 @@ const HARD_DANGEROUS: &[&str] = &[
     "sync_whitelist_plates",
     "manage_whitelist",
     "edit_code",
+    "sync_exception_correction",
     // memoria 路由危险工具（写操作 / 演化 / 身份）
     "memory_merge",
     "memory_dedup_chain",
@@ -1086,6 +1087,7 @@ impl ToolClassifier {
             "sync_whitelist_plates",
             "manage_whitelist",
             "edit_code",
+            "sync_exception_correction",
         ] {
             c.dangerous_tools.insert(t.to_string());
         }
@@ -1129,6 +1131,10 @@ impl ToolClassifier {
             }
             if name == "edit_code" {
                 self.register(name, "write");
+                continue;
+            }
+            if name == "sync_exception_correction" {
+                self.register(name, "dangerous");
                 continue;
             }
             if name == "local_fs_read" || name == "local_fs_list" || name == "local_fs_stat" {
