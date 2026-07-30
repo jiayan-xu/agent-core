@@ -1024,6 +1024,7 @@ impl ToolClassifier {
         for t in [
             "query_plate",
             "query_sql",
+            "cw_select", // 轨一：受控改库只读查询（SELECT-only）
             "search_memory",
             "check_status",
             "get_statistics",
@@ -1084,6 +1085,7 @@ impl ToolClassifier {
             "entity_upsert",
             "entity_add_mention",
             "entity_add_edge",
+            "repo_ws_diff", // 轨二：白名单仓改动（应用 diff，本质写；危险地板由 HARD_DANGEROUS 兜底）
         ] {
             c.write_tools.insert(t.to_string());
         }
@@ -1091,6 +1093,9 @@ impl ToolClassifier {
             "local_fs_read",
             "local_fs_list",
             "local_fs_stat",
+            "repo_ws_read",  // 轨二：白名单仓只读
+            "repo_ws_list",  // 轨二：白名单仓列目录（只读）
+            "repo_ws_stat",  // 轨二：白名单仓文件元数据（只读）
         ] {
             c.read_tools.insert(t.to_string());
         }
@@ -1168,6 +1173,19 @@ impl ToolClassifier {
             }
             if name == "local_fs_write" {
                 self.register(name, "dangerous");
+                continue;
+            }
+            // 双轨工具：显式归类，避免落 unknown 黄线
+            if name == "cw_select" {
+                self.register(name, "read");
+                continue;
+            }
+            if name == "repo_ws_read" || name == "repo_ws_list" || name == "repo_ws_stat" {
+                self.register(name, "read");
+                continue;
+            }
+            if name == "repo_ws_diff" {
+                self.register(name, "write");
                 continue;
             }
             let lower = name.to_lowercase();
@@ -1435,6 +1453,21 @@ mod read_only_tests {
         assert!(!is_read_only_tool("cross_agent_query"));
         assert!(!is_read_only_tool("memory_remember"));
         assert!(!is_read_only_tool("memory_merge"));
+    }
+
+    #[test]
+    fn repo_ws_and_cw_tools_classified() {
+        let c = ToolClassifier::new();
+        // 轨一只读
+        assert_eq!(c.classify("cw_select"), "read");
+        // 轨二只读
+        assert_eq!(c.classify("repo_ws_read"), "read");
+        assert_eq!(c.classify("repo_ws_list"), "read");
+        assert_eq!(c.classify("repo_ws_stat"), "read");
+        // 轨二写：语义归 write（危险地板由 HARD_DANGEROUS 独立兜底，不依赖分类器）
+        assert_eq!(c.classify("repo_ws_diff"), "write");
+        // 危险地板独立于分类器
+        assert!(HARD_DANGEROUS.contains(&"repo_ws_diff"));
     }
 
     #[test]
