@@ -459,6 +459,13 @@ fn has_path_traversal(s: &str) -> bool {
     dec.contains("../") || dec.contains("..\\") || dec.contains("%2e%2e")
 }
 
+/// repo_ws 写/改工具的文件内容（`content`）与路径（`path`）由 `resolve_safe_path` 负责路径安全，
+/// 不应在通用参数安检中按 SQL 注入 / 路径穿越拦截（否则写入含 "../" 或 "UPDATE ... SET" 的文件内容会被误杀）。
+fn is_repo_ws_payload(tool_name: &str, key: &str) -> bool {
+    matches!(tool_name, "repo_ws_write" | "repo_ws_diff")
+        && (key == "content" || key == "path")
+}
+
 /// 从工具参数中抽取显式文件路径参数做门闸（命令型参数 command/code/sql 不含路径，不抽）
 fn extract_path_arg(args: &serde_json::Value) -> Option<&Path> {
     const KEYS: &[&str] = &[
@@ -789,20 +796,24 @@ impl ComplianceBoundary {
             for (key, val) in obj {
                 if let Some(s) = val.as_str() {
                     let s_upper = s.to_uppercase();
-                    if s.contains("' --")
-                        || s.contains("';")
-                        || s_upper.contains(" UNION ")
-                        || s_upper.contains(" OR 1=1")
-                        || s_upper.contains(" AND 1=1")
-                        || s_upper.contains("DROP TABLE")
-                        || s_upper.contains("INSERT INTO")
-                        || s_upper.contains("DELETE FROM")
-                        || (s_upper.contains("UPDATE ") && s_upper.contains("SET "))
-                    {
-                        return Some(ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key)));
-                    }
-                    if has_path_traversal(s) {
-                        return Some(ToolCheck::red(&format!("参数安全检查：{} 含路径穿越", key)));
+                    // repo_ws 写/改工具的 content/path：路径安全由 resolve_safe_path 负责，
+                    // 不按 SQL 注入 / 路径穿越拦截，避免误杀含 "../" 或 "UPDATE SET" 的文件内容。
+                    if !is_repo_ws_payload(tool_name, key) {
+                        if s.contains("' --")
+                            || s.contains("';")
+                            || s_upper.contains(" UNION ")
+                            || s_upper.contains(" OR 1=1")
+                            || s_upper.contains(" AND 1=1")
+                            || s_upper.contains("DROP TABLE")
+                            || s_upper.contains("INSERT INTO")
+                            || s_upper.contains("DELETE FROM")
+                            || (s_upper.contains("UPDATE ") && s_upper.contains("SET "))
+                        {
+                            return Some(ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key)));
+                        }
+                        if has_path_traversal(s) {
+                            return Some(ToolCheck::red(&format!("参数安全检查：{} 含路径穿越", key)));
+                        }
                     }
                     if is_sql_query_param(tool_name, key) && !is_select_only(s) {
                         return Some(ToolCheck::red(&format!(
@@ -927,23 +938,27 @@ impl ComplianceBoundary {
             for (key, val) in obj {
                 if val.is_string() {
                     let s = val.as_str().unwrap_or("");
-                    // SQL 注入检测（P2-7 增强）
                     let s_upper = s.to_uppercase();
-                    if s.contains("' --")
-                        || s.contains("';")
-                        || s_upper.contains(" UNION ")
-                        || s_upper.contains(" OR 1=1")
-                        || s_upper.contains(" AND 1=1")
-                        || s_upper.contains("DROP TABLE")
-                        || s_upper.contains("INSERT INTO")
-                        || s_upper.contains("DELETE FROM")
-                        || s_upper.contains("UPDATE ") && s_upper.contains("SET ")
-                    {
-                        return ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key));
-                    }
-                    // 路径穿越检测
-                    if has_path_traversal(s) {
-                        return ToolCheck::red(&format!("参数安全检查：{} 含路径穿越", key));
+                    // repo_ws 写/改工具的 content/path：路径安全由 resolve_safe_path 负责，
+                    // 不按 SQL 注入 / 路径穿越拦截，避免误杀含 "../" 或 "UPDATE SET" 的文件内容。
+                    if !is_repo_ws_payload(tool_name, key) {
+                        // SQL 注入检测（P2-7 增强）
+                        if s.contains("' --")
+                            || s.contains("';")
+                            || s_upper.contains(" UNION ")
+                            || s_upper.contains(" OR 1=1")
+                            || s_upper.contains(" AND 1=1")
+                            || s_upper.contains("DROP TABLE")
+                            || s_upper.contains("INSERT INTO")
+                            || s_upper.contains("DELETE FROM")
+                            || (s_upper.contains("UPDATE ") && s_upper.contains("SET "))
+                        {
+                            return ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key));
+                        }
+                        // 路径穿越检测
+                        if has_path_traversal(s) {
+                            return ToolCheck::red(&format!("参数安全检查：{} 含路径穿越", key));
+                        }
                     }
                     // P1-6 修复：SQL 只读强制（正向 SELECT-only 校验，替代仅靠负向 blocklist）
                     if is_sql_query_param(tool_name, key) && !is_select_only(s) {

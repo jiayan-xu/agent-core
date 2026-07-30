@@ -43,11 +43,23 @@ pub fn repo_roots() -> Vec<PathBuf> {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "./;../dashboard".to_string());
-    raw.split(';')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map(|s| canonicalize_best_effort(Path::new(&s)))
-        .collect()
+    let mut roots = Vec::new();
+    for s in raw.split(';') {
+        let s = s.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let c = canonicalize_best_effort(Path::new(s));
+        // P1 修复：fail-closed —— 危险根（系统目录 / 用户主目录等）直接剔除，
+        // 绝不纳入白名单。此前 assert_safe_repo_root 定义却全仓无调用（死代码）。
+        match assert_safe_repo_root(&c) {
+            Ok(()) => roots.push(c),
+            Err(e) => {
+                eprintln!("[repo_ws] 拒绝将危险路径加入白名单仓库根，已跳过: {}", e);
+            }
+        }
+    }
+    roots
 }
 
 fn canonicalize_best_effort(p: &Path) -> PathBuf {
@@ -142,17 +154,20 @@ pub fn resolve_safe_path(user_path: &str) -> Result<PathBuf, String> {
         let resolved = if candidate.exists() {
             canonicalize_best_effort(&candidate)
         } else {
+            // P2 修复：先判定将落在哪个白名单根下，越界则跳到下一根，
+            // 绝不在此创建任何目录（避免越界副作用）。目录创建仅留给确认后的写路径。
             let parent = candidate
                 .parent()
                 .ok_or_else(|| "无效路径".to_string())?;
-            if !parent.exists() {
-                fs::create_dir_all(parent).map_err(|e| format!("创建父目录失败: {}", e))?;
-            }
             let parent_c = canonicalize_best_effort(parent);
-            match candidate.file_name() {
-                Some(name) => parent_c.join(name),
-                None => return Err("无效文件名".into()),
+            let filename = candidate
+                .file_name()
+                .ok_or_else(|| "无效文件名".to_string())?;
+            let would_resolved = parent_c.join(filename);
+            if !is_under_root(&would_resolved, &root) {
+                continue;
             }
+            would_resolved
         };
         if is_under_root(&resolved, &root) {
             if let Some(reason) = sensitive_path_reason(&resolved) {
@@ -304,6 +319,13 @@ pub fn execute(tool_name: &str, args: &serde_json::Value) -> Result<String, Stri
                     ),
                 })
                 .to_string());
+            }
+            // P2 修复：仅在确认写、且路径已落在白名单内后，才创建缺失的父目录
+            // （resolve_safe_path 不再越界预建目录）。
+            if let Some(parent) = p.parent() {
+                if !parent.exists() {
+                    fs::create_dir_all(parent).map_err(|e| format!("创建父目录失败: {}", e))?;
+                }
             }
             // 写前快照（复用 file_checkpoint，失败可回滚）
             let snap_ids = if p.is_file() {

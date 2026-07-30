@@ -1288,7 +1288,7 @@ impl AgentCore {
                         .run_controlled_post_verify(
                             &action.tool_name,
                             &action.arguments,
-                            &result_short,
+                            &result_text,
                             allowed_ns,
                         )
                         .await;
@@ -2724,7 +2724,13 @@ impl AgentCore {
         let mut tool_ctx = String::new();
         for (i, step_id) in keys.iter().enumerate() {
             let res = &step_results[*step_id];
-            let truncated = if res.len() > 1500 { &res[..1500] } else { res };
+            // P1 修复：按字符截断而非字节切片，避免多字节 UTF-8（中文）在第 1500 字节处
+            // 落字符中间导致 panic。
+            let truncated: String = if res.chars().count() > 1500 {
+                res.chars().take(1500).collect()
+            } else {
+                res.to_string()
+            };
             tool_ctx.push_str(&format!(
                 "\n[步骤 {}] (id={}):\n{}\n",
                 i + 1,
@@ -4608,10 +4614,13 @@ impl AgentCore {
             let desc = approval.description.chars().take(120).collect::<String>();
             // 任务 649：按工具真实返回如实上报，杜绝「假成功」
             let (executed, honest_prefix) = Self::classify_tool_execution(&exec_result);
-            let result_short = match &exec_result {
-                Ok(t) => t.chars().take(300).collect::<String>(),
-                Err(e) => e.chars().take(300).collect::<String>(),
+            // P2 修复：写后回读须用完整回执（JSON 字段 / 成功标记 / 文件路径解析），
+            // 300 字截断会误判「回读未通过」。展示文本仍用截断。
+            let result_full = match &exec_result {
+                Ok(t) => t.clone(),
+                Err(e) => e.clone(),
             };
+            let result_short = result_full.chars().take(300).collect::<String>();
             let reply = match honest_prefix {
                 Some(prefix) => format!(
                     "{}\n\n操作内容：{}\n审批人：{}\n\n{}",
@@ -4628,7 +4637,7 @@ impl AgentCore {
                     .run_controlled_post_verify(
                         &approval.tool_name,
                         &exec_args,
-                        &result_short,
+                        &result_full,
                         allowed_ns,
                     )
                     .await;
