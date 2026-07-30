@@ -2301,13 +2301,13 @@ impl AgentCore {
                         &self.in_progress_step_results.lock().await.clone(),
                     )
                     .await;
-                    let result = self
+                    let (report, step_results) = self
                         .execute_plan(&plan, session_id, allowed_ns)
                         .await
-                        .unwrap_or_else(|e| format!("组合执行失败: {}", e));
+                        .unwrap_or_else(|e| (format!("组合执行失败: {}", e), HashMap::new()));
 
                     // 蒸馏闭环：记录组合执行的摘要日志，触发 Harness 蒸馏
-                    let is_success = result.starts_with("执行结果") && !result.contains("失败");
+                    let is_success = report.starts_with("执行结果") && !report.contains("失败");
                     {
                         let mut log = self.execution_log.lock().await;
                         let query_preview: String = message.chars().take(80).collect();
@@ -2343,7 +2343,9 @@ impl AgentCore {
                     *self.in_progress_plan.lock().await = None;
                     self.in_progress_step_results.lock().await.clear();
 
-                    return result;
+                    // PFAiX 格式化修复：组合执行成功后，用 LLM 把机器话（执行计数 + 原始工具 JSON）
+                    // 改写成用户易懂的中文自然语言，避免把 {"results":[],...} 直接甩给用户。
+                    return self.summarize_composition(message, &step_results, &report).await;
                 }
                 // 单步或分解失败 → 降级到普通 LLM loop（fall through）
                 tracing::info!("合成路由降级到普通 LLM（单步或分解失败）");
@@ -2554,7 +2556,7 @@ impl AgentCore {
         plan: &crate::composer::ExecutionPlan,
         session_id: &str,
         allowed_ns: &[String],
-    ) -> Result<String, String> {
+    ) -> Result<(String, HashMap<u32, String>), String> {
         use std::collections::HashMap;
 
         // P1-1: 续跑——从已完成的步骤结果起步（崩溃恢复后 in_progress_step_results 已填充）
@@ -2705,7 +2707,58 @@ impl AgentCore {
             }
         }
 
-        Ok(report)
+        Ok((report, step_results))
+    }
+
+    /// PFAiX 回答格式化修复：把组合执行产出的机器话（"执行结果：N/N 步骤成功" + 原始工具 JSON）
+    /// 改写成用户易懂的中文自然语言。失败时回退原始 report，绝不把原始 JSON 直接甩给用户。
+    async fn summarize_composition(
+        &self,
+        user_query: &str,
+        step_results: &HashMap<u32, String>,
+        report: &str,
+    ) -> String {
+        // 按 step_id 升序稳定拼装工具原始数据（截断避免超长）
+        let mut keys: Vec<&u32> = step_results.keys().collect();
+        keys.sort();
+        let mut tool_ctx = String::new();
+        for (i, step_id) in keys.iter().enumerate() {
+            let res = &step_results[*step_id];
+            let truncated = if res.len() > 1500 { &res[..1500] } else { res };
+            tool_ctx.push_str(&format!(
+                "\n[步骤 {}] (id={}):\n{}\n",
+                i + 1,
+                step_id,
+                truncated
+            ));
+        }
+
+        let prompt = format!(
+            "你是固废监管系统的查询助手。用户用中文提问，系统已通过多个工具步骤查到了结果。\n\
+             请基于下面的工具返回数据，用简洁的中文自然语言回答用户的原始问题。\n\
+             要求：\n\
+             1. 直接说结论和数据，不要复述执行过程，不要出现\"执行结果\"、\"最终结果\"等机器字眼。\n\
+             2. 若数据为空（如查询结果 0 条），明确告诉用户「没有查到相关记录」，并简要解释可能原因，不要原样输出 JSON。\n\
+             3. 涉及的数字、车牌、企业名要原样保留，不要编造。\n\
+             4. 回答控制在 200 字以内。\n\
+             \n\
+             ## 用户的原始问题\n{}\n\
+             \n\
+             ## 工具返回的原始数据{}",
+            user_query, tool_ctx
+        );
+
+        let msg = crate::llm::Message {
+            role: "user".to_string(),
+            content: Some(prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+
+        match self.llm.chat(&[msg], &[]).await {
+            Ok(r) if !r.text.trim().is_empty() => r.text.trim().to_string(),
+            _ => report.to_string(), // LLM 失败/空响应 → 回退原始 report，绝不直接吐 JSON
+        }
     }
 
     // ── P1-1 Checkpoint 控制面辅助方法 ──
