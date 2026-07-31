@@ -76,7 +76,7 @@ impl Default for LlmConfig {
     fn default() -> Self {
         LlmConfig {
             base_url: "https://api.deepseek.com".to_string(),
-            model: "deepseek-chat".to_string(),
+            model: "deepseek-v4-flash".to_string(),
             api_key: String::new(),
             chat_path: "/v1/chat/completions".to_string(),
             max_tokens: 4096,
