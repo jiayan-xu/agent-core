@@ -1565,7 +1565,9 @@ fn main() {
                 .route("/api/login", post(handle_login))
                 .route("/api/approval/pending", get(handle_approval_pending))
                 .route("/api/approval/{id}/respond", post(handle_approval_respond))
-                .route("/approval-console", get(handle_approval_console));
+                .route("/approval-console", get(handle_approval_console))
+                .route("/updates/pfaix/latest.json", get(handle_updates_latest))
+                .route("/updates/pfaix/{file}", get(handle_updates_static));
 
             let protected = Router::new()
                 .route("/api/chat", post(handle_chat))
@@ -1589,6 +1591,7 @@ fn main() {
                     post(handle_admin_harness_activate),
                 )
                 .route("/api/admin/consolidate", post(handle_admin_consolidate))
+                .route("/api/admin/agent/repair", post(handle_agent_repair))
                 .route("/api/agent/events", axum::routing::get(handle_agent_events))
                 .route("/api/save-config", post(handle_save_config))
                 .route("/api/collab/inbox", get(handle_collab_inbox))
@@ -1684,6 +1687,67 @@ async fn handle_logo() -> impl axum::response::IntoResponse {
         [(axum::http::header::CONTENT_TYPE, "text/plain")],
         "logo not found".into(),
     )
+}
+
+/// PFAiX 局域网升级：静态目录根，默认在 agent-core.exe 同目录下 `updates/pfaix/`。
+/// 允许通过 PFAIX_UPDATES_DIR 环境变量覆盖。
+fn pfaix_updates_dir() -> std::path::PathBuf {
+    std::env::var("PFAIX_UPDATES_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join("updates")
+                .join("pfaix")
+        })
+}
+
+/// 返回当前最新版本的 manifest；若目录下没有放置 latest.json 则返回 404。
+async fn handle_updates_latest() -> impl axum::response::IntoResponse {
+    let path = pfaix_updates_dir().join("latest.json");
+    match tokio::fs::read(&path).await {
+        Ok(data) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json; charset=utf-8")],
+            data,
+        )
+            .into_response(),
+        Err(_) => (axum::http::StatusCode::NOT_FOUND, "no update manifest").into_response(),
+    }
+}
+
+/// 下载安装包等静态文件，做路径穿越防御 + 简单 MIME 推断。
+async fn handle_updates_static(
+    axum::extract::Path(file): axum::extract::Path<String>,
+) -> impl axum::response::IntoResponse {
+    let root = pfaix_updates_dir();
+    let candidate = root.join(file.replace('\\', "/"));
+    // 路径穿越防御：必须在 root 下
+    let (Ok(root_canon), Ok(cand_canon)) = (
+        std::fs::canonicalize(&root),
+        std::fs::canonicalize(&candidate),
+    ) else {
+        return (axum::http::StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    if !cand_canon.starts_with(&root_canon) || !cand_canon.is_file() {
+        return (axum::http::StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let data = match tokio::fs::read(&cand_canon).await {
+        Ok(d) => d,
+        Err(_) => return (axum::http::StatusCode::NOT_FOUND, "not found").into_response(),
+    };
+    let ct = match cand_canon
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "exe" => "application/octet-stream",
+        "json" => "application/json; charset=utf-8",
+        "txt" | "md" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    };
+    ([(axum::http::header::CONTENT_TYPE, ct)], data).into_response()
 }
 
 /// 公开健康检查（无鉴权）。供 PFAiX 状态条 / 诊断包探测。
@@ -4167,6 +4231,12 @@ struct RegisterRequest {
     project: String,
     #[serde(default)]
     div: String,
+    /// 展示用中文姓名；不进 agent_id / namespace / HTTP 头。
+    #[serde(default)]
+    display_name: String,
+    /// 展示用部门名（如「固废」）；技术部门码仍取 `department`。
+    #[serde(default)]
+    department_display: String,
 }
 #[derive(Serialize)]
 struct RegisterResponse {
@@ -4230,6 +4300,22 @@ fn sanitize_ns_segment(s: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// 协作通讯录展示名：「{部门展示}部{姓名}」；部门/姓名缺失时回退到可用值。
+/// 仅用于 display_name，绝不进入 agent_id / namespace / HTTP 头。
+fn agent_display_name(dept_display: &str, name_display: &str, fallback: &str) -> String {
+    let dept = dept_display.trim();
+    let name = name_display.trim();
+    let base = if name.is_empty() { fallback } else { name };
+    if dept.is_empty() {
+        return base.to_string();
+    }
+    if dept.ends_with('部') {
+        format!("{}{}", dept, base)
+    } else {
+        format!("{}部{}", dept, base)
+    }
 }
 
 /// 调用者 allowed_ns 是否覆盖目标 ns（与 Memoria check_ns_access 同逻辑）
@@ -4448,6 +4534,17 @@ async fn handle_register(
         });
     }
     let agent_id = format!("{}_{}_{}", COMPANY, department, name);
+    let display_name = if req.display_name.trim().is_empty() {
+        name.clone()
+    } else {
+        req.display_name.trim().to_string()
+    };
+    let department_display = if req.department_display.trim().is_empty() {
+        department.clone()
+    } else {
+        req.department_display.trim().to_string()
+    };
+    let memoria_display_name = agent_display_name(&department_display, &display_name, &agent_id);
     // B2 双 ns（与 /api/register_user、legacy 自动开户一致）：
     //   1) agent/{agent_id} —— 私人记忆隔离
     //   2) org/.../dept/... —— 部门/组织共享（工具可见 + 部门记忆）
@@ -4485,7 +4582,7 @@ async fn handle_register(
                 "register_agent",
                 &serde_json::json!({
                     "agent_id": &agent_id,
-                    "display_name": &req.name,
+                    "display_name": &memoria_display_name,
                     "admin_key": &admin_key,
                     "namespace": &namespace,
                 }),
@@ -4546,6 +4643,149 @@ async fn handle_register(
         namespace,
         error: None,
     })
+}
+
+#[derive(Deserialize)]
+struct AgentRepairRequest {
+    agent_id: String,
+    /// 技术部门码（如 gufei）；提供时会重建 `agent/{id},org/.../dept/...[/proj/...]`。
+    #[serde(default)]
+    department: String,
+    #[serde(default)]
+    project: String,
+    /// 展示用中文姓名；与 department_display 组成「固废部张三」。
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    department_display: String,
+    #[serde(default)]
+    permission: String,
+}
+
+/// 修复已注册 Agent 的协作档案（admin）：更新 Memoria display_name / namespace / permission，
+/// 不更换 badge_token，避免已分发客户端凭证失效。
+async fn handle_agent_repair(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<AgentRepairRequest>,
+) -> axum::response::Response {
+    let (caller_id, allowed_ns) = match authenticate(&headers, &st).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let is_admin = caller_id == "admin" || allowed_ns.iter().any(|n| n == "*");
+    if !is_admin {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"error": "需要 admin 身份"})),
+        )
+            .into_response();
+    }
+
+    let agent_id = req.agent_id.trim().to_string();
+    if agent_id.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "agent_id 必填"})),
+        )
+            .into_response();
+    }
+
+    const COMPANY: &str = "cs-pufa-2nd-thermal";
+    let department = sanitize_ns_segment(&req.department);
+    let project = sanitize_ns_segment(&req.project);
+    let namespace = if department.is_empty() {
+        String::new()
+    } else {
+        let mut org_ns = format!("org/{}/dept/{}", COMPANY, department);
+        if !project.is_empty() {
+            org_ns = format!("{}/proj/{}", org_ns, project);
+        }
+        format!("agent/{},{}", agent_id, org_ns)
+    };
+
+    let fallback_name = agent_id.rsplit('_').next().unwrap_or(agent_id.as_str());
+    let display_name = if req.display_name.trim().is_empty() && req.department_display.trim().is_empty() {
+        String::new()
+    } else {
+        agent_display_name(
+            req.department_display.trim(),
+            if req.display_name.trim().is_empty() {
+                fallback_name
+            } else {
+                req.display_name.trim()
+            },
+            &agent_id,
+        )
+    };
+    let permission = req.permission.trim();
+
+    if namespace.is_empty() && display_name.is_empty() && permission.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "至少提供 department / display_name / permission 之一"})),
+        )
+            .into_response();
+    }
+
+    let cfg_admin = st.config.lock().await.memoria_admin_key.clone();
+    let admin_key = env_memoria_admin_key(&cfg_admin);
+    if admin_key.is_empty() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "MEMORIA_ADMIN_KEY 未配置"})),
+        )
+            .into_response();
+    }
+    let server = {
+        let cfg = st.config.lock().await;
+        cfg.server.clone()
+    };
+    let mcp = memoria_proxy_client(&server, &cfg_admin);
+    let mut args = serde_json::json!({
+        "agent_id": &agent_id,
+        "admin_key": &admin_key,
+    });
+    if !display_name.is_empty() {
+        args["display_name"] = serde_json::Value::String(display_name.clone());
+    }
+    if !namespace.is_empty() {
+        args["namespace"] = serde_json::Value::String(namespace.clone());
+    }
+    if !permission.is_empty() {
+        args["permission"] = serde_json::Value::String(permission.to_string());
+    }
+
+    match mcp.call_json("agent_update", &args).await {
+        Ok(v) => {
+            let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            if status == "updated" {
+                axum::Json(serde_json::json!({
+                    "ok": true,
+                    "agent_id": v.get("agent_id").and_then(|x| x.as_str()).unwrap_or(&agent_id),
+                    "display_name": v.get("display_name").and_then(|x| x.as_str()).unwrap_or(&display_name),
+                    "namespace": v.get("namespace").and_then(|x| x.as_str()).unwrap_or(&namespace),
+                    "permission": v.get("permission").and_then(|x| x.as_str()).unwrap_or(permission),
+                }))
+                .into_response()
+            } else {
+                let msg = v
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("agent_update 失败");
+                (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    axum::Json(serde_json::json!({"error": msg})),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({"error": format!("Memoria agent_update 不可用: {}", e)})),
+        )
+            .into_response(),
+    }
 }
 
 /// 个人账号注册代理：转发到 Memoria `register_user`（以 admin 身份）。
