@@ -149,6 +149,40 @@ function newChat() {
   $('msgs').innerHTML = '';
   sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).slice(2,6);
   loadSessions();
+  showQuickCards();
+}
+
+// 能力引导卡片：面向普通员工，点击即提问（无需打字）
+function showQuickCards() {
+  const cards = [
+    { icon: '📊', title: '今日进厂统计', desc: '今天进了多少车、多少吨', q: '今天进了多少车？总重量多少？' },
+    { icon: '🚚', title: '查车牌', desc: '某辆车今天/最近进厂记录', q: '' },
+    { icon: '📋', title: '白名单查询', desc: '查车辆公司、固废种类', q: '查一下白名单里有多少辆车' },
+    { icon: '⚠️', title: '异常记录', desc: '本月异常情况记录', q: '这个月有哪些异常记录？' },
+    { icon: '🗓️', title: '本月汇总', desc: '本月各公司车次与重量', q: '这个月各公司进了多少车？' },
+    { icon: '🖥️', title: '系统状态', desc: '各服务是否正常运行', q: '系统现在运行正常吗？' },
+  ];
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'display:flex;flex-wrap:wrap;gap:10px;padding:14px;';
+  cards.forEach(c => {
+    const btn = document.createElement('button');
+    btn.style.cssText = 'flex:1 1 30%;min-width:150px;background:var(--surface,#171a21);border:1px solid var(--border,#2a2f3a);border-radius:10px;padding:14px;color:var(--text);cursor:pointer;text-align:left;transition:border-color .15s;';
+    btn.innerHTML = '<div style="font-size:22px;margin-bottom:6px;">' + c.icon + '</div>' +
+      '<div style="font-weight:600;font-size:14px;margin-bottom:3px;">' + c.title + '</div>' +
+      '<div style="font-size:12px;color:#9aa4b2;">' + c.desc + '</div>';
+    btn.onclick = () => {
+      let q = c.q;
+      if (c.title === '查车牌') {
+        const p = prompt('请输入车牌号，例如：苏EBS569');
+        if (!p) return;
+        q = '查一下 ' + p + ' 今天的进厂记录';
+      }
+      $('input').value = q;
+      chat();
+    };
+    wrap.appendChild(btn);
+  });
+  $('msgs').appendChild(wrap);
 }
 
 async function switchSession(sid) {
@@ -254,6 +288,7 @@ async function doRegister() {
       $('register').style.display = "none";
       $('chat').style.display = "flex";
       $('input').focus();
+      showQuickCards();
     } else { errEl.textContent = d.error || "注册失败"; errEl.style.display = "block"; }
   } catch(e) { errEl.textContent = "连接失败: " + e.message; errEl.style.display = "block"; }
   btn.disabled = false; btn.textContent = "注册并开始使用";
@@ -312,6 +347,7 @@ if (savedAgentId && savedToken) {
   $('st').textContent = '\u25CF &#x5C31;&#x7EEA;';
   $('st').className = 'st ok';
   loadSessions();
+  showQuickCards();
 }
 </script>
 </body>
