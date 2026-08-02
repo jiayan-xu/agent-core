@@ -6,7 +6,7 @@
 use rusqlite::{params, Connection};
 
 /// 权威表状态（比内存 PendingApproval.status 多 Consumed）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ApprovalRecordStatus {
     Pending,
     Approved,
@@ -35,7 +35,7 @@ impl ApprovalRecordStatus {
 }
 
 /// 一行审批权威记录
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ApprovalRecord {
     pub approval_id: String,
     pub session_id: String,
@@ -203,8 +203,29 @@ impl ApprovalStore {
         out
     }
 
-    pub fn mark_consumed(&self, approval_id: &str, consumed_at: f64) -> Result<(), String> {
-        self.conn
+    /// 审批历史（含已消费/已拒绝），按创建时间倒序，供审批台审计留证查看
+    pub fn list_history(&self, limit: usize) -> Vec<ApprovalRecord> {
+        let mut out = Vec::new();
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT approval_id, session_id, agent_id, tool_name, arguments_json,
+                    description, operation_hash, approver_id, requester_id, status,
+                    created_at, decided_at, consumed_at, decision_reason, response_json
+             FROM approvals ORDER BY created_at DESC LIMIT ?",
+        ) else {
+            return out;
+        };
+        let Ok(mut rows) = stmt.query(params![limit as i64]) else {
+            return out;
+        };
+        while let Ok(Some(row)) = rows.next() {
+            if let Ok(rec) = Self::row_to_record(row) {
+                out.push(rec);
+            }
+        }
+        out
+    }
+
+    pub fn mark_consumed(&self, approval_id: &str, consumed_at: f64) -> Result<(), String> {        self.conn
             .execute(
                 "UPDATE approvals SET status='Consumed', consumed_at=?2 WHERE approval_id=?1",
                 params![approval_id, consumed_at],

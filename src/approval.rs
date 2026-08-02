@@ -487,8 +487,17 @@ impl ApprovalManager {
     }
 
     /// 获取所有 pending 的审批项（已收到响应/已决定的不列出，避免审批台重复处理）
-    pub async fn list_pending(&self) -> Vec<PendingApproval> {
-        let outgoing = self.outgoing.lock().await;
+    /// 审批历史（含已消费/已拒绝），SQLite 权威表倒序，供审批台审计留证
+    pub async fn list_history(&self, limit: usize) -> Vec<ApprovalRecord> {
+        if let Some(ref sq) = self.sqlite {
+            if let Ok(guard) = sq.lock() {
+                return guard.list_history(limit);
+            }
+        }
+        Vec::new()
+    }
+
+    pub async fn list_pending(&self) -> Vec<PendingApproval> {        let outgoing = self.outgoing.lock().await;
         let responses = self.responses.lock().await;
         outgoing
             .values()

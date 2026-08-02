@@ -1564,6 +1564,7 @@ fn main() {
                 .route("/api/register_user", post(handle_register_user))
                 .route("/api/login", post(handle_login))
                 .route("/api/approval/pending", get(handle_approval_pending))
+                .route("/api/approval/history", get(handle_approval_history))
                 .route("/api/approval/{id}/respond", post(handle_approval_respond))
                 .route("/approval-console", get(handle_approval_console))
                 .route("/updates/pfaix/latest.json", get(handle_updates_latest))
@@ -3491,6 +3492,27 @@ async fn handle_approval_pending(
     }
 }
 
+/// 审批历史（含已消费/已拒绝），仅 admin
+async fn handle_approval_history(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !is_admin(&headers, &st).await {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "需要 admin 权限"})),
+        )
+            .into_response();
+    }
+    let guard = st.agent.lock().await;
+    if let Some(ref agent) = *guard {
+        let list = agent.approval_manager.list_history(100).await;
+        Json(serde_json::json!({ "count": list.len(), "items": list })).into_response()
+    } else {
+        Json(serde_json::json!({"error": "agent not ready"})).into_response()
+    }
+}
+
 /// 审批人（admin）对某项审批做出决定（批准/拒绝）；校验 operation_hash 防偷换
 async fn handle_approval_respond(
     State(st): State<Arc<AppState>>,
@@ -3579,6 +3601,7 @@ const APPROVAL_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
   .btn-refresh { background: #3a6df0; color: #fff; }
   .btn-approve { background: #2e9e5b; color: #fff; }
   .btn-reject { background: #c5453b; color: #fff; }
+  .btn-history { background: #6b5bd6; color: #fff; }
   .card { background: #171a21; border: 1px solid #2a2f3a; border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; }
   .card h3 { margin: 0 0 6px; font-size: 15px; color: #ffd479; }
   .meta { font-size: 12px; color: #9aa4b2; margin-bottom: 8px; }
@@ -3595,8 +3618,10 @@ const APPROVAL_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
   <div class="keybar">
     <input id="adminKey" type="password" placeholder="粘贴 admin key (MEMORIA_ADMIN_KEY)">
     <button class="btn-refresh" onclick="load()">刷新待审</button>
+    <button class="btn-history" onclick="loadHistory()">审批历史</button>
   </div>
   <div id="list"><div class="empty">点击「刷新待审」加载待审批项</div></div>
+  <div id="history" style="display:none"><div class="empty">点击「审批历史」查看审计留证</div></div>
 </div>
 <script>
 const API = "http://127.0.0.1:9753";
@@ -3638,6 +3663,47 @@ async function respond(id, hash, approved) {
   const j = await r.json();
   if (r.ok && j.ok) { alert((approved ? "已批准" : "已拒绝") + ": " + id); load(); }
   else { alert("失败：" + (j.error || "未知错误")); }
+}
+async function loadHistory() {
+  const key = document.getElementById("adminKey").value;
+  const list = document.getElementById("list");
+  const hist = document.getElementById("history");
+  if (!key) { alert("请先填写 admin key"); return; }
+  list.style.display = "none";
+  hist.style.display = "block";
+  hist.innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const r = await fetch(API + "/api/approval/history", { headers: { "x-agent-key": key } });
+    const j = await r.json();
+    if (!r.ok) { hist.innerHTML = '<div class="empty err">' + (j.error || "加载失败") + '</div>'; return; }
+    if (!j.items || j.items.length === 0) { hist.innerHTML = '<div class="empty">暂无审批历史</div>'; return; }
+    hist.innerHTML = "";
+    for (const it of j.items) {
+      const div = document.createElement("div");
+      div.className = "card";
+      let argsTxt = "";
+      try {
+        const a = JSON.parse(it.arguments_json || "{}");
+        const parts = [];
+        if (a.plate) parts.push("车牌=" + a.plate);
+        if (a.company_name) parts.push("公司=" + a.company_name);
+        if (a.waste_type) parts.push("固废种类=" + a.waste_type);
+        if (a.action) parts.push("操作=" + a.action);
+        argsTxt = parts.length ? parts.join("，") : (it.arguments_json || "");
+      } catch (e) { argsTxt = it.arguments_json || ""; }
+      const statusMap = { "Pending":"待审批","Approved":"已批准","Denied":"已拒绝","Consumed":"已执行" };
+      const st = statusMap[it.status] || it.status;
+      const stColor = it.status === "Approved" || it.status === "Consumed" ? "#2e9e5b" : (it.status === "Denied" ? "#c5453b" : "#ffd479");
+      const decided = it.decided_at ? new Date(it.decided_at*1000).toLocaleString() : "—";
+      div.innerHTML = '<h3>' + esc(it.tool_name) + ' <span style="color:' + stColor + '">[' + esc(st) + ']</span></h3>' +
+        '<div class="meta">ID: ' + esc(it.approval_id) + ' · 请求方: ' + esc(it.requester_id) + ' · 创建: ' + new Date(it.created_at*1000).toLocaleString() + '</div>' +
+        '<div class="meta">参数: ' + esc(argsTxt) + '</div>' +
+        '<div class="meta">说明: ' + esc(it.description) + '</div>' +
+        (it.decision_reason ? '<div class="meta">审批意见: ' + esc(it.decision_reason) + '</div>' : '') +
+        '<div class="meta">审批人: ' + esc(it.approver_id) + ' · 决策时间: ' + decided + '</div>';
+      hist.appendChild(div);
+    }
+  } catch (e) { hist.innerHTML = '<div class="empty err">请求出错: ' + e + '</div>'; }
 }
 function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
 </script>
