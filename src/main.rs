@@ -3497,13 +3497,13 @@ async fn handle_approval_history(
     State(st): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    if !is_admin(&headers, &st).await {
-        return (
-            axum::http::StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "需要 admin 权限"})),
-        )
-            .into_response();
-    }
+    // 审批历史绑定注册人身份：任何已注册 agent（badge 认证通过）可查看，
+    // 无需 admin key（审批人即注册用户本人）。写操作 respond 仍要求 admin。
+    let (agent_id, _allowed_ns) = match authenticate(&headers, &st).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let _ = agent_id;
     let guard = st.agent.lock().await;
     if let Some(ref agent) = *guard {
         let list = agent.approval_manager.list_history(100).await;
