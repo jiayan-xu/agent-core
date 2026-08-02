@@ -31,6 +31,16 @@ pub struct Skill {
     /// 版本号（每次 register 覆盖自动 +1；可 rollback 到历史版本）
     #[serde(default)]
     pub version: u32,
+    /// P1-2 发布语义：true=已发布可被检索使用；false=草稿（仅注册表可见）
+    #[serde(default = "default_published")]
+    pub published: bool,
+    /// P1-2 废弃时间（ISO 字符串）；非空=已废弃（检索时排除）
+    #[serde(default)]
+    pub deprecated_at: Option<String>,
+}
+
+fn default_published() -> bool {
+    true
 }
 
 /// 技能注册表抽象
@@ -53,6 +63,10 @@ pub trait SkillRegistry: Send + Sync {
     fn version_of(&self, id: &str) -> Option<u32>;
     /// 全部历史版本（按时间升序，含当前）
     fn list_versions(&self, id: &str) -> Vec<Skill>;
+    /// P1-2 发布/取消发布（published 开关）；返回更新后的技能
+    fn set_published(&self, id: &str, published: bool) -> Result<Skill, String>;
+    /// P1-2 标记废弃（deprecated_at=now）；返回更新后的技能
+    fn deprecate(&self, id: &str) -> Result<Skill, String>;
 }
 
 /// 内存版注册表（测试 / 单进程默认）
@@ -117,6 +131,8 @@ impl InMemorySkillRegistry {
                 trigger_keywords: kws.iter().map(|s| s.to_string()).collect(),
                 body: String::new(),
                 version: 1,
+                published: true,
+                deprecated_at: None,
             });
         }
     }
@@ -144,6 +160,10 @@ impl SkillRegistry for InMemorySkillRegistry {
             skills
                 .iter()
                 .filter_map(|s| {
+                    // P1-2：草稿（未发布）与已废弃技能不进检索
+                    if !s.published || s.deprecated_at.is_some() {
+                        return None;
+                    }
                     let hits = s
                         .trigger_keywords
                         .iter()
@@ -182,8 +202,11 @@ impl SkillRegistry for InMemorySkillRegistry {
         sk.version = new_version;
         {
             let mut skills = self.skills.write().unwrap();
-            if let Some(slot) = skills.iter_mut().find(|s| s.id == sk.id) {
-                *slot = sk.clone();
+            if let Some(existing) = skills.iter_mut().find(|s| s.id == sk.id) {
+                // P1-2：覆盖注册保留发布/废弃状态（新版本继承，防误重置）
+                sk.published = existing.published;
+                sk.deprecated_at = existing.deprecated_at.clone();
+                *existing = sk.clone();
             } else {
                 skills.push(sk.clone());
             }
@@ -247,6 +270,31 @@ impl SkillRegistry for InMemorySkillRegistry {
             .cloned()
             .unwrap_or_default()
     }
+
+    fn set_published(&self, id: &str, published: bool) -> Result<Skill, String> {
+        let mut skills = self.skills.write().unwrap();
+        let slot = skills
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or_else(|| format!("skill {} 不存在", id))?;
+        slot.published = published;
+        Ok(slot.clone())
+    }
+
+    fn deprecate(&self, id: &str) -> Result<Skill, String> {
+        let mut skills = self.skills.write().unwrap();
+        let slot = skills
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or_else(|| format!("skill {} 不存在", id))?;
+        slot.deprecated_at = Some(now_iso());
+        Ok(slot.clone())
+    }
+}
+
+/// P1-2 辅助：ISO 时间戳（秒级，UTC）
+fn now_iso() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 /// 持久化形状（落盘用）：skills 当前快照 + 每 id 的版本历史
@@ -371,6 +419,24 @@ impl SkillRegistry for FileBackedSkillRegistry {
     fn list_versions(&self, id: &str) -> Vec<Skill> {
         self.inner.list_versions(id)
     }
+    fn set_published(&self, id: &str, published: bool) -> Result<Skill, String> {
+        let r = self.inner.set_published(id, published);
+        if r.is_ok() {
+            if let Err(e) = self.flush() {
+                tracing::warn!(target: "agent.skill", "技能库持久化失败: {}", e);
+            }
+        }
+        r
+    }
+    fn deprecate(&self, id: &str) -> Result<Skill, String> {
+        let r = self.inner.deprecate(id);
+        if r.is_ok() {
+            if let Err(e) = self.flush() {
+                tracing::warn!(target: "agent.skill", "技能库持久化失败: {}", e);
+            }
+        }
+        r
+    }
 }
 
 #[cfg(test)]
@@ -385,7 +451,37 @@ mod tests {
             trigger_keywords: kws.iter().map(|s| s.to_string()).collect(),
             body: String::new(),
             version: 1,
+            published: true,
+            deprecated_at: None,
         }
+    }
+
+    #[test]
+    fn test_publish_deprecate_gates_search() {
+        let reg = InMemorySkillRegistry::new();
+        reg.register(sk("s1", &["对账"])).unwrap();
+        assert_eq!(reg.search_by_task("帮我做对账", 5).len(), 1);
+        reg.set_published("s1", false).unwrap();
+        assert_eq!(reg.search_by_task("帮我做对账", 5).len(), 0);
+        reg.set_published("s1", true).unwrap();
+        reg.deprecate("s1").unwrap();
+        assert_eq!(reg.search_by_task("帮我做对账", 5).len(), 0);
+        assert_eq!(reg.list().len(), 1);
+        let s = reg.get("s1").unwrap();
+        assert!(s.deprecated_at.is_some());
+        assert!(s.published);
+    }
+
+    #[test]
+    fn test_register_keeps_publish_state() {
+        let reg = InMemorySkillRegistry::new();
+        let mut s = sk("s2", &["补录"]);
+        s.published = false;
+        reg.register(s).unwrap();
+        reg.register(sk("s2", &["补录"])).unwrap();
+        let cur = reg.get("s2").unwrap();
+        assert_eq!(cur.version, 2);
+        assert!(!cur.published, "覆盖注册应继承未发布状态");
     }
 
     #[test]
@@ -470,6 +566,8 @@ mod persistence_tests {
             trigger_keywords: kws.iter().map(|s| s.to_string()).collect(),
             body: String::new(),
             version: 1,
+            published: true,
+            deprecated_at: None,
         }
     }
 

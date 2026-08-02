@@ -630,7 +630,11 @@ mod tests {
         store.save("b", &c, &s, "", None).unwrap();
 
         let list = store.list_all(true).unwrap();
-        assert_eq!(list.len(), 2);
+        // open_memory 会 seed 部门 harness（gufei_lian_dan_evidence 等），
+        // 断言改为「>= 2 且包含 a/b」以兼容 seed（修复预存失败）
+        assert!(list.len() >= 2, "应至少含 a/b 两技能，实际 {}", list.len());
+        let names: Vec<&str> = list.iter().map(|h| h.name.as_str()).collect();
+        assert!(names.contains(&"a") && names.contains(&"b"));
     }
 
     #[test]

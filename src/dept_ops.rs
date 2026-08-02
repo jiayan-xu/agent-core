@@ -155,8 +155,7 @@ pub fn ops_playbook_prompt() -> &'static str {
 }
 
 /// Composer 规划器附加规则（运维意图）
-pub fn composer_ops_rules() -> &'static str {
-    r#"
+pub fn composer_ops_rules() -> &'static str {    r#"
 - 【固废运维强制】用户提到联单/整理/文件夹/归档/放入/理文时：
   - 禁止整单只用 auto_route / cross_agent_query / a2a_*
   - 必须优先使用 dashboard 固废技能：organize_folders、check_media_files、query_entrance、query_today、archive_ops、ocr_manifest 等（以可用工具列表为准）
@@ -170,8 +169,7 @@ pub fn composer_ops_rules() -> &'static str {
 }
 
 /// 未取证却试图下结论时的拒答
-pub fn refuse_ungrounded_ops_reply(message: &str) -> String {
-    if is_engineer_intent(message) {
+pub fn refuse_ungrounded_ops_reply(message: &str) -> String {    if is_engineer_intent(message) {
         return format!(
             "⚠️ 未走改码闭环，拒绝空嘴交差。\n\
              涉及改代码/修 bug 时，必须先 code_reader 取证，再 edit_code(dry_run) 预览，\
@@ -235,4 +233,22 @@ mod tests {
         assert!(is_engineer_intent("请改代码修这个 skill 的报错"));
         assert!(is_dept_grounded_intent("traceback 修bug"));
     }
+}
+
+/// P0-3 收尾：数据字典业务口径（并入部门 playbook，dept 身份常驻生效）
+///
+/// 口径与 dashboard /api/db/data-dictionary 一致（22 字段/4 派生规则），
+/// 让 agent 答题口径不再靠 prompt 硬编码/猜单位。仅口径说明，无真实行数据。
+pub fn data_dict_prompt() -> &'static str {
+    r#"
+## 固废数据字典（口径参考，P0-3）
+查询/回答固废业务数据时，字段口径以本字典为准（与 dashboard /api/db/data-dictionary 一致）：
+- vehicle_entrance（入厂记录）：license_plate=车牌；weight=毛重(吨)；net_weight=净重合计(吨)；entrance_date=YYYY-MM-DD；waste_type=固废种类(如一般工业固废SW59)
+- vehicle_whitelist（白名单）：license_plate=授权车牌(唯一)；company_name=企业全称；short_name=企业简称；enabled=1启用/0停用
+- manifest_records（联单）：manifest_no=联单编号；plate=验证后车牌；sender_company=移出单位；receiver_company=接收单位
+- indicator_history（指标）：indicator_name 形如 当日重量_YYYY-MM-DD / 月总量_YYYY-MM；indicator_value 单位见 indicator_unit
+- sample_records（取样）：supplier=供应商；license_plate=取样车牌
+⚠️ 高敏字段（车牌/供应商）对只读试用身份默认打码展示，如 ***569；内部身份可看全量。
+⚠️ 白名单≠入厂记录：某车可能只有白名单无入厂记录，反之亦然；两表勿混淆。
+"#
 }

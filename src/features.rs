@@ -37,6 +37,8 @@ mod tests {
             trigger_keywords: kws.iter().map(|s| s.to_string()).collect(),
             body: String::new(),
             version: 1,
+            published: true,
+            deprecated_at: None,
         }
     }
 

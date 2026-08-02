@@ -5232,6 +5232,12 @@ impl AgentCore {
         // &String 可自动解引用为 &str，后续所有 tool_name 引用无需改动
         let tool_name = &resolved_tool;
 
+        // ── P2-3 澄清工具：暂停执行向用户澄清（Palantir Request clarification 对标） ──
+        // 不经过 persona 白名单/配额/边界——它是纯对话工具，无副作用、无数据访问。
+        if tool_name == "request_clarification" {
+            return crate::clarify::build_clarify_result(args);
+        }
+
         // ── Phase 1+2：分身级工具白名单（真实 persona_id 来自会话；缺省 "default"） ──
         if let Err(e) = self.check_persona_tool(persona_id, tool_name) {
             return Err(e);
@@ -6122,6 +6128,11 @@ impl AgentCore {
             boundary.learn_tools(&names);
         }
 
+        // P2-3：澄清工具始终暴露（纯对话，无数据访问/无副作用）
+        if seen_names.insert("request_clarification".to_string()) {
+            all_tools.push(crate::clarify::tool_def());
+        }
+
         if all_tools.is_empty() {
             tracing::warn!("命名空间过滤后无可用 MCP 工具，使用 fallback");
             return Self::fallback_tools();
@@ -6444,6 +6455,8 @@ impl AgentCore {
 
         // P0：固废本部门运维纪律（证据门禁 + 作业剧本）
         prompt.push_str(crate::dept_ops::ops_playbook_prompt());
+        // P0-3 收尾：数据字典口径（dept 身份常驻，答题口径一致）
+        prompt.push_str(crate::dept_ops::data_dict_prompt());
         // WorkBuddy 铁轨：本仓沙箱文件工具
         prompt.push_str(crate::local_fs::system_hint());
         // 双轨：受控改库扳手 + 本机白名单仓库编辑
