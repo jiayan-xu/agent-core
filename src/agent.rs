@@ -5225,8 +5225,11 @@ impl AgentCore {
         // ── P2-3 澄清工具：暂停执行向用户澄清（Palantir Request clarification 对标） ──
         // 必须在 resolve_tool_name_middleware 之前拦截：该中间件不识别本内置工具，
         // 会报「未找到」或模糊纠错成其他已注册工具。纯对话工具，无副作用、无数据访问，
-        // 不经过 persona 白名单/配额/边界。
+        // 不经过 persona 白名单/配额/边界；但 kill_switch 全局禁用时同样拒绝（security review：降级语义一致）。
         if tool_name == "request_clarification" {
+            if self.degrade.kill_switch_on() {
+                return Err("🛑 Kill switch 已启用，工具调用已全局禁用。".to_string());
+            }
             return crate::clarify::build_clarify_result(args);
         }
 
