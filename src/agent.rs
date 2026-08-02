@@ -5222,6 +5222,14 @@ impl AgentCore {
         allowed_ns: &[String],
         trace_id: &str,
     ) -> Result<String, String> {
+        // ── P2-3 澄清工具：暂停执行向用户澄清（Palantir Request clarification 对标） ──
+        // 必须在 resolve_tool_name_middleware 之前拦截：该中间件不识别本内置工具，
+        // 会报「未找到」或模糊纠错成其他已注册工具。纯对话工具，无副作用、无数据访问，
+        // 不经过 persona 白名单/配额/边界。
+        if tool_name == "request_clarification" {
+            return crate::clarify::build_clarify_result(args);
+        }
+
         // ── 工具名校验 + 自动纠错中间件：消灭 LLM"必须猜对工具名"的体感 ──
         // 先用实时注册表校验；未命中则强制刷新 + 模糊匹配自动纠错；
         // 毫无近似才返回清晰错误，绝不把 MCP 层晦涩报错甩给用户。
@@ -5231,12 +5239,6 @@ impl AgentCore {
         };
         // &String 可自动解引用为 &str，后续所有 tool_name 引用无需改动
         let tool_name = &resolved_tool;
-
-        // ── P2-3 澄清工具：暂停执行向用户澄清（Palantir Request clarification 对标） ──
-        // 不经过 persona 白名单/配额/边界——它是纯对话工具，无副作用、无数据访问。
-        if tool_name == "request_clarification" {
-            return crate::clarify::build_clarify_result(args);
-        }
 
         // ── Phase 1+2：分身级工具白名单（真实 persona_id 来自会话；缺省 "default"） ──
         if let Err(e) = self.check_persona_tool(persona_id, tool_name) {
@@ -6128,14 +6130,14 @@ impl AgentCore {
             boundary.learn_tools(&names);
         }
 
-        // P2-3：澄清工具始终暴露（纯对话，无数据访问/无副作用）
-        if seen_names.insert("request_clarification".to_string()) {
-            all_tools.push(crate::clarify::tool_def());
-        }
-
         if all_tools.is_empty() {
             tracing::warn!("命名空间过滤后无可用 MCP 工具，使用 fallback");
             return Self::fallback_tools();
+        }
+
+        // P2-3：澄清工具始终暴露（纯对话，无数据访问/无副作用）；置于 fallback 检查之后
+        if seen_names.insert("request_clarification".to_string()) {
+            all_tools.push(crate::clarify::tool_def());
         }
 
         all_tools
