@@ -55,6 +55,8 @@ const HARD_DANGEROUS: &[&str] = &[
     "manage_whitelist",
     "edit_code",
     "sync_exception_correction",
+    // P0-1 场景沙箱提交：影子变更落生产，强制审批闸
+    "scenario_commit",
     // 双轨：受控写（无论分类器如何，强制危险地板 → L2 黄线）
     "cw_write", // 轨一：受控改库写
     "repo_ws_write", // 轨二：白名单仓写
@@ -1086,6 +1088,11 @@ impl ToolClassifier {
             "entity_add_mention",
             "entity_add_edge",
             "repo_ws_diff", // 轨二：白名单仓改动（应用 diff，本质写；危险地板由 HARD_DANGEROUS 兜底）
+            // P0-1 场景沙箱：写生命周期（创建/加变更/提交/丢弃；commit 强制审批）
+            "scenario_create",
+            "scenario_add_change",
+            "scenario_commit",
+            "scenario_discard",
         ] {
             c.write_tools.insert(t.to_string());
         }
@@ -1096,6 +1103,10 @@ impl ToolClassifier {
             "repo_ws_read",  // 轨二：白名单仓只读
             "repo_ws_list",  // 轨二：白名单仓列目录（只读）
             "repo_ws_stat",  // 轨二：白名单仓文件元数据（只读）
+            // P0-1 场景沙箱：只读推演（基线+影子叠加，绝不写生产）
+            "scenario_list",
+            "scenario_get",
+            "scenario_view",
         ] {
             c.read_tools.insert(t.to_string());
         }
@@ -1980,6 +1991,25 @@ mod tests {
         assert!(!b.is_dangerous_floor("query_plate"));
         assert!(!b.is_dangerous_floor("update_profile"));
         assert!(!b.is_dangerous_floor("send_email")); // 出域走另一道闸，不在地板
+        // P0-1 场景沙箱：commit 落生产必须走危险地板（审批闸）；只读推演不在地板
+        assert!(b.is_dangerous_floor("scenario_commit"));
+        assert!(!b.is_dangerous_floor("scenario_view"));
+        assert!(!b.is_dangerous_floor("scenario_list"));
+        assert!(!b.is_dangerous_floor("scenario_get"));
+    }
+
+    #[test]
+    fn test_scenario_tool_classification() {
+        let b = ComplianceBoundary::new(None);
+        let mut classifier = b.classifier.lock().unwrap();
+        // 读工具白名单
+        for t in ["scenario_list", "scenario_get", "scenario_view"] {
+            assert!(classifier.read_tools.contains(t), "{t} 应在 read_tools");
+        }
+        // 写工具（生命周期）
+        for t in ["scenario_create", "scenario_add_change", "scenario_commit", "scenario_discard"] {
+            assert!(classifier.write_tools.contains(t), "{t} 应在 write_tools");
+        }
     }
 
     #[test]
