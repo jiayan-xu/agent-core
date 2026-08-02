@@ -1871,6 +1871,34 @@ impl AgentCore {
         None
     }
 
+    /// 从受控写参数中提取人类可读摘要（用于审批提示，避免盲批）
+    fn summarize_args(args: &serde_json::Value) -> String {
+        let mut parts = Vec::new();
+        if let Some(v) = args.get("plate").and_then(|v| v.as_str()) {
+            parts.push(format!("车牌={}", v));
+        }
+        if let Some(v) = args.get("company_name").and_then(|v| v.as_str()) {
+            parts.push(format!("公司={}", v));
+        }
+        if let Some(v) = args.get("waste_type").and_then(|v| v.as_str()) {
+            parts.push(format!("固废种类={}", v));
+        }
+        if let Some(v) = args.get("action").and_then(|v| v.as_str()) {
+            parts.push(format!("操作={}", v));
+        }
+        if let Some(v) = args.get("plates").and_then(|v| v.as_array()) {
+            parts.push(format!("车牌清单={}辆", v.len()));
+        }
+        if let Some(v) = args.get("reason").and_then(|v| v.as_str()) {
+            parts.push(format!("原因={}", v));
+        }
+        if parts.is_empty() {
+            let s = args.to_string();
+            return s.chars().take(150).collect();
+        }
+        parts.join("，")
+    }
+
     /// L2 受控写统一入口：创建审批 + checkpoint + AWAITING_APPROVAL 文案（权限生存线）。
     async fn submit_controlled_write_approval(
         &self,
@@ -1898,9 +1926,10 @@ impl AgentCore {
             approval_id: Some(aid.clone()),
         };
         self.checkpoint_pending_approval(session_id, &aid, &pa).await;
+        let summary = Self::summarize_args(&pa.arguments);
         let reply = format!(
-            "AWAITING_APPROVAL:工具「{}」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续——{}",
-            tool_name, reason
+            "AWAITING_APPROVAL:工具「{}」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续——{}\n参数：{}",
+            tool_name, reason, summary
         );
         self.save_to_history(session_id, user_message, &reply).await;
         reply
@@ -3565,9 +3594,10 @@ impl AgentCore {
                             };
                             self.checkpoint_pending_approval(session_id, &aid, &pa)
                                 .await;
+                            let summary = Self::summarize_args(&tc.arguments);
                             let reply = format!(
-                                "AWAITING_APPROVAL:危险/红线工具「{}」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续",
-                                tc.name
+                                "AWAITING_APPROVAL:危险/红线工具「{}」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续\n参数：{}",
+                                tc.name, summary
                             );
                             self.save_to_history(session_id, raw_message, &reply).await;
                             return reply;
