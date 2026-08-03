@@ -1568,7 +1568,12 @@ fn main() {
                 .route("/api/approval/{id}/respond", post(handle_approval_respond))
                 .route("/approval-console", get(handle_approval_console))
                 .route("/updates/pfaix/latest.json", get(handle_updates_latest))
-                .route("/updates/pfaix/{file}", get(handle_updates_static));
+                .route("/updates/pfaix/{file}", get(handle_updates_static))
+                // /v1 别名：PFAiX 的 getAgentCoreBaseUrl() 返回带 /v1 的 base，
+                // lanManifestUrl 直接拼接导致请求 /v1/updates/...——旧版客户端无法改，
+                // 服务端同时挂别名兼容（review/修复：检查更新 401 根因）
+                .route("/v1/updates/pfaix/latest.json", get(handle_updates_latest))
+                .route("/v1/updates/pfaix/{file}", get(handle_updates_static));
 
             let protected = Router::new()
                 .route("/api/chat", post(handle_chat))
