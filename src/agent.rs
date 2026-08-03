@@ -1271,7 +1271,16 @@ impl AgentCore {
                 };
                 let result_short = result_text.chars().take(300).collect::<String>();
                 // 任务 649：按工具真实返回如实上报，杜绝「假成功」
-                let (executed, honest_prefix) = Self::classify_tool_execution(&exec_res);
+                let (mut executed, mut honest_prefix) = Self::classify_tool_execution(&exec_res);
+                // P1 假成功根治：只读/查询工具不产生写副作用，禁止回显「操作已执行成功」，
+                // 否则用户会误以为数据已修改（DB 实际未变）。仅提示未产生写入，并引导到真实写工具。
+                if executed && Self::is_readonly_query_tool(&action.tool_name) {
+                    executed = false;
+                    honest_prefix = Some(
+                        "⚠️ 该工具为只读查询，未修改任何数据。如确需写入，请确认存在对应写工具（例如 sync_whitelist_plates 的 update_company 操作）。"
+                            .to_string(),
+                    );
+                }
                 let reply = match honest_prefix {
                     Some(prefix) => format!(
                         "{}\n\n操作内容：{}\n\n{}",
@@ -4934,6 +4943,24 @@ impl AgentCore {
                 }
             }
         }
+    }
+
+    /// P1 假成功根治：已知只读/查询类工具。确认→执行链路中，这类工具即使返回
+    /// `success:true` 也**未产生任何写副作用**，绝不能回显「操作已执行成功」，
+    /// 否则用户会误以为数据已修改（DB 实际未变）。用于拦截只读工具被误当写成功。
+    fn is_readonly_query_tool(tool_name: &str) -> bool {
+        const READONLY: &[&str] = &[
+            "diagnose_data_gap",
+            "query_plate",
+            "query_sql",
+            "memory_search",
+            "memory_search_v2",
+            "memory_recall",
+            "memory",
+            "memory_profile",
+            "memory_health",
+        ];
+        READONLY.contains(&tool_name)
     }
 
     /// 查找能处理该工具的 MCP 源
