@@ -5228,7 +5228,11 @@ impl AgentCore {
         // 不经过 persona 白名单/配额/边界；但 kill_switch 全局禁用时同样拒绝（security review：降级语义一致）。
         if tool_name == "request_clarification" {
             if self.degrade.kill_switch_on() {
-                return Err("🛑 Kill switch 已启用，工具调用已全局禁用。".to_string());
+                // [ocr-low 修复] 与下方通用 kill-switch 拒绝分支对齐：补 warn 日志 + 规范文案
+                tracing::warn!("[DEGRADE] Kill switch 启用，拒绝澄清工具: {}", tool_name);
+                return Err(
+                    "🛑 Kill switch 已启用，工具调用已全局禁用，仅系统状态查询可用。".to_string(),
+                );
             }
             return crate::clarify::build_clarify_result(args);
         }
@@ -6135,10 +6139,16 @@ impl AgentCore {
 
         if all_tools.is_empty() {
             tracing::warn!("命名空间过滤后无可用 MCP 工具，使用 fallback");
-            return Self::fallback_tools();
+            let mut fb = Self::fallback_tools();
+            // [ocr-medium 修复] 澄清工具始终暴露：降级路径（all_tools 为空提前 return）此前
+            // 漏掉该工具，导致暴露/可调工具集不一致（call_tool_routed 仍接受 request_clarification）。
+            if !fb.iter().any(|t| t.function.name == "request_clarification") {
+                fb.push(crate::clarify::tool_def());
+            }
+            return fb;
         }
 
-        // P2-3：澄清工具始终暴露（纯对话，无数据访问/无副作用）；置于 fallback 检查之后
+        // P2-3：澄清工具始终暴露（纯对话，无数据访问/无副作用）
         if seen_names.insert("request_clarification".to_string()) {
             all_tools.push(crate::clarify::tool_def());
         }
