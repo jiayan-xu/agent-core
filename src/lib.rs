@@ -18,6 +18,7 @@ pub mod namespace;
 pub mod file_checkpoint;
 pub mod quota;
 pub mod sandbox;
+pub mod intent; // 重构阶段1：统一意图分类（一次分类，下游守卫统一读取）
 pub mod session;
 pub mod runtime;
 pub mod scheduler;

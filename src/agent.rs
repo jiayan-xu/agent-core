@@ -1191,17 +1191,17 @@ impl AgentCore {
             self.session_manager
                 .set_state(session_id, SessionState::Confirmed)
                 .await;
-            return {
-            let raw = self.execute_chat(
+            return crate::reply_polish::polish_llm_reply(
+                self.execute_chat(
                     message,
                     user_id,
                     session_id,
                     allowed_ns,
                     &trace_id,
                     external_history.clone(),
-                ).await;
-            crate::reply_polish::polish_llm_reply(raw)
-        };
+                )
+                .await,
+            );
         }
 
         // ── 0a. 工具级确认（现有）：pending_actions 中的操作等待确认 ──
@@ -1349,10 +1349,17 @@ impl AgentCore {
                         .await
                         .unwrap_or_else(|| message.to_string());
                     self.checkpoint_confirmed(session_id).await;
-                    return {
-            let raw = self.execute_chat(&original, user_id, session_id, allowed_ns, &trace_id, external_history.clone()).await;
-            crate::reply_polish::polish_llm_reply(raw)
-        };
+                    return crate::reply_polish::polish_llm_reply(
+                        self.execute_chat(
+                            &original,
+                            user_id,
+                            session_id,
+                            allowed_ns,
+                            &trace_id,
+                            external_history.clone(),
+                        )
+                        .await,
+                    );
                 }
                 // P1-2: 计划编辑（当前支持「删除第N步」）
                 if let Some(new_plan) = self.try_apply_plan_edit(trimmed).await {
@@ -1374,10 +1381,17 @@ impl AgentCore {
                         return self.handle_topic_switch(message, session_id).await;
                     }
                 }
-                return {
-            let raw = self.execute_chat(message, user_id, session_id, allowed_ns, &trace_id, external_history.clone()).await;
-            crate::reply_polish::polish_llm_reply(raw)
-        };
+                return crate::reply_polish::polish_llm_reply(
+                    self.execute_chat(
+                        message,
+                        user_id,
+                        session_id,
+                        allowed_ns,
+                        &trace_id,
+                        external_history.clone(),
+                    )
+                    .await,
+                );
             }
 
             // ── 新会话 ──
@@ -1399,10 +1413,17 @@ impl AgentCore {
                 self.session_manager
                     .set_state(session_id, SessionState::Confirmed)
                     .await;
-                return {
-            let raw = self.execute_chat(message, user_id, session_id, allowed_ns, &trace_id, external_history.clone()).await;
-            crate::reply_polish::polish_llm_reply(raw)
-        };
+                return crate::reply_polish::polish_llm_reply(
+                    self.execute_chat(
+                        message,
+                        user_id,
+                        session_id,
+                        allowed_ns,
+                        &trace_id,
+                        external_history.clone(),
+                    )
+                    .await,
+                );
             }
         }
     }
@@ -2049,6 +2070,54 @@ impl AgentCore {
         None
     }
 
+    /// 统一意图分类（重构阶段 1-3）：一次分类产出 `Intent`，下游守卫/预路由/循环
+    /// 豁免统一读取，替代散落的 7+ 个 is_xxx 判断。内部复用既有确定性判断函数，
+    /// 行为与散落判断完全一致（等价性由单元测试锁定）。
+    fn classify_intent(message: &str) -> crate::intent::Intent {
+        let attachment = Self::has_attachment_block(message);
+        let guard_block = Self::input_guardrail_block(message);
+        let approval_confirm = Self::is_approval_confirm_message(message);
+        let data_query = Self::is_data_query_intent(message);
+        let whitelist_add = Self::extract_whitelist_add(message);
+        let whitelist_update = Self::extract_whitelist_update(message);
+        let whitelist_waste = Self::extract_whitelist_waste_type(message);
+        let whitelist_remove = Self::extract_whitelist_remove(message);
+        let exception_sync = Self::is_exception_sync_intent(message);
+        let sample_sync = Self::is_sample_sync_intent(message);
+        let kind = if guard_block.is_some() {
+            crate::intent::IntentKind::GuardBlocked
+        } else if approval_confirm {
+            crate::intent::IntentKind::ApprovalConfirm
+        } else if whitelist_add.is_some()
+            || whitelist_update.is_some()
+            || whitelist_waste.is_some()
+            || whitelist_remove.is_some()
+            || exception_sync
+            || sample_sync
+        {
+            crate::intent::IntentKind::WhitelistWrite
+        } else if attachment {
+            crate::intent::IntentKind::Attachment
+        } else if data_query {
+            crate::intent::IntentKind::DataQuery
+        } else {
+            crate::intent::IntentKind::Chat
+        };
+        crate::intent::Intent {
+            kind,
+            attachment,
+            data_query,
+            approval_confirm,
+            guard_block,
+            whitelist_add,
+            whitelist_update,
+            whitelist_waste,
+            whitelist_remove,
+            exception_sync,
+            sample_sync,
+        }
+    }
+
     /// 判断消息是否为「确认类」——用户回应审批（确认/批准/同意/已批准等）。
     /// execute_chat 入口仅在确认类消息时消费就绪审批，避免新请求被残留审批顶掉。
     fn is_approval_confirm_message(message: &str) -> bool {
@@ -2200,6 +2269,178 @@ impl AgentCore {
         None
     }
 
+    /// P1 guardrail 输入级硬拦截（重构阶段 2 抽取，行为与内联一致）：
+    /// 绕过审批诱导 / 危险系统操作 → 拦截 + 审计 + 存历史。返回 Some(拒绝文案)。
+    async fn guard_input(&self, message: &str, session_id: &str) -> Option<String> {
+        let block_reply = Self::input_guardrail_block(message)?;
+        self.audit_logger
+            .log_decision(
+                &self.config.identity.agent_id,
+                "input_guardrail",
+                &block_reply,
+                false,
+            )
+            .await;
+        self.save_to_history(session_id, message, &block_reply).await;
+        Some(block_reply)
+    }
+
+    /// 确定性预路由表（重构阶段 2 抽取，行为与内联一致）：白名单 5 类受控写 +
+    /// 异常/取样同步，命中即构造审批闸。返回 Some(已处理回复)。
+    async fn try_preroute(&self, message: &str, session_id: &str) -> Option<String> {
+        // ── 白名单公司名变更 → sync_whitelist_plates update_company ──
+        // 绕过 LLM 规划器对 memory 工具的顽固误路由（详见 extract_whitelist_update）。
+        if let Some((plate, company)) = Self::extract_whitelist_update(message) {
+            if self.config.human_approval {
+                let reason = format!(
+                    "白名单受控写：修改车牌 {} 的公司名为「{}」（需人工审批）",
+                    plate, company
+                );
+                let args = serde_json::json!({
+                    "action": "update_company",
+                    "plate": plate,
+                    "company_name": company,
+                    "reason": reason,
+                    "confirmed": false
+                });
+                return Some(
+                    self.submit_controlled_write_approval(
+                        session_id,
+                        message,
+                        "sync_whitelist_plates",
+                        args,
+                        reason,
+                    )
+                    .await,
+                );
+            }
+        }
+
+        // ── 白名单固废种类变更 → manage_whitelist update_waste_type ──
+        if let Some((plate, waste)) = Self::extract_whitelist_waste_type(message) {
+            if self.config.human_approval {
+                let reason = format!(
+                    "白名单受控写：修改车牌 {} 的固废种类为「{}」（需人工审批）",
+                    plate, waste
+                );
+                let args = serde_json::json!({
+                    "action": "update_waste_type",
+                    "plate": plate,
+                    "waste_type": waste,
+                    "reason": reason,
+                    "confirmed": false
+                });
+                return Some(
+                    self.submit_controlled_write_approval(
+                        session_id,
+                        message,
+                        "manage_whitelist",
+                        args,
+                        reason,
+                    )
+                    .await,
+                );
+            }
+        }
+
+        // ── 白名单「添加新车」→ sync_whitelist_plates add ──
+        if let Some((plate, company)) = Self::extract_whitelist_add(message) {
+            if self.config.human_approval {
+                let reason = format!(
+                    "白名单受控写：新增车牌 {}（公司「{}」，需人工审批）",
+                    plate, company
+                );
+                let args = serde_json::json!({
+                    "action": "add",
+                    "plate": plate,
+                    "company_name": company,
+                    "reason": reason,
+                    "confirmed": false
+                });
+                return Some(
+                    self.submit_controlled_write_approval(
+                        session_id,
+                        message,
+                        "sync_whitelist_plates",
+                        args,
+                        reason,
+                    )
+                    .await,
+                );
+            }
+        }
+
+        // ── 白名单软删 → sync_whitelist_plates remove ──
+        if let Some(plate) = Self::extract_whitelist_remove(message) {
+            if self.config.human_approval {
+                let reason = format!("白名单受控写：软删除车牌 {}（需人工审批）", plate);
+                let args = serde_json::json!({
+                    "action": "remove",
+                    "plate": plate,
+                    "reason": reason,
+                    "confirmed": false
+                });
+                return Some(
+                    self.submit_controlled_write_approval(
+                        session_id,
+                        message,
+                        "sync_whitelist_plates",
+                        args,
+                        reason,
+                    )
+                    .await,
+                );
+            }
+        }
+
+        // ── 异常表修正同步 → sync_exception_correction ──
+        if Self::is_exception_sync_intent(message) {
+            if self.config.human_approval {
+                let reason =
+                    "异常修正同步：将异常情况记录表同步到 DB/入厂日志（需人工审批）".to_string();
+                let args = serde_json::json!({
+                    "dry_run": false,
+                    "reason": reason,
+                });
+                return Some(
+                    self.submit_controlled_write_approval(
+                        session_id,
+                        message,
+                        "sync_exception_correction",
+                        args,
+                        reason,
+                    )
+                    .await,
+                );
+            }
+        }
+
+        // ── 取样台账同步 → manage_samples(action=sync) ──
+        if Self::is_sample_sync_intent(message) {
+            if self.config.human_approval {
+                let reason =
+                    "取样台账受控写：同步异常记录到样品台账（需人工审批）".to_string();
+                let args = serde_json::json!({
+                    "action": "sync",
+                    "dry_run": false,
+                    "reason": reason,
+                });
+                return Some(
+                    self.submit_controlled_write_approval(
+                        session_id,
+                        message,
+                        "manage_samples",
+                        args,
+                        reason,
+                    )
+                    .await,
+                );
+            }
+        }
+
+        None
+    }
+
     /// 已确认会话的执行路径（原 chat() 主体 + Step 前缀）
     async fn execute_chat(
         &self,
@@ -2235,19 +2476,9 @@ impl AgentCore {
             }
         }
 
-        // ── P1 guardrail：输入级硬拦截（确定性规则，LLM 前）──
-        // 绕过审批诱导 / 危险系统操作 → 直接拒绝 + 审计（OpenAI Agents SDK 输入 guardrail 语义）
-        if let Some(block_reply) = Self::input_guardrail_block(message) {
-            self.audit_logger
-                .log_decision(
-                    &self.config.identity.agent_id,
-                    "input_guardrail",
-                    &block_reply,
-                    false,
-                )
-                .await;
-            self.save_to_history(session_id, message, &block_reply).await;
-            return block_reply;
+        // ── P1 guardrail：输入级硬拦截（重构阶段2 抽为 guard_input）──
+        if let Some(reply) = self.guard_input(message, session_id).await {
+            return reply;
         }
 
         // ── 短确认写意图：从历史还原车牌/全称 → 受控写闸门（禁止只读工具假成功）──
@@ -2289,151 +2520,10 @@ impl AgentCore {
             }
         }
 
-        // ── 确定性预路由：白名单公司名变更 → 直接构造受控写审批闸门 ──
-        // 绕过 LLM 规划器对 memory 工具的顽固误路由（详见 extract_whitelist_update）。
-        if let Some((plate, company)) = Self::extract_whitelist_update(message) {
-            if self.config.human_approval {
-                let reason = format!(
-                    "白名单受控写：修改车牌 {} 的公司名为「{}」（需人工审批）",
-                    plate, company
-                );
-                let args = serde_json::json!({
-                    "action": "update_company",
-                    "plate": plate,
-                    "company_name": company,
-                    "reason": reason,
-                    "confirmed": false
-                });
-                return self
-                    .submit_controlled_write_approval(
-                        session_id,
-                        message,
-                        "sync_whitelist_plates",
-                        args,
-                        reason,
-                    )
-                    .await;
-            }
-        }
-
-        // ── 确定性预路由：白名单固废种类变更 → manage_whitelist ──
-        if let Some((plate, waste)) = Self::extract_whitelist_waste_type(message) {
-            if self.config.human_approval {
-                let reason = format!(
-                    "白名单受控写：修改车牌 {} 的固废种类为「{}」（需人工审批）",
-                    plate, waste
-                );
-                let args = serde_json::json!({
-                    "action": "update_waste_type",
-                    "plate": plate,
-                    "waste_type": waste,
-                    "reason": reason,
-                    "confirmed": false
-                });
-                return self
-                    .submit_controlled_write_approval(
-                        session_id,
-                        message,
-                        "manage_whitelist",
-                        args,
-                        reason,
-                    )
-                    .await;
-            }
-        }
-
-        // ── 确定性预路由：白名单「添加新车」→ 直接构造受控写审批闸门 ──
-        if let Some((plate, company)) = Self::extract_whitelist_add(message) {
-            if self.config.human_approval {
-                let reason = format!(
-                    "白名单受控写：新增车牌 {}（公司「{}」，需人工审批）",
-                    plate, company
-                );
-                let args = serde_json::json!({
-                    "action": "add",
-                    "plate": plate,
-                    "company_name": company,
-                    "reason": reason,
-                    "confirmed": false
-                });
-                return self
-                    .submit_controlled_write_approval(
-                        session_id,
-                        message,
-                        "sync_whitelist_plates",
-                        args,
-                        reason,
-                    )
-                    .await;
-            }
-        }
-
-        // ── 确定性预路由：白名单软删 → sync_whitelist_plates remove ──
-        if let Some(plate) = Self::extract_whitelist_remove(message) {
-            if self.config.human_approval {
-                let reason = format!(
-                    "白名单受控写：软删除车牌 {}（需人工审批）",
-                    plate
-                );
-                let args = serde_json::json!({
-                    "action": "remove",
-                    "plate": plate,
-                    "reason": reason,
-                    "confirmed": false
-                });
-                return self
-                    .submit_controlled_write_approval(
-                        session_id,
-                        message,
-                        "sync_whitelist_plates",
-                        args,
-                        reason,
-                    )
-                    .await;
-            }
-        }
-
-        // ── 确定性预路由：异常表修正同步 → sync_exception_correction ──
-        if Self::is_exception_sync_intent(message) {
-            if self.config.human_approval {
-                let reason =
-                    "异常修正同步：将异常情况记录表同步到 DB/入厂日志（需人工审批）".to_string();
-                let args = serde_json::json!({
-                    "dry_run": false,
-                    "reason": reason,
-                });
-                return self
-                    .submit_controlled_write_approval(
-                        session_id,
-                        message,
-                        "sync_exception_correction",
-                        args,
-                        reason,
-                    )
-                    .await;
-            }
-        }
-
-        // ── 确定性预路由：取样台账同步 → manage_samples(action=sync) ──
-        if Self::is_sample_sync_intent(message) {
-            if self.config.human_approval {
-                let reason =
-                    "取样台账受控写：同步异常记录到样品台账（需人工审批）".to_string();
-                let args = serde_json::json!({
-                    "action": "sync",
-                    "dry_run": false,
-                    "reason": reason,
-                });
-                return self
-                    .submit_controlled_write_approval(
-                        session_id,
-                        message,
-                        "manage_samples",
-                        args,
-                        reason,
-                    )
-                    .await;
-            }
+        // ── 确定性预路由（重构阶段2 抽为 try_preroute）：白名单 5 类 + 异常/取样
+        // 全部收敛到一张路由表 → 受控写审批闸 ──
+        if let Some(reply) = self.try_preroute(message, session_id).await {
+            return reply;
         }
 
         // ── HY3 1.3：MultiAgent Compose（子 agent 派发，非 Meta RSI）──
@@ -3594,6 +3684,9 @@ impl AgentCore {
         let mut did_work = false;
         let mut executed_tools: Vec<String> = Vec::new();
 
+        // 重构阶段3：一次分类，循环内守卫统一读取（消除散落 is_xxx / 豁免条件复制）
+        let intent = Self::classify_intent(raw_message);
+
         for _round in 0..self.config.max_tool_rounds {
             // P2-1: 日 token 预算预估（请求上下文体量），超限硬拒
             let ctx_chars: usize = messages
@@ -3644,10 +3737,8 @@ impl AgentCore {
             // 无工具调用 → LLM 直接回复
             if response.tool_calls.is_empty() {
                 // P0 证据门禁：运维意图未取证 → 拒绝空嘴根因/方案
-                // ⚠️ 附件消息豁免：用户消息含【附件正文:】时数据已在消息内（即证据），
-                // 对比/分析附件不应被门禁拦截（修复 2026-08-04 附件对比被拒答）。
-                let has_attachment = Self::has_attachment_block(raw_message);
-                if crate::dept_ops::is_dept_grounded_intent(raw_message) && !did_work && !has_attachment {
+                // 附件豁免统一读 intent.attachment（重构阶段3）
+                if crate::dept_ops::is_dept_grounded_intent(raw_message) && !did_work && !intent.attachment {
                     let refuse = crate::dept_ops::refuse_ungrounded_ops_reply(raw_message);
                     self.save_to_history(session_id, raw_message, &refuse).await;
                     return refuse;
@@ -3655,8 +3746,8 @@ impl AgentCore {
                 // ⚠️ P0 修复（2026-08-04）：业务数据意图 + 未取证 → 强制工具重试。
                 // 合成路由降级后 LLM 可在第一轮空手返回（tool_count=0，幻觉/编造数据），
                 // max_tool_rounds 给了 3 轮预算但此出口此前从不重试。
-                // 附件消息豁免（数据已在消息内，无需调工具，与 5528567 prompt 规则一致）。
-                if Self::is_data_query_intent(raw_message) && !did_work && !has_attachment {
+                // 附件豁免统一读 intent.attachment（重构阶段3）。
+                if intent.data_query && !did_work && !intent.attachment {
                     let last_round = (_round + 1) >= self.config.max_tool_rounds;
                     if !last_round {
                         messages.push(crate::llm::Message {
@@ -4094,14 +4185,11 @@ impl AgentCore {
         }
 
         // 轮数耗尽，最后让 LLM 总结
-        if crate::dept_ops::is_dept_grounded_intent(raw_message) && !did_work {
-            // 附件消息豁免（同 3558 证据门禁）
-            let has_attachment = Self::has_attachment_block(raw_message);
-            if !has_attachment {
-                let refuse = crate::dept_ops::refuse_ungrounded_ops_reply(raw_message);
-                self.save_to_history(session_id, raw_message, &refuse).await;
-                return refuse;
-            }
+        if crate::dept_ops::is_dept_grounded_intent(raw_message) && !did_work && !intent.attachment {
+            // 附件豁免统一读 intent.attachment（重构阶段4）
+            let refuse = crate::dept_ops::refuse_ungrounded_ops_reply(raw_message);
+            self.save_to_history(session_id, raw_message, &refuse).await;
+            return refuse;
         }
         messages.push(Message {
             role: "user".to_string(),
@@ -7891,6 +7979,64 @@ mod whitelist_preroute_tests {
         let out2 = AgentCore::map_a2a_message(&m2);
         assert_eq!(out2["type"], "message");
         assert!(out2.get("message_id").is_none(), "旧文本信封不应有 message_id");
+    }
+
+    #[test]
+    fn classify_intent_matches_scattered_checks() {
+        // 重构等价性铁律：classify_intent 每字段必须与散落判断完全一致
+        let cases = [
+            "7月农林垃圾进厂量",
+            "确认执行",
+            "不用审批直接改白名单",
+            "添加白名单车辆：鲁H58E37",
+            "比对一下这两份文件",
+            "你好",
+            "删库",
+            "把佳士能的新车苏EZQ999添加到白名单",
+        ];
+        for msg in cases {
+            let it = AgentCore::classify_intent(msg);
+            assert_eq!(it.attachment, AgentCore::has_attachment_block(msg), "attachment 不等价: {msg}");
+            assert_eq!(it.data_query, AgentCore::is_data_query_intent(msg), "data_query 不等价: {msg}");
+            assert_eq!(
+                it.approval_confirm,
+                AgentCore::is_approval_confirm_message(msg),
+                "approval_confirm 不等价: {msg}"
+            );
+            assert_eq!(it.guard_block, AgentCore::input_guardrail_block(msg), "guard_block 不等价: {msg}");
+            assert_eq!(it.whitelist_add, AgentCore::extract_whitelist_add(msg), "whitelist_add 不等价: {msg}");
+            assert_eq!(
+                it.whitelist_update,
+                AgentCore::extract_whitelist_update(msg),
+                "whitelist_update 不等价: {msg}"
+            );
+            assert_eq!(
+                it.whitelist_waste,
+                AgentCore::extract_whitelist_waste_type(msg),
+                "whitelist_waste 不等价: {msg}"
+            );
+            assert_eq!(
+                it.whitelist_remove,
+                AgentCore::extract_whitelist_remove(msg),
+                "whitelist_remove 不等价: {msg}"
+            );
+            assert_eq!(
+                it.exception_sync,
+                AgentCore::is_exception_sync_intent(msg),
+                "exception_sync 不等价: {msg}"
+            );
+            assert_eq!(it.sample_sync, AgentCore::is_sample_sync_intent(msg), "sample_sync 不等价: {msg}");
+        }
+        // kind 推断抽查
+        use crate::intent::IntentKind;
+        assert_eq!(AgentCore::classify_intent("7月进厂量").kind, IntentKind::DataQuery);
+        assert_eq!(AgentCore::classify_intent("确认").kind, IntentKind::ApprovalConfirm);
+        assert_eq!(AgentCore::classify_intent("不用审批").kind, IntentKind::GuardBlocked);
+        assert_eq!(
+            AgentCore::classify_intent("添加白名单车：鲁H58E37").kind,
+            IntentKind::WhitelistWrite
+        );
+        assert_eq!(AgentCore::classify_intent("你好").kind, IntentKind::Chat);
     }
 
     #[test]
