@@ -2865,13 +2865,18 @@ async fn handle_collab_inbox(
     headers: axum::http::HeaderMap,
     axum::extract::Query(q): axum::extract::Query<CollabInboxQuery>,
 ) -> axum::response::Response {
-    let (agent_id, _allowed_ns) = match authenticate(&headers, &st).await {
+    let (agent_id, allowed_ns) = match authenticate(&headers, &st).await {
         Ok(a) => a,
         Err(r) => return r,
     };
     let agent_key = resolve_caller_memoria_key(&st, &agent_id, &headers).await;
-    // ADMIN 标识：独立头 x-admin-key（避免把 admin_key 塞进 x-agent-key 破坏 a2a badge 鉴权）
-    let is_admin_caller = is_admin_by_admin_key(&headers, &st).await;
+    // ADMIN 判定（badge 绑定，无需 x-admin-key 头）：
+    // 调用者 allowed_ns 含 `*`（管理员注册提权后 namespace 追加 `*`）即视为 admin，
+    // 协作收件箱注入待审批项。此前依赖 x-admin-key 需在每台 PFAiX 手动填 key，
+    // 且 8/1 瘦身工程误删 PFAiX 的 adminKey 字段导致审批不可见。
+    let is_admin_caller = allowed_ns.iter().any(|n| n == "*" || n == "system");
+    // 兼容：仍接受 x-admin-key 头（存量客户端/脚本）
+    let is_admin_caller = is_admin_caller || is_admin_by_admin_key(&headers, &st).await;
 
     // 拉取（持有 agent 锁的模式与 handle_chat 一致）
     let raw = {
@@ -4679,6 +4684,40 @@ async fn handle_register(
             agent_id.clone(),
             (badge_token.clone(), std::time::Instant::now()),
         );
+        // 管理员名单提权：display_name（中文名）命中 AGENT_ADMIN_NAMES 的注册者，
+        // 自动提升 permission=admin + namespace 追加 `*`——PFAiX 用自己身份即可见审批，
+        // 无需在每台客户端手动填 MEMORIA_ADMIN_KEY（老大反馈：手动填 key 多此一举且有泄密面）。
+        let admin_names = std::env::var("AGENT_ADMIN_NAMES").unwrap_or_default();
+        let is_admin_reg = admin_names
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .any(|n| {
+                n == display_name.trim()
+                    || n == name.trim()
+                    || n == agent_id
+            });
+        if is_admin_reg {
+            let admin_key2 = env_memoria_admin_key(&cfg_admin);
+            let mcp2 = memoria_proxy_client(&server, &cfg_admin);
+            let admin_ns = if namespace.contains('*') {
+                namespace.clone()
+            } else {
+                format!("{},*", namespace)
+            };
+            let _ = mcp2
+                .call_json(
+                    "agent_update",
+                    &serde_json::json!({
+                        "agent_id": &agent_id,
+                        "admin_key": &admin_key2,
+                        "namespace": &admin_ns,
+                        "permission": "admin",
+                    }),
+                )
+                .await;
+            tracing::info!(target: "agent.register", agent=%agent_id, "管理员名单命中，已提权 admin");
+        }
     }
 
     // 审计日志：记录身份注册（admin + ADMIN_KEY，禁止 admin + jarvis badge）

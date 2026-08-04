@@ -1932,7 +1932,7 @@ impl AgentCore {
             .await;
         let pa = PendingAction {
             tool_name: tool_name.to_string(),
-            arguments: args,
+            arguments: args.clone(),
             description: reason.clone(),
             approval_id: Some(aid.clone()),
         };
@@ -1943,6 +1943,32 @@ impl AgentCore {
             tool_name, reason, summary
         );
         self.save_to_history(session_id, user_message, &reply).await;
+        // P2-D 修复：审批创建后必须主动推送审批人（a2a approval_request）。
+        // 此前仅返回 AWAITING_APPROVAL 文案给请求方，审批人收件箱无消息 →「审批没有发给我」。
+        // 与危险工具路径（approver_id 分支）保持一致。
+        if let Some(approver_id) = &self.config.approver_id {
+            let msg = serde_json::json!({
+                "type": "approval_request",
+                "approval_id": aid,
+                "tool_name": tool_name,
+                "description": reason,
+                "arguments": args.clone(),
+                "requester_id": self.config.identity.agent_id.clone(),
+                "requester_ns": self.config.identity.ns(),
+            });
+            let _ = self
+                .mcp
+                .call(
+                    "a2a_send",
+                    &serde_json::json!({
+                        "to": approver_id,
+                        "content": msg.to_string(),
+                        "namespace": format!("agent/{}", approver_id),
+                    }),
+                )
+                .await;
+            tracing::info!(target: "agent.approval", approver=%approver_id, aid=%aid, "审批请求已推送");
+        }
         reply
     }
 
