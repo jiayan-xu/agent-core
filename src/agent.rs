@@ -2005,11 +2005,21 @@ impl AgentCore {
     /// execute_chat 入口仅在确认类消息时消费就绪审批，避免新请求被残留审批顶掉。
     fn is_approval_confirm_message(message: &str) -> bool {
         let m = message.trim();
+        // 长消息（>8 字）绝不视为确认类：普通请求如「可以把文件比对一下吗」含高频词
+        // 「可以」会被误判为确认而误消费残留审批（与 is_confirm 的 >8 字豁免一致）。
+        if m.chars().count() > 8 {
+            return false;
+        }
+        // 强确认词：专指审批回应，普通请求几乎不会出现，contains 匹配即可。
         const CONFIRM_WORDS: &[&str] = &[
             "确认", "确认添加", "确认执行", "确认删除", "批准", "已批准", "同意", "已同意",
-            "通过", "已通过", "好的", "可以", "执行", "确定", "继续", "就按这个",
+            "就按这个",
         ];
+        // 高频泛词：普通请求也常见（「可以把录像列表去掉吗」「通过浏览器打开」），
+        // 仅当消息**以该词开头**（如「可以」「可以查」「好的，执行」）才视为确认。
+        const WEAK_WORDS: &[&str] = &["可以", "通过", "好的", "执行", "确定", "继续"];
         CONFIRM_WORDS.iter().any(|w| m.contains(w))
+            || WEAK_WORDS.iter().any(|w| m.starts_with(w))
     }
 
     /// 抽取车牌（容忍空格），如「鲁 H736A 7」→「鲁H736A7」。
@@ -7581,10 +7591,20 @@ mod whitelist_preroute_tests {
         assert!(AgentCore::is_approval_confirm_message("已批准"));
         assert!(AgentCore::is_approval_confirm_message("好的，确认执行"));
         assert!(AgentCore::is_approval_confirm_message("同意"));
+        // 短确认（高频词作为整条消息/开头）：仍是确认意图
+        assert!(AgentCore::is_approval_confirm_message("可以"));
+        assert!(AgentCore::is_approval_confirm_message("可以查"));
+        assert!(AgentCore::is_approval_confirm_message("通过"));
+        assert!(AgentCore::is_approval_confirm_message("执行"));
         // 普通新请求：不消费审批（防残留审批顶掉新请求——回归 2026-08-04 文件比对被顶）
         assert!(!AgentCore::is_approval_confirm_message("比对一下这两份文件"));
         assert!(!AgentCore::is_approval_confirm_message("一般固废入厂日志-2026年7月.xlsx"));
         assert!(!AgentCore::is_approval_confirm_message("查询7月的进厂记录"));
+        // 回归 2026-08-04 review：高频词「可以/通过」出现在长消息中间/开头时不得误判
+        // （否则新请求会误消费残留审批，错误执行白名单写）
+        assert!(!AgentCore::is_approval_confirm_message("可以把录像列表去掉吗"));
+        assert!(!AgentCore::is_approval_confirm_message("通过浏览器打开这个页面"));
+        assert!(!AgentCore::is_approval_confirm_message("好的，今天进厂的车都有哪些"));
     }
 
     #[test]
