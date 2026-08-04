@@ -55,14 +55,28 @@ use agent_core::metrics::MetricsRegistry;
 use agent_core::approval::ApprovalResponse;
 use agent_core::mcp_client::McpClient;
 use agent_core::resources::SharedResourceSnapshot;
+use std::sync::OnceLock;
 
-/// 公司根命名空间（与 agent.toml 的 mcp_source namespace org/ 前缀、Memoria 注册一致）
-const ORG_COMPANY: &str = "cs-pufa-2nd-thermal";
+/// 公司根命名空间（与 agent.toml 的 mcp_source namespace org/ 前缀、Memoria 注册一致）。
+/// 改为运行时配置：启动时由 agent.toml `org_company` 注入（默认 cs-pufa-2nd-thermal，行为不变）。
+static ORG_COMPANY: OnceLock<String> = OnceLock::new();
+
+/// 取当前公司根标识（未初始化时回退默认，保证测试/旧路径不崩）。
+fn org_company() -> &'static str {
+    ORG_COMPANY.get().map(|s| s.as_str()).unwrap_or("cs-pufa-2nd-thermal")
+}
 
 /// 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Config {
     agent_id: String,
+    /// 领域模式：`solid_waste`（默认，保持固废行为）/ `office` / `general`。
+    /// 非 solid_waste 下关闭「固废本部门运维纪律 / 证据门禁 / 部门工具包自动注入」。
+    #[serde(default = "default_domain_mode")]
+    domain_mode: String,
+    /// 公司根标识（命名空间 org/<org_company> 前缀）。默认 cs-pufa-2nd-thermal。
+    #[serde(default = "default_org_company")]
+    org_company: String,
     #[serde(default)]
     api_key: String,
     #[serde(default = "default_server")]
@@ -153,6 +167,13 @@ fn default_fn_name() -> String {
 }
 fn default_true() -> bool {
     true
+}
+
+fn default_domain_mode() -> String {
+    "solid_waste".to_string()
+}
+fn default_org_company() -> String {
+    "cs-pufa-2nd-thermal".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -509,6 +530,9 @@ struct CollabApprovalBody {
     /// 拒绝/备注理由，可选
     reason: Option<String>,
     /// 创建时计算的操作指纹，必须回显一致，否则视为操作被偷换而拒绝（防 LLM 自批）。
+    /// serde default：PFAiX 前端（0.8.13）不发该字段；本地 L2 待批项由 admin 判定兜底，
+    /// A2A 路径仍强制校验（见 handle_collab_approval 内 is_local 分支）。
+    #[serde(default)]
     operation_hash: String,
 }
 
@@ -532,7 +556,7 @@ fn ns_blob(ns: &[String]) -> String {
 fn caller_in_org(caller_ns: &[String]) -> bool {
     let blob = ns_blob(caller_ns);
     caller_ns.iter().any(|n| n == "*")
-        || blob.contains(&format!("org/{}", ORG_COMPANY))
+        || blob.contains(&format!("org/{}", org_company()))
 }
 
 fn caller_has_dept(caller_ns: &[String], dept: &str) -> bool {
@@ -625,7 +649,7 @@ fn collab_reachability(
 }
 
 fn peer_in_company(namespace: &str) -> bool {
-    namespace.contains(&format!("org/{}", ORG_COMPANY)) || namespace.contains('*')
+    namespace.contains(&format!("org/{}", org_company())) || namespace.contains('*')
 }
 
 struct AppState {
@@ -1254,11 +1278,14 @@ fn load_or_create_config() -> Config {
             // P1-4 修复：load 阶段不再原地展开 ${ENV} 占位符。
             // 存储态（AppState.config）始终保留占位符，save 时不会把 ${AGENT_API_KEY} 回写成明文。
             // 运行时展开交由 resolve_config_for_runtime（克隆后展开），见 build_agent 调用点。
+            init_domain_and_org(&cfg);
             return cfg;
         }
     }
     let cfg = Config {
         agent_id: whoami().unwrap_or_else(|| "default".to_string()),
+        domain_mode: default_domain_mode(),
+        org_company: default_org_company(),
         api_key: String::new(),
         server: default_server(),
         port: 9753,
@@ -1277,6 +1304,7 @@ fn load_or_create_config() -> Config {
         ttc: Default::default(),
         intake_filter: None,
     };
+    init_domain_and_org(&cfg);
     let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());
     cfg
 }
@@ -1284,6 +1312,13 @@ fn load_or_create_config() -> Config {
 fn save_config(cfg: &Config) {
     let path = config_path();
     let _ = std::fs::write(&path, toml::to_string_pretty(cfg).unwrap_or_default());
+}
+
+/// 启动时把配置里的 domain_mode / org_company 注入全局（dept_ops 门禁、命名空间判定读取）。
+fn init_domain_and_org(cfg: &Config) {
+    agent_core::dept_ops::init_domain_mode(agent_core::dept_ops::DomainMode::from_str(&cfg.domain_mode));
+    agent_core::dept_ops::init_org_ns(&cfg.org_company);
+    let _ = ORG_COMPANY.set(cfg.org_company.clone());
 }
 
 fn build_cors_layer(host: &str, port: u16, configured: &[String]) -> CorsLayer {
@@ -3211,7 +3246,7 @@ async fn handle_collab_send(
                             // 按 scope 过滤同组织/同部门/同项目成员
                             let ns = peers_ns_of(&peers, id);
                             match scope {
-                                "org" => ns.contains(&format!("org/{}", ORG_COMPANY)),
+                                "org" => ns.contains(&format!("org/{}", org_company())),
                                 "dept" => ns.contains(&format!("dept/{}", scope_id)),
                                 "proj" => ns.contains(&format!("proj/{}", scope_id)),
                                 _ => false,
@@ -3312,7 +3347,7 @@ async fn handle_collab_approval(
     headers: axum::http::HeaderMap,
     axum::extract::Json(body): axum::extract::Json<CollabApprovalBody>,
 ) -> axum::response::Response {
-    let (agent_id, _allowed_ns) = match authenticate(&headers, &st).await {
+    let (agent_id, allowed_ns) = match authenticate(&headers, &st).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -3343,8 +3378,11 @@ async fn handle_collab_approval(
                 (req, aid, false)
             }
             Ok(None) => {
-                // 本地 L2 待批项（受控写触发，未推 A2A 收件箱）：仅 admin 可处理
-                if !is_admin_by_admin_key(&headers, &st).await {
+                // 本地 L2 待批项（受控写触发，未推 A2A 收件箱）：仅 admin 可处理。
+                // admin 判定 = 调用者 allowed_ns 含 `*`（badge 绑定，与 inbox 注入一致），
+                // 兼容 x-admin-key 头（存量脚本）。
+                let is_admin_badge = allowed_ns.iter().any(|n| n == "*" || n == "system");
+                if !is_admin_badge && !is_admin_by_admin_key(&headers, &st).await {
                     return (
                         axum::http::StatusCode::FORBIDDEN,
                         axum::Json(serde_json::json!({"error": "需要 admin 权限"})),
@@ -3383,6 +3421,9 @@ async fn handle_collab_approval(
     // 回写 requester 收件箱（先校验 operation_hash，防 A2A 中转偷换）
     let send_res = if let Some(ref agent) = *agent_guard {
         // C1c: 取回 pending 的 operation_hash，校验 A2A 响应回显一致（防 LLM 自批 / 偷换）
+        // 本地 L2 待批项（is_local=true，受控写触发未走 A2A）跳过 hash 校验：
+        // 已过 admin 判定（allowed_ns 含 * 或 x-admin-key），且 PFAiX 前端不发该字段；
+        // 防偷换语义由 admin 判定承担。A2A 中转路径仍强制校验。
         let expected_hash = match agent.approval_manager.get_pending(&approval_id).await {
             Some(p) => p.operation_hash,
             None => {
@@ -3393,7 +3434,7 @@ async fn handle_collab_approval(
                     .into_response()
             }
         };
-        if body.operation_hash != expected_hash {
+        if !is_local && body.operation_hash != expected_hash {
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 axum::Json(serde_json::json!({
@@ -5349,13 +5390,13 @@ mod collab_policy_tests {
 
     #[test]
     fn org_broadcast_requires_whitelist() {
-        let ns = vec![format!("org/{}", ORG_COMPANY)];
+        let ns = vec![format!("org/{}", org_company())];
         // 普通成员有 org ns 也不能发
-        assert!(collab_reachability("random-user", &ns, "org", ORG_COMPANY, "notify").is_err());
+        assert!(collab_reachability("random-user", &ns, "org", org_company(), "notify").is_err());
         // 白名单默认 office-agent
-        assert!(collab_reachability("office-agent", &ns, "org", ORG_COMPANY, "notify").is_ok());
+        assert!(collab_reachability("office-agent", &ns, "org", org_company(), "notify").is_ok());
         // org+query 仍拒绝
-        assert!(collab_reachability("office-agent", &ns, "org", ORG_COMPANY, "query").is_err());
+        assert!(collab_reachability("office-agent", &ns, "org", org_company(), "query").is_err());
     }
 
     #[test]

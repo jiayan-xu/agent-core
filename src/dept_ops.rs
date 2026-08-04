@@ -4,11 +4,64 @@
 //! 而不是用 auto_route / 空嘴分析冒充运维。
 
 use crate::composer::ExecutionPlan;
+use std::sync::OnceLock;
 
-/// 公司根 ns（dashboard 技能树挂在此下）
-pub const ORG_NS: &str = "org/cs-pufa-2nd-thermal";
-/// 固废部门工具包 ns（与 agent.toml [[mcp_source]] dashboard.namespace 对齐）
-pub const DEPT_TOOLKIT_NS: &str = "org/cs-pufa-2nd-thermal/dept/gufei";
+/// 领域模式：控制「固废本部门运维纪律 / 证据门禁」是否启用。
+/// 默认 `SolidWaste`（保持既有行为不变）；`Office` / `General` 下整套运维门禁与注入提示关闭，
+/// 使 agent-core 可作为通用办公 / 通用 agent 运行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainMode {
+    SolidWaste,
+    Office,
+    General,
+}
+
+impl DomainMode {
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "office" => DomainMode::Office,
+            "general" => DomainMode::General,
+            _ => DomainMode::SolidWaste, // 默认保持固废行为
+        }
+    }
+    pub fn is_solid_waste(&self) -> bool {
+        *self == DomainMode::SolidWaste
+    }
+}
+
+static DOMAIN_MODE: OnceLock<DomainMode> = OnceLock::new();
+
+/// main 启动时调用一次，从 agent.toml `domain_mode` 字段加载。
+pub fn init_domain_mode(mode: DomainMode) {
+    let _ = DOMAIN_MODE.set(mode);
+}
+
+/// 当前领域模式（未初始化时默认 SolidWaste，行为与旧版一致）。
+pub fn domain_mode() -> DomainMode {
+    *DOMAIN_MODE.get().unwrap_or(&DomainMode::SolidWaste)
+}
+
+/// 公司根 ns（dashboard 技能树挂在此下）。
+/// 重构 2026-08-04：由 main 启动时经 `init_org_ns` 注入（agent.toml `org_company`），
+/// 与 main.rs 的 `org_company()` 保持一致；未注入时回退默认，行为与旧版相同。
+static ORG_NS_CELL: OnceLock<String> = OnceLock::new();
+
+pub fn init_org_ns(org_company: &str) {
+    let _ = ORG_NS_CELL.set(format!("org/{}", org_company));
+}
+
+pub fn org_ns() -> String {
+    ORG_NS_CELL
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "org/cs-pufa-2nd-thermal".to_string())
+}
+
+/// 固废部门工具包 ns（与 agent.toml [[mcp_source]] dashboard.namespace 对齐），
+/// 随 org_ns 派生。
+pub fn dept_toolkit_ns() -> String {
+    format!("{}/dept/gufei", org_ns())
+}
 
 /// 是否关闭部门工具包自动 enrichment（默认开启；`DEPT_TOOLKIT_ENRICH=0` 关闭）
 pub fn dept_toolkit_enrich_enabled() -> bool {
@@ -23,25 +76,33 @@ pub fn dept_toolkit_enrich_enabled() -> bool {
 /// 为调用者补齐本部门工具包 ns，使 dashboard 固废技能必可见。
 /// 已有 `*` 超管不改；可用 `DEPT_TOOLKIT_ENRICH=0` 关闭。
 pub fn enrich_allowed_ns(allowed: &mut Vec<String>) {
+    if !domain_mode().is_solid_waste() {
+        return; // 非固废模式不自动注入部门工具包 ns
+    }
     if !dept_toolkit_enrich_enabled() {
         return;
     }
     if allowed.iter().any(|n| n == "*") {
         return;
     }
-    if !allowed.iter().any(|n| n == ORG_NS || n.starts_with(&format!("{ORG_NS}/"))) {
-        allowed.push(ORG_NS.to_string());
+    let org_ns = org_ns();
+    let dept_ns = dept_toolkit_ns();
+    if !allowed.iter().any(|n| n == &org_ns || n.starts_with(&format!("{org_ns}/"))) {
+        allowed.push(org_ns);
     }
     if !allowed
         .iter()
-        .any(|n| n == DEPT_TOOLKIT_NS || n.starts_with(&format!("{DEPT_TOOLKIT_NS}/")))
+        .any(|n| n == &dept_ns || n.starts_with(&format!("{dept_ns}/")))
     {
-        allowed.push(DEPT_TOOLKIT_NS.to_string());
+        allowed.push(dept_ns);
     }
 }
 
 /// 是否为「必须先取证」的固废现场/整理类意图
 pub fn is_ops_investigate_intent(message: &str) -> bool {
+    if !domain_mode().is_solid_waste() {
+        return false;
+    }
     const KEYS: &[&str] = &[
         "联单",
         "整理",
@@ -63,6 +124,9 @@ pub fn is_ops_investigate_intent(message: &str) -> bool {
 
 /// 是否为「本部门工程师改码」意图
 pub fn is_engineer_intent(message: &str) -> bool {
+    if !domain_mode().is_solid_waste() {
+        return false;
+    }
     const KEYS: &[&str] = &[
         "改代码",
         "改码",
@@ -88,6 +152,9 @@ pub fn is_engineer_intent(message: &str) -> bool {
 
 /// 运维或工程师意图（证据门禁 / 拒演戏计划）
 pub fn is_dept_grounded_intent(message: &str) -> bool {
+    if !domain_mode().is_solid_waste() {
+        return false;
+    }
     is_ops_investigate_intent(message) || is_engineer_intent(message)
 }
 
@@ -113,6 +180,9 @@ pub fn is_theater_plan(plan: &ExecutionPlan) -> bool {
 
 /// 注入 system prompt 的本部门运维纪律
 pub fn ops_playbook_prompt() -> &'static str {
+    if !domain_mode().is_solid_waste() {
+        return "";
+    }
     r#"
 
 ## 固废本部门运维纪律（P0，强制）
@@ -151,11 +221,20 @@ pub fn ops_playbook_prompt() -> &'static str {
 - **禁止**通用 shell；只能用白名单校验工具
 - **禁止**改 `.env` / 密钥 / `*.db`
 - 允许仓仅：dashboard / agent-core / agent-base
+
+### 通用办公地基复用（P1，与 office 层协作）
+- Excel / Word / PPT / PDF / 网页等**通用文档操作优先调用通用办公工具**（全局可见的 office 地基）：
+  `read_xlsx` / `write_xlsx` / `create_docx` / `read_docx` / `create_pptx` / `generate_pdf` / `summarize_url`
+- **禁止**在本部门 skill 内重复实现 openpyxl / docx / fpdf 样板；新需求一律走 office 地基
 "#
 }
 
 /// Composer 规划器附加规则（运维意图）
-pub fn composer_ops_rules() -> &'static str {    r#"
+pub fn composer_ops_rules() -> &'static str {
+    if !domain_mode().is_solid_waste() {
+        return "";
+    }
+    r#"
 - 【固废运维强制】用户提到联单/整理/文件夹/归档/放入/理文时：
   - 禁止整单只用 auto_route / cross_agent_query / a2a_*
   - 必须优先使用 dashboard 固废技能：organize_folders、check_media_files、query_entrance、query_today、archive_ops、ocr_manifest 等（以可用工具列表为准）
@@ -196,8 +275,8 @@ mod tests {
     fn enrich_adds_org_and_dept() {
         let mut ns = vec!["agent/user".to_string()];
         enrich_allowed_ns(&mut ns);
-        assert!(ns.iter().any(|n| n == ORG_NS));
-        assert!(ns.iter().any(|n| n == DEPT_TOOLKIT_NS));
+        assert!(ns.iter().any(|n| n == &org_ns()));
+        assert!(ns.iter().any(|n| n == &dept_toolkit_ns()));
     }
 
     #[test]

@@ -24,10 +24,12 @@ FULL_REVIEW_*.md
 PLAN.md
 agent_core_*_review_*.md
 agent_core_*_audit_*.md
+ISSUE_backlog.md
 
 # 临时/诊断文件（运行时产物，不公开）
 _diag/
 agent_core_run.err
+agent_core_run.out
 checkpoints.db
 # 本仓 local_fs 默认沙箱根
 sandbox_workspace/
@@ -39,3 +41,25 @@ meta_evolution.db
 meta_evolution.db-*
 *.bak.*
 tests/test_*.py
+
+# 运行时数据与产物（2026-08-04 补充，严禁进公开仓库）
+data/
+backups/
+updates/
+*.db
+*.db-journal
+__pycache__/
+*.pyc
+agent-core.exe
+agent-core.exe.bak-*
+*.out
+_session.json
+*_final_reply*.txt
+agent_list_dump.json
+e2e_status_test.py
+verify_plan_fix.py
+start_agentcore_prod.py
+personas.json
+reasonix.toml
+skill_library.json
+
