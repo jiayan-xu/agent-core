@@ -2039,6 +2039,40 @@ impl AgentCore {
                 }
             }
         }
+        // 消息开头的公司名 + 空格/标点 + 添加动词（如「佳士能 添加一辆新的白名单车辆：鲁H58E37」）
+        for m in ["添加", "新增", "登记", "录入"] {
+            if let Some(p) = msg.find(m) {
+                let before = &msg[..p];
+                // 从动词往前收 token（跳过空白与助词）
+                let mut token: Vec<char> = Vec::new();
+                for ch in before.chars().rev() {
+                    if ('\u{4e00}'..='\u{9fff}').contains(&ch) {
+                        token.push(ch);
+                    } else if ch.is_whitespace() || matches!(ch, '，' | ',' | '：' | ':' | '；') {
+                        if !token.is_empty() {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                token.reverse();
+                let s: String = token
+                    .into_iter()
+                    .collect::<String>()
+                    .trim_start_matches(|c| {
+                        matches!(
+                            c,
+                            '这' | '那' | '个' | '是' | '给' | '把' | '辆' | '一' | '台' | '的' | '又' | '再' | '要' | '想' | '请' | '帮'
+                        )
+                    })
+                    .trim()
+                    .to_string();
+                if s.chars().count() >= 2 {
+                    return Some(s);
+                }
+            }
+        }
         None
     }
 
@@ -7448,12 +7482,21 @@ mod whitelist_preroute_tests {
 
     #[test]
     fn extract_add_new_vehicle_without_company() {
-        // 用户只给车牌不给公司名：确定性路由仍须命中（skill 走继承/补全），
-        // 否则落入 LLM 降级路径不调工具（回复诊断而非执行）——回归测试
-        let msg = "添加一辆新的白名单车辆：鲁H58E37";
-        let (plate, company) = AgentCore::extract_whitelist_add(msg).expect("should match even w/o company");
+        // 用户「佳士能 添加一辆新的白名单车辆：鲁H58E37」——公司名在消息开头、
+        // 与添加动词间用空格分隔（非「公司是X/X的新车」模式），须能提取
+        let msg = "佳士能 添加一辆新的白名单车辆：鲁H58E37";
+        let (plate, company) = AgentCore::extract_whitelist_add(msg).expect("should match");
         assert_eq!(plate, "鲁H58E37");
-        assert!(company.is_empty());
+        assert!(company.contains("佳士能"), "应提取出前缀公司名: {company:?}");
+    }
+
+    #[test]
+    fn extract_add_vehicle_company_after_verb() {
+        // 公司名在添加动词之后（如「添加白名单车辆 佳士能 鲁H58E37」形态走引号/公司是）
+        let msg = "把「佳士能」的新车苏EZQ999添加到白名单";
+        let (plate, company) = AgentCore::extract_whitelist_add(msg).expect("should match");
+        assert_eq!(plate, "苏EZQ999");
+        assert!(company.contains("佳士能"));
     }
 
     #[test]
