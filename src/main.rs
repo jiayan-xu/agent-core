@@ -998,6 +998,27 @@ fn unauthorized(message: &str) -> axum::response::Response {
 
 /// 身份认证：从 header 取 X-Agent-Id + X-Agent-Key，向 Memoria 反查调用者命名空间授权。
 /// 成功返回 (agent_id, allowed_ns)；失败返回 401 Response（由调用方 ? 直接返回）。
+/// PFAiX toAsciiHeaderValue 的 percent-encode 解码：还原含中文的 agent_id。
+/// 仅解码 `%XX`（UTF-8 字节），保留其余字符原样（agent_id 本是 ASCII 安全集）。
+fn percent_decode_agent_id(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = &s[i + 1..i + 3];
+            if let Ok(b) = u8::from_str_radix(hex, 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 async fn authenticate(
     headers: &axum::http::HeaderMap,
     st: &Arc<AppState>,
@@ -1009,6 +1030,9 @@ async fn authenticate(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // PFAiX 对含中文的 agent_id 做 percent-encode（toAsciiHeaderValue），
+    // 此处解码还原真实 agent_id，否则 badge 认证失败、协作审批不可见。
+    let raw_agent_id = percent_decode_agent_id(&raw_agent_id);
     let user_tag = headers
         .get("x-user-tag")
         .and_then(|v| v.to_str().ok())
