@@ -1416,7 +1416,7 @@ impl AgentCore {
     /// 永不触发。此处用确定性解析绕过 LLM 的工具选择不确定性，保证受控写审批链路稳定。
     fn extract_whitelist_update(message: &str) -> Option<(String, String)> {
         // 附件正文块防护（同 extract_whitelist_add）：块内「白名单/公司」是数据不是指令
-        if message.contains("【附件正文:") || message.contains("[附件正文:") {
+        if Self::has_attachment_block(message) {
             return None;
         }
         let has_target = message.contains("白名单") || message.contains("车牌");
@@ -1666,7 +1666,7 @@ impl AgentCore {
     fn extract_whitelist_add(message: &str) -> Option<(String, String)> {
         // 附件正文块内出现「白名单/车牌」是文件数据，不是用户指令：
         // 消息含【附件正文:】时禁用白名单写预路由（修复 2026-08-04：对比文件被误判为添加车牌）
-        if message.contains("【附件正文:") || message.contains("[附件正文:") {
+        if Self::has_attachment_block(message) {
             return None;
         }
         let add_verbs = ["添加", "新增", "登记", "录入", "加入", "加进", "收录", "补录"];
@@ -1988,6 +1988,17 @@ impl AgentCore {
             tracing::info!(target: "agent.approval", approver=%approver_id, aid=%aid, "审批请求已推送");
         }
         reply
+    }
+
+    /// 判断消息是否含附件正文块（用户上传文件内容）：
+    /// - 【附件正文: 文件名】格式（旧）
+    /// - File: 文件名 / # Sheet: 表名 格式（PFAiX 实际 inline 格式，2026-08-04 实测）
+    fn has_attachment_block(message: &str) -> bool {
+        message.contains("【附件正文:")
+            || message.contains("[附件正文:")
+            || message.contains("\nFile: ")
+            || message.starts_with("File: ")
+            || message.contains("\n# Sheet: ")
     }
 
     /// 判断消息是否为「确认类」——用户回应审批（确认/批准/同意/已批准等）。
@@ -2357,7 +2368,7 @@ impl AgentCore {
         // ⚠️ 附件消息跳过：用户消息含【附件正文:】时数据已在消息内，直接对比/分析
         // 即可，无需 multiagent 派发或 composer 入库检索（修复 2026-08-04 附件对比
         // 被 composer 拆成 ingest_document+memory_search 而非直接对比）。
-        let has_attachment_msg = message.contains("【附件正文:") || message.contains("[附件正文:");
+        let has_attachment_msg = Self::has_attachment_block(message);
         if !has_attachment_msg {
             if let Some(result) = self
                 .maybe_compose(message, user_id, session_id, allowed_ns)
@@ -3562,7 +3573,7 @@ impl AgentCore {
                 // P0 证据门禁：运维意图未取证 → 拒绝空嘴根因/方案
                 // ⚠️ 附件消息豁免：用户消息含【附件正文:】时数据已在消息内（即证据），
                 // 对比/分析附件不应被门禁拦截（修复 2026-08-04 附件对比被拒答）。
-                let has_attachment = raw_message.contains("【附件正文:") || raw_message.contains("[附件正文:");
+                let has_attachment = Self::has_attachment_block(raw_message);
                 if crate::dept_ops::is_dept_grounded_intent(raw_message) && !did_work && !has_attachment {
                     let refuse = crate::dept_ops::refuse_ungrounded_ops_reply(raw_message);
                     self.save_to_history(session_id, raw_message, &refuse).await;
@@ -3968,7 +3979,7 @@ impl AgentCore {
         // 轮数耗尽，最后让 LLM 总结
         if crate::dept_ops::is_dept_grounded_intent(raw_message) && !did_work {
             // 附件消息豁免（同 3558 证据门禁）
-            let has_attachment = raw_message.contains("【附件正文:") || raw_message.contains("[附件正文:");
+            let has_attachment = Self::has_attachment_block(raw_message);
             if !has_attachment {
                 let refuse = crate::dept_ops::refuse_ungrounded_ops_reply(raw_message);
                 self.save_to_history(session_id, raw_message, &refuse).await;
@@ -6611,11 +6622,12 @@ impl AgentCore {
         // 修复 2026-08-04：此前 LLM 忽略附件块，被表内公司名等词带偏去查白名单/入厂记录。
         prompt.push_str(
             "\n## 附件正文处理\n\
-             - 用户消息中的【附件正文: xxx】块 = 用户上传文件的完整内容（表格已转为文本）。\n\
-             - 用户要求「对比/比对/分析这两份文件」时，指**附件正文块与附件正文块之间互相对比**（如入厂日志 vs 汇总表），**直接基于块内数据回答**。\n\
+             - 用户消息中出现的【附件正文: 文件名】或【File: 文件名 / # Sheet: 表名】块 = 用户上传文件的完整内容（表格已转为文本）。\n\
+             - 用户要求「对比/比对/分析这两份文件」时，指**附件块与附件块之间互相对比**（如入厂日志 vs 汇总表），**直接基于块内数据回答**。\n\
              - **不要调用 read_xlsx / query_entrance / query_daily_stats 等工具**——文件数据已在消息内，服务端无该文件、也无需查数据库。\n\
              - 仅当用户明确说「和数据库比」「查一下历史」等才调用 query_* 工具。\n\
-             - 对比方法：先分别概括两份附件的结构（sheet 名/表头），再按相同口径（日期/车牌/重量/固废种类）逐项对比，列出差异。\n",
+             - 对比方法：先分别概括两份附件的结构（sheet 名/表头），再按相同口径（日期/车牌/重量/固废种类）逐项对比，列出差异。\n\
+             - [ATTACHED_FILES] 块是附件**元数据**（file_id/size/mode），不是内容；内容在 File:/Sheet: 块内。\n",
         );
         // WorkBuddy 铁轨：本仓沙箱文件工具
         prompt.push_str(crate::local_fs::system_hint());

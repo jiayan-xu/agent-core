@@ -32,15 +32,19 @@ pub fn fold_v1_messages(messages: &[(String, String)]) -> V1FoldedInput {
         .join("\n\n");
     let system_ctx: String = system_raw.chars().take(SYSTEM_SUFFIX_CAP).collect();
 
-    let last_user = messages
+    let raw_last = messages
         .iter()
         .rev()
         .find(|(role, _)| role.eq_ignore_ascii_case("user"))
         .map(|(_, c)| c.as_str())
-        .unwrap_or("")
-        .chars()
-        .take(USER_CAP)
-        .collect::<String>();
+        .unwrap_or("");
+    // 附件消息（File:/Sheet: 块）容量大：两份 xlsx 全文可达 7 万字符，32768 会截掉第二份
+    let cap = if raw_last.contains("File: ") && (raw_last.contains("# Sheet:") || raw_last.contains("附件正文")) {
+        100_000
+    } else {
+        USER_CAP
+    };
+    let last_user: String = raw_last.chars().take(cap).collect();
 
     // 历史：过滤后跳过「最后一条 user」的那一次出现
     let mut history: Vec<(String, String)> = Vec::new();
