@@ -1667,9 +1667,8 @@ impl AgentCore {
         }
         let plate = Self::extract_plate_spaced(message)?;
         let company = Self::extract_company_for_add(message).unwrap_or_default();
-        if company.is_empty() {
-            return None;
-        }
+        // 公司名可为空：skill 的 add 在无公司时走「继承默认 / 需补全」路径；
+        // 若因缺公司名放弃确定性路由，会落入 LLM 降级路径不调工具（回复诊断而非执行）。
         Some((plate, company))
     }
 
@@ -7445,6 +7444,16 @@ mod whitelist_preroute_tests {
         let (plate, company) = AgentCore::extract_whitelist_add(msg).expect("should match");
         assert_eq!(plate, "苏EZQ999");
         assert!(company.contains("佳士能"));
+    }
+
+    #[test]
+    fn extract_add_new_vehicle_without_company() {
+        // 用户只给车牌不给公司名：确定性路由仍须命中（skill 走继承/补全），
+        // 否则落入 LLM 降级路径不调工具（回复诊断而非执行）——回归测试
+        let msg = "添加一辆新的白名单车辆：鲁H58E37";
+        let (plate, company) = AgentCore::extract_whitelist_add(msg).expect("should match even w/o company");
+        assert_eq!(plate, "鲁H58E37");
+        assert!(company.is_empty());
     }
 
     #[test]
