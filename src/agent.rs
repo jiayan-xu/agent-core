@@ -1090,7 +1090,16 @@ impl AgentCore {
         ];
         // 确认词用「包含匹配」而非精确相等：用户常回“对的”“好的，执行”“可以，查吧”
         // 等变体，精确匹配会漏掉导致确认状态机死循环（反复问“方向对吗？”）。
-        let is_confirm = |m: &str| confirm_words.iter().any(|w| m.contains(*w));
+        // ⚠️ 修复 2026-08-04：宽泛词（对/好/是/行）对长消息误伤严重——「对比一下这两份文件」
+        // 含「对」被误判为确认 → 走审批路径 → 孤儿自愈「已失效」打断正常请求。
+        // 长消息（>8 字，如附件对比/查询请求）绝不命中确认。
+        let is_confirm = |m: &str| {
+            let t = m.trim();
+            if t.chars().count() > 8 {
+                return false;
+            }
+            confirm_words.iter().any(|w| t.contains(*w))
+        };
         let is_cancel = |m: &str| {
             let kws = [
                 "取消",
@@ -1406,6 +1415,10 @@ impl AgentCore {
     /// memory_search_v2（记忆库不是业务数据库，写入不生效也不留审计），导致受控写闸门
     /// 永不触发。此处用确定性解析绕过 LLM 的工具选择不确定性，保证受控写审批链路稳定。
     fn extract_whitelist_update(message: &str) -> Option<(String, String)> {
+        // 附件正文块防护（同 extract_whitelist_add）：块内「白名单/公司」是数据不是指令
+        if message.contains("【附件正文:") || message.contains("[附件正文:") {
+            return None;
+        }
         let has_target = message.contains("白名单") || message.contains("车牌");
         let has_company = message.contains("公司名") || message.contains("公司");
         let verbs = [
@@ -1651,6 +1664,11 @@ impl AgentCore {
     /// 识别「添加/登记白名单新车」意图，抽取 (车牌, 公司提示)。
     /// 公司提示可为简称/全称（skill 经 _resolve_company_name 解析为全称）。
     fn extract_whitelist_add(message: &str) -> Option<(String, String)> {
+        // 附件正文块内出现「白名单/车牌」是文件数据，不是用户指令：
+        // 消息含【附件正文:】时禁用白名单写预路由（修复 2026-08-04：对比文件被误判为添加车牌）
+        if message.contains("【附件正文:") || message.contains("[附件正文:") {
+            return None;
+        }
         let add_verbs = ["添加", "新增", "登记", "录入", "加入", "加进", "收录", "补录"];
         let has_add = add_verbs.iter().any(|v| message.contains(*v));
         let has_ctx = message.contains("白名单")
@@ -2336,16 +2354,22 @@ impl AgentCore {
 
         // ── HY3 1.3：MultiAgent Compose（子 agent 派发，非 Meta RSI）──
         // features.multiagent=false 或任务非 Hard 或分解空 → 返回 None，走原路径
-        if let Some(result) = self
-            .maybe_compose(message, user_id, session_id, allowed_ns)
-            .await
-        {
-            return result;
+        // ⚠️ 附件消息跳过：用户消息含【附件正文:】时数据已在消息内，直接对比/分析
+        // 即可，无需 multiagent 派发或 composer 入库检索（修复 2026-08-04 附件对比
+        // 被 composer 拆成 ingest_document+memory_search 而非直接对比）。
+        let has_attachment_msg = message.contains("【附件正文:") || message.contains("[附件正文:");
+        if !has_attachment_msg {
+            if let Some(result) = self
+                .maybe_compose(message, user_id, session_id, allowed_ns)
+                .await
+            {
+                return result;
+            }
         }
 
         // ── 0. 组合路由路径：多 Skill 分解 + 按序执行 ──
         // 工程师改码意图：跳过 composer，直接进 LLM+常驻工具闭环（避免规划器空嘴作文）
-        if self.config.enable_compositional_routing && !engineer_intent {
+        if self.config.enable_compositional_routing && !engineer_intent && !has_attachment_msg {
             let mut ns_buf = allowed_ns.to_vec();
             crate::dept_ops::enrich_allowed_ns(&mut ns_buf);
             let allowed_ns = ns_buf.as_slice();
@@ -3536,7 +3560,10 @@ impl AgentCore {
             // 无工具调用 → LLM 直接回复
             if response.tool_calls.is_empty() {
                 // P0 证据门禁：运维意图未取证 → 拒绝空嘴根因/方案
-                if crate::dept_ops::is_dept_grounded_intent(raw_message) && !did_work {
+                // ⚠️ 附件消息豁免：用户消息含【附件正文:】时数据已在消息内（即证据），
+                // 对比/分析附件不应被门禁拦截（修复 2026-08-04 附件对比被拒答）。
+                let has_attachment = raw_message.contains("【附件正文:") || raw_message.contains("[附件正文:");
+                if crate::dept_ops::is_dept_grounded_intent(raw_message) && !did_work && !has_attachment {
                     let refuse = crate::dept_ops::refuse_ungrounded_ops_reply(raw_message);
                     self.save_to_history(session_id, raw_message, &refuse).await;
                     return refuse;
@@ -3940,9 +3967,13 @@ impl AgentCore {
 
         // 轮数耗尽，最后让 LLM 总结
         if crate::dept_ops::is_dept_grounded_intent(raw_message) && !did_work {
-            let refuse = crate::dept_ops::refuse_ungrounded_ops_reply(raw_message);
-            self.save_to_history(session_id, raw_message, &refuse).await;
-            return refuse;
+            // 附件消息豁免（同 3558 证据门禁）
+            let has_attachment = raw_message.contains("【附件正文:") || raw_message.contains("[附件正文:");
+            if !has_attachment {
+                let refuse = crate::dept_ops::refuse_ungrounded_ops_reply(raw_message);
+                self.save_to_history(session_id, raw_message, &refuse).await;
+                return refuse;
+            }
         }
         messages.push(Message {
             role: "user".to_string(),
@@ -6575,6 +6606,17 @@ impl AgentCore {
         prompt.push_str(crate::dept_ops::ops_playbook_prompt());
         // P0-3 收尾：数据字典口径（dept 身份常驻，答题口径一致）
         prompt.push_str(crate::dept_ops::data_dict_prompt());
+        // PFAiX 附件正文规则：用户消息里的「【附件正文: 文件名】」块是文件完整内容，
+        // 应直接读取/对比块内数据（无需调用 read_xlsx 等工具——文件在客户端，服务端无路径）。
+        // 修复 2026-08-04：此前 LLM 忽略附件块，被表内公司名等词带偏去查白名单/入厂记录。
+        prompt.push_str(
+            "\n## 附件正文处理\n\
+             - 用户消息中的【附件正文: xxx】块 = 用户上传文件的完整内容（表格已转为文本）。\n\
+             - 用户要求「对比/比对/分析这两份文件」时，指**附件正文块与附件正文块之间互相对比**（如入厂日志 vs 汇总表），**直接基于块内数据回答**。\n\
+             - **不要调用 read_xlsx / query_entrance / query_daily_stats 等工具**——文件数据已在消息内，服务端无该文件、也无需查数据库。\n\
+             - 仅当用户明确说「和数据库比」「查一下历史」等才调用 query_* 工具。\n\
+             - 对比方法：先分别概括两份附件的结构（sheet 名/表头），再按相同口径（日期/车牌/重量/固废种类）逐项对比，列出差异。\n",
+        );
         // WorkBuddy 铁轨：本仓沙箱文件工具
         prompt.push_str(crate::local_fs::system_hint());
         // 双轨：受控改库扳手 + 本机白名单仓库编辑
@@ -7541,6 +7583,19 @@ mod whitelist_preroute_tests {
         let (plate, company) = AgentCore::extract_whitelist_add(msg).expect("should match");
         assert_eq!(plate, "鲁H58E37");
         assert!(company.contains("佳士能"), "应提取出前缀公司名: {company:?}");
+    }
+
+    #[test]
+    fn extract_add_skipped_when_attachment_block() {
+        // 附件正文块内的「白名单/车牌」是文件数据不是指令：
+        // 对比文件消息不得触发白名单写预路由（回归 2026-08-04 误执行添加鲁H58E37）
+        let msg = "【附件正文: 一般固废入厂日志-2026年7月.xlsx】\n车牌\t公司\n鲁H58E37\t佳士能\n\n对比一下这两份文件";
+        assert!(AgentCore::extract_whitelist_add(msg).is_none(), "附件块消息不应触发白名单添加");
+        let msg2 = "【附件正文: 白名单.xlsx】\n添加 鲁H58E37 到白名单";
+        assert!(AgentCore::extract_whitelist_add(msg2).is_none());
+        // 正常指令仍触发
+        let msg3 = "佳士能 添加一辆新的白名单车辆：苏A12345";
+        assert!(AgentCore::extract_whitelist_add(msg3).is_some());
     }
 
     #[test]
