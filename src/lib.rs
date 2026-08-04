@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod approval;
 pub mod clarify; // P2-3：澄清工具（Request clarification 对标）
+pub mod reply_polish; // PFAiX 回复净化：检测 JSON/代码块泄漏
 pub mod approval_store; // TASK-652：审批权威表（checkpoints.db 同库异表）
 pub mod resources;
 pub mod audit;

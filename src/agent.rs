@@ -1064,8 +1064,7 @@ impl AgentCore {
         allowed_ns: &[String],
         external_history: Option<Vec<(String, String)>>,
     ) -> String {
-        let confirm_words = [
-            "确认",
+        let confirm_words = [            "确认",
             "确认添加",
             "确认执行",
             "添加",
@@ -1183,16 +1182,17 @@ impl AgentCore {
             self.session_manager
                 .set_state(session_id, SessionState::Confirmed)
                 .await;
-            return self
-                .execute_chat(
+            return {
+            let raw = self.execute_chat(
                     message,
                     user_id,
                     session_id,
                     allowed_ns,
                     &trace_id,
                     external_history.clone(),
-                )
-                .await;
+                ).await;
+            crate::reply_polish::polish_llm_reply(raw)
+        };
         }
 
         // ── 0a. 工具级确认（现有）：pending_actions 中的操作等待确认 ──
@@ -1340,9 +1340,10 @@ impl AgentCore {
                         .await
                         .unwrap_or_else(|| message.to_string());
                     self.checkpoint_confirmed(session_id).await;
-                    return self
-                        .execute_chat(&original, user_id, session_id, allowed_ns, &trace_id, external_history.clone())
-                        .await;
+                    return {
+            let raw = self.execute_chat(&original, user_id, session_id, allowed_ns, &trace_id, external_history.clone()).await;
+            crate::reply_polish::polish_llm_reply(raw)
+        };
                 }
                 // P1-2: 计划编辑（当前支持「删除第N步」）
                 if let Some(new_plan) = self.try_apply_plan_edit(trimmed).await {
@@ -1364,9 +1365,10 @@ impl AgentCore {
                         return self.handle_topic_switch(message, session_id).await;
                     }
                 }
-                return self
-                    .execute_chat(message, user_id, session_id, allowed_ns, &trace_id, external_history.clone())
-                    .await;
+                return {
+            let raw = self.execute_chat(message, user_id, session_id, allowed_ns, &trace_id, external_history.clone()).await;
+            crate::reply_polish::polish_llm_reply(raw)
+        };
             }
 
             // ── 新会话 ──
@@ -1388,9 +1390,10 @@ impl AgentCore {
                 self.session_manager
                     .set_state(session_id, SessionState::Confirmed)
                     .await;
-                return self
-                    .execute_chat(message, user_id, session_id, allowed_ns, &trace_id, external_history.clone())
-                    .await;
+                return {
+            let raw = self.execute_chat(message, user_id, session_id, allowed_ns, &trace_id, external_history.clone()).await;
+            crate::reply_polish::polish_llm_reply(raw)
+        };
             }
         }
     }
