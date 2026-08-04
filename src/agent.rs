@@ -2001,6 +2001,25 @@ impl AgentCore {
             || message.contains("\n# Sheet: ")
     }
 
+    /// 判断消息是否为「业务数据查询意图」——需要调用 query_* 等数据工具取数才能回答。
+    /// 用于无工具调用出口的分诊（P0 强制工具循环）：数据意图 + 未取证 → 注入强制
+    /// 工具提示重试，而非让 LLM 空嘴回答（tool_count=0 幻觉/编造数据）。
+    ///
+    /// 命中规则：
+    /// - 业务名词（进厂/车次/重量/白名单…）命中 → 数据意图（需取数）
+    /// - 仅查询动词（查询/统计/对比/分析/多少…）→ 需消息 ≥6 字才命中，
+    ///   避免「查询」「统计一下」这类空泛/闲聊误判
+    fn is_data_query_intent(message: &str) -> bool {
+        const DATA_NOUNS: &[&str] = &[
+            "进厂", "入厂", "车次", "重量", "吨", "固废", "白名单", "卸料", "车牌",
+            "联单", "台账", "汇总表", "进厂日志", "企业", "公司",
+        ];
+        const QUERY_VERBS: &[&str] = &["查询", "统计", "对比", "分析", "汇总", "报表", "多少"];
+        let has_noun = DATA_NOUNS.iter().any(|w| message.contains(w));
+        let has_verb = QUERY_VERBS.iter().any(|w| message.contains(w));
+        has_noun || (has_verb && message.chars().count() >= 6)
+    }
+
     /// 判断消息是否为「确认类」——用户回应审批（确认/批准/同意/已批准等）。
     /// execute_chat 入口仅在确认类消息时消费就绪审批，避免新请求被残留审批顶掉。
     fn is_approval_confirm_message(message: &str) -> bool {
@@ -3588,6 +3607,33 @@ impl AgentCore {
                     let refuse = crate::dept_ops::refuse_ungrounded_ops_reply(raw_message);
                     self.save_to_history(session_id, raw_message, &refuse).await;
                     return refuse;
+                }
+                // ⚠️ P0 修复（2026-08-04）：业务数据意图 + 未取证 → 强制工具重试。
+                // 合成路由降级后 LLM 可在第一轮空手返回（tool_count=0，幻觉/编造数据），
+                // max_tool_rounds 给了 3 轮预算但此出口此前从不重试。
+                // 附件消息豁免（数据已在消息内，无需调工具，与 5528567 prompt 规则一致）。
+                if Self::is_data_query_intent(raw_message) && !did_work && !has_attachment {
+                    let last_round = (_round + 1) >= self.config.max_tool_rounds;
+                    if !last_round {
+                        messages.push(crate::llm::Message {
+                            role: "user".to_string(),
+                            content: Some(
+                                "⚠️ 请重新回答：你刚才没有调用任何工具。当前问题需要查询业务数据（进厂/车次/重量/白名单等），请立即调用 query_* / get_* 等真实数据工具获取数据后再回答，严禁凭记忆编造数据。".to_string(),
+                            ),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
+                        tracing::info!(target = "agent.data_intent", round = _round, max = %self.config.max_tool_rounds, "数据意图无工具，注入强制工具提示重试");
+                        continue;
+                    }
+                    // 末轮仍无工具 → 诚实降级（替代幻觉回答）：直接返回，不经过 TTC 精炼
+                    let raw_text = response.text;
+                    let reply = format!(
+                        "⚠️ 未查询到业务数据（未调用数据工具）。\n\n请稍后重试，或明确要查询的口径（如时间范围、车辆、企业）。\n\n（以下为模型原始回复，可能未基于真实数据，仅供参考）：\n{}",
+                        raw_text.chars().take(300).collect::<String>()
+                    );
+                    self.save_to_history(session_id, raw_message, &reply).await;
+                    return reply;
                 }
                 let mut reply = response.text;
                 // HY3 TTC：终答自一致性 + verifier-guided 精炼
@@ -7605,6 +7651,25 @@ mod whitelist_preroute_tests {
         assert!(!AgentCore::is_approval_confirm_message("可以把录像列表去掉吗"));
         assert!(!AgentCore::is_approval_confirm_message("通过浏览器打开这个页面"));
         assert!(!AgentCore::is_approval_confirm_message("好的，今天进厂的车都有哪些"));
+    }
+
+    #[test]
+    fn data_query_intent_detection() {
+        // 业务名词命中 → 数据意图（强制工具循环应触发）
+        assert!(AgentCore::is_data_query_intent("7月农林垃圾进厂量"));
+        assert!(AgentCore::is_data_query_intent("统计昨天进厂的车次"));
+        assert!(AgentCore::is_data_query_intent("白名单现在有几家"));
+        assert!(AgentCore::is_data_query_intent("查询7月的进厂记录"));
+        assert!(AgentCore::is_data_query_intent("对比一下这两份文件的差异"));
+        assert!(AgentCore::is_data_query_intent("帮我查询一下固废入库重量"));
+        // 非数据意图：闲聊/确认/空泛 → 不得命中
+        assert!(!AgentCore::is_data_query_intent("你好"));
+        assert!(!AgentCore::is_data_query_intent("谢谢"));
+        assert!(!AgentCore::is_data_query_intent("确认"));
+        assert!(!AgentCore::is_data_query_intent("可以"));
+        assert!(!AgentCore::is_data_query_intent("今天天气怎么样"));
+        assert!(!AgentCore::is_data_query_intent("统计一下"));
+        assert!(!AgentCore::is_data_query_intent("好的，就按这个方案执行"));
     }
 
     #[test]
