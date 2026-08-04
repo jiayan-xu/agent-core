@@ -1972,6 +1972,17 @@ impl AgentCore {
         reply
     }
 
+    /// 判断消息是否为「确认类」——用户回应审批（确认/批准/同意/已批准等）。
+    /// execute_chat 入口仅在确认类消息时消费就绪审批，避免新请求被残留审批顶掉。
+    fn is_approval_confirm_message(message: &str) -> bool {
+        let m = message.trim();
+        const CONFIRM_WORDS: &[&str] = &[
+            "确认", "确认添加", "确认执行", "确认删除", "批准", "已批准", "同意", "已同意",
+            "通过", "已通过", "好的", "可以", "执行", "确定", "继续", "就按这个",
+        ];
+        CONFIRM_WORDS.iter().any(|w| m.contains(w))
+    }
+
     /// 抽取车牌（容忍空格），如「鲁 H736A 7」→「鲁H736A7」。
     fn extract_plate_spaced(msg: &str) -> Option<String> {
         let chars: Vec<char> = msg.chars().collect();
@@ -2123,15 +2134,18 @@ impl AgentCore {
         // 之前消费。否则用户「确认」类消息会被 composer 分解为写计划并提前 return，
         // 导致 execute_approved_request（含 confirmed=true 注入）被插队抢跑、审批永不真正执行、
         // 工具仅回 require_confirm 预览，LLM 却谎报「操作已执行成功」。
-        // 置于此处：每条用户消息先检查并执行就绪审批，再走后续路由。
+        // ⚠️ 修复（2026-08-04）：仅「确认类」消息才消费就绪审批——否则用户新请求
+        // （如「比对两份文件」）会被残留审批的执行结果无条件顶掉（错误执行白名单写）。
         self.check_approval_responses().await;
-        if let Some(reply) = self.execute_approved_request(session_id, allowed_ns).await {
-            let ns = self.caller_ns(session_id);
-            let db_path = self.harness.lock().await.db_path();
-            self.session_manager
-                .save_to_history(session_id, &ns, &db_path, message, &reply)
-                .await;
-            return reply;
+        if Self::is_approval_confirm_message(message) {
+            if let Some(reply) = self.execute_approved_request(session_id, allowed_ns).await {
+                let ns = self.caller_ns(session_id);
+                let db_path = self.harness.lock().await.db_path();
+                self.session_manager
+                    .save_to_history(session_id, &ns, &db_path, message, &reply)
+                    .await;
+                return reply;
+            }
         }
 
         // ── 短确认写意图：从历史还原车牌/全称 → 受控写闸门（禁止只读工具假成功）──
@@ -7504,6 +7518,19 @@ mod whitelist_preroute_tests {
         let (plate, company) = AgentCore::extract_whitelist_add(msg).expect("should match");
         assert_eq!(plate, "苏EZQ999");
         assert!(company.contains("佳士能"));
+    }
+
+    #[test]
+    fn approval_confirm_message_detection() {
+        // 确认类：消费就绪审批
+        assert!(AgentCore::is_approval_confirm_message("确认"));
+        assert!(AgentCore::is_approval_confirm_message("已批准"));
+        assert!(AgentCore::is_approval_confirm_message("好的，确认执行"));
+        assert!(AgentCore::is_approval_confirm_message("同意"));
+        // 普通新请求：不消费审批（防残留审批顶掉新请求——回归 2026-08-04 文件比对被顶）
+        assert!(!AgentCore::is_approval_confirm_message("比对一下这两份文件"));
+        assert!(!AgentCore::is_approval_confirm_message("一般固废入厂日志-2026年7月.xlsx"));
+        assert!(!AgentCore::is_approval_confirm_message("查询7月的进厂记录"));
     }
 
     #[test]
