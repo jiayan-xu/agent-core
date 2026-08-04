@@ -3846,341 +3846,22 @@ impl AgentCore {
                 return reply;
             }
 
-            // 有工具调用 → 执行工具
-            for tc in &response.tool_calls {
-                // 边界检查
-                let boundary = self.boundary.lock().await;
-                let ns = self.current_ns_paths();
-                let tool_level = boundary
-                    .classifier
-                    .lock()
-                    .unwrap()
-                    .classify(&tc.name)
-                    .to_string();
-                let check = boundary.check_tool(
-                    &tc.name,
-                    &tc.arguments,
-                    &self.config.identity.agent_id,
-                    "user",
-                    &self.config.parent_permission,
-                    ns.as_deref(),
-                );
-                drop(boundary);
-
-                // P2-3：boundary 结果写入 span（allow / reason / level 可观测）
-                tracing::debug!(
-                    tool = %tc.name,
-                    allowed = check.allow,
-                    level = ?check.level,
-                    reason = %check.reason,
-                    "llm_tool_boundary"
-                );
-
-                if !check.allow {
-                    // 审计日志：记录边界/红线拒绝（P2-2 统一事件，带 trace_id 串联）
-                    self.audit_logger
-                        .boundary_deny(
-                            &self.config.identity.agent_id,
-                            &tc.name,
-                            &check.reason,
-                            trace_id,
-                            Some(session_id),
-                        )
-                        .await;
-
-                    // 危险/红线工具：无审批人时直接硬拒绝，不进入 LLM 下一轮
-                    let is_dangerous = tool_level == "dangerous";
-                    if check.level == Some(BlockLevel::Red) || is_dangerous {
-                        // L2 人工审批通道：human_approval 为真时改走 dashboard 审批台（HTTP 暴露），
-                        // 不走 a2a 到 AI agent（避免 AI 批 AI、真人无兜底）。
-                        if self.config.human_approval {
-                            let aid = self
-                                .approval_manager
-                                .create_request_for_session(
-                                    &tc.name,
-                                    &tc.arguments,
-                                    &check.reason,
-                                    "dashboard-admin", // 固定标识，由 dashboard 审批台经 HTTP 回执
-                                    &self.config.identity.agent_id,
-                                    session_id,
-                                )
-                                .await;
-                            // P2-2: 审批创建事件（带 trace_id）
-                            self.audit_logger
-                                .approval_event(
-                                    "created",
-                                    &self.config.identity.agent_id,
-                                    &tc.name,
-                                    &check.reason,
-                                    trace_id,
-                                    Some(session_id),
-                                )
-                                .await;
-                            // P1-1: 记录待审批到 checkpoint（崩溃恢复后审批意图仍可见）
-                            let pa = PendingAction {
-                                tool_name: tc.name.clone(),
-                                arguments: tc.arguments.clone(),
-                                description: check.reason.clone(),
-                                approval_id: Some(aid.clone()),
-                            };
-                            self.checkpoint_pending_approval(session_id, &aid, &pa)
-                                .await;
-                            let summary = Self::summarize_args(&tc.arguments);
-                            let reply = format!(
-                                "AWAITING_APPROVAL:危险/红线工具「{}」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续\n参数：{}",
-                                tc.name, summary
-                            );
-                            self.save_to_history(session_id, raw_message, &reply).await;
-                            return reply;
-                        }
-                        if let Some(approver_id) = &self.config.approver_id {
-                            let aid = self
-                                .approval_manager
-                                .create_request_for_session(
-                                    &tc.name,
-                                    &tc.arguments,
-                                    &check.reason,
-                                    approver_id,
-                                    &self.config.identity.agent_id,
-                                    session_id,
-                                )
-                                .await;
-                            let msg = serde_json::json!({
-                                "type": "approval_request",
-                                "approval_id": aid,
-                                "tool_name": tc.name,
-                                "description": check.reason,
-                                "arguments": tc.arguments,
-                                "requester_id": self.config.identity.agent_id,
-                                "requester_ns": self.config.identity.ns(),
-                            });
-                            let _ = self
-                                .mcp
-                                .call(
-                                    "a2a_send",
-                                    &serde_json::json!({
-                                            "to": approver_id,
-                                            "content": msg.to_string(),
-                                            "namespace": format!("agent/{}", approver_id),
-                                    }),
-                                )
-                                .await;
-                            // P2-2: 审批创建事件（带 trace_id）
-                            self.audit_logger
-                                .approval_event(
-                                    "created",
-                                    &self.config.identity.agent_id,
-                                    &tc.name,
-                                    &check.reason,
-                                    trace_id,
-                                    Some(session_id),
-                                )
-                                .await;
-                            // P1-1: 记录待审批到 checkpoint（崩溃恢复后审批意图仍可见）
-                            let pa = PendingAction {
-                                tool_name: tc.name.clone(),
-                                arguments: tc.arguments.clone(),
-                                description: check.reason.clone(),
-                                approval_id: None,
-                            };
-                            self.checkpoint_pending_approval(session_id, &aid, &pa)
-                                .await;
-                            let reply = format!(
-                                "AWAITING_APPROVAL:等待审批人「{}」审批工具「{}」，请稍后",
-                                approver_id, tc.name
-                            );
-                            self.save_to_history(session_id, raw_message, &reply).await;
-                            return reply;
-                        }
-                        let reply = format!(
-                            "硬拒绝: 工具「{}」触发{}，未配置审批人，无法执行",
-                            tc.name,
-                            if check.level == Some(BlockLevel::Red) {
-                                "红线"
-                            } else {
-                                "危险工具策略"
-                            }
-                        );
-                        self.save_to_history(session_id, raw_message, &reply).await;
-                        return reply;
-                    }
-
-                    // 黄线（未知工具、权限递减、dept 写操作等）
-                    // HumanInLoop：与危险工具一致走 dashboard 审批台（真人兜底），不走 a2a。
-                    if self.config.human_approval {
-                        let aid = self
-                            .approval_manager
-                            .create_request_for_session(
-                                &tc.name,
-                                &tc.arguments,
-                                &check.reason,
-                                "dashboard-admin",
-                                &self.config.identity.agent_id,
-                                session_id,
-                            )
-                            .await;
-                        self.audit_logger
-                            .approval_event(
-                                "created",
-                                &self.config.identity.agent_id,
-                                &tc.name,
-                                &check.reason,
-                                trace_id,
-                                Some(session_id),
-                            )
-                            .await;
-                        let pa = PendingAction {
-                            tool_name: tc.name.clone(),
-                            arguments: tc.arguments.clone(),
-                            description: check.reason.clone(),
-                            approval_id: Some(aid.clone()),
-                        };
-                        self.checkpoint_pending_approval(session_id, &aid, &pa)
-                            .await;
-                        let reply = format!(
-                            "AWAITING_APPROVAL:工具「{}」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续——{}",
-                            tc.name, check.reason
-                        );
-                        self.save_to_history(session_id, raw_message, &reply).await;
-                        return reply;
-                    }
-                    if let Some(approver_id) = &self.config.approver_id {
-                        let aid = self
-                            .approval_manager
-                            .create_request_for_session(
-                                &tc.name,
-                                &tc.arguments,
-                                &check.reason,
-                                approver_id,
-                                &self.config.identity.agent_id,
-                                session_id,
-                            )
-                            .await;
-                        let msg = serde_json::json!({
-                            "type": "approval_request",
-                            "approval_id": aid,
-                            "tool_name": tc.name,
-                            "description": check.reason,
-                            "arguments": tc.arguments,
-                            "requester_id": self.config.identity.agent_id,
-                            "requester_ns": self.config.identity.ns(),
-                        });
-                        let _ = self
-                            .mcp
-                            .call(
-                                "a2a_send",
-                                &serde_json::json!({
-                                    "to": approver_id,
-                                    "content": msg.to_string(),
-                                    "namespace": format!("agent/{}", approver_id),
-                                }),
-                            )
-                            .await;
-                        let reply = format!(
-                            "AWAITING_APPROVAL:等待审批人「{}」审批工具「{}」，请稍后",
-                            approver_id, tc.name
-                        );
-                        self.save_to_history(session_id, raw_message, &reply).await;
-                        return reply;
-                    }
-                    let reply = format!(
-                        "REQUIRES_REVIEW:{}:工具「{}」需要确认——{}",
-                        tc.name, tc.name, check.reason
-                    );
-                    self.save_to_history(session_id, raw_message, &reply).await;
-                    return reply;
-                }
-
-                // P1-4: 工具参数 JSON Schema 校验（校验失败不调用 MCP）
-                if let Some(schema) = tool_schemas.get(&tc.name) {
-                    if let Err(e) = Self::validate_tool_args(&tc.arguments, schema) {
-                        if self.config.strict_schema {
-                            let reply =
-                                format!("工具「{}」参数校验失败: {}。请修正后重试。", tc.name, e);
-                            self.save_to_history(session_id, raw_message, &reply).await;
-                            return reply;
-                        }
-                        // 非严格模式：把错误回灌 LLM，让其修正参数后重试（受 max_tool_rounds 限制）
-                        tracing::info!(tool = %tc.name, error = %e, "工具参数 schema 校验失败，回灌 LLM 修正");
-                        messages.push(Message {
-                            role: "user".to_string(),
-                            content: Some(format!(
-                                "工具 {} 参数错误: {}。请严格按该工具的 JSON Schema（required 字段必填）修正参数后重试。",
-                                tc.name, e
-                            )),
-                            tool_calls: None,
-                            tool_call_id: None,
-                        });
-                        continue;
-                    }
-                }
-
-                // 通过 MCP 调用工具（按名称路由到正确的源）
-                let result = match self
-                    .call_tool_routed(&tc.name, &self.persona_for_session(session_id), &tc.arguments, allowed_ns, trace_id)
-                    .await
-                {
-                    Ok(text) => {
-                        executed_tools.push(tc.name.clone());
-                        text
-                    }
-                    Err(e) => format!("执行失败: {}", e),
-                };
-
-                // 记录执行日志（供蒸馏）
-                {
-                    let mut log = self.execution_log.lock().await;
-                    log.push(ExecutionLog {
-                        name: tc.name.clone(),
-                        trigger_conditions: serde_json::json!({"tool": tc.name}),
-                        steps: serde_json::json!([{
-                            "tool": tc.name,
-                            "args": tc.arguments,
-                        }]),
-                        verify_rule: String::new(),
-                        success: !result.starts_with("执行失败"),
-                    });
-                }
-
-                // 需要确认的操作 → 保存到 pending_actions
-                if result.contains("require_confirm") || result.contains("确认") {
-                    let action = PendingAction {
-                        tool_name: tc.name.clone(),
-                        arguments: {
-                            let mut args = tc.arguments.clone();
-                            if let Some(obj) = args.as_object_mut() {
-                                obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
-                            }
-                            args
-                        },
-                        description: format!("{} ({})", tc.name, tc.arguments),
-                        approval_id: None,
-                    };
-                    self.session_manager
-                        .set_pending_action(session_id, action)
-                        .await;
-                }
-
-                // 将工具调用 + 结果加入消息列表
-                messages.push(Message {
-                    role: "assistant".to_string(),
-                    content: None,
-                    tool_calls: Some(vec![crate::llm::ToolCallJson {
-                        id: tc.id.clone(),
-                        type_: "function".to_string(),
-                        function: crate::llm::ToolFunction {
-                            name: tc.name.clone(),
-                            arguments: tc.arguments.to_string(),
-                        },
-                    }]),
-                    tool_call_id: None,
-                });
-                messages.push(Message {
-                    role: "tool".to_string(),
-                    content: Some(result),
-                    tool_calls: None,
-                    tool_call_id: Some(tc.id.clone()),
-                });
+            // 有工具调用 → 执行工具（重构 L 阶段：Agents SDK turn 语义）
+            match self
+                .execute_tool_calls(
+                    &mut messages,
+                    &response.tool_calls,
+                    &mut executed_tools,
+                    &tool_schemas,
+                    session_id,
+                    raw_message,
+                    allowed_ns,
+                    trace_id,
+                )
+                .await
+            {
+                ToolExecOutcome::Abort(reply) => return reply,
+                ToolExecOutcome::Executed(any) => did_work |= any,
             }
         }
 
@@ -4608,6 +4289,360 @@ impl AgentCore {
         }
         out
     }
+
+    /// 执行 LLM 返回的工具调用（重构 L 阶段：Agents SDK turn 语义——校验→审批→执行→回灌）。
+    /// 返回 ToolExecOutcome：Executed(是否执行了工具) 或 Abort(提前终止文案，llm_loop 直接返回)。
+    async fn execute_tool_calls(
+        &self,
+        messages: &mut Vec<Message>,
+        tool_calls: &[crate::llm::ToolCall],
+        executed_tools: &mut Vec<String>,
+        tool_schemas: &HashMap<String, serde_json::Value>,
+        session_id: &str,
+        raw_message: &str,
+        allowed_ns: &[String],
+        trace_id: &str,
+    ) -> ToolExecOutcome {
+        let mut executed_any = false;
+        for tc in tool_calls {
+            // 边界检查
+            let boundary = self.boundary.lock().await;
+            let ns = self.current_ns_paths();
+            let tool_level = boundary
+                .classifier
+                .lock()
+                .unwrap()
+                .classify(&tc.name)
+                .to_string();
+            let check = boundary.check_tool(
+                &tc.name,
+                &tc.arguments,
+                &self.config.identity.agent_id,
+                "user",
+                &self.config.parent_permission,
+                ns.as_deref(),
+            );
+            drop(boundary);
+
+            // P2-3：boundary 结果写入 span（allow / reason / level 可观测）
+            tracing::debug!(
+                tool = %tc.name,
+                allowed = check.allow,
+                level = ?check.level,
+                reason = %check.reason,
+                "llm_tool_boundary"
+            );
+
+            if !check.allow {
+                // 审计日志：记录边界/红线拒绝（P2-2 统一事件，带 trace_id 串联）
+                self.audit_logger
+                    .boundary_deny(
+                        &self.config.identity.agent_id,
+                        &tc.name,
+                        &check.reason,
+                        trace_id,
+                        Some(session_id),
+                    )
+                    .await;
+
+                // 危险/红线工具：无审批人时直接硬拒绝，不进入 LLM 下一轮
+                let is_dangerous = tool_level == "dangerous";
+                if check.level == Some(BlockLevel::Red) || is_dangerous {
+                    // L2 人工审批通道：human_approval 为真时改走 dashboard 审批台（HTTP 暴露），
+                    // 不走 a2a 到 AI agent（避免 AI 批 AI、真人无兜底）。
+                    if self.config.human_approval {
+                        let aid = self
+                            .approval_manager
+                            .create_request_for_session(
+                                &tc.name,
+                                &tc.arguments,
+                                &check.reason,
+                                "dashboard-admin", // 固定标识，由 dashboard 审批台经 HTTP 回执
+                                &self.config.identity.agent_id,
+                                session_id,
+                            )
+                            .await;
+                        // P2-2: 审批创建事件（带 trace_id）
+                        self.audit_logger
+                            .approval_event(
+                                "created",
+                                &self.config.identity.agent_id,
+                                &tc.name,
+                                &check.reason,
+                                trace_id,
+                                Some(session_id),
+                            )
+                            .await;
+                        // P1-1: 记录待审批到 checkpoint（崩溃恢复后审批意图仍可见）
+                        let pa = PendingAction {
+                            tool_name: tc.name.clone(),
+                            arguments: tc.arguments.clone(),
+                            description: check.reason.clone(),
+                            approval_id: Some(aid.clone()),
+                        };
+                        self.checkpoint_pending_approval(session_id, &aid, &pa)
+                            .await;
+                        let summary = Self::summarize_args(&tc.arguments);
+                        let reply = format!(
+                            "AWAITING_APPROVAL:危险/红线工具「{}」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续\n参数：{}",
+                            tc.name, summary
+                        );
+                        self.save_to_history(session_id, raw_message, &reply).await;
+                        return ToolExecOutcome::Abort(reply);
+                    }
+                    if let Some(approver_id) = &self.config.approver_id {
+                        let aid = self
+                            .approval_manager
+                            .create_request_for_session(
+                                &tc.name,
+                                &tc.arguments,
+                                &check.reason,
+                                approver_id,
+                                &self.config.identity.agent_id,
+                                session_id,
+                            )
+                            .await;
+                        let msg = serde_json::json!({
+                            "type": "approval_request",
+                            "approval_id": aid,
+                            "tool_name": tc.name,
+                            "description": check.reason,
+                            "arguments": tc.arguments,
+                            "requester_id": self.config.identity.agent_id,
+                            "requester_ns": self.config.identity.ns(),
+                        });
+                        let _ = self
+                            .mcp
+                            .call(
+                                "a2a_send",
+                                &serde_json::json!({
+                                        "to": approver_id,
+                                        "content": msg.to_string(),
+                                        "namespace": format!("agent/{}", approver_id),
+                                }),
+                            )
+                            .await;
+                        // P2-2: 审批创建事件（带 trace_id）
+                        self.audit_logger
+                            .approval_event(
+                                "created",
+                                &self.config.identity.agent_id,
+                                &tc.name,
+                                &check.reason,
+                                trace_id,
+                                Some(session_id),
+                            )
+                            .await;
+                        // P1-1: 记录待审批到 checkpoint（崩溃恢复后审批意图仍可见）
+                        let pa = PendingAction {
+                            tool_name: tc.name.clone(),
+                            arguments: tc.arguments.clone(),
+                            description: check.reason.clone(),
+                            approval_id: None,
+                        };
+                        self.checkpoint_pending_approval(session_id, &aid, &pa)
+                            .await;
+                        let reply = format!(
+                            "AWAITING_APPROVAL:等待审批人「{}」审批工具「{}」，请稍后",
+                            approver_id, tc.name
+                        );
+                        self.save_to_history(session_id, raw_message, &reply).await;
+                        return ToolExecOutcome::Abort(reply);
+                    }
+                    let reply = format!(
+                        "硬拒绝: 工具「{}」触发{}，未配置审批人，无法执行",
+                        tc.name,
+                        if check.level == Some(BlockLevel::Red) {
+                            "红线"
+                        } else {
+                            "危险工具策略"
+                        }
+                    );
+                    self.save_to_history(session_id, raw_message, &reply).await;
+                    return ToolExecOutcome::Abort(reply);
+                }
+
+                // 黄线（未知工具、权限递减、dept 写操作等）
+                // HumanInLoop：与危险工具一致走 dashboard 审批台（真人兜底），不走 a2a。
+                if self.config.human_approval {
+                    let aid = self
+                        .approval_manager
+                        .create_request_for_session(
+                            &tc.name,
+                            &tc.arguments,
+                            &check.reason,
+                            "dashboard-admin",
+                            &self.config.identity.agent_id,
+                            session_id,
+                        )
+                        .await;
+                    self.audit_logger
+                        .approval_event(
+                            "created",
+                            &self.config.identity.agent_id,
+                            &tc.name,
+                            &check.reason,
+                            trace_id,
+                            Some(session_id),
+                        )
+                        .await;
+                    let pa = PendingAction {
+                        tool_name: tc.name.clone(),
+                        arguments: tc.arguments.clone(),
+                        description: check.reason.clone(),
+                        approval_id: Some(aid.clone()),
+                    };
+                    self.checkpoint_pending_approval(session_id, &aid, &pa)
+                        .await;
+                    let reply = format!(
+                        "AWAITING_APPROVAL:工具「{}」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续——{}",
+                        tc.name, check.reason
+                    );
+                    self.save_to_history(session_id, raw_message, &reply).await;
+                    return ToolExecOutcome::Abort(reply);
+                }
+                if let Some(approver_id) = &self.config.approver_id {
+                    let aid = self
+                        .approval_manager
+                        .create_request_for_session(
+                            &tc.name,
+                            &tc.arguments,
+                            &check.reason,
+                            approver_id,
+                            &self.config.identity.agent_id,
+                            session_id,
+                        )
+                        .await;
+                    let msg = serde_json::json!({
+                        "type": "approval_request",
+                        "approval_id": aid,
+                        "tool_name": tc.name,
+                        "description": check.reason,
+                        "arguments": tc.arguments,
+                        "requester_id": self.config.identity.agent_id,
+                        "requester_ns": self.config.identity.ns(),
+                    });
+                    let _ = self
+                        .mcp
+                        .call(
+                            "a2a_send",
+                            &serde_json::json!({
+                                "to": approver_id,
+                                "content": msg.to_string(),
+                                "namespace": format!("agent/{}", approver_id),
+                            }),
+                        )
+                        .await;
+                    let reply = format!(
+                        "AWAITING_APPROVAL:等待审批人「{}」审批工具「{}」，请稍后",
+                        approver_id, tc.name
+                    );
+                    self.save_to_history(session_id, raw_message, &reply).await;
+                    return ToolExecOutcome::Abort(reply);
+                }
+                let reply = format!(
+                    "REQUIRES_REVIEW:{}:工具「{}」需要确认——{}",
+                    tc.name, tc.name, check.reason
+                );
+                self.save_to_history(session_id, raw_message, &reply).await;
+                return ToolExecOutcome::Abort(reply);
+            }
+
+            // P1-4: 工具参数 JSON Schema 校验（校验失败不调用 MCP）
+            if let Some(schema) = tool_schemas.get(&tc.name) {
+                if let Err(e) = Self::validate_tool_args(&tc.arguments, schema) {
+                    if self.config.strict_schema {
+                        let reply =
+                            format!("工具「{}」参数校验失败: {}。请修正后重试。", tc.name, e);
+                        self.save_to_history(session_id, raw_message, &reply).await;
+                        return ToolExecOutcome::Abort(reply);
+                    }
+                    // 非严格模式：把错误回灌 LLM，让其修正参数后重试（受 max_tool_rounds 限制）
+                    tracing::info!(tool = %tc.name, error = %e, "工具参数 schema 校验失败，回灌 LLM 修正");
+                    messages.push(Message {
+                        role: "user".to_string(),
+                        content: Some(format!(
+                            "工具 {} 参数错误: {}。请严格按该工具的 JSON Schema（required 字段必填）修正参数后重试。",
+                            tc.name, e
+                        )),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                    continue;
+                }
+            }
+
+            // 通过 MCP 调用工具（按名称路由到正确的源）
+            let result = match self
+                .call_tool_routed(&tc.name, &self.persona_for_session(session_id), &tc.arguments, allowed_ns, trace_id)
+                .await
+            {
+                Ok(text) => {
+                    executed_tools.push(tc.name.clone());
+                        executed_any = true;
+                    text
+                }
+                Err(e) => format!("执行失败: {}", e),
+            };
+
+            // 记录执行日志（供蒸馏）
+            {
+                let mut log = self.execution_log.lock().await;
+                log.push(ExecutionLog {
+                    name: tc.name.clone(),
+                    trigger_conditions: serde_json::json!({"tool": tc.name}),
+                    steps: serde_json::json!([{
+                        "tool": tc.name,
+                        "args": tc.arguments,
+                    }]),
+                    verify_rule: String::new(),
+                    success: !result.starts_with("执行失败"),
+                });
+            }
+
+            // 需要确认的操作 → 保存到 pending_actions
+            if result.contains("require_confirm") || result.contains("确认") {
+                let action = PendingAction {
+                    tool_name: tc.name.clone(),
+                    arguments: {
+                        let mut args = tc.arguments.clone();
+                        if let Some(obj) = args.as_object_mut() {
+                            obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
+                        }
+                        args
+                    },
+                    description: format!("{} ({})", tc.name, tc.arguments),
+                    approval_id: None,
+                };
+                self.session_manager
+                    .set_pending_action(session_id, action)
+                    .await;
+            }
+
+            // 将工具调用 + 结果加入消息列表
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![crate::llm::ToolCallJson {
+                    id: tc.id.clone(),
+                    type_: "function".to_string(),
+                    function: crate::llm::ToolFunction {
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+            });
+            messages.push(Message {
+                role: "tool".to_string(),
+                content: Some(result),
+                tool_calls: None,
+                tool_call_id: Some(tc.id.clone()),
+            });
+        }
+        ToolExecOutcome::Executed(executed_any)
+    }
+
 
     /// A2A 协议最小兼容（2026-08-04）：为信封补 A2A 规范字段
     /// （`messageId` / `conversationId` / `sender{agentId}` / `parts[{kind,text}]`），
@@ -7778,6 +7813,15 @@ impl AgentCore {
             }
         })
     }
+}
+
+/// 工具执行结果（Agents SDK turn 语义：单轮内校验→审批→执行→回灌）。
+/// 模块级定义：Rust 不允许 enum 声明在 impl 块内。
+enum ToolExecOutcome {
+    /// 正常执行完成（bool = 是否至少执行了一个工具）
+    Executed(bool),
+    /// 提前终止 llm_loop（危险工具提交审批 / 硬拒绝），携带回复文案
+    Abort(String),
 }
 
 fn now_secs() -> f64 {
