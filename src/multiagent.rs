@@ -170,7 +170,11 @@ impl SharedState {
         let mut rejected = 0usize;
         let mut delta: i64 = 0;
         let total = self.total_bytes.load(Ordering::Relaxed) as i64;
-        for (k, val) in changes {
+        // 排序键迭代：部分接受时接受/拒绝子集确定（HashMap 遍历序随机）
+        let mut keys: Vec<&String> = changes.keys().collect();
+        keys.sort();
+        for k in keys {
+            let val = &changes[k];
             if !Self::value_allowed(val) {
                 rejected += 1;
                 continue;
@@ -489,7 +493,7 @@ async fn dispatch_group(
     for (title, res) in results {
         match res {
             Ok(Ok(r)) => {
-                let (changes, body) = if let Some(bb) = blackboard {
+                let body = if let Some(bb) = blackboard {
                     // P2-2：解析黑板回写块 → 合并进黑板 → 正文剔除整个代码块
                     let (c, b) = extract_blackboard_write(&r.text);
                     if !c.is_empty() {
@@ -502,11 +506,10 @@ async fn dispatch_group(
                             title
                         );
                     }
-                    (c, b)
+                    b
                 } else {
-                    (HashMap::new(), r.text.clone())
+                    r.text.clone()
                 };
-                let _ = changes;
                 out.push_str(&format!("### {}\n{}\n\n", title, body));
             }
             Ok(Err(e)) => out.push_str(&format!("### {} (失败: {})\n\n", title, e)),
