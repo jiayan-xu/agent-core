@@ -4045,7 +4045,7 @@ impl AgentCore {
 
     /// LLM 调用循环（支持多轮 tool calling）
     // ── A1: 白龙马 ACI 请求前上下文预取（工具子集选择，只选 schema 不调工具）──
-    const EXPOSE_TOOL_CAP: usize = 512; // 抬升：原 12 致模型仅见~12工具；本 ns ~45-98 工具需全量暴露
+    const EXPOSE_TOOL_CAP: usize = 30; // 2026-08-05 二降：60 时单次 LLM 仍 20s（工具 schema 大）。30 = 相关查询 + 常驻诊断，Easy 查询足够；DeepSeek 裸 API 0.3s，慢在 prompt 体积
 
     /// 始终暴露给 LLM 的关键工具（不论相关性打分），确保诊断/运维/工程师类能力不被 top-K 过滤掉。
     const ALWAYS_EXPOSE_TOOLS: &[&str] = &[
@@ -4061,19 +4061,27 @@ impl AgentCore {
 
     fn prefetch_tokens(s: &str) -> Vec<String> {
         let s = s.to_lowercase();
-        let s: String = s.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect();
+        // 保留 ASCII 字母数字 + 中文字符（非 ASCII），中文按 bigram 切分参与打分。
+        // 修复 2026-08-05：原 filter 用 is_alphanumeric() 过滤，中文字符全被剔除 →
+        // 中文查询分词为空 → 相关性全 0 → 退回 125 工具全量暴露（首 token 慢 + TTC 预算爆）。
+        let s: String = s
+            .chars()
+            .filter(|c| !c.is_ascii_punctuation() && !c.is_ascii_whitespace())
+            .collect();
         let mut toks = Vec::new();
         for w in s.split_whitespace() {
-            if w.len() >= 2 { toks.push(w.to_string()); }
+            if w.len() >= 2 {
+                toks.push(w.to_string());
+            }
         }
-        let cn: Vec<char> = s.chars().filter(|c| !c.is_alphanumeric() && !c.is_whitespace()).collect();
+        let cn: Vec<char> = s.chars().filter(|c| !c.is_ascii_alphanumeric()).collect();
         for w in cn.windows(2) {
             toks.push(w.iter().collect());
         }
         toks
     }
 
-    fn score_tool_relevance(&self, query: &str, name: &str, desc: &str) -> f64 {
+    fn score_tool_relevance(query: &str, name: &str, desc: &str) -> f64 {
         let q = Self::prefetch_tokens(query);
         let t = Self::prefetch_tokens(&format!("{} {}", name, desc));
         if q.is_empty() || t.is_empty() { return 0.0; }
@@ -4110,7 +4118,7 @@ impl AgentCore {
         let mut scored: Vec<(f64, ToolDef)> = rest
             .into_iter()
             .map(|t| {
-                let s = self.score_tool_relevance(message, &t.function.name, &t.function.description);
+                let s = Self::score_tool_relevance(message, &t.function.name, &t.function.description);
                 (s, t)
             })
             .collect();
@@ -8384,6 +8392,22 @@ fn now_secs() -> f64 {
 #[cfg(test)]
 mod tool_fix_tests {
     use super::*;
+
+    #[test]
+    fn test_prefetch_tokens_chinese() {
+        // 回归 2026-08-05：中文查询须产生 bigram token，否则相关性打分全 0 → 全量暴露
+        let q = AgentCore::prefetch_tokens("7月装修垃圾进了多少");
+        assert!(!q.is_empty(), "中文查询不应为空分词");
+        assert!(q.iter().any(|t| t.contains("装修")), "应含中文 bigram: {q:?}");
+        assert!(q.iter().any(|t| t.contains("垃圾")), "应含中文 bigram: {q:?}");
+        // 打分：query 与 query_entrance 描述（含业务关键词 垃圾/装修/进厂）应 > 0
+        let score = AgentCore::score_tool_relevance(
+            "7月装修垃圾进了多少",
+            "query_entrance",
+            "查询车辆入厂记录。业务关键词：入厂/进厂/车次/重量/吨/车牌/固废/垃圾/装修",
+        );
+        assert!(score > 0.0, "中文查询应对查询工具打正分, got {score}");
+    }
 
     #[test]
     fn test_levenshtein_basic() {
