@@ -1367,6 +1367,27 @@ impl AgentCore {
                     self.checkpoint_preview(session_id, &new_plan).await;
                     return self.render_plan_preview(&new_plan).await;
                 }
+                // ⚠️ 修复 2026-08-05（PFAiX 会话卡死根因）：会话停在 AwaitingConfirmation 时，
+                // 若用户发来的是【全新查询】（requires_confirmation=false，如「苏EJB897 在白名单里么」
+                // 「固废种类是什么」），应视为新请求直接执行，而不是反复复述「方向对吗？」死循环。
+                // 否则 PFAiX 会话被上一个 PlanPreview checkpoint 卡死，所有后续查询全部被复述闸拦截。
+                if !crate::boundary::TaskConfirmationGate::requires_confirmation(message) {
+                    self.session_manager
+                        .set_state(session_id, SessionState::Confirmed)
+                        .await;
+                    self.checkpoint_confirmed(session_id).await;
+                    return crate::reply_polish::polish_llm_reply(
+                        self.execute_chat(
+                            message,
+                            user_id,
+                            session_id,
+                            allowed_ns,
+                            &trace_id,
+                            external_history.clone(),
+                        )
+                        .await,
+                    );
+                }
                 // 修改/补充 → 保留 AwaitingConfirmation，重新复述
                 return self
                     .rephrase_and_confirm(message, user_id, session_id, allowed_ns)

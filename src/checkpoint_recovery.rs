@@ -40,6 +40,34 @@ pub async fn apply_checkpoint_recovery(
         Some(c) => c,
         None => return None,
     };
+    // ⚠️ 修复 2026-08-05（PFAiX 会话卡死防复发）：确认类 checkpoint（AwaitingConfirmation /
+    // PlanPreview）超过 30 分钟未更新视为「陈旧确认」，不再恢复确认态（回到 New 直接执行）。
+    // 否则用户昨天留下的 PlanPreview 会让该会话此后所有新查询都被「方向对吗？」复述闸拦截
+    // （restore 每次刷新 confirm_started_at，check_confirm_timeouts 永不触发）。
+    const CONFIRM_CHECKPOINT_TTL: chrono::Duration = chrono::Duration::minutes(30);
+    if matches!(
+        cp.state,
+        CheckpointState::AwaitingConfirmation | CheckpointState::PlanPreview
+    ) {
+        let stale = chrono::Utc::now()
+            - chrono::NaiveDateTime::parse_from_str(&cp.updated_at, "%Y-%m-%d %H:%M:%S")
+                .map(|ndt| ndt.and_utc())
+                .unwrap_or_else(|_| chrono::Utc::now());
+        if stale > CONFIRM_CHECKPOINT_TTL {
+            tracing::info!(
+                session_id = %session_id,
+                state = %cp.state.as_str(),
+                updated_at = %cp.updated_at,
+                "checkpoint 确认态已过期（>30min），放弃恢复，回退 New"
+            );
+            // 清掉陈旧 checkpoint，避免每次请求都重新命中
+            let _ = {
+                let guard = store.lock().await;
+                guard.delete(session_id)
+            };
+            return Some(CheckpointState::New);
+        }
+    }
     let state_str = cp.state.as_str();
     // 战略罗盘「可观测」：崩溃/重启后续跑恢复计数（仅当存在非 New 控制面状态）
     if cp.state != CheckpointState::New {
