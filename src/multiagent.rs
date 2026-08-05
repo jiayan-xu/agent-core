@@ -11,11 +11,103 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use futures::future::join_all;
 
 use crate::llm::{LlmClient, Message, RoutedLlm, ToolDef};
+
+/// P2-2 黑板模式：多 Agent 协作的共享工作区（SharedState）。
+///
+/// 与 A2A 消息通道互补——消息是「异步通信」，黑板是「共享结构化状态」：
+/// 子 agent 把中间产物（数据切片、半成品、结论草稿）写入黑板，供后续
+/// 阶段或其他子 agent 读取，避免重复劳动与结论不一致。
+///
+/// 并发语义：`version` 每次写操作自增（乐观锁）；`merge` 批量合并为一次写。
+/// 本实现为进程内共享（compose 派发期间有效），跨进程黑板留待后续。
+#[derive(Clone, Debug, Default)]
+pub struct SharedState {
+    data: Arc<RwLock<HashMap<String, serde_json::Value>>>,
+    version: Arc<AtomicU64>,
+}
+
+impl SharedState {
+    /// 空黑板（版本 0）
+    pub fn new() -> Self {
+        SharedState::default()
+    }
+
+    /// 读取一个键
+    pub fn get(&self, key: &str) -> Option<serde_json::Value> {
+        self.data.read().ok()?.get(key).cloned()
+    }
+
+    /// 写入一个键，版本号自增；返回新版本号
+    pub fn set(&self, key: &str, value: serde_json::Value) -> u64 {
+        let mut v = self.data.write().expect("blackboard poisoned");
+        v.insert(key.to_string(), value);
+        let ver = self.version.fetch_add(1, Ordering::SeqCst) + 1;
+        ver
+    }
+
+    /// 当前版本号（0 = 从未写入）
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::SeqCst)
+    }
+
+    /// 全量快照（子 agent 只读上下文用）
+    pub fn snapshot(&self) -> HashMap<String, serde_json::Value> {
+        self.data.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// 批量合并（子 agent 回写），版本号自增一次；返回新版本号
+    pub fn merge(&self, changes: &HashMap<String, serde_json::Value>) -> u64 {
+        if changes.is_empty() {
+            return self.version();
+        }
+        let mut v = self.data.write().expect("blackboard poisoned");
+        for (k, val) in changes {
+            v.insert(k.clone(), val.clone());
+        }
+        self.version.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
+/// 从子 agent 回复中解析黑板回写块：回复末尾附
+/// `{"__blackboard__": {"key": value}}` JSON 块即视为回写意图。
+/// 解析成功返回 (回写映射, 剔除回写块后的正文)；失败返回 (空, 原文)。
+fn extract_blackboard_write(text: &str) -> (HashMap<String, serde_json::Value>, String) {
+    let trimmed = text.trim_end();
+    // 查找最后一个 ```json 代码块（容错：子 agent 可能不用代码围栏，直接尾随 JSON）
+    let candidates: Vec<&str> = trimmed.split("```json").collect();
+    for cand in candidates.iter().rev() {
+        let block = cand.split("```").next().unwrap_or("");
+        let block = block.trim().trim_matches('`').trim();
+        if block.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(block) {
+            if let Some(obj) = v.as_object() {
+                if let Some(bw) = obj.get("__blackboard__").and_then(|x| x.as_object()) {
+                    let mut changes = HashMap::new();
+                    for (k, val) in bw {
+                        changes.insert(k.clone(), val.clone());
+                    }
+                    let mut cleaned = text.to_string();
+                    if let Some(pos) = cleaned.find(block) {
+                        cleaned.replace_range(pos..pos + block.len(), "");
+                        cleaned = cleaned.trim_end().to_string();
+                    }
+                    return (changes, cleaned);
+                }
+            }
+        }
+    }
+    (HashMap::new(), text.to_string())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MultiAgentConfig {
@@ -129,14 +221,18 @@ const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 120;
 /// 每个子任务包 `tokio::time::timeout` 隔离：超时/失败仅该子任务降级为说明，不拖垮整体输出。
 /// 结果按 subtask 原始顺序拼装，保证输出可预期。
 pub async fn dispatch(rt: &RoutedLlm, subtasks: &[SubTask]) -> String {
-    dispatch_with_timeout(rt, subtasks, DEFAULT_SUBAGENT_TIMEOUT_SECS).await
+    dispatch_with_timeout(rt, subtasks, DEFAULT_SUBAGENT_TIMEOUT_SECS, None).await
 }
 
 /// 带超时参数的派发（供 `maybe_compose` 传入配置中的 `subagent_timeout_secs`）。
+/// `blackboard`：可选黑板（P2-2）。传 Some 时，每个子任务消息前注入黑板快照作为
+/// 共享上下文；子任务回复若附 `{"__blackboard__": {...}}` 回写块则合并回黑板并从
+/// 汇总文本剔除。传 None 则与旧行为完全一致（纯并行独立）。
 pub async fn dispatch_with_timeout(
     rt: &RoutedLlm,
     subtasks: &[SubTask],
     timeout_secs: u64,
+    blackboard: Option<SharedState>,
 ) -> String {
     let timeout = Duration::from_secs(timeout_secs);
     // 每个子任务一个 future；rt 为 &RoutedLlm（引用 Copy），闭包内仅借用 rt、持有自有 title/desc，
@@ -144,10 +240,26 @@ pub async fn dispatch_with_timeout(
     let futures = subtasks.iter().map(|st| {
         let title = st.title.clone();
         let desc = st.description.clone();
+        let bb = blackboard.clone();
         async move {
+            // P2-2：黑板快照注入子任务上下文（只读参考；回写走 __blackboard__ 协议）
+            let mut content = desc;
+            if let Some(bb) = &bb {
+                let snap = bb.snapshot();
+                if !snap.is_empty() {
+                    if let Ok(snap_json) = serde_json::to_string_pretty(&snap) {
+                        content = format!(
+                            "{content}\n\n## 协作黑板（共享状态，只读参考）\n```json\n{snap_json}\n```\n\
+                             如需把中间产物共享给其他子 agent，在回复**末尾**附一个 JSON 代码块：\n\
+                             ```json\n{{\"__blackboard__\": {{\"键\": 值}}}}\n```\n\
+                             该块不会进入最终汇总，仅写入黑板供后续阶段读取。"
+                        );
+                    }
+                }
+            }
             let msg = Message {
                 role: "user".to_string(),
-                content: Some(desc),
+                content: Some(content),
                 tool_calls: None,
                 tool_call_id: None,
             };
@@ -159,7 +271,23 @@ pub async fn dispatch_with_timeout(
     let mut out = String::new();
     for (title, res) in results {
         match res {
-            Ok(Ok(r)) => out.push_str(&format!("### {}\n{}\n\n", title, r.text)),
+            Ok(Ok(r)) => {
+                // P2-2：解析黑板回写块 → 合并进黑板 → 正文剔除回写块
+                let (changes, body) = extract_blackboard_write(&r.text);
+                if !changes.is_empty() {
+                    if let Some(bb) = &blackboard {
+                        let ver = bb.merge(&changes);
+                        tracing::info!(
+                            target: "agent.multiagent",
+                            keys = ?changes.keys().collect::<Vec<_>>(),
+                            version = ver,
+                            "黑板回写合并（子任务: {}）",
+                            title
+                        );
+                    }
+                }
+                out.push_str(&format!("### {}\n{}\n\n", title, body));
+            }
             Ok(Err(e)) => out.push_str(&format!("### {} (失败: {})\n\n", title, e)),
             Err(_) => out.push_str(&format!("### {} (超时 {}s，已隔离)\n\n", title, timeout_secs)),
         }
@@ -183,5 +311,52 @@ mod tests {
     #[test]
     fn parse_subtasks_empty_on_garbage() {
         assert!(parse_subtasks("not json at all").is_empty());
+    }
+
+    #[test]
+    fn blackboard_set_get_version() {
+        let bb = SharedState::new();
+        assert_eq!(bb.version(), 0);
+        assert!(bb.get("k").is_none());
+        bb.set("k", serde_json::json!("v1"));
+        assert_eq!(bb.version(), 1);
+        assert_eq!(bb.get("k"), Some(serde_json::json!("v1")));
+        bb.set("k", serde_json::json!("v2"));
+        assert_eq!(bb.version(), 2);
+        assert_eq!(bb.get("k"), Some(serde_json::json!("v2")));
+    }
+
+    #[test]
+    fn blackboard_merge_and_snapshot() {
+        let bb = SharedState::new();
+        let mut m = HashMap::new();
+        m.insert("a".to_string(), serde_json::json!(1));
+        m.insert("b".to_string(), serde_json::json!("x"));
+        let ver = bb.merge(&m);
+        assert_eq!(ver, 1);
+        let snap = bb.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap["a"], serde_json::json!(1));
+        // 空合并不推进版本
+        assert_eq!(bb.merge(&HashMap::new()), 1);
+    }
+
+    #[test]
+    fn blackboard_extract_write_removes_block() {
+        let text = "分析完成，结论见上。\n```json\n{\"__blackboard__\": {\"summary\": \"xxx\", \"count\": 3}}\n```\n";
+        let (changes, body) = extract_blackboard_write(text);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes["summary"], serde_json::json!("xxx"));
+        assert_eq!(changes["count"], serde_json::json!(3));
+        assert!(!body.contains("__blackboard__"));
+        assert!(body.contains("分析完成"));
+    }
+
+    #[test]
+    fn blackboard_extract_no_write_returns_original() {
+        let text = "正常回复，无回写块";
+        let (changes, body) = extract_blackboard_write(text);
+        assert!(changes.is_empty());
+        assert_eq!(body, text);
     }
 }

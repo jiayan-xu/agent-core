@@ -7112,9 +7112,15 @@ impl AgentCore {
         if subtasks.is_empty() {
             return None;
         }
-        let result =
-            crate::multiagent::dispatch_with_timeout(&self.routed_llm, &subtasks, cfg.subagent_timeout_secs)
-                .await;
+        // P2-2：黑板模式——compose 派发共享工作区，子 agent 可读写中间产物
+        let blackboard = crate::multiagent::SharedState::new();
+        let result = crate::multiagent::dispatch_with_timeout(
+            &self.routed_llm,
+            &subtasks,
+            cfg.subagent_timeout_secs,
+            Some(blackboard),
+        )
+        .await;
         if result.trim().is_empty() {
             // 派发全失败 → 回退 composer+工具，不做空壳返回（P0-2 回退）
             tracing::warn!(target: "agent.multiagent", "dispatch 全失败，回退原路径");
