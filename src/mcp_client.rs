@@ -7,9 +7,9 @@ use rand::Rng;
 use reqwest::Client as HttpClient;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::AtomicU64;
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ── 通用 MCP 结果 ──
 
@@ -25,8 +25,8 @@ pub struct McpResult {
 // 客户端须在首次调用前发 initialize 握手 + 请求头声明协议版本，否则服务端一旦
 // 严格化（要求握手/协议头，如标准 SSE 响应）后，全部 tools/* 调用会被拒绝。
 const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
-/// 进程级一次性握手标记（stateless：每个 HTTP 请求本身无会话，握手仅需一次）
-static MCP_INITIALIZED: OnceLock<()> = OnceLock::new();
+/// 握手失败后的冷却窗口（秒）：避免热路径（list_tools 路由刷新/健康检查）反复打失败请求
+const INIT_RETRY_COOLDOWN_SECS: u64 = 30;
 
 /// HTTP MCP 客户端（原 McpClient）
 #[derive(Clone)]
@@ -36,6 +36,12 @@ pub struct HttpMcpClient {
     agent_id: String,
     badge_token: String,
     timeout_secs: u64,
+    /// 实例级握手状态：每个 server 一个 client（memoria + 各 additional_mcp）必须各自握手，
+    /// 进程级全局标志会导致一个 client 握手后其他 client（不同/重启 server）跳过握手被拒绝。
+    /// Arc 使 Clone 的同源实例（同 base_url）共享状态。
+    initialized: Arc<OnceLock<()>>,
+    /// 上次握手尝试（unix secs）：失败后冷却（INIT_RETRY_COOLDOWN_SECS），防止热路径重复轰炸。
+    last_init_attempt: Arc<AtomicU64>,
 }
 
 impl HttpMcpClient {
@@ -60,16 +66,30 @@ impl HttpMcpClient {
             agent_id: agent_id.to_string(),
             badge_token: badge_token.to_string(),
             timeout_secs,
+            initialized: Arc::new(OnceLock::new()),
+            last_init_attempt: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// MCP 协议握手（stateless 一次性）：进程级只发一次 initialize。
-    /// 失败仅告警不阻断——向后兼容宽松服务端（如 memoria 不强制握手），
-    /// 对严格要求握手+协议头的标准服务端则保证首次调用前已完成协商。
+    /// MCP 协议握手（stateless 一次性，实例级）：每个 server client 独立握手一次。
+    /// - 成功：仅当 HTTP 2xx 且响应体无 JSON-RPC `error`（严格 server 拒绝初始化时
+    ///   常见 HTTP 200 + error payload，仅看状态码会永久误置位）。
+    /// - 失败：记录冷却时间（INIT_RETRY_COOLDOWN_SECS 内不重试），不阻断调用——
+    ///   向后兼容宽松服务端（如 memoria 不强制握手）；对严格要求握手的标准服务端
+    ///   保证首次调用前已完成协商。
     async fn ensure_initialized(&self) {
-        if MCP_INITIALIZED.get().is_some() {
+        if self.initialized.get().is_some() {
             return;
         }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = self.last_init_attempt.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < INIT_RETRY_COOLDOWN_SECS {
+            return;
+        }
+        self.last_init_attempt.store(now, Ordering::Relaxed);
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
@@ -86,21 +106,34 @@ impl HttpMcpClient {
             .header("X-Agent-Id", &self.agent_id)
             .header("X-Agent-Key", &self.badge_token)
             .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
-            .header("Accept", "application/json, text/event-stream")
+            .header("Accept", "application/json")
             .send()
             .await;
         match resp {
-            Ok(r) if r.status().is_success() => {
-                let _ = MCP_INITIALIZED.set(());
-                tracing::info!(target: "mcp", "MCP initialize 握手完成（stateless 一次性）");
-            }
+            Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                Ok(v) if v.get("error").is_none() => {
+                    let _ = self.initialized.set(());
+                    tracing::info!(
+                        target: "mcp", base_url = %self.base_url,
+                        "MCP initialize 握手完成（stateless 一次性）"
+                    );
+                }
+                Ok(v) => tracing::warn!(
+                    target: "mcp", err = ?v.get("error"),
+                    "MCP initialize 返回 JSON-RPC error，不置位（冷却期内不重试）"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "mcp", err = %e,
+                    "MCP initialize 响应解析失败，不置位（冷却期内不重试）"
+                ),
+            },
             Ok(r) => tracing::warn!(
                 target: "mcp", status = %r.status(),
-                "MCP initialize 非 2xx，继续兼容模式（旧服务端）"
+                "MCP initialize 非 2xx（冷却期内不重试）"
             ),
             Err(e) => tracing::warn!(
                 target: "mcp", err = %e,
-                "MCP initialize 传输失败，继续兼容模式（旧服务端）"
+                "MCP initialize 传输失败（冷却期内不重试）"
             ),
         }
     }
@@ -123,7 +156,7 @@ impl HttpMcpClient {
                 .header("X-Agent-Id", &self.agent_id)
                 .header("X-Agent-Key", &self.badge_token)
                 .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
-                .header("Accept", "application/json, text/event-stream")
+                .header("Accept", "application/json")
                 .header("x-trace-id", &trace_id)
                 .send()
                 .await;
@@ -194,7 +227,7 @@ impl HttpMcpClient {
             .header("X-Agent-Id", &self.agent_id)
             .header("X-Agent-Key", &self.badge_token)
             .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
-            .header("Accept", "application/json, text/event-stream")
+            .header("Accept", "application/json")
             .send()
             .await
             .map_err(|e| format!("tools/list: {}", e))?;
