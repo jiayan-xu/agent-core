@@ -1048,6 +1048,38 @@ impl ToolClassifier {
             "execute_sql",
             "fuzzy_match_plate",
             "fuzzy_match_indicator",
+            // P0 权限评审 2026-08-05：只读问数/查询类此前漏分类，导致
+            // 「7月装修垃圾进了多少」等纯查询被 nl_query 判"未分类"要求审批。
+            // 全部为只读（nl_query 自带白名单表/字段防注入）。
+            "nl_query",
+            "query_entrance",
+            "query_whitelist",
+            "query_daily_stats",
+            "query_monthly_stats",
+            "query_indicators",
+            "query_today",
+            "query_yesterday",
+            "query_vehicle",
+            "query_system_status",
+            "query_chart",
+            "get_project_context",
+            "get_schema",
+            "render_query_chart",
+            // 只读诊断/分析/报告类（P0 权限评审同批补全，均不写生产）
+            "cross_validate",
+            "data_analysis",
+            "explain_anomaly",
+            "diagnose_data_gap",
+            "diagnose_discrepancy",
+            "check_media_files",
+            "analyze_manifest_anomaly",
+            "predict_vehicle_flow",
+            "review_data",
+            "generate_report",
+            "create_docx",
+            "create_pptx",
+            "generate_pdf",
+            "summarize_url",
             // Memoria 只读：前缀 memory_ 不在 query_/search_/get_ 启发式内，必须显式列入
             "memory_search",
             "memory_search_v2",
@@ -1976,6 +2008,39 @@ mod tests {
     }
 
     // ── C1a: 危险工具硬地板 ──
+
+    #[test]
+    fn test_read_tools_no_approval_needed() {
+        // P0 权限评审 2026-08-05：只读问数/查询/诊断类必须归 read，不得走审批
+        let b = ComplianceBoundary::new(None);
+        let c = b.classifier.lock().unwrap();
+        for t in [
+            "nl_query",
+            "query_entrance",
+            "query_whitelist",
+            "query_daily_stats",
+            "query_monthly_stats",
+            "query_indicators",
+            "query_today",
+            "query_yesterday",
+            "query_vehicle",
+            "query_system_status",
+            "query_chart",
+            "get_project_context",
+            "get_schema",
+            "render_query_chart",
+            "cross_validate",
+            "data_analysis",
+            "explain_anomaly",
+            "diagnose_data_gap",
+            "diagnose_discrepancy",
+            "check_media_files",
+            "analyze_manifest_anomaly",
+            "predict_vehicle_flow",
+        ] {
+            assert_eq!(c.classify(t), "read", "{t} 应分类为 read（纯查询，不得审批）");
+        }
+    }
 
     #[test]
     fn test_dangerous_floor_direct() {
