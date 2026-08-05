@@ -3756,18 +3756,68 @@ impl AgentCore {
         bounded
     }
 
-    /// P1-1: LLM 四要素结构化摘要（当前目标/关键实体状态/核心约束/待办）
+    /// P2-4: 专职 Summarizer 输出解析（纯函数，便于单测）。支持三种形态：
+    /// 1. JSON（裸或 ```json 围栏）：{"summary": "...", "entities": [...], "constraints": [...], "todos": [...]}
+    /// 2. markdown 四要素（旧格式）：- 当前目标：... 等
+    /// 3. 纯文本：原样返回（容错）
+    /// 返回注入用文本：优先 summary 字段 + 结构化清单；无结构化则原文。
+    fn parse_summary_output(raw: &str) -> String {
+        let t = raw.trim();
+        // 剥 ```json 前缀与 ``` 后缀（两者独立处理，顺序无依赖）
+        let mut c = t;
+        if let Some(inner) = c.strip_prefix("```json") {
+            c = inner;
+        }
+        if let Some(inner) = c.strip_suffix("```") {
+            c = inner;
+        }
+        let json_candidate = c.trim();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_candidate) {
+            if let Some(obj) = v.as_object() {
+                let mut parts = Vec::new();
+                if let Some(s) = obj.get("summary").and_then(|x| x.as_str()) {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        parts.push(s.to_string());
+                    }
+                }
+                for (key, label) in [
+                    ("entities", "关键实体"),
+                    ("constraints", "核心约束"),
+                    ("todos", "待办"),
+                ] {
+                    if let Some(arr) = obj.get(key).and_then(|x| x.as_array()) {
+                        let items: Vec<String> = arr
+                            .iter()
+                            .filter_map(|i| i.as_str().map(|s| s.trim().to_string()))
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !items.is_empty() {
+                            parts.push(format!("{label}: {}", items.join("；")));
+                        }
+                    }
+                }
+                if !parts.is_empty() {
+                    return parts.join("\n");
+                }
+            }
+        }
+        // markdown 四要素 / 纯文本容错：原样返回
+        raw.trim().to_string()
+    }
+
+    /// P1-1/P2-4: 专职 Summarizer Agent——独立于对话主循环的历史压缩角色。
+    /// 角色化：职责边界（只压缩不回答）、保留/丢弃清单、JSON 输出协议。
+    /// 输出经 parse_summary_output 结构化为注入文本（summary + 实体/约束/待办清单）。
     async fn summarize_history_llm(&self, transcript: &str) -> Option<String> {
         let prompt = format!(
-            "你是上下文压缩专家。请将以下 Agent 与用户的历史对话压缩为结构化摘要。\n\
-             【必须保留】用户核心意图、已确认关键实体（人名/项目/参数）、任务进度状态、明确约束（如'不要用X'）。\n\
+            "你是专职 Summarizer Agent（上下文压缩专家），独立于对话主循环工作。\n\
+             【职责边界】只做历史对话的结构化压缩，不回答问题、不执行任务、不调用工具。\n\
+             【必须保留】用户核心意图、已确认关键实体（人名/项目/参数）、任务进度状态、明确约束（如'不要用X'）、未决待办。\n\
              【必须丢弃】寒暄、重复确认、已解决的报错细节、工具返回的原始冗长数据。\n\
-             【输出格式】（严格按此结构）\n\
-             - 当前目标：...\n\
-             - 关键实体与状态：...\n\
-             - 核心约束：...\n\
-             - 已完成步骤：...\n\
-             - 待办/未决问题：...\n\n\
+             【输出协议】严格输出 JSON（不要 markdown 围栏、不要任何额外文字）：\n\
+             {{\"summary\": \"当前目标与进度摘要（2-4句，覆盖目标/实体状态/约束/已完成步骤/待办）\",\n\
+             \"entities\": [\"关键实体1\", \"实体2\"], \"constraints\": [\"明确约束\"], \"todos\": [\"待办/未决\"]}}\n\n\
              【历史对话】\n{}",
             transcript
         );
@@ -3778,10 +3828,10 @@ impl AgentCore {
             tool_call_id: None,
         };
         match self.llm.chat(&[msg], &[]).await {
-            Ok(r) if !r.text.trim().is_empty() => Some(r.text.trim().to_string()),
+            Ok(r) if !r.text.trim().is_empty() => Some(Self::parse_summary_output(&r.text)),
             Ok(_) => None,
             Err(e) => {
-                tracing::warn!(target: "agent.summary", err = %e, "P1-1 历史摘要 LLM 失败（降级不注入）");
+                tracing::warn!(target: "agent.summary", err = %e, "P2-4 Summarizer LLM 失败（降级不注入）");
                 None
             }
         }
@@ -8384,6 +8434,37 @@ mod whitelist_preroute_tests {
     fn token_window_empty_history() {
         // 空历史 → 0（take(0) 自然为空，无消息可保留）
         assert_eq!(AgentCore::token_window_len(&[], 4000), 0);
+    }
+
+    /// P2-4: 专职 Summarizer 输出解析单测
+    #[test]
+    fn parse_summary_json_structured() {
+        let raw = r#"{"summary": "完成固废调度重构", "entities": ["苏EZQ117", "佳士能"], "constraints": ["不要动生产库"], "todos": ["补测试"]}"#;
+        let out = AgentCore::parse_summary_output(raw);
+        assert!(out.contains("完成固废调度重构"));
+        assert!(out.contains("关键实体: 苏EZQ117；佳士能"));
+        assert!(out.contains("核心约束: 不要动生产库"));
+        assert!(out.contains("待办: 补测试"));
+    }
+
+    #[test]
+    fn parse_summary_json_fenced() {
+        let raw = "```json\n{\"summary\": \"重构完成\", \"entities\": [], \"todos\": [\"推送\"]}\n```";
+        let out = AgentCore::parse_summary_output(raw);
+        assert!(out.contains("重构完成"));
+        assert!(out.contains("待办: 推送"));
+        // 空 entities 不出现
+        assert!(!out.contains("关键实体"));
+    }
+
+    #[test]
+    fn parse_summary_markdown_fallback() {
+        // 旧格式 markdown 四要素 → 原样返回
+        let raw = "- 当前目标：重构\n- 关键实体与状态：A";
+        assert_eq!(AgentCore::parse_summary_output(raw), raw);
+        // 纯文本 → 原样返回
+        let plain = "这是一段普通摘要文本";
+        assert_eq!(AgentCore::parse_summary_output(plain), plain);
     }
 
     #[test]
