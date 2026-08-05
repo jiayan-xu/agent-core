@@ -5308,7 +5308,7 @@ async fn build_agent(
         memoria_url: config.server.clone(),
         additional_mcp,
         skill_whitelist: None,
-        max_tool_rounds: 3,
+        max_tool_rounds: 20, // P0 调优：固废多步推理(进厂调度/称重/企业信息多步查询)需更多轮次，原 3 轮易过早触顶"轮数耗尽"
         parent_permission: PermissionLevel::Write,
         enable_compositional_routing: true,
         compositional_preview: true, // P1-2: 企业默认开启计划预览（HITL）

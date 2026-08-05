@@ -3745,7 +3745,7 @@ impl AgentCore {
                 }
                 // ⚠️ P0 修复（2026-08-04）：业务数据意图 + 未取证 → 强制工具重试。
                 // 合成路由降级后 LLM 可在第一轮空手返回（tool_count=0，幻觉/编造数据），
-                // max_tool_rounds 给了 3 轮预算但此出口此前从不重试。
+                // max_tool_rounds 给了 20 轮预算（固废多步推理）但此出口此前从不重试。
                 // 附件豁免统一读 intent.attachment（重构阶段3）。
                 if intent.data_query && !did_work && !intent.attachment {
                     let last_round = (_round + 1) >= self.config.max_tool_rounds;
