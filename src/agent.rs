@@ -3765,32 +3765,51 @@ impl AgentCore {
         let t = raw.trim();
         let bytes = t.as_bytes();
         // 平衡括号扫描：从每个 '{' 尝试提取完整 JSON 对象（容错前后散文、
-        // ```json / ```JSON / 裸 ``` 等任意围栏形态、无关花括号、多对象并存）。
+        // 任意围栏形态、无关花括号、多对象并存）。
         let mut i = 0usize;
+        let mut in_str = false; // 外层跟踪散文引号：字符串内的 { 不算对象起点
+        let mut esc = false;
         while i < bytes.len() {
-            if bytes[i] != b'{' {
+            let c = bytes[i];
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if c == b'\\' {
+                    esc = true;
+                } else if c == b'"' {
+                    in_str = false;
+                }
+                i += 1;
+                continue;
+            }
+            if c == b'"' {
+                in_str = true;
+                i += 1;
+                continue;
+            }
+            if c != b'{' {
                 i += 1;
                 continue;
             }
             // 平衡扫描候选对象（处理字符串内转义）
             let mut depth: i32 = 0;
-            let mut in_str = false;
-            let mut esc = false;
+            let mut obj_in_str = false;
+            let mut obj_esc = false;
             let mut j = i;
             let mut matched = false;
             while j < bytes.len() {
-                let c = bytes[j];
-                if in_str {
-                    if esc {
-                        esc = false;
-                    } else if c == b'\\' {
-                        esc = true;
-                    } else if c == b'"' {
-                        in_str = false;
+                let oc = bytes[j];
+                if obj_in_str {
+                    if obj_esc {
+                        obj_esc = false;
+                    } else if oc == b'\\' {
+                        obj_esc = true;
+                    } else if oc == b'"' {
+                        obj_in_str = false;
                     }
                 } else {
-                    match c {
-                        b'"' => in_str = true,
+                    match oc {
+                        b'"' => obj_in_str = true,
                         b'{' => depth += 1,
                         b'}' => {
                             depth -= 1;
@@ -3805,7 +3824,9 @@ impl AgentCore {
                 j += 1;
             }
             if !matched {
-                break; // 无闭合括号，放弃扫描
+                // 该 { 无闭合（散文里的游离括号）→ 跳过它继续找下一个对象，不放弃整个扫描
+                i += 1;
+                continue;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t[i..=j]) {
                 if let Some(obj) = v.as_object() {
@@ -3832,9 +3853,10 @@ impl AgentCore {
                             }
                         }
                     }
-                    // 摘要结构判定：任一摘要字段存在**且类型正确**（str / array）。
-                    // 类型错（如 {"summary": 123}）视为非摘要结构 → 继续找下一个候选；
-                    // 类型对但内容空 → 返回空串（干净降级，不注入原文/围栏）。
+                    // 摘要结构判定：任一摘要字段存在**且内容形态正确**——
+                    // summary 是字符串；数组字段需至少一个字符串元素（{"entities":[1,2]}
+                    // 是散文对象，非摘要结构）。形态对但内容空 → 返回空串（干净降级）；
+                    // 非摘要结构 → 继续找下一个候选。
                     let mut struct_ok = false;
                     if let Some(s) = obj.get("summary") {
                         if s.is_string() {
@@ -3843,7 +3865,11 @@ impl AgentCore {
                     }
                     for k in ["entities", "constraints", "todos"] {
                         if let Some(a) = obj.get(k) {
-                            if a.is_array() {
+                            if a.is_array()
+                                && a.as_array()
+                                    .map(|arr| arr.iter().any(|e| e.is_string()))
+                                    .unwrap_or(false)
+                            {
                                 struct_ok = true;
                             }
                         }
@@ -8561,6 +8587,19 @@ mod whitelist_preroute_tests {
         let raw = "配置参数 {\"a\": 1} 和 {\"summary\": \"最终结论\"} 已完成";
         let out = AgentCore::parse_summary_output(raw);
         assert_eq!(out, "最终结论");
+        // 游离无闭合 { 在散文里（不放弃扫描）→ 仍找到后面的摘要对象
+        let raw2 = "配置参数 { 和 {\"summary\": \"结论二\"} 已完成";
+        assert_eq!(AgentCore::parse_summary_output(raw2), "结论二");
+        // 散文引号内的 {（"a{b"）不误判为对象起点 → 仍找到摘要对象
+        let raw3 = "\"a{b\" {\"summary\": \"结论三\"}";
+        assert_eq!(AgentCore::parse_summary_output(raw3), "结论三");
+    }
+
+    #[test]
+    fn parse_summary_non_string_array_not_struct() {
+        // 数组字段但元素非字符串（{"entities": [1,2]} 是散文对象）→ 非摘要结构 → 回退原文
+        let raw = "配置 {\"entities\": [1, 2]} 完成";
+        assert_eq!(AgentCore::parse_summary_output(raw), raw);
     }
 
     #[test]
