@@ -8,6 +8,7 @@ use reqwest::Client as HttpClient;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicU64;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 // ── 通用 MCP 结果 ──
@@ -19,6 +20,13 @@ pub struct McpResult {
 }
 
 // ── HTTP 传输 ──
+
+// MCP Streamable HTTP (stateless, 2026-07-28 RC) 协议对齐：
+// 客户端须在首次调用前发 initialize 握手 + 请求头声明协议版本，否则服务端一旦
+// 严格化（要求握手/协议头，如标准 SSE 响应）后，全部 tools/* 调用会被拒绝。
+const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
+/// 进程级一次性握手标记（stateless：每个 HTTP 请求本身无会话，握手仅需一次）
+static MCP_INITIALIZED: OnceLock<()> = OnceLock::new();
 
 /// HTTP MCP 客户端（原 McpClient）
 #[derive(Clone)]
@@ -55,7 +63,50 @@ impl HttpMcpClient {
         }
     }
 
+    /// MCP 协议握手（stateless 一次性）：进程级只发一次 initialize。
+    /// 失败仅告警不阻断——向后兼容宽松服务端（如 memoria 不强制握手），
+    /// 对严格要求握手+协议头的标准服务端则保证首次调用前已完成协商。
+    async fn ensure_initialized(&self) {
+        if MCP_INITIALIZED.get().is_some() {
+            return;
+        }
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "agent-core", "version": env!("CARGO_PKG_VERSION")}
+            }
+        });
+        let url = format!("{}/mcp", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .header("X-Agent-Id", &self.agent_id)
+            .header("X-Agent-Key", &self.badge_token)
+            .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
+            .header("Accept", "application/json, text/event-stream")
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let _ = MCP_INITIALIZED.set(());
+                tracing::info!(target: "mcp", "MCP initialize 握手完成（stateless 一次性）");
+            }
+            Ok(r) => tracing::warn!(
+                target: "mcp", status = %r.status(),
+                "MCP initialize 非 2xx，继续兼容模式（旧服务端）"
+            ),
+            Err(e) => tracing::warn!(
+                target: "mcp", err = %e,
+                "MCP initialize 传输失败，继续兼容模式（旧服务端）"
+            ),
+        }
+    }
+
     pub async fn call(&self, tool: &str, args: &serde_json::Value) -> Result<String, String> {
+        self.ensure_initialized().await;
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": tool, "arguments": args }
@@ -71,6 +122,8 @@ impl HttpMcpClient {
                 .json(&body)
                 .header("X-Agent-Id", &self.agent_id)
                 .header("X-Agent-Key", &self.badge_token)
+                .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
+                .header("Accept", "application/json, text/event-stream")
                 .header("x-trace-id", &trace_id)
                 .send()
                 .await;
@@ -129,6 +182,7 @@ impl HttpMcpClient {
     }
 
     pub async fn list_tools(&self) -> Result<Vec<(String, String, serde_json::Value)>, String> {
+        self.ensure_initialized().await;
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
         });
@@ -139,6 +193,8 @@ impl HttpMcpClient {
             .json(&body)
             .header("X-Agent-Id", &self.agent_id)
             .header("X-Agent-Key", &self.badge_token)
+            .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
+            .header("Accept", "application/json, text/event-stream")
             .send()
             .await
             .map_err(|e| format!("tools/list: {}", e))?;
