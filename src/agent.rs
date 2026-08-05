@@ -3551,11 +3551,12 @@ impl AgentCore {
                                 continue;
                             }
                             // 追加前预检：本条会让累计超 2000 则截断（严格封顶，防单条 +300 越限）
-                            if tail_chars + c.chars().count() > 2000 {
+                            let c_len = c.chars().count();
+                            if tail_chars + c_len > 2000 {
                                 out.push_str("…（尾部超长已省略）\n");
                                 break;
                             }
-                            tail_chars += c.chars().count();
+                            tail_chars += c_len;
                             out.push_str(&format!("[{}] {}\n", m.role, c));
                         }
                     }
