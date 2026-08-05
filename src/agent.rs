@@ -3763,50 +3763,99 @@ impl AgentCore {
     /// 返回注入用文本：优先 summary 字段 + 结构化清单；无结构化则原文。
     fn parse_summary_output(raw: &str) -> String {
         let t = raw.trim();
-        // 鲁棒 JSON 提取：取第一个 { 与最后一个 } 之间的子串（容错前后散文、
-        // ```json / ```JSON / 裸 ``` 等任意围栏形态），再整体解析。
-        if let (Some(s), Some(e)) = (t.find('{'), t.rfind('}')) {
-            if e > s {
-                let cand = &t[s..=e];
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(cand) {
-                    if let Some(obj) = v.as_object() {
-                        let mut parts = Vec::new();
-                        if let Some(s) = obj.get("summary").and_then(|x| x.as_str()) {
-                            let s = s.trim();
-                            if !s.is_empty() {
-                                parts.push(s.to_string());
+        let bytes = t.as_bytes();
+        // 平衡括号扫描：从每个 '{' 尝试提取完整 JSON 对象（容错前后散文、
+        // ```json / ```JSON / 裸 ``` 等任意围栏形态、无关花括号、多对象并存）。
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] != b'{' {
+                i += 1;
+                continue;
+            }
+            // 平衡扫描候选对象（处理字符串内转义）
+            let mut depth: i32 = 0;
+            let mut in_str = false;
+            let mut esc = false;
+            let mut j = i;
+            let mut matched = false;
+            while j < bytes.len() {
+                let c = bytes[j];
+                if in_str {
+                    if esc {
+                        esc = false;
+                    } else if c == b'\\' {
+                        esc = true;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                } else {
+                    match c {
+                        b'"' => in_str = true,
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                matched = true;
+                                break;
                             }
                         }
-                        for (key, label) in [
-                            ("entities", "关键实体"),
-                            ("constraints", "核心约束"),
-                            ("todos", "待办"),
-                        ] {
-                            if let Some(arr) = obj.get(key).and_then(|x| x.as_array()) {
-                                let items: Vec<String> = arr
-                                    .iter()
-                                    .filter_map(|i| i.as_str().map(|s| s.trim().to_string()))
-                                    .filter(|s| !s.is_empty())
-                                    .collect();
-                                if !items.is_empty() {
-                                    parts.push(format!("{label}: {}", items.join("；")));
-                                }
+                        _ => {}
+                    }
+                }
+                j += 1;
+            }
+            if !matched {
+                break; // 无闭合括号，放弃扫描
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t[i..=j]) {
+                if let Some(obj) = v.as_object() {
+                    let mut parts = Vec::new();
+                    if let Some(s) = obj.get("summary").and_then(|x| x.as_str()) {
+                        let s = s.trim();
+                        if !s.is_empty() {
+                            parts.push(s.to_string());
+                        }
+                    }
+                    for (key, label) in [
+                        ("entities", "关键实体"),
+                        ("constraints", "核心约束"),
+                        ("todos", "待办"),
+                    ] {
+                        if let Some(arr) = obj.get(key).and_then(|x| x.as_array()) {
+                            let items: Vec<String> = arr
+                                .iter()
+                                .filter_map(|i| i.as_str().map(|s| s.trim().to_string()))
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            if !items.is_empty() {
+                                parts.push(format!("{label}: {}", items.join("；")));
                             }
                         }
-                        // 是 Summarizer 摘要结构（含任一结构化字段）→ 返回结构化文本；
-                        // 字段均在但内容为空 → 返回空串（干净降级，不注入原文/围栏）。
-                        let is_struct = ["summary", "entities", "constraints", "todos"]
-                            .iter()
-                            .any(|k| obj.contains_key(*k));
-                        if is_struct {
-                            return parts.join("\n");
+                    }
+                    // 摘要结构判定：任一摘要字段存在**且类型正确**（str / array）。
+                    // 类型错（如 {"summary": 123}）视为非摘要结构 → 继续找下一个候选；
+                    // 类型对但内容空 → 返回空串（干净降级，不注入原文/围栏）。
+                    let mut struct_ok = false;
+                    if let Some(s) = obj.get("summary") {
+                        if s.is_string() {
+                            struct_ok = true;
                         }
-                        // 非摘要结构（任意 JSON，如对话内容里的 {"a":1}）→ 回退原文
+                    }
+                    for k in ["entities", "constraints", "todos"] {
+                        if let Some(a) = obj.get(k) {
+                            if a.is_array() {
+                                struct_ok = true;
+                            }
+                        }
+                    }
+                    if struct_ok {
+                        return parts.join("\n");
                     }
                 }
             }
+            i = j + 1; // 本候选非摘要结构 → 继续找下一个对象
         }
-        // markdown 四要素 / 纯文本容错：原样返回
+        // markdown 四要素 / 纯文本 / 无摘要结构 → 原样返回
         raw.trim().to_string()
     }
 
@@ -8494,6 +8543,24 @@ mod whitelist_preroute_tests {
         assert_eq!(AgentCore::parse_summary_output(raw), "");
         // 空对象 {} → 非摘要结构 → 回退原文
         assert_eq!(AgentCore::parse_summary_output("{}"), "{}");
+    }
+
+    #[test]
+    fn parse_summary_wrong_type_falls_back() {
+        // summary 类型错（数字）且无其他结构字段 → 非摘要结构 → 回退原文（不丢弃模型输出）
+        let raw = "{\"summary\": 123}";
+        assert_eq!(AgentCore::parse_summary_output(raw), raw);
+        // summary 有效 + todos 类型错 → 提取有效 summary（类型错的字段被忽略）
+        let raw2 = "{\"summary\": \"x\", \"todos\": \"a, b\"}";
+        assert_eq!(AgentCore::parse_summary_output(raw2), "x");
+    }
+
+    #[test]
+    fn parse_summary_multi_object_prose() {
+        // 散文含无关花括号 + 多个对象 → 平衡扫描找到摘要结构对象
+        let raw = "配置参数 {\"a\": 1} 和 {\"summary\": \"最终结论\"} 已完成";
+        let out = AgentCore::parse_summary_output(raw);
+        assert_eq!(out, "最终结论");
     }
 
     #[test]
