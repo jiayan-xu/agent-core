@@ -3764,58 +3764,27 @@ impl AgentCore {
     fn parse_summary_output(raw: &str) -> String {
         let t = raw.trim();
         let bytes = t.as_bytes();
-        // 平衡括号扫描：从每个 '{' 尝试提取完整 JSON 对象（容错前后散文、
-        // 任意围栏形态、无关花括号、多对象并存）。
-        // 不做全局引号跟踪——散文里不平衡引号（5"、跨对象引号）会让全局状态卡死并跳过
-        // 真对象；平衡扫描自带字符串态处理（obj_in_str），从每个 { 独立尝试。
-        // 失败语义：无闭合或解析失败 → i+=1 逐跳继续（正确性优先——游离 { 之后可能有
-        // 自闭合的有效对象，如 "配置 { 和 {"summary":"x"}" 内层对象有效）。
-        // 性能说明：真实输入是 Summarizer 摘要输出（几 KB），病态全游离 { 的 O(n²)
-        // 上限也就几百万次字符操作（亚毫秒），无需字节上限（避免截断超长有效对象）。
-        let mut i = 0usize;
-        while i < bytes.len() {
-            if bytes[i] != b'{' {
-                i += 1;
-                continue;
-            }
-            // 平衡扫描候选对象（处理字符串内转义）
-            let mut depth: i32 = 0;
-            let mut obj_in_str = false;
-            let mut obj_esc = false;
-            let mut j = i;
-            let mut matched = false;
-            while j < bytes.len() {
-                let oc = bytes[j];
-                if obj_in_str {
-                    if obj_esc {
-                        obj_esc = false;
-                    } else if oc == b'\\' {
-                        obj_esc = true;
-                    } else if oc == b'"' {
-                        obj_in_str = false;
-                    }
-                } else {
-                    match oc {
-                        b'"' => obj_in_str = true,
-                        b'{' => depth += 1,
-                        b'}' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                matched = true;
-                                break;
-                            }
-                        }
-                        _ => {}
+        // 线性栈扫描：一次扫描收集所有完整闭合的 {...} 区间（O(n)，无重复扫描），
+        // 从后往前试候选（Summarizer 的 JSON 输出通常在末尾）。
+        // 不跟踪字符串引号（散文 5"、跨对象引号、字符串值内 { } 均容错）——配对误差
+        // 只产生解析失败的候选（丢弃），有效对象因区间正确而不丢失；字符串值内的 { }
+        // 产生的多余小候选会在「大区间先试成功」时自然跳过。
+        let mut stack: Vec<usize> = Vec::new();
+        let mut candidates: Vec<(usize, usize)> = Vec::new();
+        for (idx, &c) in bytes.iter().enumerate() {
+            match c {
+                b'{' => stack.push(idx),
+                b'}' => {
+                    if let Some(start) = stack.pop() {
+                        candidates.push((start, idx));
                     }
                 }
-                j += 1;
+                _ => {}
             }
-            if !matched {
-                // 无闭合：该 { 是散文游离括号 → 跳过它继续找下一个候选（不放弃扫描）
-                i += 1;
-                continue;
-            }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t[i..=j]) {
+        }
+        // 从最后一个候选向前尝试
+        for (s, e) in candidates.iter().rev() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t[*s..=*e]) {
                 if let Some(obj) = v.as_object() {
                     let mut parts = Vec::new();
                     if let Some(s) = obj.get("summary").and_then(|x| x.as_str()) {
@@ -3866,7 +3835,6 @@ impl AgentCore {
                     }
                 }
             }
-            i = j + 1; // 本候选非摘要结构 → 继续找下一个对象
         }
         // markdown 四要素 / 纯文本 / 无摘要结构 → 原样返回
         raw.trim().to_string()
