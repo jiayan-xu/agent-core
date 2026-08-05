@@ -3679,10 +3679,17 @@ impl AgentCore {
         });
         if let Some(s) = &bounded {
             let mut cache = self.history_summary_cache.lock().await;
-            // 并发防护：await LLM 期间可能已有更新的条目（另一并发调用基于更长历史刚写入），
-            // 有则用 fresher 不覆盖。fresh 条目自身指纹完备（基于其更长历史），无需重算校验。
-            if let Some((fresh_upto, fresh_text, _)) = cache.get(session_id) {
-                if *fresh_upto >= old_len {
+            // 并发防护：await LLM 期间另一调用可能已写入基于更长历史的 fresher 条目。
+            // - fresh_upto > history.len()：fresh 基于更长历史（并发追加场景）→ 必然更新，信任；
+            // - fresh_upto <= len：fresh 不更长 → 校验内容指纹，防「外部替换竞态」接受过期摘要。
+            //   指纹不一致则用本次结果覆盖（本次基于最新历史，优先）。
+            if let Some((fresh_upto, fresh_text, fresh_fp)) = cache.get(session_id) {
+                let fresh_ok = if *fresh_upto > history.len() {
+                    true
+                } else {
+                    *fresh_fp == Self::history_fingerprint(history, *fresh_upto)
+                };
+                if fresh_ok && *fresh_upto >= old_len {
                     return Some(fresh_text.clone());
                 }
             }
