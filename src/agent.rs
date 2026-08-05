@@ -3592,9 +3592,9 @@ impl AgentCore {
         if let Some(s) = &bounded {
             let mut cache = self.history_summary_cache.lock().await;
             // 并发防护：await LLM 期间可能已有更新的条目（upto >= old_len），有则用 fresher 不覆盖
-            if let Some((fresh_upto, _)) = cache.get(session_id) {
+            if let Some((fresh_upto, fresh_text)) = cache.get(session_id) {
                 if *fresh_upto >= old_len {
-                    return cache.get(session_id).map(|(_, t)| t.clone());
+                    return Some(fresh_text.clone());
                 }
             }
             // cache 上限防内存泄漏：超过 200 条清空重建（session 数有限，粗放可接受）
