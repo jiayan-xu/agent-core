@@ -3773,26 +3773,15 @@ impl AgentCore {
     /// 返回注入用文本：优先 summary 字段 + 结构化清单；无结构化则原文。
     fn parse_summary_output(raw: &str) -> String {
         let t = raw.trim();
-        let bytes = t.as_bytes();
-        // 线性栈扫描：一次扫描收集所有完整闭合的 {...} 区间（O(n)，无重复扫描），
-        // 从后往前试候选（Summarizer 的 JSON 输出通常在末尾）。
-        // 不跟踪字符串引号（散文 5"、跨对象引号、字符串值内 { } 均容错）——配对误差
-        // 只产生解析失败的候选（丢弃），有效对象因区间正确而不丢失；字符串值内的 { }
-        // 产生的多余小候选会在「大区间先试成功」时自然跳过。
-        let mut stack: Vec<usize> = Vec::new();
-        let mut candidates: Vec<(usize, usize)> = Vec::new();
-        for (idx, &c) in bytes.iter().enumerate() {
-            match c {
-                b'{' => stack.push(idx),
-                b'}' => {
-                    if let Some(start) = stack.pop() {
-                        candidates.push((start, idx));
-                    }
-                }
-                _ => {}
-            }
+        // 两层候选提取（互补覆盖两类输入缺陷）：
+        // 1) 带字符串态：正确处理 JSON 字符串值内的 { }（如 {"summary":"使用 } 符号"}"），
+        //    但会被散文不平衡引号（5"、跨对象引号）破坏；
+        // 2) 无字符串态：容错散文不平衡引号，字符串值内 { } 误配对产生解析失败的候选被丢弃。
+        let mut candidates = Self::collect_brace_candidates(t.as_bytes(), true);
+        if candidates.is_empty() {
+            candidates = Self::collect_brace_candidates(t.as_bytes(), false);
         }
-        // 从最后一个候选向前尝试
+        // 从最后一个候选（Summarizer 的 JSON 输出通常在末尾）向前尝试
         for (s, e) in candidates.iter().rev() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t[*s..=*e]) {
                 if let Some(obj) = v.as_object() {
@@ -3848,6 +3837,55 @@ impl AgentCore {
         }
         // markdown 四要素 / 纯文本 / 无摘要结构 → 原样返回
         raw.trim().to_string()
+    }
+
+    /// 收集所有完整闭合的 {...} 区间（线性栈扫描，O(n)）。
+    /// `track_string=true`：跟踪引号与转义——JSON 字符串值内的 { } 不参与配对（正确处理
+    ///   {"summary":"使用 } 符号"} 这类值内含括号的摘要），但散文不平衡引号会破坏状态；
+    /// `track_string=false`：不跟踪——容错散文引号（5" 英寸等），字符串值内 { } 误配对
+    ///   产生截断候选（后续 JSON 解析失败被丢弃），有效对象在字符串内括号平衡时不丢失。
+    fn collect_brace_candidates(bytes: &[u8], track_string: bool) -> Vec<(usize, usize)> {
+        let mut stack: Vec<usize> = Vec::new();
+        let mut candidates: Vec<(usize, usize)> = Vec::new();
+        if track_string {
+            let mut in_str = false;
+            let mut esc = false;
+            for (idx, &c) in bytes.iter().enumerate() {
+                if in_str {
+                    if esc {
+                        esc = false;
+                    } else if c == b'\\' {
+                        esc = true;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                    continue;
+                }
+                match c {
+                    b'"' => in_str = true,
+                    b'{' => stack.push(idx),
+                    b'}' => {
+                        if let Some(start) = stack.pop() {
+                            candidates.push((start, idx));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            for (idx, &c) in bytes.iter().enumerate() {
+                match c {
+                    b'{' => stack.push(idx),
+                    b'}' => {
+                        if let Some(start) = stack.pop() {
+                            candidates.push((start, idx));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        candidates
     }
 
     /// P1-1/P2-4: 专职 Summarizer Agent——独立于对话主循环的历史压缩角色。
@@ -8626,6 +8664,12 @@ mod whitelist_preroute_tests {
         // 引号包裹整个对象（他说"摘要如下 {...}"）→ 仍提取（平衡扫描自带字符串态）
         let raw2 = "他说\"摘要如下 {\"summary\": \"结论二\"}\"";
         assert_eq!(AgentCore::parse_summary_output(raw2), "结论二");
+        // 字符串值内不平衡 }（{"summary":"使用 } 符号"}）→ 带字符串态扫描正确处理
+        let raw3 = "{\"summary\": \"使用 } 符号\", \"todos\": [\"继续\"]}";
+        assert_eq!(AgentCore::parse_summary_output(raw3), "使用 } 符号\n待办: 继续");
+        // 字符串值内不平衡 {（{"summary":"目标 {A"}）→ 带字符串态扫描正确处理
+        let raw4 = "{\"summary\": \"目标 {A 达成\"}";
+        assert_eq!(AgentCore::parse_summary_output(raw4), "目标 {A 达成");
     }
 
     #[test]
