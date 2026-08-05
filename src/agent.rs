@@ -3525,13 +3525,33 @@ impl AgentCore {
                 if upto * 10 >= history.len() * 9
                     && fp == Self::history_fingerprint(&history, upto)
                 {
-                    Some(text)
+                    Some((upto, text))
                 } else {
                     None
                 }
             });
             match reuse {
-                Some(text) if !text.trim().is_empty() => text,
+                // 复用摘要 + 追加 [upto, len) 尾部原文——摘要只描述窗口外旧对话，
+                // 最近未覆盖消息（最终结果/最后决策）必须进结论，否则记忆不完整
+                Some((upto, text)) if !text.trim().is_empty() => {
+                    let mut out = text;
+                    if upto < history.len() {
+                        out.push_str("\n\n## 会话尾部（未压缩原文）\n");
+                        for m in history.iter().skip(upto) {
+                            let c: String = m
+                                .content
+                                .clone()
+                                .unwrap_or_default()
+                                .chars()
+                                .take(300)
+                                .collect();
+                            if !c.is_empty() {
+                                out.push_str(&format!("[{}] {}\n", m.role, c));
+                            }
+                        }
+                    }
+                    out
+                }
                 _ => match self.compress_episode(&transcript).await {
                     Some(c) if !c.trim().is_empty() => c,
                     _ => {
@@ -4009,6 +4029,7 @@ impl AgentCore {
             ns_list.push(root_ns);
         }
         let mut lessons = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new(); // P3-2 去重
         for ns in &ns_list {
             let args = serde_json::json!({ "query": query, "namespace": ns, "max_results": 3 });
             if let Ok(resp) = self.mcp.call_json("memory_search_v2", &args).await {
@@ -4026,7 +4047,8 @@ impl AgentCore {
                         ) || content.contains("教训")
                             || content.contains("失败")
                             || content.contains("报错");
-                        if is_lesson && !content.is_empty() {
+                        // 同一教训可能同时挂在根 ns 与会话 ns → 按内容去重（P3-2）
+                        if is_lesson && !content.is_empty() && seen.insert(content.to_string()) {
                             lessons.push(format!(
                                 "[{}] {}",
                                 category,
