@@ -8,7 +8,7 @@
 #   例: ocr-review.sh --from HEAD~3 --to HEAD
 #
 # 环境变量:
-#   OCR_BIN   : 显式指定 ocr 二进制(默认: 优先 PATH 中的 ocr, 其次本机托管 node 直跑, 再退化 npx)
+#   OCR_BIN   : 显式指定 ocr 二进制(默认: 优先 PATH 中的 ocr, 未找到则退化 npx; Windows 本机直跑 node 请经此变量或 --ocr-bin 指定)
 #   OCR_GATE  : 设为 1 时等价于传 --gate
 set -uo pipefail
 
@@ -16,10 +16,10 @@ OCR_BIN="${OCR_BIN:-}"
 if [ -z "$OCR_BIN" ]; then
   if command -v ocr >/dev/null 2>&1; then
     OCR_BIN="ocr"
-  elif [ -x "C:/Users/user/.workbuddy/binaries/node/workspace/node_modules/.bin/ocr" ]; then
-    # Windows 下用 node 直跑 ocr.js，避开 MSYS/Cygwin 对 /c/... 的路径转换坑
-    OCR_BIN="C:/Users/user/.workbuddy/binaries/node/versions/22.22.2/node.exe C:/Users/user/.workbuddy/binaries/node/workspace/node_modules/@alibaba-group/open-code-review/bin/ocr.js"
   else
+    # 未安装到 PATH 时兜底 npx（联网拉取）。
+    # Windows 本机直跑 node 的用法（避开 MSYS/Cygwin 对 /c/... 的路径转换坑）：
+    #   OCR_BIN="<node.exe 绝对路径> <ocr.js 绝对路径>" 或 ocr-review.sh --ocr-bin "..."
     OCR_BIN="npx -y @alibaba-group/open-code-review"
   fi
 fi
