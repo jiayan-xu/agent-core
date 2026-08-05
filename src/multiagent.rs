@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -27,11 +27,29 @@ use crate::llm::{LlmClient, Message, RoutedLlm, ToolDef};
 /// 阶段或其他子 agent 读取，避免重复劳动与结论不一致。
 ///
 /// 并发语义：`version` 每次写操作自增（乐观锁）；`merge` 批量合并为一次写。
-/// 本实现为进程内共享（compose 派发期间有效），跨进程黑板留待后续。
+/// 阶段化：compose 派发按 `SubTask.stage` 分组，同 stage 并行、stage 间顺序，
+/// 后一 stage 能看到前一 stage 的回写（同 stage 内并发快照互不可见，语义诚实）。
+///
+/// 安全：黑板内容源于不可信模型文本，写入受限（键数/深度/单值/总量上限），
+/// 超限丢弃并告警；锁中毒时优雅降级（与 get/snapshot 一致），不 panic。
 #[derive(Clone, Debug, Default)]
 pub struct SharedState {
-    data: Arc<RwLock<HashMap<String, serde_json::Value>>>,
+    data: Arc<RwLock<BTreeMap<String, serde_json::Value>>>,
     version: Arc<AtomicU64>,
+}
+
+/// 黑板写入防护上限（内容源于不可信模型文本）
+const BB_MAX_KEYS: usize = 32; // 最大键数
+const BB_MAX_VALUE_DEPTH: usize = 4; // 单值最大嵌套深度
+const BB_MAX_VALUE_BYTES: usize = 4096; // 单值序列化最大字节
+const BB_MAX_TOTAL_BYTES: usize = 65536; // 黑板全量序列化估算上限
+
+fn json_depth(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Array(a) => a.iter().map(json_depth).max().unwrap_or(0) + 1,
+        serde_json::Value::Object(o) => o.values().map(json_depth).max().unwrap_or(0) + 1,
+        _ => 0,
+    }
 }
 
 impl SharedState {
@@ -45,12 +63,31 @@ impl SharedState {
         self.data.read().ok()?.get(key).cloned()
     }
 
-    /// 写入一个键，版本号自增；返回新版本号
+    /// 写入一个键（受深度/大小上限约束），版本号自增；返回新版本号
     pub fn set(&self, key: &str, value: serde_json::Value) -> u64 {
-        let mut v = self.data.write().expect("blackboard poisoned");
+        if !Self::value_allowed(&value) {
+            tracing::warn!(
+                target: "agent.multiagent",
+                key = %key,
+                "黑板写入拒绝：值超限（深度/大小）"
+            );
+            return self.version();
+        }
+        let mut v = match self.data.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(), // 中毒恢复：继续可写
+        };
+        if v.len() >= BB_MAX_KEYS && !v.contains_key(key) {
+            tracing::warn!(
+                target: "agent.multiagent",
+                key = %key,
+                "黑板写入拒绝：键数达上限 {}",
+                BB_MAX_KEYS
+            );
+            return self.version();
+        }
         v.insert(key.to_string(), value);
-        let ver = self.version.fetch_add(1, Ordering::SeqCst) + 1;
-        ver
+        self.version.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// 当前版本号（0 = 从未写入）
@@ -58,9 +95,19 @@ impl SharedState {
         self.version.load(Ordering::SeqCst)
     }
 
-    /// 全量快照（子 agent 只读上下文用）
-    pub fn snapshot(&self) -> HashMap<String, serde_json::Value> {
+    /// 全量快照（子 agent 只读上下文用；BTreeMap 保证注入顺序确定性）
+    pub fn snapshot(&self) -> BTreeMap<String, serde_json::Value> {
         self.data.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// 单值是否可入黑板（深度/大小上限）
+    fn value_allowed(value: &serde_json::Value) -> bool {
+        if json_depth(value) > BB_MAX_VALUE_DEPTH {
+            return false;
+        }
+        serde_json::to_string(value)
+            .map(|s| s.len() <= BB_MAX_VALUE_BYTES)
+            .unwrap_or(false)
     }
 
     /// 批量合并（子 agent 回写），版本号自增一次；返回新版本号
@@ -68,45 +115,88 @@ impl SharedState {
         if changes.is_empty() {
             return self.version();
         }
-        let mut v = self.data.write().expect("blackboard poisoned");
+        let mut v = match self.data.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(), // 中毒恢复：继续可写
+        };
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
         for (k, val) in changes {
+            if !Self::value_allowed(val) {
+                rejected += 1;
+                continue;
+            }
+            if v.len() >= BB_MAX_KEYS && !v.contains_key(k) {
+                rejected += 1;
+                continue;
+            }
             v.insert(k.clone(), val.clone());
+            accepted += 1;
         }
-        self.version.fetch_add(1, Ordering::SeqCst) + 1
+        if rejected > 0 {
+            tracing::warn!(
+                target: "agent.multiagent",
+                accepted, rejected,
+                "黑板回写部分拒绝（深度/大小/键数上限）"
+            );
+        }
+        if accepted > 0 {
+            return self.version.fetch_add(1, Ordering::SeqCst) + 1;
+        }
+        self.version()
     }
 }
 
 /// 从子 agent 回复中解析黑板回写块：回复末尾附
-/// `{"__blackboard__": {"key": value}}` JSON 块即视为回写意图。
-/// 解析成功返回 (回写映射, 剔除回写块后的正文)；失败返回 (空, 原文)。
+/// `{"__blackboard__": {"key": value}}` JSON 代码块即视为回写意图。
+/// 解析成功返回 (回写映射, 剔除**所有**回写代码块含围栏后的正文)；失败返回 (空, 原文)。
+/// 容错：存在多个回写块时，合并取最靠后的一个；所有回写块（控制面）均从正文剔除。
 fn extract_blackboard_write(text: &str) -> (HashMap<String, serde_json::Value>, String) {
-    let trimmed = text.trim_end();
-    // 查找最后一个 ```json 代码块（容错：子 agent 可能不用代码围栏，直接尾随 JSON）
-    let candidates: Vec<&str> = trimmed.split("```json").collect();
-    for cand in candidates.iter().rev() {
-        let block = cand.split("```").next().unwrap_or("");
-        let block = block.trim().trim_matches('`').trim();
-        if block.is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(block) {
-            if let Some(obj) = v.as_object() {
-                if let Some(bw) = obj.get("__blackboard__").and_then(|x| x.as_object()) {
+    // 顺序扫描所有 ```json 代码块（pos 逐块前跳，区间有序且不重叠）
+    let mut removals: Vec<(usize, usize)> = Vec::new();
+    let mut last_changes: Option<HashMap<String, serde_json::Value>> = None;
+    let mut pos = 0usize;
+    while let Some(rel) = text[pos..].find("```json") {
+        let open = pos + rel;
+        let after = open + "```json".len();
+        if let Some(rel_close) = text[after..].find("```") {
+            let close = after + rel_close;
+            let block = &text[after..close];
+            let t = block.trim().trim_matches('`').trim();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+                if let Some(bw) = v
+                    .as_object()
+                    .and_then(|o| o.get("__blackboard__"))
+                    .and_then(|x| x.as_object())
+                {
                     let mut changes = HashMap::new();
                     for (k, val) in bw {
                         changes.insert(k.clone(), val.clone());
                     }
-                    let mut cleaned = text.to_string();
-                    if let Some(pos) = cleaned.find(block) {
-                        cleaned.replace_range(pos..pos + block.len(), "");
-                        cleaned = cleaned.trim_end().to_string();
-                    }
-                    return (changes, cleaned);
+                    // 顺序扫描：最后一次赋值即最靠后的回写块
+                    last_changes = Some(changes);
+                    removals.push((open, close + 3)); // 含 ```json 与收尾 ```
                 }
             }
+            pos = close + 3;
+        } else {
+            break;
         }
     }
-    (HashMap::new(), text.to_string())
+    match last_changes {
+        Some(changes) => {
+            // 重建正文：跳过所有回写块区间（有序不重叠，无索引漂移）
+            let mut cleaned = String::with_capacity(text.len());
+            let mut cursor = 0usize;
+            for (s, e) in &removals {
+                cleaned.push_str(&text[cursor..*s]);
+                cursor = *e;
+            }
+            cleaned.push_str(&text[cursor..]);
+            (changes, cleaned.trim_end().to_string())
+        }
+        None => (HashMap::new(), text.to_string()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,13 +250,19 @@ impl Default for MultiAgentConfig {
 pub struct SubTask {
     pub title: String,
     pub description: String,
+    /// P2-2 黑板模式：阶段号（默认 0 = 单轮）。同 stage 的子任务并行执行；
+    /// stage 间顺序执行——后一 stage 能看到前一 stage 写入黑板的中间产物。
+    #[serde(default)]
+    pub stage: u32,
 }
 
 /// 把任务 decompose 成若干子任务（LLM 调用）。失败/空返回空 vec。
 pub async fn plan_decomposition(llm: &LlmClient, task: &str) -> Vec<SubTask> {
     let prompt = format!(
         "把以下任务分解为至多 {} 个可独立执行的子任务。\n\
-         严格按 JSON 输出：{{\"tasks\":[{{\"title\":\"简短标题\",\"description\":\"子任务具体描述\"}}]}}\n\
+         严格按 JSON 输出：{{\"tasks\":[{{\"title\":\"简短标题\",\"description\":\"子任务具体描述\",\"stage\":0}}]}}\n\
+         说明：stage 为阶段号（从 0 起）。若子任务间有先后依赖（后一任务依赖前一任务的中间结果），\n\
+         给它们不同的 stage（0 先执行，1 后执行……）；无依赖则全部 stage=0（并行执行）。\n\
          任务：{}",
         default_fanout(),
         task
@@ -203,7 +299,15 @@ pub fn parse_subtasks(json: &str) -> Vec<SubTask> {
                     .filter_map(|t| {
                         let title = t.get("title")?.as_str()?.to_string();
                         let description = t.get("description")?.as_str()?.to_string();
-                        Some(SubTask { title, description })
+                        let stage = t
+                            .get("stage")
+                            .and_then(|s| s.as_u64())
+                            .unwrap_or(0) as u32;
+                        Some(SubTask {
+                            title,
+                            description,
+                            stage,
+                        })
                     })
                     .collect();
             }
@@ -225,9 +329,12 @@ pub async fn dispatch(rt: &RoutedLlm, subtasks: &[SubTask]) -> String {
 }
 
 /// 带超时参数的派发（供 `maybe_compose` 传入配置中的 `subagent_timeout_secs`）。
-/// `blackboard`：可选黑板（P2-2）。传 Some 时，每个子任务消息前注入黑板快照作为
-/// 共享上下文；子任务回复若附 `{"__blackboard__": {...}}` 回写块则合并回黑板并从
-/// 汇总文本剔除。传 None 则与旧行为完全一致（纯并行独立）。
+/// `blackboard`：可选黑板（P2-2）。传 Some 时：
+/// - 子任务按 `stage` 分组执行——同 stage 并行（`join_all`），stage 间顺序；
+/// - 每个子任务消息前注入**当前**黑板快照（含前序 stage 的回写，只读参考）；
+/// - 子任务回复若附 `{"__blackboard__": {...}}` 回写块则合并进黑板，并从汇总文本
+///   剔除整个代码块（不污染最终聚合）。
+/// 传 None 则与旧行为完全一致（纯并行独立，stage 忽略）。
 pub async fn dispatch_with_timeout(
     rt: &RoutedLlm,
     subtasks: &[SubTask],
@@ -235,61 +342,81 @@ pub async fn dispatch_with_timeout(
     blackboard: Option<SharedState>,
 ) -> String {
     let timeout = Duration::from_secs(timeout_secs);
-    // 每个子任务一个 future；rt 为 &RoutedLlm（引用 Copy），闭包内仅借用 rt、持有自有 title/desc，
-    // 可安全并发。空工具列表 `&[] as &[ToolDef]` 为语句内临时，跨 await 存活（与原顺序版同构）。
-    let futures = subtasks.iter().map(|st| {
-        let title = st.title.clone();
-        let desc = st.description.clone();
-        let bb = blackboard.clone();
-        async move {
-            // P2-2：黑板快照注入子任务上下文（只读参考；回写走 __blackboard__ 协议）
-            let mut content = desc;
-            if let Some(bb) = &bb {
-                let snap = bb.snapshot();
-                if !snap.is_empty() {
-                    if let Ok(snap_json) = serde_json::to_string_pretty(&snap) {
-                        content = format!(
-                            "{content}\n\n## 协作黑板（共享状态，只读参考）\n```json\n{snap_json}\n```\n\
-                             如需把中间产物共享给其他子 agent，在回复**末尾**附一个 JSON 代码块：\n\
-                             ```json\n{{\"__blackboard__\": {{\"键\": 值}}}}\n```\n\
-                             该块不会进入最终汇总，仅写入黑板供后续阶段读取。"
-                        );
-                    }
-                }
-            }
-            let msg = Message {
-                role: "user".to_string(),
-                content: Some(content),
-                tool_calls: None,
-                tool_call_id: None,
-            };
-            let r = tokio::time::timeout(timeout, rt.chat(&[msg], &[] as &[ToolDef])).await;
-            (title, r)
-        }
-    });
-    let results = join_all(futures).await;
+    // P2-2：按 stage 分组（BTreeMap 保证阶段顺序 0,1,2...）
+    let mut by_stage: BTreeMap<u32, Vec<&SubTask>> = BTreeMap::new();
+    for st in subtasks {
+        by_stage.entry(st.stage).or_default().push(st);
+    }
     let mut out = String::new();
-    for (title, res) in results {
-        match res {
-            Ok(Ok(r)) => {
-                // P2-2：解析黑板回写块 → 合并进黑板 → 正文剔除回写块
-                let (changes, body) = extract_blackboard_write(&r.text);
-                if !changes.is_empty() {
-                    if let Some(bb) = &blackboard {
-                        let ver = bb.merge(&changes);
-                        tracing::info!(
-                            target: "agent.multiagent",
-                            keys = ?changes.keys().collect::<Vec<_>>(),
-                            version = ver,
-                            "黑板回写合并（子任务: {}）",
-                            title
-                        );
+    let mut any_bb = false;
+    for (_stage, group) in by_stage {
+        // 同一 stage 内并行；rt 为 &RoutedLlm（引用 Copy），闭包内仅借用 rt、
+        // 持有自有 title/desc 与黑板句柄，可安全并发。
+        let futures = group.iter().map(|st| {
+            let title = st.title.clone();
+            let desc = st.description.clone();
+            let bb = blackboard.clone();
+            async move {
+                // P2-2：注入**当前**黑板快照（前序 stage 回写已可见；同 stage 互不可见）
+                let mut content = desc;
+                if let Some(bb) = &bb {
+                    let snap = bb.snapshot();
+                    if !snap.is_empty() {
+                        if let Ok(snap_json) = serde_json::to_string_pretty(&snap) {
+                            content = format!(
+                                "{content}\n\n## 协作黑板（共享状态，只读参考）\n```json\n{snap_json}\n```\n\
+                                 如需把中间产物共享给后续阶段，在回复**末尾**附一个 JSON 代码块：\n\
+                                 ```json\n{{\"__blackboard__\": {{\"键\": 值}}}}\n```\n\
+                                 该块不会进入最终汇总，仅写入黑板供后续阶段读取。"
+                            );
+                        }
                     }
                 }
-                out.push_str(&format!("### {}\n{}\n\n", title, body));
+                let msg = Message {
+                    role: "user".to_string(),
+                    content: Some(content),
+                    tool_calls: None,
+                    tool_call_id: None,
+                };
+                let r = tokio::time::timeout(timeout, rt.chat(&[msg], &[] as &[ToolDef])).await;
+                (title, r)
             }
-            Ok(Err(e)) => out.push_str(&format!("### {} (失败: {})\n\n", title, e)),
-            Err(_) => out.push_str(&format!("### {} (超时 {}s，已隔离)\n\n", title, timeout_secs)),
+        });
+        let results = join_all(futures).await;
+        for (title, res) in results {
+            match res {
+                Ok(Ok(r)) => {
+                    // P2-2：解析黑板回写块 → 合并进黑板 → 正文剔除整个代码块
+                    let (changes, body) = extract_blackboard_write(&r.text);
+                    if !changes.is_empty() {
+                        if let Some(bb) = &blackboard {
+                            let ver = bb.merge(&changes);
+                            any_bb = true;
+                            tracing::info!(
+                                target: "agent.multiagent",
+                                keys = ?changes.keys().collect::<Vec<_>>(),
+                                version = ver,
+                                "黑板回写合并（子任务: {}）",
+                                title
+                            );
+                        }
+                    }
+                    out.push_str(&format!("### {}\n{}\n\n", title, body));
+                }
+                Ok(Err(e)) => out.push_str(&format!("### {} (失败: {})\n\n", title, e)),
+                Err(_) => {
+                    out.push_str(&format!("### {} (超时 {}s，已隔离)\n\n", title, timeout_secs))
+                }
+            }
+        }
+    }
+    if any_bb {
+        if let Some(bb) = &blackboard {
+            out.push_str(&format!(
+                "\n---\n协作黑板最终状态（版本 {}，键 {} 个）\n",
+                bb.version(),
+                bb.snapshot().len()
+            ));
         }
     }
     out
@@ -349,6 +476,8 @@ mod tests {
         assert_eq!(changes["summary"], serde_json::json!("xxx"));
         assert_eq!(changes["count"], serde_json::json!(3));
         assert!(!body.contains("__blackboard__"));
+        // 围栏也要干净移除（不残留空代码块）
+        assert!(!body.contains("```"));
         assert!(body.contains("分析完成"));
     }
 
@@ -358,5 +487,40 @@ mod tests {
         let (changes, body) = extract_blackboard_write(text);
         assert!(changes.is_empty());
         assert_eq!(body, text);
+    }
+
+    #[test]
+    fn blackboard_extract_multiple_blocks_takes_last() {
+        let text = "第一段\n```json\n{\"__blackboard__\": {\"a\": 1}}\n```\n中间\n```json\n{\"__blackboard__\": {\"b\": 2}}\n```\n";
+        let (changes, body) = extract_blackboard_write(text);
+        assert!(changes.contains_key("b"));
+        assert!(!changes.contains_key("a"));
+        assert!(!body.contains("```"));
+    }
+
+    #[test]
+    fn blackboard_size_caps_reject() {
+        let bb = SharedState::new();
+        // 深度超限（5 层）
+        let deep = serde_json::json!({"a": {"b": {"c": {"d": {"e": 1}}}}});
+        assert_eq!(bb.set("deep", deep), 0); // 拒绝，版本不变
+        // 大值超限（> 4KB）
+        let big = serde_json::json!({"x": "y".repeat(6000)});
+        assert_eq!(bb.set("big", big), 0);
+        // 正常值可写
+        bb.set("ok", serde_json::json!(1));
+        assert_eq!(bb.version(), 1);
+    }
+
+    #[test]
+    fn subtask_stage_parse() {
+        let j = r#"{"tasks":[{"title":"A","description":"做A","stage":0},{"title":"B","description":"做B","stage":1}]}"#;
+        let v = parse_subtasks(j);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].stage, 0);
+        assert_eq!(v[1].stage, 1);
+        // 无 stage 字段向后兼容
+        let v2 = parse_subtasks(r#"{"tasks":[{"title":"C","description":"做C"}]}"#);
+        assert_eq!(v2[0].stage, 0);
     }
 }
