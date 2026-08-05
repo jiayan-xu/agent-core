@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -36,6 +36,8 @@ use crate::llm::{LlmClient, Message, RoutedLlm, ToolDef};
 pub struct SharedState {
     data: Arc<RwLock<BTreeMap<String, serde_json::Value>>>,
     version: Arc<AtomicU64>,
+    /// 全量序列化字节计数器（写锁内增量维护，O(1) 总量判断）
+    total_bytes: Arc<AtomicUsize>,
 }
 
 /// 黑板写入防护上限（内容源于不可信模型文本）
@@ -61,9 +63,11 @@ fn json_width(v: &serde_json::Value) -> usize {
     }
 }
 
-/// 序列化字节数（深度/宽度预检通过后调用，物化代价可控）
-fn value_bytes(v: &serde_json::Value) -> usize {
-    serde_json::to_string(v).map(|s| s.len()).unwrap_or(0)
+/// 序列化字节数（深度/宽度预检通过后调用，物化代价可控）。
+/// 返回 None 表示序列化失败（如 NaN/Infinity 非有限浮点）——调用方应拒绝该值，
+/// 避免非有限值被量成 0 字节绕过字节上限防护。
+fn value_bytes(v: &serde_json::Value) -> Option<usize> {
+    serde_json::to_string(v).ok().map(|s| s.len())
 }
 
 impl SharedState {
@@ -83,7 +87,7 @@ impl SharedState {
             tracing::warn!(
                 target: "agent.multiagent",
                 key = %key,
-                "黑板写入拒绝：值超限（深度/宽度/大小）"
+                "黑板写入拒绝：值超限（深度/宽度/大小/序列化失败）"
             );
             return self.version();
         }
@@ -103,11 +107,12 @@ impl SharedState {
             );
             return self.version();
         }
-        // 总量上限：全量字节 - 旧键字节 + 新值字节
-        let old_bytes = v.get(key).map(value_bytes).unwrap_or(0);
-        let new_bytes = value_bytes(&value);
-        let total: usize = v.values().map(value_bytes).sum();
-        if total as i64 - old_bytes as i64 + new_bytes as i64 > BB_MAX_TOTAL_BYTES as i64 {
+        // 总量上限（O(1) 增量）：当前总量 + (新值 - 旧值)
+        let new_bytes = value_bytes(&value).unwrap_or(0) as i64;
+        let old_bytes = v.get(key).and_then(value_bytes).unwrap_or(0) as i64;
+        let delta = new_bytes - old_bytes;
+        let total = self.total_bytes.load(Ordering::Relaxed) as i64;
+        if total + delta > BB_MAX_TOTAL_BYTES as i64 {
             tracing::warn!(
                 target: "agent.multiagent",
                 key = %key,
@@ -116,6 +121,11 @@ impl SharedState {
             );
             return self.version();
         }
+        let _ = self.total_bytes.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |t| Some((t as i64 + delta) as usize),
+        );
         v.insert(key.to_string(), value);
         self.version.fetch_add(1, Ordering::SeqCst) + 1
     }
@@ -130,7 +140,7 @@ impl SharedState {
         self.data.read().map(|g| g.clone()).unwrap_or_default()
     }
 
-    /// 单值是否可入黑板（深度/宽度/大小上限，均先预检再序列化）
+    /// 单值是否可入黑板（深度/宽度/大小上限，均先预检再序列化；序列化失败即拒绝）
     fn value_allowed(value: &serde_json::Value) -> bool {
         if json_depth(value) > BB_MAX_VALUE_DEPTH {
             return false;
@@ -138,10 +148,13 @@ impl SharedState {
         if json_width(value) > BB_MAX_VALUE_WIDTH {
             return false;
         }
-        value_bytes(value) <= BB_MAX_VALUE_BYTES
+        match value_bytes(value) {
+            Some(n) => n <= BB_MAX_VALUE_BYTES,
+            None => false, // NaN/Infinity 等序列化失败 → 拒绝（防 0 字节绕过）
+        }
     }
 
-    /// 批量合并（子 agent 回写），版本号自增一次；返回新版本号
+    /// 批量合并（子 agent 回写）：逐键增量总量检查，部分接受（能放下的键都收），版本号自增一次。
     pub fn merge(&self, changes: &HashMap<String, serde_json::Value>) -> u64 {
         if changes.is_empty() {
             return self.version();
@@ -153,26 +166,10 @@ impl SharedState {
                 p.into_inner()
             }
         };
-        // 总量上限预校验：全量字节 + 增量（新值-旧值）
-        let mut delta: i64 = 0;
-        for (k, val) in changes {
-            if !Self::value_allowed(val) {
-                continue;
-            }
-            delta += value_bytes(val) as i64 - v.get(k).map(value_bytes).unwrap_or(0) as i64;
-        }
-        let total: i64 = v.values().map(|x| value_bytes(x) as i64).sum();
-        if total + delta > BB_MAX_TOTAL_BYTES as i64 {
-            tracing::warn!(
-                target: "agent.multiagent",
-                delta,
-                "黑板回写整体拒绝：总量超上限 {}",
-                BB_MAX_TOTAL_BYTES
-            );
-            return self.version();
-        }
         let mut accepted = 0usize;
         let mut rejected = 0usize;
+        let mut delta: i64 = 0;
+        let total = self.total_bytes.load(Ordering::Relaxed) as i64;
         for (k, val) in changes {
             if !Self::value_allowed(val) {
                 rejected += 1;
@@ -182,6 +179,13 @@ impl SharedState {
                 rejected += 1;
                 continue;
             }
+            let k_delta = value_bytes(val).unwrap_or(0) as i64
+                - v.get(k).and_then(value_bytes).unwrap_or(0) as i64;
+            if total + delta + k_delta > BB_MAX_TOTAL_BYTES as i64 {
+                rejected += 1;
+                continue;
+            }
+            delta += k_delta;
             v.insert(k.clone(), val.clone());
             accepted += 1;
         }
@@ -189,10 +193,15 @@ impl SharedState {
             tracing::warn!(
                 target: "agent.multiagent",
                 accepted, rejected,
-                "黑板回写部分拒绝（深度/宽度/大小/键数上限）"
+                "黑板回写部分拒绝（深度/宽度/大小/键数/总量上限）"
             );
         }
         if accepted > 0 {
+            let _ = self.total_bytes.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |t| Some((t as i64 + delta) as usize),
+            );
             return self.version.fetch_add(1, Ordering::SeqCst) + 1;
         }
         self.version()
@@ -407,110 +416,101 @@ pub async fn dispatch_with_timeout(
     blackboard: Option<SharedState>,
 ) -> String {
     let timeout = Duration::from_secs(timeout_secs);
-    // None = 旧行为完全一致（纯并行独立，stage 忽略）
-    if blackboard.is_none() {
-        let futures = subtasks.iter().map(|st| {
-            let title = st.title.clone();
-            let desc = st.description.clone();
-            async move {
-                let msg = Message {
-                    role: "user".to_string(),
-                    content: Some(desc),
-                    tool_calls: None,
-                    tool_call_id: None,
-                };
-                let r = tokio::time::timeout(timeout, rt.chat(&[msg], &[] as &[ToolDef])).await;
-                (title, r)
-            }
-        });
-        let results = join_all(futures).await;
-        let mut out = String::new();
-        for (title, res) in results {
-            match res {
-                Ok(Ok(r)) => out.push_str(&format!("### {}\n{}\n\n", title, r.text)),
-                Ok(Err(e)) => out.push_str(&format!("### {} (失败: {})\n\n", title, e)),
-                Err(_) => {
-                    out.push_str(&format!("### {} (超时 {}s，已隔离)\n\n", title, timeout_secs))
-                }
-            }
-        }
-        return out;
-    }
-    // P2-2：黑板模式——按 stage 分组（BTreeMap 保证阶段顺序 0,1,2...）
-    let mut by_stage: BTreeMap<u32, Vec<&SubTask>> = BTreeMap::new();
-    for st in subtasks {
-        by_stage.entry(st.stage).or_default().push(st);
-    }
     let mut out = String::new();
-    let mut any_bb = false;
-    for (_stage, group) in by_stage {
-        // 同一 stage 内并行；rt 为 &RoutedLlm（引用 Copy），闭包内仅借用 rt、
-        // 持有自有 title/desc 与黑板句柄，可安全并发。
-        let futures = group.iter().map(|st| {
-            let title = st.title.clone();
-            let desc = st.description.clone();
-            let bb = blackboard.clone();
-            async move {
-                // P2-2：注入**当前**黑板快照（前序 stage 回写已可见；同 stage 互不可见）
-                let mut content = desc;
-                if let Some(bb) = &bb {
-                    let snap = bb.snapshot();
-                    if !snap.is_empty() {
-                        if let Ok(snap_json) = serde_json::to_string_pretty(&snap) {
-                            content = format!(
-                                "{content}\n\n## 协作黑板（共享状态，只读参考）\n```json\n{snap_json}\n```\n\
-                                 如需把中间产物共享给后续阶段，在回复**末尾**附一个 JSON 代码块：\n\
-                                 ```json\n{{\"__blackboard__\": {{\"键\": 值}}}}\n```\n\
-                                 该块不会进入最终汇总，仅写入黑板供后续阶段读取。"
-                            );
-                        }
-                    }
-                }
-                let msg = Message {
-                    role: "user".to_string(),
-                    content: Some(content),
-                    tool_calls: None,
-                    tool_call_id: None,
-                };
-                let r = tokio::time::timeout(timeout, rt.chat(&[msg], &[] as &[ToolDef])).await;
-                (title, r)
+    match &blackboard {
+        // None = 旧行为完全一致：纯并行独立（stage 忽略）
+        None => {
+            let group: Vec<&SubTask> = subtasks.iter().collect();
+            out.push_str(&dispatch_group(rt, &group, timeout, None).await);
+        }
+        // P2-2：黑板模式——按 stage 分组（BTreeMap 保证阶段顺序 0,1,2...）
+        Some(bb) => {
+            let mut by_stage: BTreeMap<u32, Vec<&SubTask>> = BTreeMap::new();
+            for st in subtasks {
+                by_stage.entry(st.stage).or_default().push(st);
             }
-        });
-        let results = join_all(futures).await;
-        for (title, res) in results {
-            match res {
-                Ok(Ok(r)) => {
-                    // P2-2：解析黑板回写块 → 合并进黑板 → 正文剔除整个代码块
-                    let (changes, body) = extract_blackboard_write(&r.text);
-                    if !changes.is_empty() {
-                        if let Some(bb) = &blackboard {
-                            let ver = bb.merge(&changes);
-                            any_bb = true;
-                            tracing::info!(
-                                target: "agent.multiagent",
-                                keys = ?changes.keys().collect::<Vec<_>>(),
-                                version = ver,
-                                "黑板回写合并（子任务: {}）",
-                                title
-                            );
-                        }
-                    }
-                    out.push_str(&format!("### {}\n{}\n\n", title, body));
-                }
-                Ok(Err(e)) => out.push_str(&format!("### {} (失败: {})\n\n", title, e)),
-                Err(_) => {
-                    out.push_str(&format!("### {} (超时 {}s，已隔离)\n\n", title, timeout_secs))
-                }
+            for (_stage, group) in by_stage {
+                out.push_str(&dispatch_group(rt, &group, timeout, Some(bb)).await);
+            }
+            if bb.version() > 0 {
+                out.push_str(&format!(
+                    "\n---\n协作黑板最终状态（版本 {}，键 {} 个）\n",
+                    bb.version(),
+                    bb.snapshot().len()
+                ));
             }
         }
     }
-    if any_bb {
-        if let Some(bb) = &blackboard {
-            out.push_str(&format!(
-                "\n---\n协作黑板最终状态（版本 {}，键 {} 个）\n",
-                bb.version(),
-                bb.snapshot().len()
-            ));
+    out
+}
+
+/// 执行一组子任务并聚合结果（格式化逻辑 None/Some 共用，杜绝分支漂移）。
+/// `blackboard`：Some 时组内每个子任务消息前注入**当前**黑板快照（只读参考），
+/// 回复附 `__blackboard__` 回写块则合并进黑板并从正文剔除整个代码块；
+/// None 时纯并行独立（无注入、无回写解析），语义与旧行为一致。
+async fn dispatch_group(
+    rt: &RoutedLlm,
+    group: &[&SubTask],
+    timeout: Duration,
+    blackboard: Option<&SharedState>,
+) -> String {
+    let futures = group.iter().map(|st| {
+        let title = st.title.clone();
+        let desc = st.description.clone();
+        let bb = blackboard.cloned();
+        async move {
+            // P2-2：注入**当前**黑板快照（前序 stage 回写已可见；同 stage 互不可见）
+            let mut content = desc;
+            if let Some(bb) = &bb {
+                let snap = bb.snapshot();
+                if !snap.is_empty() {
+                    if let Ok(snap_json) = serde_json::to_string_pretty(&snap) {
+                        content = format!(
+                            "{content}\n\n## 协作黑板（共享状态，只读参考）\n```json\n{snap_json}\n```\n\
+                             如需把中间产物共享给后续阶段，在回复**末尾**附一个 JSON 代码块：\n\
+                             ```json\n{{\"__blackboard__\": {{\"键\": 值}}}}\n```\n\
+                             该块不会进入最终汇总，仅写入黑板供后续阶段读取。"
+                        );
+                    }
+                }
+            }
+            let msg = Message {
+                role: "user".to_string(),
+                content: Some(content),
+                tool_calls: None,
+                tool_call_id: None,
+            };
+            let r = tokio::time::timeout(timeout, rt.chat(&[msg], &[] as &[ToolDef])).await;
+            (title, r)
+        }
+    });
+    let results = join_all(futures).await;
+    let mut out = String::new();
+    for (title, res) in results {
+        match res {
+            Ok(Ok(r)) => {
+                let (changes, body) = if let Some(bb) = blackboard {
+                    // P2-2：解析黑板回写块 → 合并进黑板 → 正文剔除整个代码块
+                    let (c, b) = extract_blackboard_write(&r.text);
+                    if !c.is_empty() {
+                        let ver = bb.merge(&c);
+                        tracing::info!(
+                            target: "agent.multiagent",
+                            keys = ?c.keys().collect::<Vec<_>>(),
+                            version = ver,
+                            "黑板回写合并（子任务: {}）",
+                            title
+                        );
+                    }
+                    (c, b)
+                } else {
+                    (HashMap::new(), r.text.clone())
+                };
+                let _ = changes;
+                out.push_str(&format!("### {}\n{}\n\n", title, body));
+            }
+            Ok(Err(e)) => out.push_str(&format!("### {} (失败: {})\n\n", title, e)),
+            Err(_) => out.push_str(&format!("### {} (超时 {}s，已隔离)\n\n", title, timeout.as_secs())),
         }
     }
     out
