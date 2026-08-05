@@ -3773,15 +3773,26 @@ impl AgentCore {
     /// 返回注入用文本：优先 summary 字段 + 结构化清单；无结构化则原文。
     fn parse_summary_output(raw: &str) -> String {
         let t = raw.trim();
-        // 两层候选提取（互补覆盖两类输入缺陷）：
+        // 两层完整尝试（互补覆盖两类输入缺陷，各试一轮完整遍历）：
         // 1) 带字符串态：正确处理 JSON 字符串值内的 { }（如 {"summary":"使用 } 符号"}"），
-        //    但会被散文不平衡引号（5"、跨对象引号）破坏；
+        //    但会被散文不平衡引号（5"、跨对象引号）破坏——此时可能产生非空但不可用的候选，
+        //    因此不能仅凭「候选为空」判断是否回退（须完整遍历未命中才进第二层）；
         // 2) 无字符串态：容错散文不平衡引号，字符串值内 { } 误配对产生解析失败的候选被丢弃。
-        let mut candidates = Self::collect_brace_candidates(t.as_bytes(), true);
-        if candidates.is_empty() {
-            candidates = Self::collect_brace_candidates(t.as_bytes(), false);
+        let c1 = Self::collect_brace_candidates(t.as_bytes(), true);
+        if let Some(out) = Self::try_summary_candidates(t, &c1) {
+            return out;
         }
-        // 从最后一个候选（Summarizer 的 JSON 输出通常在末尾）向前尝试
+        let c2 = Self::collect_brace_candidates(t.as_bytes(), false);
+        if let Some(out) = Self::try_summary_candidates(t, &c2) {
+            return out;
+        }
+        // markdown 四要素 / 纯文本 / 无摘要结构 → 原样返回
+        raw.trim().to_string()
+    }
+
+    /// 从候选区间提取摘要结构（从最后一个候选向前试，Summarizer 的 JSON 输出通常在末尾）。
+    /// 命中返回 Some(注入文本)；全部候选无摘要结构返回 None。
+    fn try_summary_candidates(t: &str, candidates: &[(usize, usize)]) -> Option<String> {
         for (s, e) in candidates.iter().rev() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t[*s..=*e]) {
                 if let Some(obj) = v.as_object() {
@@ -3830,13 +3841,12 @@ impl AgentCore {
                         }
                     }
                     if struct_ok {
-                        return parts.join("\n");
+                        return Some(parts.join("\n"));
                     }
                 }
             }
         }
-        // markdown 四要素 / 纯文本 / 无摘要结构 → 原样返回
-        raw.trim().to_string()
+        None
     }
 
     /// 收集所有完整闭合的 {...} 区间（线性栈扫描，O(n)）。
@@ -8670,6 +8680,9 @@ mod whitelist_preroute_tests {
         // 字符串值内不平衡 {（{"summary":"目标 {A"}）→ 带字符串态扫描正确处理
         let raw4 = "{\"summary\": \"目标 {A 达成\"}";
         assert_eq!(AgentCore::parse_summary_output(raw4), "目标 {A 达成");
+        // 散文引号破坏 string-state 产生非空但不可用候选（{ 随意 }），有效对象在无字符串态层找回
+        let raw5 = "前言\" {\"summary\": \"结论\"} 然后\" { 随意 }";
+        assert_eq!(AgentCore::parse_summary_output(raw5), "结论");
     }
 
     #[test]
