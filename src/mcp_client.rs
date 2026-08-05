@@ -28,12 +28,13 @@ const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 /// 握手失败后的冷却窗口（秒）：避免热路径（list_tools 路由刷新/健康检查）反复打失败请求
 const INIT_RETRY_COOLDOWN_SECS: u64 = 30;
 
-/// 解析 MCP 响应体：兼容纯 JSON 与 SSE（`event: message\ndata: {...}\n\n`）两种格式。
-/// Streamable HTTP 规范允许 server 对带 `Accept: ... text/event-stream` 的请求回 SSE，
-/// client 必须两种都能解析，否则广告 SSE 却只认 JSON 会造成契约不匹配。
+/// 解析 MCP 响应体：主路径纯 JSON；保留 SSE 单事件防御分支（`event: ...\ndata: {...}\n\n`
+/// 或以 `data:` 直接开头的流）。注意：client 仅支持 JSON 响应，`Accept` 只广告
+/// application/json；此分支仅防御不守规范的 server 直接回 SSE。完整流式 SSE 需
+/// 流式读取（当前 resp.text() 读至 EOF 会挂起），超出当前能力，故不广告该能力。
 fn parse_mcp_response_body(raw: &str) -> Result<serde_json::Value, String> {
     let t = raw.trim_start();
-    if t.starts_with("event:") || t.contains("\ndata:") {
+    if t.starts_with("event:") || t.starts_with("data:") || t.contains("\ndata:") {
         for line in raw.lines() {
             if let Some(d) = line.strip_prefix("data:") {
                 return serde_json::from_str(d.trim()).map_err(|e| format!("SSE data JSON: {}", e));
@@ -121,7 +122,7 @@ impl HttpMcpClient {
             .header("X-Agent-Id", &self.agent_id)
             .header("X-Agent-Key", &self.badge_token)
             .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
-            .header("Accept", "application/json, text/event-stream")
+            .header("Accept", "application/json")
             .send()
             .await;
         match resp {
@@ -198,7 +199,7 @@ impl HttpMcpClient {
                 .header("X-Agent-Id", &self.agent_id)
                 .header("X-Agent-Key", &self.badge_token)
                 .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
-                .header("Accept", "application/json, text/event-stream")
+                .header("Accept", "application/json")
                 .header("x-trace-id", &trace_id)
                 .send()
                 .await;
@@ -280,7 +281,7 @@ impl HttpMcpClient {
             .header("X-Agent-Id", &self.agent_id)
             .header("X-Agent-Key", &self.badge_token)
             .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
-            .header("Accept", "application/json, text/event-stream")
+            .header("Accept", "application/json")
             .send()
             .await
             .map_err(|e| format!("tools/list: {}", e))?;
