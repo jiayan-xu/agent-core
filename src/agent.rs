@@ -2592,7 +2592,14 @@ impl AgentCore {
 
         // ── 0. 组合路由路径：多 Skill 分解 + 按序执行 ──
         // 工程师改码意图：跳过 composer，直接进 LLM+常驻工具闭环（避免规划器空嘴作文）
-        if self.config.enable_compositional_routing && !engineer_intent && !has_attachment_msg {
+        // ⚠️ 2026-08-05 提速修复：Easy 任务（简单查询）跳过组合路由——decompose 会把
+        // 「7月装修垃圾进了多少」拆成 6-7 步（每步一次 LLM 往返，共 70s+），
+        // 而单步 LLM + 动态工具选择只需 1-2 轮。Hard 任务才值得分解。
+        let difficulty_route = self.routed_llm.classify(&[
+            crate::llm::Message { role: "user".to_string(), content: Some(message.to_string()), tool_calls: None, tool_call_id: None },
+        ]).await;
+        let is_easy_query = difficulty_route == crate::llm::TaskDifficulty::Easy;
+        if self.config.enable_compositional_routing && !engineer_intent && !has_attachment_msg && !is_easy_query {
             let mut ns_buf = allowed_ns.to_vec();
             crate::dept_ops::enrich_allowed_ns(&mut ns_buf);
             let allowed_ns = ns_buf.as_slice();
@@ -2860,6 +2867,7 @@ impl AgentCore {
                 user_id,
                 allowed_ns,
                 trace_id,
+                is_easy_query,
             )
             .await;
 
@@ -2884,9 +2892,11 @@ impl AgentCore {
             .await;
 
         // SAD 风格：并行获取上下文（记忆）和可用能力（工具列表）
+        // 2026-08-05 提速：单步路径用动态工具选择（select_exposed_tools 按查询相关性
+        // 暴露 top-30，而非全量 125）——Easy 查询 prompt 大幅缩小。
         let (mem_result, tools) = tokio::join!(
             self.search_memory(message, session_id, allowed_ns),
-            self.fetch_tools_filtered(allowed_ns),
+            self.select_exposed_tools(message, allowed_ns),
         );
 
         let mut knowledge = Vec::new();
@@ -4079,8 +4089,11 @@ impl AgentCore {
             .collect();
         let max_score = scored.iter().map(|(s, _)| *s).fold(0.0f64, f64::max);
         if max_score <= 0.0 {
-            tracing::info!(exposed_tools = total, total = total, "prefetch: 相关性全 0，退回全量暴露（含常驻）");
-            let mut out: Vec<ToolDef> = scored.into_iter().map(|(_, t)| t).collect();
+            // 2026-08-05 提速：相关性全 0 时不再退回全量 125——按字母序硬取 top-cap，
+            // 保证 prompt 体积可控（查询工具 query_* 字母序靠前，天然优先）。
+            tracing::info!(exposed_tools = cap, total = total, "prefetch: 相关性全 0，按字母序硬取 top-cap");
+            scored.sort_by(|a, b| a.1.function.name.cmp(&b.1.function.name));
+            let mut out: Vec<ToolDef> = scored.into_iter().take(cap).map(|(_, t)| t).collect();
             out.extend(always);
             return out;
         }
@@ -4107,6 +4120,7 @@ impl AgentCore {
         user_id: &str,
         allowed_ns: &[String],
         trace_id: &str,
+        is_easy_query: bool,
     ) -> String {
         // P0：本部门工具包 ns enrichment（与鉴权侧双保险）
         let mut ns_owned = allowed_ns.to_vec();
@@ -4164,7 +4178,27 @@ impl AgentCore {
         // 重构阶段3：一次分类，循环内守卫统一读取（消除散落 is_xxx / 豁免条件复制）
         let intent = Self::classify_intent(raw_message);
 
-        for _round in 0..self.config.max_tool_rounds {
+        // ⚠️ 2026-08-05 提速：数据查询首轮即强制工具（不等 LLM 空手犯错被重试提示顶回）。
+        // deepseek-v4-flash 对 Easy 数据查询首轮常直接编答案 → did_work=false →
+        // 注入重试提示 → 第二轮才调工具（多耗 1 轮 5-20s）。首轮注入后一轮到位。
+        if intent.data_query && !intent.attachment {
+            ctx.messages.push(crate::llm::Message {
+                role: "system".to_string(),
+                content: Some(
+                    "你正在处理一个业务数据查询（如进厂/车次/重量/白名单/固废种类等）。\
+                     你必须先调用数据查询工具（query_* / nl_query / get_* / execute_sql）获取真实数据，\
+                     再基于工具结果回答。禁止第一轮空手回答或凭记忆编造。"
+                        .to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        // Easy 查询轮次封顶：一轮工具 + 一轮总结 = 3 轮足够（原 20 轮导致简单查询
+        // 反复重试 6-7 轮 → 70s+）。Hard 任务保持 20 轮（固废多步推理）。
+        let max_rounds = if is_easy_query { 3u32 } else { self.config.max_tool_rounds };
+
+        for _round in 0..max_rounds {
             // P2-1: 日 token 预算预估（请求上下文体量），超限硬拒
             let ctx_chars: usize = ctx
                 .messages
