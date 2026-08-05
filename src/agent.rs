@@ -3766,10 +3766,12 @@ impl AgentCore {
         let bytes = t.as_bytes();
         // 平衡括号扫描：从每个 '{' 尝试提取完整 JSON 对象（容错前后散文、
         // 任意围栏形态、无关花括号、多对象并存）。
-        // 注意：不做全局引号跟踪——散文里不平衡引号（5"、跨对象引号）会让全局状态
-        // 卡死并跳过真对象；平衡扫描自带字符串态处理（obj_in_str），从每个 { 独立尝试，
-        // 解析失败自然跳过，正确性由"逐候选解析"保证。
-        let max_scan = 4096; // 内层扫描字节上限：游离 { 不触发全尾 O(n²) 扫描
+        // 不做全局引号跟踪——散文里不平衡引号（5"、跨对象引号）会让全局状态卡死并跳过
+        // 真对象；平衡扫描自带字符串态处理（obj_in_str），从每个 { 独立尝试。
+        // 失败语义：无闭合或解析失败 → i+=1 逐跳继续（正确性优先——游离 { 之后可能有
+        // 自闭合的有效对象，如 "配置 { 和 {"summary":"x"}" 内层对象有效）。
+        // 性能说明：真实输入是 Summarizer 摘要输出（几 KB），病态全游离 { 的 O(n²)
+        // 上限也就几百万次字符操作（亚毫秒），无需字节上限（避免截断超长有效对象）。
         let mut i = 0usize;
         while i < bytes.len() {
             if bytes[i] != b'{' {
@@ -3782,8 +3784,7 @@ impl AgentCore {
             let mut obj_esc = false;
             let mut j = i;
             let mut matched = false;
-            let scan_end = (i + max_scan).min(bytes.len());
-            while j < scan_end {
+            while j < bytes.len() {
                 let oc = bytes[j];
                 if obj_in_str {
                     if obj_esc {
@@ -3810,7 +3811,7 @@ impl AgentCore {
                 j += 1;
             }
             if !matched {
-                // 该 { 无闭合（散文里的游离括号 / 超扫描上限）→ 跳过它继续找下一个对象，不放弃整个扫描
+                // 无闭合：该 { 是散文游离括号 → 跳过它继续找下一个候选（不放弃扫描）
                 i += 1;
                 continue;
             }
