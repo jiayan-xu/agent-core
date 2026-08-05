@@ -3560,11 +3560,16 @@ impl AgentCore {
         // 释放 cache guard 再 await LLM（避免跨 await 持锁阻塞其他 session 的摘要请求）
         drop(cache);
         let new_part = self.summarize_history_llm(&transcript).await;
-        let merged = match (cached, new_part) {
-            (Some((_, old)), Some(new)) => Some(format!("{old}\n\n{new}")),
-            (Some((_, old)), None) => Some(old),
-            (None, Some(new)) => Some(new),
-            (None, None) => None,
+
+        // LLM 失败且已有缓存 → 直接返回旧摘要，不更新覆盖范围
+        // （否则会用更大 old_len 声称覆盖了未摘要区间，[prev_upto, old_len) 将永久丢段）
+        if new_part.is_none() {
+            return cached.map(|(_, t)| t);
+        }
+        let new_text = new_part.unwrap_or_default();
+        let merged = match cached {
+            Some((_, old)) => Some(format!("{old}\n\n{new_text}")),
+            None => Some(new_text),
         };
         // 摘要防无限膨胀：合并后截断（保留头部目标/约束 + 尾部最新增量）
         let bounded = merged.map(|s| {
@@ -3586,6 +3591,12 @@ impl AgentCore {
         });
         if let Some(s) = &bounded {
             let mut cache = self.history_summary_cache.lock().await;
+            // 并发防护：await LLM 期间可能已有更新的条目（upto >= old_len），有则用 fresher 不覆盖
+            if let Some((fresh_upto, _)) = cache.get(session_id) {
+                if *fresh_upto >= old_len {
+                    return cache.get(session_id).map(|(_, t)| t.clone());
+                }
+            }
             // cache 上限防内存泄漏：超过 200 条清空重建（session 数有限，粗放可接受）
             if cache.len() >= 200 {
                 cache.clear();
