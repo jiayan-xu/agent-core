@@ -1270,6 +1270,10 @@ impl LlmClient {
 
         let mut last_error = String::new();
         tracing::info!("llm.complete start");
+        // 2026-08-05 慢查询诊断：记录请求体总字符数（system+历史+工具 schema）
+        let msgs_chars: usize = messages.iter().map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0) + 80).sum();
+        let tools_chars: usize = tools.iter().map(|t| serde_json::to_string(t).unwrap_or_default().len()).sum();
+        tracing::info!(target = "agent.llm", msgs_chars, tools_chars, total_chars = msgs_chars + tools_chars, "llm request size");
 
         for (idx, p) in providers.iter().enumerate() {
             let base_url = &p.base_url;
@@ -1280,8 +1284,7 @@ impl LlmClient {
             let mut body = serde_json::json!({
                 "model": model,
                 "messages": messages,
-                "max_tokens": self.config.max_tokens,
-                "temperature": self.config.temperature,
+                "max_tokens": self.config.max_tokens,                "temperature": self.config.temperature,
             });
 
             if !tools.is_empty() {
@@ -1861,5 +1864,41 @@ mod dsml_tests {
         let (clean, calls) = parse_dsml_tool_calls("普通回复，无工具调用");
         assert!(calls.is_empty());
         assert_eq!(clean, "普通回复，无工具调用");
+    }
+}
+
+#[cfg(test)]
+mod quick_difficulty_tests {
+    use super::*;
+    #[test]
+    fn q1_query_is_easy() {
+        // 2026-08-05：Q1「7月装修垃圾进了多少」必须判 Easy（否则 3 轮封顶失效 → 7 轮）
+        let m = vec![Message {
+            role: "user".to_string(),
+            content: Some("7月装修垃圾进了多少".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        assert_eq!(classify_heuristic(&m), TaskDifficulty::Easy);
+    }
+    #[test]
+    fn q2_yesterday_is_easy() {
+        let m = vec![Message {
+            role: "user".to_string(),
+            content: Some("昨天进了多少车".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        assert_eq!(classify_heuristic(&m), TaskDifficulty::Easy);
+    }
+    #[test]
+    fn sql_stays_hard() {
+        let m = vec![Message {
+            role: "user".to_string(),
+            content: Some("写个sql查询最近订单".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        assert_eq!(classify_heuristic(&m), TaskDifficulty::Hard);
     }
 }

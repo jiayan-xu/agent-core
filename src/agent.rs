@@ -2849,9 +2849,45 @@ impl AgentCore {
         for h in history.iter().rev().take(window_len) {
             messages.push(h.clone());
         }
+        // ── 4.5 快速通道（2026-08-05）：Easy 数据查询 → 预取 nl_query 结果注入首轮 ──
+        // 简单统计查询（多少/几车/几吨 + 时间/种类）直接调 nl_query 拿汇总，
+        // LLM 首轮即有数据 → 只做总结，1 轮完成（总耗时 ≈ nl_query 0.5s + LLM 总结 3-5s）。
+        // 避免 LLM 自己选工具（可能选错 query_entrance 逐车明细）且省去 2-3 轮往返。
+        let mut fast_query_result: Option<String> = None;
+        let fast_intent = Self::classify_intent(message);
+        if is_easy_query && fast_intent.data_query && !fast_intent.attachment {
+            let args = serde_json::json!({
+                "question": message,
+                "period": "",
+            });
+            match self
+                .call_tool_routed("nl_query", &self.persona_for_session(session_id), &args, allowed_ns, trace_id)
+                .await
+            {
+                Ok(t) if !t.contains("执行失败") && !t.contains("未找到") => {
+                    fast_query_result = Some(t);
+                    tracing::info!(target = "agent.fastpath", "nl_query 快速通道命中");
+                }
+                Ok(_) | Err(_) => { /* 快速通道失败 → 正常 LLM 工具循环兜底 */ }
+            }
+        }
+
+
+        let first_user_content = if let Some(ref qr) = fast_query_result {
+            // 预取结果作为「系统代查」注入（明确标注来源，防 LLM 误以为是它查的）
+            format!(
+                "{}
+
+[系统已完成数据查询（nl_query 实时执行，以下为权威结果）。请直接基于此数据作答，禁止再调用任何查询/统计工具；如需补充维度请在回答中说明]
+{}",
+                enriched_message, qr
+            )
+        } else {
+            enriched_message
+        };
         messages.push(Message {
             role: "user".to_string(),
-            content: Some(enriched_message),
+            content: Some(first_user_content),
             tool_calls: None,
             tool_call_id: None,
         });
@@ -2899,7 +2935,7 @@ impl AgentCore {
         // 暴露 top-30，而非全量 125）——Easy 查询 prompt 大幅缩小。
         let (mem_result, tools) = tokio::join!(
             self.search_memory(message, session_id, allowed_ns),
-            self.select_exposed_tools(message, allowed_ns),
+            self.select_exposed_tools(message, allowed_ns, Self::EXPOSE_TOOL_CAP),
         );
 
         let mut knowledge = Vec::new();
@@ -4137,7 +4173,9 @@ impl AgentCore {
         "edit_code",
         "verify_code",
         "organize_folders",
-        "query_entrance",
+        // 2026-08-05：查询首选 nl_query（自然语言问数，自动汇总统计），
+        // query_entrance 是逐车明细，放常驻会诱导 LLM 选它做聚合 → 数据错。
+        "nl_query",
         "check_media_files",
         "query_today",
     ];
@@ -4174,7 +4212,7 @@ impl AgentCore {
 
     /// 白龙马 ACI 的 selectTools 等价物：按当前消息(task_context)从全量工具中选 top-K 暴露给 LLM。
     /// 其余工具本轮不进 schema（模型仍可经 find_tool 被动发现，复用现有机制）。
-    async fn select_exposed_tools(&self, message: &str, allowed_ns: &[String]) -> Vec<ToolDef> {
+    async fn select_exposed_tools(&self, message: &str, allowed_ns: &[String], cap: usize) -> Vec<ToolDef> {
         let all = self.fetch_tools_filtered(allowed_ns).await;
         let total = all.len();
         // 抽离始终暴露的工具（诊断/运维类），剩余走相关性打分
@@ -4191,13 +4229,13 @@ impl AgentCore {
             tracing::info!(exposed_tools = always.len(), total = total, "prefetch: 仅有常驻工具，直接返回");
             return always;
         }
-        if rest.len() <= Self::EXPOSE_TOOL_CAP.saturating_sub(always.len()) {
+        if rest.len() <= cap.saturating_sub(always.len()) {
             let mut out = rest;
             out.extend(always);
             tracing::info!(exposed_tools = out.len(), total = total, "prefetch: 工具数未超阈值（含常驻），全量暴露");
             return out;
         }
-        let cap = Self::EXPOSE_TOOL_CAP.saturating_sub(always.len());
+        let cap = cap.saturating_sub(always.len());
         let mut scored: Vec<(f64, ToolDef)> = rest
             .into_iter()
             .map(|t| {
@@ -4246,7 +4284,9 @@ impl AgentCore {
         let allowed_ns = ns_owned.as_slice();
 
         // 从 Memoria 取可用工具列表（A1: 白龙马 ACI 请求前按 task_context 选暴露子集）
-        let tools = self.select_exposed_tools(raw_message, allowed_ns).await;
+        // 2026-08-05 提速：Easy 查询只暴露 12 工具（8 常驻 + 4 相关性），Hard 30
+        let expose_cap = if is_easy_query { 12usize } else { Self::EXPOSE_TOOL_CAP };
+        let tools = self.select_exposed_tools(raw_message, allowed_ns, expose_cap).await;
         // P1-4: 构建工具名 → JSON Schema 映射，用于参数校验
         ctx.tool_schemas = tools
             .iter()
@@ -5274,9 +5314,27 @@ impl AgentCore {
                 }]),
                 tool_call_id: None,
             });
+            // 2026-08-05 慢查询修复：工具结果全量塞入 → 多轮上下文滚到 19 万字符，
+            // DeepSeek prefill 慢（10s+/轮）+ 偶发空答。截断到 4000 字符（统计结论在 answer 字段）。
+            const TOOL_RESULT_CAP: usize = 4000;
+            let result_capped: String = {
+                let chars: Vec<char> = result.chars().collect();
+                if chars.len() <= TOOL_RESULT_CAP {
+                    result
+                } else {
+                    let mut s: String = chars[..TOOL_RESULT_CAP].iter().collect();
+                    s.push_str(&format!(
+                        "
+…[结果已截断，共 {} 字符，仅保留前 {}；如需完整明细请要求汇总统计或缩小范围]",
+                        chars.len(),
+                        TOOL_RESULT_CAP
+                    ));
+                    s
+                }
+            };
             messages.push(Message {
                 role: "tool".to_string(),
-                content: Some(result),
+                content: Some(result_capped),
                 tool_calls: None,
                 tool_call_id: Some(tc.id.clone()),
             });
