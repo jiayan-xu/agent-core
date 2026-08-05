@@ -4777,6 +4777,27 @@ impl AgentCore {
             .find(|m| m["id"].as_str() == Some(msg_id)))
     }
 
+    /// 删除收件箱中的一条消息（通知清理，仅限自己收件箱）
+    pub async fn collab_delete_message(
+        &self,
+        caller_agent_id: &str,
+        caller_agent_key: &str,
+        msg_id: &str,
+    ) -> Result<u64, String> {
+        let mcp = McpClient::new(&self.config.memoria_url, caller_agent_id, caller_agent_key);
+        let val = mcp
+            .call_json(
+                "a2a_delete",
+                &serde_json::json!({
+                    "id": msg_id,
+                    "namespace": format!("agent/{}", caller_agent_id),
+                }),
+            )
+            .await
+            .map_err(|e| format!("a2a_delete 失败: {}", e))?;
+        Ok(val["deleted"].as_u64().unwrap_or(0))
+    }
+
     /// 解析旧版 `[subject] body` 文本消息为信封各部分（type 降级为 `message`）。
     fn legacy_parts(
         content: &str,

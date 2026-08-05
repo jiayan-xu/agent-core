@@ -1662,6 +1662,7 @@ fn main() {
                 .route("/api/collab/inbox", get(handle_collab_inbox))
                 .route("/api/collab/send", post(handle_collab_send))
                 .route("/api/collab/approval", post(handle_collab_approval))
+                .route("/api/collab/delete", post(handle_collab_delete))
                 .route("/api/collab/peers", get(handle_collab_peers))
                 .route("/api/memory/feedback", post(handle_memory_feedback))
                 .route("/v1/chat/completions", post(handle_v1_chat))
@@ -3826,6 +3827,60 @@ async fn handle_collab_peers(
                 .collect();
             axum::Json(serde_json::json!({ "agents": filtered })).into_response()
         }
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/collab/delete — 删除收件箱中的一条消息（通知清理）
+#[derive(serde::Deserialize)]
+struct CollabDeleteBody {
+    /// 要删除的消息 id（collab/inbox 返回的 id）
+    id: String,
+}
+
+async fn handle_collab_delete(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<CollabDeleteBody>,
+) -> axum::response::Response {
+    let (agent_id, _allowed_ns) = match authenticate(&headers, &st).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    if body.id.trim().is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "缺少 id"})),
+        )
+            .into_response();
+    }
+    let agent_key = resolve_caller_memoria_key(&st, &agent_id, &headers).await;
+    let agent_guard = st.agent.lock().await;
+    let res = if let Some(ref agent) = *agent_guard {
+        agent
+            .collab_delete_message(&agent_id, &agent_key, &body.id)
+            .await
+    } else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "agent 尚未就绪"})),
+        )
+            .into_response();
+    };
+    drop(agent_guard);
+    match res {
+        Ok(n) if n > 0 => {
+            axum::Json(serde_json::json!({"status": "ok", "deleted": n})).into_response()
+        }
+        Ok(_) => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "消息不存在或不属于当前账号"})),
+        )
+            .into_response(),
         Err(e) => (
             axum::http::StatusCode::BAD_GATEWAY,
             axum::Json(serde_json::json!({"error": e})),
