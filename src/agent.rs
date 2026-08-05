@@ -15,11 +15,9 @@ use crate::boundary::{self, BlockLevel, ComplianceBoundary, PermissionLevel};
 /// P2-3 起为 token 预算的硬上限：短消息可保留满 20 条，长消息按预算压缩。
 /// 统一常量，避免字面量 20 散落两处（P1 审查 P3 提示）。
 const HISTORY_WINDOW: usize = 20;
-/// P2-3: 历史窗口 token 预算（保守估算：中英混合 ≈ 3 字符/token）。
+/// P2-3: 历史窗口 token 预算（估算：CJK 约 1~1.5 字符/token，用 chars/2 保守上界）。
 /// 预算保留给 system prompt + 当前输入 + 工具定义，历史窗口默认 4000 tokens。
 const HISTORY_TOKEN_BUDGET: usize = 4000;
-/// P2-3: 窗口轮数下限（保底：即便消息极长也至少保留最近 5 轮，避免对话断裂）。
-const MIN_HISTORY_WINDOW: usize = 5;
 use crate::checkpoint::{CheckpointState, CheckpointStore};
 use crate::degrade::{DegradeMode, DegradeMonitor, UNHEALTHY_THRESHOLD};
 use crate::harness::{self, ExecutionLog, HarnessStore};
@@ -3590,15 +3588,17 @@ impl AgentCore {
     }
 
     /// P2-3: token 级滑动窗口——按 token 预算从后往前保留历史条数（纯函数，便于单测）。
-    /// 估算：chars/3（中英混合保守）+ 1；从最近往旧累计，超预算即停（至少保底 1 条）。
-    /// 约束：返回 [MIN_HISTORY_WINDOW, HISTORY_WINDOW]（下限保底 5 条，上限 20 条）。
+    /// 估算：chars/2 + 1（CJK 为主场景约 1~1.5 字符/token，取保守边界）；
+    /// 从最近往旧累计，**预算硬约束**：第一条必保留，此后超预算即停。
+    /// 返回 [0, HISTORY_WINDOW]（空历史 0；预算极小至少 1 条）。
+    /// 早期信息的保底由摘要层承担（窗口外内容走 maybe_history_summary，不静默丢弃）。
     fn token_window_len(history: &[Message], budget_tokens: usize) -> usize {
         let mut acc = 0usize;
         let mut count = 0usize;
         for m in history.iter().rev() {
             let chars = m.content.as_deref().map(|c| c.chars().count()).unwrap_or(0);
-            let est = chars / 3 + 1;
-            // 至少保底 1 条；之后累计超预算即停止
+            let est = chars / 2 + 1;
+            // 至少保底 1 条；此后累计超预算即停止（预算硬约束，不做条数下限抬升）
             if count > 0 && acc + est > budget_tokens {
                 break;
             }
@@ -3608,7 +3608,7 @@ impl AgentCore {
                 break;
             }
         }
-        count.max(MIN_HISTORY_WINDOW)
+        count
     }
 
     /// 历史内容指纹：对 history[..upto]（已摘要区间）做确定性哈希（DefaultHasher 固定 key）。
@@ -3631,13 +3631,13 @@ impl AgentCore {
         history: &[Message],
         window: usize,
     ) -> Option<String> {
-        // P2-3: window 由调用方按 token 预算动态给定；窗口外内容 < 12 条时不摘要
-        // （保留原「窗口 + 增量 12」的防过度摘要语义）
+        // P2-3: window 由调用方按 token 预算动态给定；窗口外无内容时不摘要。
+        // 窗口外 1~N 条均走摘要保留（增量缓存控制 token 成本），杜绝静默丢弃。
         if history.len() <= window {
             return None;
         }
         let old_len = history.len() - window;
-        if old_len < 12 {
+        if old_len == 0 {
             return None;
         }
         let mut cache = self.history_summary_cache.lock().await;
@@ -8356,7 +8356,7 @@ mod whitelist_preroute_tests {
             tool_calls: None,
             tool_call_id: None,
         };
-        // 30 条短消息（每条 ~10 字符 ≈ 4 token）→ 保留满 20 条上限
+        // 30 条短消息（每条 ~10 字符 ≈ 6 token）→ 保留满 20 条上限
         let history: Vec<Message> = (0..30).map(|i| msg(&format!("短消息{i}"))).collect();
         assert_eq!(AgentCore::token_window_len(&history, 4000), 20);
     }
@@ -8369,19 +8369,19 @@ mod whitelist_preroute_tests {
             tool_calls: None,
             tool_call_id: None,
         };
-        // 10 条超长消息（每条 3000 字符 ≈ 1000 token）→ 预算 4000 只够 ~4 条，但下限保底 5
+        // 10 条超长消息（每条 3000 字符 ≈ 1501 token，chars/2 保守）→ 预算 4000 只够 2 条
         let long: String = "长".repeat(3000);
         let history: Vec<Message> = (0..10).map(|_| msg(&long)).collect();
         let n = AgentCore::token_window_len(&history, 4000);
-        assert!(n >= 5 && n <= 5, "got {n}");
-        // 预算极小 → 仍保底 1 条以上（下限 5 已含）
-        assert!(AgentCore::token_window_len(&history, 100) >= 5);
+        assert_eq!(n, 2, "预算硬约束应只保留 2 条, got {n}");
+        // 极小预算 → 至少保底 1 条（第一条不检查预算）
+        assert_eq!(AgentCore::token_window_len(&history, 100), 1);
     }
 
     #[test]
-    fn token_window_budget_zero_floor() {
-        // 空历史 → 返回下限 5（保底，无消息可保留时仍返回下限，调用方 take 自然为空）
-        assert_eq!(AgentCore::token_window_len(&[], 4000), 5);
+    fn token_window_empty_history() {
+        // 空历史 → 0（take(0) 自然为空，无消息可保留）
+        assert_eq!(AgentCore::token_window_len(&[], 4000), 0);
     }
 
     #[test]
