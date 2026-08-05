@@ -3532,12 +3532,18 @@ impl AgentCore {
             });
             match reuse {
                 // 复用摘要 + 追加 [upto, len) 尾部原文——摘要只描述窗口外旧对话，
-                // 最近未覆盖消息（最终结果/最后决策）必须进结论，否则记忆不完整
+                // 最近未覆盖消息（最终结果/最后决策）必须进结论，否则记忆不完整；
+                // 尾部总长 2000 字符封顶（缓存 stale 时 10% 历史可超数万字符，防结论膨胀）
                 Some((upto, text)) if !text.trim().is_empty() => {
                     let mut out = text;
                     if upto < history.len() {
                         out.push_str("\n\n## 会话尾部（未压缩原文）\n");
+                        let mut tail_chars = 0usize;
                         for m in history.iter().skip(upto) {
+                            if tail_chars >= 2000 {
+                                out.push_str("…（尾部超长已省略）\n");
+                                break;
+                            }
                             let c: String = m
                                 .content
                                 .clone()
@@ -3546,6 +3552,7 @@ impl AgentCore {
                                 .take(300)
                                 .collect();
                             if !c.is_empty() {
+                                tail_chars += c.chars().count();
                                 out.push_str(&format!("[{}] {}\n", m.role, c));
                             }
                         }
@@ -4047,13 +4054,13 @@ impl AgentCore {
                         ) || content.contains("教训")
                             || content.contains("失败")
                             || content.contains("报错");
-                        // 同一教训可能同时挂在根 ns 与会话 ns → 按内容去重（P3-2）
-                        if is_lesson && !content.is_empty() && seen.insert(content.to_string()) {
-                            lessons.push(format!(
-                                "[{}] {}",
-                                category,
-                                content.chars().take(400).collect::<String>()
-                            ));
+                        // 同一教训可能同时挂在根 ns 与会话 ns → 按**截断后输出形式**去重（P3-2）：
+                        // 前 400 字符相同即视为同一教训（完整 content 去重无法拦截同前缀不同后缀）
+                        if is_lesson && !content.is_empty() {
+                            let truncated: String = content.chars().take(400).collect();
+                            if seen.insert(truncated.clone()) {
+                                lessons.push(format!("[{}] {}", category, truncated));
+                            }
                             if lessons.len() >= 2 {
                                 return Some(lessons.join("\n"));
                             }
