@@ -3928,7 +3928,7 @@ impl AgentCore {
         }
 
         // HY3 1.3：LATS 过程树展开（features.lats=false 时 self.lats=None → 直接返回，原路径零改动）
-        self.maybe_lats_expand(&mut messages, raw_message).await;
+        self.maybe_lats_expand(&mut ctx.messages, raw_message).await;
 
         // P2-1: 配额命名空间（与 call_tool_routed 保持一致）
         let quota_ns_llm = allowed_ns
@@ -3936,16 +3936,13 @@ impl AgentCore {
             .cloned()
             .unwrap_or_else(|| self.caller_ns(session_id));
 
-        // 本请求是否执行过工具（分身策展记忆门控：只记「做了事」的任务，不记闲聊）
-        let mut did_work = false;
-        let mut executed_tools: Vec<String> = Vec::new();
-
         // 重构阶段3：一次分类，循环内守卫统一读取（消除散落 is_xxx / 豁免条件复制）
         let intent = Self::classify_intent(raw_message);
 
         for _round in 0..self.config.max_tool_rounds {
             // P2-1: 日 token 预算预估（请求上下文体量），超限硬拒
-            let ctx_chars: usize = messages
+            let ctx_chars: usize = ctx
+                .messages
                 .iter()
                 .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
                 .sum();
@@ -4089,13 +4086,13 @@ impl AgentCore {
                 )
                 .await;
                 // 分身在「执行过工具」的任务完成后，写策展记忆到其专属 ns
-                if did_work {
+                if ctx.did_work {
                     self.maybe_persona_task_memory(session_id, raw_message, &reply).await;
                 }
                 // 保存到内存缓存
                 let reply = Self::honesty_guard_readonly_as_write(
                     raw_message,
-                    &executed_tools,
+                    &ctx.executed_tools,
                     &reply,
                 );
                 self.save_to_history(session_id, raw_message, &reply).await;
@@ -4103,12 +4100,13 @@ impl AgentCore {
             }
 
             // 有工具调用 → 执行工具（重构 L 阶段：Agents SDK turn 语义）
+            // P2-1: 字段级借用拆分，execute_tool_calls 保持子例程参数化
             match self
                 .execute_tool_calls(
-                    &mut messages,
+                    &mut ctx.messages,
                     &response.tool_calls,
-                    &mut executed_tools,
-                    &tool_schemas,
+                    &mut ctx.executed_tools,
+                    &ctx.tool_schemas,
                     session_id,
                     raw_message,
                     allowed_ns,
@@ -4117,21 +4115,21 @@ impl AgentCore {
                 .await
             {
                 ToolExecOutcome::Abort(reply) => return reply,
-                ToolExecOutcome::Executed(any) => did_work |= any,
+                ToolExecOutcome::Executed(any) => ctx.did_work |= any,
             }
         }
 
         // 轮数耗尽，最后让 LLM 总结
-        if crate::dept_ops::is_dept_grounded_intent(raw_message) && !did_work && !intent.attachment {
+        if crate::dept_ops::is_dept_grounded_intent(raw_message) && !ctx.did_work && !intent.attachment {
             // 附件豁免统一读 intent.attachment（重构阶段4）
             let refuse = crate::dept_ops::refuse_ungrounded_ops_reply(raw_message);
             self.save_to_history(session_id, raw_message, &refuse).await;
             return refuse;
         }
-        messages.push(Message {
+        ctx.messages.push(Message {
             role: "user".to_string(),
             content: Some(
-                if did_work {
+                if ctx.did_work {
                     "请基于刚才工具返回的事实总结结果，直接回复用户。不要调用工具，不要编造未在工具结果中出现的原因。"
                         .to_string()
                 } else {
@@ -4142,11 +4140,11 @@ impl AgentCore {
             tool_call_id: None,
         });
 
-        match self.llm.chat(&messages, &[]).await {
+        match self.llm.chat(&ctx.messages, &[]).await {
             Ok(r) => {
                 let reply = Self::honesty_guard_readonly_as_write(
                     raw_message,
-                    &executed_tools,
+                    &ctx.executed_tools,
                     &r.text,
                 );
                 // 分身在「执行过工具」的任务完成后，写策展记忆到其专属 ns
