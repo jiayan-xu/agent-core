@@ -346,6 +346,22 @@ pub struct Meeting {
     pub consensus: Option<String>,
 }
 
+/// P2-1: 单次任务执行的工作记忆状态机（AgentRunContext）
+///
+/// 收敛 llm_loop 主循环内散落的中间态：消息流（messages）、已执行工具清单
+/// （executed_tools）、是否执行过工具（did_work）、工具 JSON Schema 映射
+/// （tool_schemas）。统一入口便于未来扩展（预算跟踪/进度钩子/上下文监控）。
+struct AgentRunContext {
+    /// LLM 消息流（系统提示 + 历史 + 工具结果回灌）
+    messages: Vec<Message>,
+    /// 本请求已执行的工具名清单（honesty_guard / 策展记忆门控用）
+    executed_tools: Vec<String>,
+    /// 本请求是否执行过工具（分身策展记忆门控：只记「做了事」的任务）
+    did_work: bool,
+    /// 工具名 → JSON Schema 映射（参数校验用）
+    tool_schemas: HashMap<String, serde_json::Value>,
+}
+
 impl AgentCore {
     /// 创建 Agent 核心
     pub fn new(
@@ -2806,9 +2822,21 @@ impl AgentCore {
             tool_call_id: None,
         });
 
-        // ── 5. LLM 调用循环 ──
+        // ── 5. LLM 调用循环（P2-1: 工作记忆收敛进 AgentRunContext）──
         let result = self
-            .llm_loop(messages, session_id, message, user_id, allowed_ns, trace_id)
+            .llm_loop(
+                AgentRunContext {
+                    messages,
+                    executed_tools: Vec::new(),
+                    did_work: false,
+                    tool_schemas: HashMap::new(),
+                },
+                session_id,
+                message,
+                user_id,
+                allowed_ns,
+                trace_id,
+            )
             .await;
 
         // 直接返回结果，不再向用户泄露内部执行步骤标记
@@ -3848,7 +3876,7 @@ impl AgentCore {
 
     async fn llm_loop(
         &self,
-        mut messages: Vec<Message>,
+        mut ctx: AgentRunContext,
         session_id: &str,
         raw_message: &str,
         user_id: &str,
@@ -3863,7 +3891,7 @@ impl AgentCore {
         // 从 Memoria 取可用工具列表（A1: 白龙马 ACI 请求前按 task_context 选暴露子集）
         let tools = self.select_exposed_tools(raw_message, allowed_ns).await;
         // P1-4: 构建工具名 → JSON Schema 映射，用于参数校验
-        let tool_schemas: HashMap<String, serde_json::Value> = tools
+        ctx.tool_schemas = tools
             .iter()
             .map(|t| (t.function.name.clone(), t.function.parameters.clone()))
             .collect();
@@ -3873,7 +3901,7 @@ impl AgentCore {
         // (execute_sql/fuzzy_match_plate) 对不上，会导致 LLM 调错或调不存在的工具。
         // 这里以"权威工具清单"覆盖，确保 LLM 使用真实存在的工具名。
         if !tools.is_empty() {
-            if let Some(sys_msg) = messages.first_mut() {
+            if let Some(sys_msg) = ctx.messages.first_mut() {
                 if let Some(ref mut content) = sys_msg.content {
                     let mut extra =
                         String::from("\n\n## 当前真实可用工具（调用时务必使用以下名称）\n");
@@ -3889,7 +3917,7 @@ impl AgentCore {
 
         // HY3 1.3：技能库注入（features.skill_library=false 时 skill_registry=None → 不生效）
         if let Some(reg) = self.skill_registry.as_ref() {
-            if let Some(sys_msg) = messages.first_mut() {
+            if let Some(sys_msg) = ctx.messages.first_mut() {
                 if let Some(ref mut content) = sys_msg.content {
                     if let Some(block) = crate::features::render_skill_block(reg.as_ref(), raw_message, 3) {
                         self.metrics.inc_skill();
@@ -3944,7 +3972,7 @@ impl AgentCore {
             }
             // 战略罗盘「可观测」：主 agent 循环 LLM 调用计数
             self.metrics.inc_llm_calls();
-            let response = match self.routed_llm.chat(&messages, &tools).await {
+            let response = match self.routed_llm.chat(&ctx.messages, &tools).await {
                 Ok(r) => r,
                 // P1-5：LLM 主/备 Provider 均失败 → 返回「可重试错误」，而非裸崩
                 Err(e) => {
@@ -3954,7 +3982,7 @@ impl AgentCore {
                 }
             };
             // 标记本轮回合是否执行了工具（用于分身策展记忆门控）
-            did_work |= !response.tool_calls.is_empty();
+            ctx.did_work |= !response.tool_calls.is_empty();
             // P2-1: 记录本次 token 消耗（请求 + 响应估算），跨天自动重置
             let resp_est = (response.text.len() as u64) / 4;
             self.quota
@@ -3966,7 +3994,7 @@ impl AgentCore {
             if response.tool_calls.is_empty() {
                 // P0 证据门禁：运维意图未取证 → 拒绝空嘴根因/方案
                 // 附件豁免统一读 intent.attachment（重构阶段3）
-                if crate::dept_ops::is_dept_grounded_intent(raw_message) && !did_work && !intent.attachment {
+                if crate::dept_ops::is_dept_grounded_intent(raw_message) && !ctx.did_work && !intent.attachment {
                     let refuse = crate::dept_ops::refuse_ungrounded_ops_reply(raw_message);
                     self.save_to_history(session_id, raw_message, &refuse).await;
                     return refuse;
@@ -3975,10 +4003,10 @@ impl AgentCore {
                 // 合成路由降级后 LLM 可在第一轮空手返回（tool_count=0，幻觉/编造数据），
                 // max_tool_rounds 给了 20 轮预算（固废多步推理）但此出口此前从不重试。
                 // 附件豁免统一读 intent.attachment（重构阶段3）。
-                if intent.data_query && !did_work && !intent.attachment {
+                if intent.data_query && !ctx.did_work && !intent.attachment {
                     let last_round = (_round + 1) >= self.config.max_tool_rounds;
                     if !last_round {
-                        messages.push(crate::llm::Message {
+                        ctx.messages.push(crate::llm::Message {
                             role: "user".to_string(),
                             content: Some(
                                 "⚠️ 请重新回答：你刚才没有调用任何工具。当前问题需要查询业务数据（进厂/车次/重量/白名单等），请立即调用 query_* / get_* 等真实数据工具获取数据后再回答，严禁凭记忆编造数据。".to_string(),
@@ -4009,7 +4037,7 @@ impl AgentCore {
                     };
                     // 1) 终答自一致性（N 路采样 + 选择器择优）
                     if matches!(ttc.decide(), crate::ttc::TtcAction::Sample) {
-                        let sampled = self.routed_llm.chat_ttc(&messages, &chosen, cfg).await;
+                        let sampled = self.routed_llm.chat_ttc(&ctx.messages, &chosen, cfg).await;
                         chosen = sampled;
                         self.metrics.inc_ttc();
                         tracing::info!(target = "agent.ttc", "TTC 终答自一致性已应用");
@@ -4017,7 +4045,7 @@ impl AgentCore {
                     // 2) verifier-guided 精炼（judge 判不通过则带反馈重生成，基线保底）
                     if cfg.verifier_enabled {
                         let refined =
-                            self.routed_llm.chat_verifier_guided(&messages, &chosen, cfg).await;
+                            self.routed_llm.chat_verifier_guided(&ctx.messages, &chosen, cfg).await;
                         chosen = refined;
                         self.metrics.inc_ttc_refine();
                         tracing::info!(target = "agent.ttc", "TTC verifier-guided 已应用");
@@ -4030,7 +4058,7 @@ impl AgentCore {
                 if crate::reply_polish::needs_polish(&reply)
                     && (_round + 1) < self.config.max_tool_rounds
                 {
-                    messages.push(crate::llm::Message {
+                    ctx.messages.push(crate::llm::Message {
                         role: "user".to_string(),
                         content: Some(
                             "⚠️ 请用自然语言重写你刚才的回答：不要输出 JSON 或代码块，直接把结果用中文文字、数字和表格描述清楚。".to_string(),
