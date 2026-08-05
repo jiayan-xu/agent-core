@@ -3763,42 +3763,46 @@ impl AgentCore {
     /// 返回注入用文本：优先 summary 字段 + 结构化清单；无结构化则原文。
     fn parse_summary_output(raw: &str) -> String {
         let t = raw.trim();
-        // 剥 ```json 前缀与 ``` 后缀（两者独立处理，顺序无依赖）
-        let mut c = t;
-        if let Some(inner) = c.strip_prefix("```json") {
-            c = inner;
-        }
-        if let Some(inner) = c.strip_suffix("```") {
-            c = inner;
-        }
-        let json_candidate = c.trim();
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_candidate) {
-            if let Some(obj) = v.as_object() {
-                let mut parts = Vec::new();
-                if let Some(s) = obj.get("summary").and_then(|x| x.as_str()) {
-                    let s = s.trim();
-                    if !s.is_empty() {
-                        parts.push(s.to_string());
-                    }
-                }
-                for (key, label) in [
-                    ("entities", "关键实体"),
-                    ("constraints", "核心约束"),
-                    ("todos", "待办"),
-                ] {
-                    if let Some(arr) = obj.get(key).and_then(|x| x.as_array()) {
-                        let items: Vec<String> = arr
-                            .iter()
-                            .filter_map(|i| i.as_str().map(|s| s.trim().to_string()))
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        if !items.is_empty() {
-                            parts.push(format!("{label}: {}", items.join("；")));
+        // 鲁棒 JSON 提取：取第一个 { 与最后一个 } 之间的子串（容错前后散文、
+        // ```json / ```JSON / 裸 ``` 等任意围栏形态），再整体解析。
+        if let (Some(s), Some(e)) = (t.find('{'), t.rfind('}')) {
+            if e > s {
+                let cand = &t[s..=e];
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(cand) {
+                    if let Some(obj) = v.as_object() {
+                        let mut parts = Vec::new();
+                        if let Some(s) = obj.get("summary").and_then(|x| x.as_str()) {
+                            let s = s.trim();
+                            if !s.is_empty() {
+                                parts.push(s.to_string());
+                            }
                         }
+                        for (key, label) in [
+                            ("entities", "关键实体"),
+                            ("constraints", "核心约束"),
+                            ("todos", "待办"),
+                        ] {
+                            if let Some(arr) = obj.get(key).and_then(|x| x.as_array()) {
+                                let items: Vec<String> = arr
+                                    .iter()
+                                    .filter_map(|i| i.as_str().map(|s| s.trim().to_string()))
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                if !items.is_empty() {
+                                    parts.push(format!("{label}: {}", items.join("；")));
+                                }
+                            }
+                        }
+                        // 是 Summarizer 摘要结构（含任一结构化字段）→ 返回结构化文本；
+                        // 字段均在但内容为空 → 返回空串（干净降级，不注入原文/围栏）。
+                        let is_struct = ["summary", "entities", "constraints", "todos"]
+                            .iter()
+                            .any(|k| obj.contains_key(*k));
+                        if is_struct {
+                            return parts.join("\n");
+                        }
+                        // 非摘要结构（任意 JSON，如对话内容里的 {"a":1}）→ 回退原文
                     }
-                }
-                if !parts.is_empty() {
-                    return parts.join("\n");
                 }
             }
         }
@@ -8465,6 +8469,31 @@ mod whitelist_preroute_tests {
         // 纯文本 → 原样返回
         let plain = "这是一段普通摘要文本";
         assert_eq!(AgentCore::parse_summary_output(plain), plain);
+    }
+
+    #[test]
+    fn parse_summary_prose_wrapped_and_case() {
+        // 前有散文 + 大写围栏 → 仍提取 JSON
+        let raw = "好的，总结如下：```JSON\n{\"summary\": \"重构完成\", \"todos\": [\"推送\"]}\n```";
+        let out = AgentCore::parse_summary_output(raw);
+        assert!(out.contains("重构完成"));
+        assert!(out.contains("待办: 推送"));
+        // 裸 ``` 围栏（无 json 标记）→ 仍提取
+        let raw2 = "```\n{\"summary\": \"完成\"}\n```";
+        let out2 = AgentCore::parse_summary_output(raw2);
+        assert_eq!(out2, "完成");
+        // 任意 JSON 对象（非摘要结构，如对话内容）→ 回退原文
+        let raw3 = "配置参数 {\"a\": 1, \"b\": 2} 已完成";
+        assert_eq!(AgentCore::parse_summary_output(raw3), raw3);
+    }
+
+    #[test]
+    fn parse_summary_empty_struct_clean() {
+        // 摘要结构字段存在但全空 → 返回空串（不注入原文/围栏，干净降级）
+        let raw = "```json\n{\"summary\": \"\", \"entities\": [], \"todos\": []}\n```";
+        assert_eq!(AgentCore::parse_summary_output(raw), "");
+        // 空对象 {} → 非摘要结构 → 回退原文
+        assert_eq!(AgentCore::parse_summary_output("{}"), "{}");
     }
 
     #[test]
