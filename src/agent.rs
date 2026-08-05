@@ -3766,28 +3766,13 @@ impl AgentCore {
         let bytes = t.as_bytes();
         // 平衡括号扫描：从每个 '{' 尝试提取完整 JSON 对象（容错前后散文、
         // 任意围栏形态、无关花括号、多对象并存）。
+        // 注意：不做全局引号跟踪——散文里不平衡引号（5"、跨对象引号）会让全局状态
+        // 卡死并跳过真对象；平衡扫描自带字符串态处理（obj_in_str），从每个 { 独立尝试，
+        // 解析失败自然跳过，正确性由"逐候选解析"保证。
+        let max_scan = 4096; // 内层扫描字节上限：游离 { 不触发全尾 O(n²) 扫描
         let mut i = 0usize;
-        let mut in_str = false; // 外层跟踪散文引号：字符串内的 { 不算对象起点
-        let mut esc = false;
         while i < bytes.len() {
-            let c = bytes[i];
-            if in_str {
-                if esc {
-                    esc = false;
-                } else if c == b'\\' {
-                    esc = true;
-                } else if c == b'"' {
-                    in_str = false;
-                }
-                i += 1;
-                continue;
-            }
-            if c == b'"' {
-                in_str = true;
-                i += 1;
-                continue;
-            }
-            if c != b'{' {
+            if bytes[i] != b'{' {
                 i += 1;
                 continue;
             }
@@ -3797,7 +3782,8 @@ impl AgentCore {
             let mut obj_esc = false;
             let mut j = i;
             let mut matched = false;
-            while j < bytes.len() {
+            let scan_end = (i + max_scan).min(bytes.len());
+            while j < scan_end {
                 let oc = bytes[j];
                 if obj_in_str {
                     if obj_esc {
@@ -3824,7 +3810,7 @@ impl AgentCore {
                 j += 1;
             }
             if !matched {
-                // 该 { 无闭合（散文里的游离括号）→ 跳过它继续找下一个对象，不放弃整个扫描
+                // 该 { 无闭合（散文里的游离括号 / 超扫描上限）→ 跳过它继续找下一个对象，不放弃整个扫描
                 i += 1;
                 continue;
             }
@@ -8624,6 +8610,19 @@ mod whitelist_preroute_tests {
         // 数组字段但元素非字符串（{"entities": [1,2]} 是散文对象）→ 非摘要结构 → 回退原文
         let raw = "配置 {\"entities\": [1, 2]} 完成";
         assert_eq!(AgentCore::parse_summary_output(raw), raw);
+        // 空数组字段（{"entities": []}）无字符串元素 → 非摘要结构 → 回退原文
+        let raw2 = "{\"entities\": []}";
+        assert_eq!(AgentCore::parse_summary_output(raw2), raw2);
+    }
+
+    #[test]
+    fn parse_summary_unbalanced_quotes_in_prose() {
+        // 对象前有不平衡引号（英寸 5"）→ 无全局引号状态，仍提取
+        let raw = "尺寸 5\" 的 {\"summary\": \"结论\"} 完成";
+        assert_eq!(AgentCore::parse_summary_output(raw), "结论");
+        // 引号包裹整个对象（他说"摘要如下 {...}"）→ 仍提取（平衡扫描自带字符串态）
+        let raw2 = "他说\"摘要如下 {\"summary\": \"结论二\"}\"";
+        assert_eq!(AgentCore::parse_summary_output(raw2), "结论二");
     }
 
     #[test]
