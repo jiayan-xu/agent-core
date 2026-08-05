@@ -3540,10 +3540,6 @@ impl AgentCore {
                         out.push_str("\n\n## 会话尾部（未压缩原文）\n");
                         let mut tail_chars = 0usize;
                         for m in history.iter().skip(upto) {
-                            if tail_chars >= 2000 {
-                                out.push_str("…（尾部超长已省略）\n");
-                                break;
-                            }
                             let c: String = m
                                 .content
                                 .clone()
@@ -3551,10 +3547,16 @@ impl AgentCore {
                                 .chars()
                                 .take(300)
                                 .collect();
-                            if !c.is_empty() {
-                                tail_chars += c.chars().count();
-                                out.push_str(&format!("[{}] {}\n", m.role, c));
+                            if c.is_empty() {
+                                continue;
                             }
+                            // 追加前预检：本条会让累计超 2000 则截断（严格封顶，防单条 +300 越限）
+                            if tail_chars + c.chars().count() > 2000 {
+                                out.push_str("…（尾部超长已省略）\n");
+                                break;
+                            }
+                            tail_chars += c.chars().count();
+                            out.push_str(&format!("[{}] {}\n", m.role, c));
                         }
                     }
                     out
