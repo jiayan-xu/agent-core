@@ -41,8 +41,9 @@ pub struct SharedState {
 /// 黑板写入防护上限（内容源于不可信模型文本）
 const BB_MAX_KEYS: usize = 32; // 最大键数
 const BB_MAX_VALUE_DEPTH: usize = 4; // 单值最大嵌套深度
+const BB_MAX_VALUE_WIDTH: usize = 512; // 单值数组/对象最大元素数（宽度预检，防宽数组物化）
 const BB_MAX_VALUE_BYTES: usize = 4096; // 单值序列化最大字节
-const BB_MAX_TOTAL_BYTES: usize = 65536; // 黑板全量序列化估算上限
+const BB_MAX_TOTAL_BYTES: usize = 65536; // 黑板全量序列化字节上限（merge 时强校验）
 
 fn json_depth(v: &serde_json::Value) -> usize {
     match v {
@@ -50,6 +51,19 @@ fn json_depth(v: &serde_json::Value) -> usize {
         serde_json::Value::Object(o) => o.values().map(json_depth).max().unwrap_or(0) + 1,
         _ => 0,
     }
+}
+
+fn json_width(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Array(a) => a.len(),
+        serde_json::Value::Object(o) => o.len(),
+        _ => 0,
+    }
+}
+
+/// 序列化字节数（深度/宽度预检通过后调用，物化代价可控）
+fn value_bytes(v: &serde_json::Value) -> usize {
+    serde_json::to_string(v).map(|s| s.len()).unwrap_or(0)
 }
 
 impl SharedState {
@@ -63,19 +77,22 @@ impl SharedState {
         self.data.read().ok()?.get(key).cloned()
     }
 
-    /// 写入一个键（受深度/大小上限约束），版本号自增；返回新版本号
+    /// 写入一个键（受深度/宽度/大小/总量上限约束），版本号自增；返回新版本号
     pub fn set(&self, key: &str, value: serde_json::Value) -> u64 {
         if !Self::value_allowed(&value) {
             tracing::warn!(
                 target: "agent.multiagent",
                 key = %key,
-                "黑板写入拒绝：值超限（深度/大小）"
+                "黑板写入拒绝：值超限（深度/宽度/大小）"
             );
             return self.version();
         }
         let mut v = match self.data.write() {
             Ok(g) => g,
-            Err(p) => p.into_inner(), // 中毒恢复：继续可写
+            Err(p) => {
+                tracing::warn!(target: "agent.multiagent", "黑板锁中毒恢复（set）");
+                p.into_inner()
+            }
         };
         if v.len() >= BB_MAX_KEYS && !v.contains_key(key) {
             tracing::warn!(
@@ -83,6 +100,19 @@ impl SharedState {
                 key = %key,
                 "黑板写入拒绝：键数达上限 {}",
                 BB_MAX_KEYS
+            );
+            return self.version();
+        }
+        // 总量上限：全量字节 - 旧键字节 + 新值字节
+        let old_bytes = v.get(key).map(value_bytes).unwrap_or(0);
+        let new_bytes = value_bytes(&value);
+        let total: usize = v.values().map(value_bytes).sum();
+        if total as i64 - old_bytes as i64 + new_bytes as i64 > BB_MAX_TOTAL_BYTES as i64 {
+            tracing::warn!(
+                target: "agent.multiagent",
+                key = %key,
+                "黑板写入拒绝：总量超上限 {}",
+                BB_MAX_TOTAL_BYTES
             );
             return self.version();
         }
@@ -100,14 +130,15 @@ impl SharedState {
         self.data.read().map(|g| g.clone()).unwrap_or_default()
     }
 
-    /// 单值是否可入黑板（深度/大小上限）
+    /// 单值是否可入黑板（深度/宽度/大小上限，均先预检再序列化）
     fn value_allowed(value: &serde_json::Value) -> bool {
         if json_depth(value) > BB_MAX_VALUE_DEPTH {
             return false;
         }
-        serde_json::to_string(value)
-            .map(|s| s.len() <= BB_MAX_VALUE_BYTES)
-            .unwrap_or(false)
+        if json_width(value) > BB_MAX_VALUE_WIDTH {
+            return false;
+        }
+        value_bytes(value) <= BB_MAX_VALUE_BYTES
     }
 
     /// 批量合并（子 agent 回写），版本号自增一次；返回新版本号
@@ -117,8 +148,29 @@ impl SharedState {
         }
         let mut v = match self.data.write() {
             Ok(g) => g,
-            Err(p) => p.into_inner(), // 中毒恢复：继续可写
+            Err(p) => {
+                tracing::warn!(target: "agent.multiagent", "黑板锁中毒恢复（merge）");
+                p.into_inner()
+            }
         };
+        // 总量上限预校验：全量字节 + 增量（新值-旧值）
+        let mut delta: i64 = 0;
+        for (k, val) in changes {
+            if !Self::value_allowed(val) {
+                continue;
+            }
+            delta += value_bytes(val) as i64 - v.get(k).map(value_bytes).unwrap_or(0) as i64;
+        }
+        let total: i64 = v.values().map(|x| value_bytes(x) as i64).sum();
+        if total + delta > BB_MAX_TOTAL_BYTES as i64 {
+            tracing::warn!(
+                target: "agent.multiagent",
+                delta,
+                "黑板回写整体拒绝：总量超上限 {}",
+                BB_MAX_TOTAL_BYTES
+            );
+            return self.version();
+        }
         let mut accepted = 0usize;
         let mut rejected = 0usize;
         for (k, val) in changes {
@@ -137,7 +189,7 @@ impl SharedState {
             tracing::warn!(
                 target: "agent.multiagent",
                 accepted, rejected,
-                "黑板回写部分拒绝（深度/大小/键数上限）"
+                "黑板回写部分拒绝（深度/宽度/大小/键数上限）"
             );
         }
         if accepted > 0 {
@@ -159,8 +211,11 @@ fn extract_blackboard_write(text: &str) -> (HashMap<String, serde_json::Value>, 
     while let Some(rel) = text[pos..].find("```json") {
         let open = pos + rel;
         let after = open + "```json".len();
-        if let Some(rel_close) = text[after..].find("```") {
-            let close = after + rel_close;
+        // 收尾围栏候选循环：JSON 内容内可能合法嵌入 ```（如代码示例），
+        // 首个候选解析失败则继续找更远的 ``` 重试，直到解析成功或耗尽。
+        let mut close_opt = text[after..].find("```").map(|r| after + r);
+        let mut handled = false;
+        while let Some(close) = close_opt {
             let block = &text[after..close];
             let t = block.trim().trim_matches('`').trim();
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
@@ -177,10 +232,17 @@ fn extract_blackboard_write(text: &str) -> (HashMap<String, serde_json::Value>, 
                     last_changes = Some(changes);
                     removals.push((open, close + 3)); // 含 ```json 与收尾 ```
                 }
+                // 该块 JSON 合法（无论是否回写块），块边界确定 → 跳过整个块
+                handled = true;
+                pos = close + 3;
+                break;
             }
-            pos = close + 3;
-        } else {
-            break;
+            // 解析失败 → 内容里嵌了 ```，找下一个收尾候选重试
+            close_opt = text[close + 3..].find("```").map(|r| close + 3 + r);
+        }
+        if !handled {
+            // 无合法收尾（可能被 ``` 截断的残缺块）→ 跳过 ```json 标记避免死循环
+            pos = after;
         }
     }
     match last_changes {
@@ -299,10 +361,13 @@ pub fn parse_subtasks(json: &str) -> Vec<SubTask> {
                     .filter_map(|t| {
                         let title = t.get("title")?.as_str()?.to_string();
                         let description = t.get("description")?.as_str()?.to_string();
+                        // stage 源于不可信 LLM JSON：钳制到 [0,255]，防恶意大值 as u32 静默回绕
+                        // 与低 stage 合并、打乱预期执行顺序
                         let stage = t
                             .get("stage")
                             .and_then(|s| s.as_u64())
-                            .unwrap_or(0) as u32;
+                            .map(|s| s.min(255) as u32)
+                            .unwrap_or(0);
                         Some(SubTask {
                             title,
                             description,
@@ -342,7 +407,36 @@ pub async fn dispatch_with_timeout(
     blackboard: Option<SharedState>,
 ) -> String {
     let timeout = Duration::from_secs(timeout_secs);
-    // P2-2：按 stage 分组（BTreeMap 保证阶段顺序 0,1,2...）
+    // None = 旧行为完全一致（纯并行独立，stage 忽略）
+    if blackboard.is_none() {
+        let futures = subtasks.iter().map(|st| {
+            let title = st.title.clone();
+            let desc = st.description.clone();
+            async move {
+                let msg = Message {
+                    role: "user".to_string(),
+                    content: Some(desc),
+                    tool_calls: None,
+                    tool_call_id: None,
+                };
+                let r = tokio::time::timeout(timeout, rt.chat(&[msg], &[] as &[ToolDef])).await;
+                (title, r)
+            }
+        });
+        let results = join_all(futures).await;
+        let mut out = String::new();
+        for (title, res) in results {
+            match res {
+                Ok(Ok(r)) => out.push_str(&format!("### {}\n{}\n\n", title, r.text)),
+                Ok(Err(e)) => out.push_str(&format!("### {} (失败: {})\n\n", title, e)),
+                Err(_) => {
+                    out.push_str(&format!("### {} (超时 {}s，已隔离)\n\n", title, timeout_secs))
+                }
+            }
+        }
+        return out;
+    }
+    // P2-2：黑板模式——按 stage 分组（BTreeMap 保证阶段顺序 0,1,2...）
     let mut by_stage: BTreeMap<u32, Vec<&SubTask>> = BTreeMap::new();
     for st in subtasks {
         by_stage.entry(st.stage).or_default().push(st);
@@ -522,5 +616,42 @@ mod tests {
         // 无 stage 字段向后兼容
         let v2 = parse_subtasks(r#"{"tasks":[{"title":"C","description":"做C"}]}"#);
         assert_eq!(v2[0].stage, 0);
+        // 恶意超大 stage 钳制到 255（不回绕到 0 与低 stage 合并）
+        let v3 = parse_subtasks(r#"{"tasks":[{"title":"D","description":"做D","stage":4294967296}]}"#);
+        assert_eq!(v3[0].stage, 255);
+    }
+
+    #[test]
+    fn blackboard_total_bytes_cap() {
+        let bb = SharedState::new();
+        // 单值 ~4KB（序列化后 4002 字节 < 4096 单值上限），16 个 = 64KB 内；第 17 个超总量 64KB
+        let big = serde_json::json!(serde_json::Value::String("x".repeat(4000)));
+        for i in 0..16 {
+            bb.set(&format!("k{i}"), big.clone());
+        }
+        assert_eq!(bb.version(), 16);
+        // 第 17 个被总量上限拒绝
+        bb.set("k16", big.clone());
+        assert_eq!(bb.version(), 16);
+        // 小值可写
+        bb.set("small", serde_json::json!(1));
+        assert_eq!(bb.version(), 17);
+    }
+
+    #[test]
+    fn blackboard_extract_fence_inside_content() {
+        // JSON 字符串值内含 ```（代码示例）——不应截断块
+        let text = "结果如下\n```json\n{\"__blackboard__\": {\"code\": \"先看 ``` 再写\"}}\n```\n正文";
+        let (changes, body) = extract_blackboard_write(text);
+        assert!(changes.contains_key("code"));
+        assert!(body.contains("正文"));
+        assert!(!body.contains("```"));
+    }
+
+    #[test]
+    fn blackboard_width_cap_rejects_wide_array() {
+        let bb = SharedState::new();
+        let wide = serde_json::json!((0..600).collect::<Vec<u32>>()); // 600 元素 > 512 宽度上限
+        assert_eq!(bb.set("wide", wide), 0); // 拒绝
     }
 }
