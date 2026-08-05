@@ -10,6 +10,10 @@ use crate::approval::ApprovalManager;
 use crate::audit::{new_trace_id, AuditLogger};
 use crate::boundary::prompt_injection::{PromptInjectionDetector, ThreatLevel};
 use crate::boundary::{self, BlockLevel, ComplianceBoundary, PermissionLevel};
+
+/// P1-1 滑动窗口大小：窗口内保留原文（与 history take(HISTORY_WINDOW) 对齐）。
+/// 统一常量，避免字面量 20 散落两处（P1 审查 P3 提示）。
+const HISTORY_WINDOW: usize = 20;
 use crate::checkpoint::{CheckpointState, CheckpointStore};
 use crate::degrade::{DegradeMode, DegradeMonitor, UNHEALTHY_THRESHOLD};
 use crate::harness::{self, ExecutionLog, HarnessStore};
@@ -253,8 +257,9 @@ pub struct AgentCore {
     in_progress_step_results: Arc<Mutex<HashMap<u32, String>>>,
     /// P1-5: 降级收缩监视器（MCP 源健康 + Kill switch + 模式推导）
     pub degrade: Arc<DegradeMonitor>,
-    /// P1-1: 会话历史摘要缓存（session_id → (已摘要条数, 摘要文本)）——滑动窗口+摘要层
-    history_summary_cache: tokio::sync::Mutex<HashMap<String, (usize, String)>>,
+    /// P1-1: 会话历史摘要缓存（session_id → (已摘要条数, 摘要文本, 已摘要区间指纹)）——滑动窗口+摘要层。
+    /// 指纹防「外部历史替换但条数不变」场景返回过期摘要（P1 审查#3）。
+    history_summary_cache: tokio::sync::Mutex<HashMap<String, (usize, String, u64)>>,
     /// P2-1: 命名空间级配额与成本（tool 轮次 / 日 token 预算 / 并发会话）
     pub quota: Arc<std::sync::Mutex<NsQuotaStore>>,
     /// 白龙马 A3: Focus Stack → Thread 模型 —— 已归档话题（episode）软隐藏索引
@@ -2780,16 +2785,20 @@ impl AgentCore {
         };
 
         // ── P1-2: 会话级主动记忆预热 ──
-        // 新会话首条消息确定性拉用户偏好/硬规则注入 knowledge（不依赖当前消息检索命中，
+        // 新会话首条消息确定性拉用户偏好/硬规则（不依赖当前消息检索命中，
         // 堵灾难性遗忘入口：任务初期约束/偏好不再等 LLM 自觉调检索）
+        // P1 审查#2：硬规则独立段注入 system prompt 头部（身份之后、通用记忆之前），
+        // 不再 push 到 knowledge 尾部——"请始终遵守"的强调力度不打折。
+        let mut prefs_block: Option<String> = None;
         if history.is_empty() {
-            if let Some(prefs) = self.load_user_prefs_for_session(session_id).await {
-                knowledge.push(prefs);
-            }
+            prefs_block = self.load_user_prefs_for_session(session_id).await;
         }
 
         // ── 4. 构建消息列表 ──
         let mut system_prompt = self.build_system_prompt(&knowledge);
+        if let Some(p) = &prefs_block {
+            system_prompt = format!("{}\n\n{}", p, system_prompt);
+        }
         // 白龙马 Phase C: 条件式本地资源门控（仅消息命中 ssh/git/部署 等规则才注入）
         self.inject_resources_if_relevant(&mut system_prompt, message);
         // HY3 1.3：技能库注入（features.skill_library=false 时 skill_registry=None → 不生效）
@@ -2812,7 +2821,7 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         });
-        for h in history.iter().rev().take(20) {
+        for h in history.iter().rev().take(HISTORY_WINDOW) {
             messages.push(h.clone());
         }
         messages.push(Message {
@@ -3553,8 +3562,38 @@ impl AgentCore {
     /// P1-1: 滑动窗口+摘要——历史超过窗口+阈值时，把窗口外更旧部分增量压缩为会话摘要
     /// （四要素模板：目标/实体状态/约束/待办），注入 System Prompt 后部。
     /// 缓存避免每轮全量重算；LLM 失败降级（不注入、不阻断主流程）。
+    /// 历史摘要缓存判定（纯函数，便于单测）：
+    /// 命中条件 = 已摘要区间内容指纹一致（未被外部替换/篡改）且覆盖到当前窗口。
+    /// 返回 Some(text) 命中；None 需重算（可能增量或全量，由调用方判断）。
+    fn summary_cache_hit(
+        cached: Option<&(usize, String, u64)>,
+        history_fp_upto: u64,
+        old_len: usize,
+    ) -> Option<String> {
+        let (upto, text, fp) = cached?;
+        if *fp == history_fp_upto && *upto >= old_len {
+            Some(text.clone())
+        } else {
+            None
+        }
+    }
+
+    /// 历史内容指纹：对 history[..upto]（已摘要区间）做确定性哈希（DefaultHasher 固定 key）。
+    /// 用于检测「外部历史被替换但条数不变」——内容变化即指纹变化，缓存判失效。
+    fn history_fingerprint(history: &[Message], upto: usize) -> u64 {
+        use std::hash::Hasher;
+        let n = upto.min(history.len());
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for m in history.iter().take(n) {
+            h.write(m.role.as_bytes());
+            h.write_u8(0xFF); // role/content 分隔
+            h.write(m.content.as_deref().unwrap_or("").as_bytes());
+        }
+        h.finish()
+    }
+
     async fn maybe_history_summary(&self, session_id: &str, history: &[Message]) -> Option<String> {
-        const WINDOW: usize = 20; // 与 history take(20) 对齐：窗口内保留原文
+        const WINDOW: usize = HISTORY_WINDOW; // 窗口内保留原文
         const TRIGGER: usize = 32; // 超过 32 条才触发摘要（窗口 20 + 增量 12）
         if history.len() <= TRIGGER {
             return None;
@@ -3562,13 +3601,27 @@ impl AgentCore {
         let old_len = history.len() - WINDOW;
         let cache = self.history_summary_cache.lock().await;
         let cached = cache.get(session_id).cloned();
-        if let Some((upto, text)) = &cached {
-            if *upto >= old_len {
-                return Some(text.clone());
+        // 命中判定：已摘要区间指纹一致（内容未被替换）且覆盖到当前窗口
+        if let Some((upto, _, _)) = &cached {
+            let fp = Self::history_fingerprint(history, *upto);
+            if let Some(text) = Self::summary_cache_hit(cached.as_ref(), fp, old_len) {
+                return Some(text);
             }
         }
+        // 未命中：区分「增量」（历史只增未改）与「全量」（外部替换/篡改）。
+        // 内容一致性：比较已覆盖区间当前指纹 vs 缓存指纹；不一致 = 内容被改 → 全量从 0 重摘。
+        let content_unchanged = cached
+            .as_ref()
+            .map(|(upto, _, fp)| {
+                Self::history_fingerprint(history, *upto) == *fp
+            })
+            .unwrap_or(false);
+        let start = if content_unchanged {
+            cached.as_ref().map(|(n, _, _)| *n).unwrap_or(0)
+        } else {
+            0
+        };
         // 增量转录：只摘上次摘要之后的新增旧历史（截断控制 token 成本）
-        let start = cached.as_ref().map(|(n, _)| *n).unwrap_or(0);
         let mut transcript = String::new();
         for m in history.iter().skip(start).take(old_len.saturating_sub(start)) {
             let line: String = m
@@ -3583,7 +3636,7 @@ impl AgentCore {
             }
         }
         if transcript.trim().is_empty() {
-            return cached.map(|(_, t)| t);
+            return cached.map(|(_, t, _)| t);
         }
         // 释放 cache guard 再 await LLM（避免跨 await 持锁阻塞其他 session 的摘要请求）
         drop(cache);
@@ -3592,11 +3645,11 @@ impl AgentCore {
         // LLM 失败且已有缓存 → 直接返回旧摘要，不更新覆盖范围
         // （否则会用更大 old_len 声称覆盖了未摘要区间，[prev_upto, old_len) 将永久丢段）
         if new_part.is_none() {
-            return cached.map(|(_, t)| t);
+            return cached.map(|(_, t, _)| t);
         }
         let new_text = new_part.unwrap_or_default();
         let merged = match cached {
-            Some((_, old)) => Some(format!("{old}\n\n{new_text}")),
+            Some((_, old, _)) => Some(format!("{old}\n\n{new_text}")),
             None => Some(new_text),
         };
         // 摘要防无限膨胀：合并后截断（保留头部目标/约束 + 尾部最新增量）
@@ -3619,9 +3672,11 @@ impl AgentCore {
         });
         if let Some(s) = &bounded {
             let mut cache = self.history_summary_cache.lock().await;
-            // 并发防护：await LLM 期间可能已有更新的条目（upto >= old_len），有则用 fresher 不覆盖
-            if let Some((fresh_upto, fresh_text)) = cache.get(session_id) {
-                if *fresh_upto >= old_len {
+            // 并发防护：await LLM 期间可能已有更新的条目（upto >= old_len 且指纹新），有则用 fresher 不覆盖
+            if let Some((fresh_upto, fresh_text, fresh_fp)) = cache.get(session_id) {
+                let fresh_ok = *fresh_upto >= old_len
+                    && *fresh_fp == Self::history_fingerprint(history, *fresh_upto);
+                if fresh_ok {
                     return Some(fresh_text.clone());
                 }
             }
@@ -3629,7 +3684,8 @@ impl AgentCore {
             if cache.len() >= 200 {
                 cache.clear();
             }
-            cache.insert(session_id.to_string(), (old_len, s.clone()));
+            let fp = Self::history_fingerprint(history, old_len);
+            cache.insert(session_id.to_string(), (old_len, s.clone(), fp));
         }
         bounded
     }
@@ -3675,14 +3731,25 @@ impl AgentCore {
         if arr.is_empty() {
             return None;
         }
+        // P1 审查#1：hard_rule（硬规则）优先排序——取 8 条时绝不截掉最该遵守的约束。
+        // 稳定排序：硬规则在前，其余保持原序（sort_by 是稳定排序）。
+        let mut entries: Vec<(&serde_json::Value, &str, &str, &str, bool)> = arr
+            .iter()
+            .filter_map(|p| {
+                let key = p.get("key").and_then(|k| k.as_str()).unwrap_or("");
+                let value = p.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                let tag = p.get("tag").and_then(|t| t.as_str()).unwrap_or("");
+                if key.is_empty() || value.is_empty() {
+                    None
+                } else {
+                    Some((p, key, value, tag, tag == "hard_rule" || tag == "hard"))
+                }
+            })
+            .collect();
+        entries.sort_by_key(|(_, _, _, _, is_hard)| std::cmp::Reverse(*is_hard));
         let mut lines = Vec::new();
-        for p in arr.iter().take(8) {
-            let key = p.get("key").and_then(|k| k.as_str()).unwrap_or("");
-            let value = p.get("value").and_then(|v| v.as_str()).unwrap_or("");
-            let tag = p.get("tag").and_then(|t| t.as_str()).unwrap_or("");
-            if !key.is_empty() && !value.is_empty() {
-                lines.push(format!("- [{}] {}：{}", tag, key, value));
-            }
+        for (_, key, value, tag, _) in entries.iter().take(8) {
+            lines.push(format!("- [{}] {}：{}", tag, key, value));
         }
         if lines.is_empty() {
             None
@@ -8170,6 +8237,51 @@ mod tool_fix_tests {
 #[cfg(test)]
 mod whitelist_preroute_tests {
     use super::*;
+
+    /// P1 审查#4：摘要缓存判定与指纹的纯函数单测
+    #[test]
+    fn summary_cache_hit_matches_when_fingerprint_ok() {
+        let cached = (5usize, "摘要".to_string(), 42u64);
+        // 指纹一致 + 覆盖到窗口 → 命中
+        let hit = AgentCore::summary_cache_hit(Some(&cached), 42, 5);
+        assert_eq!(hit, Some("摘要".to_string()));
+        // 指纹一致但未覆盖到窗口 → 未命中（需增量）
+        assert!(AgentCore::summary_cache_hit(Some(&cached), 42, 8).is_none());
+        // 指纹不一致（外部历史被替换）→ 未命中（需全量重摘）
+        assert!(AgentCore::summary_cache_hit(Some(&cached), 99, 5).is_none());
+        // 无缓存 → 未命中
+        assert!(AgentCore::summary_cache_hit(None, 42, 5).is_none());
+    }
+
+    #[test]
+    fn history_fingerprint_stable_and_sensitive() {
+        let msg = |role: &str, c: &str| Message {
+            role: role.to_string(),
+            content: Some(c.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let h1 = vec![msg("user", "a"), msg("assistant", "b"), msg("user", "c")];
+        let h2 = vec![msg("user", "a"), msg("assistant", "b"), msg("user", "c")];
+        let h3 = vec![msg("user", "a"), msg("assistant", "b"), msg("user", "D")];
+        // 相同内容 → 指纹一致（确定性）
+        assert_eq!(
+            AgentCore::history_fingerprint(&h1, 3),
+            AgentCore::history_fingerprint(&h2, 3)
+        );
+        // 内容变化 → 指纹不同（外部替换检测的关键）
+        assert_ne!(
+            AgentCore::history_fingerprint(&h1, 3),
+            AgentCore::history_fingerprint(&h3, 3)
+        );
+        // 覆盖范围不同 → 指纹不同
+        assert_ne!(
+            AgentCore::history_fingerprint(&h1, 2),
+            AgentCore::history_fingerprint(&h1, 3)
+        );
+        // upto 超出历史长度 → clamp 不 panic
+        let _ = AgentCore::history_fingerprint(&h1, 99);
+    }
 
     #[test]
     fn extract_update_company_rename() {
