@@ -3599,7 +3599,17 @@ impl AgentCore {
             return None;
         }
         let old_len = history.len() - WINDOW;
-        let cache = self.history_summary_cache.lock().await;
+        let mut cache = self.history_summary_cache.lock().await;
+        // 残留条目清理：缓存 upto 超过当前历史长度（外部历史被替换/截短，如 jan 传更短
+        // external_history）→ 条目描述的是旧历史，直接移除走全量重摘；否则它会在并发
+        // 防护分支绕过指纹被信任（本方法最安全的一层清理）。
+        let stale = cache
+            .get(session_id)
+            .map(|(u, _, _)| *u > history.len())
+            .unwrap_or(false);
+        if stale {
+            cache.remove(session_id);
+        }
         let cached = cache.get(session_id).cloned();
         // 命中判定：已摘要区间指纹一致（内容未被替换）且覆盖到当前窗口
         if let Some((upto, _, _)) = &cached {
