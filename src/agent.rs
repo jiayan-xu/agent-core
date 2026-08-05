@@ -2787,8 +2787,8 @@ impl AgentCore {
         // ── P1-2: 会话级主动记忆预热 ──
         // 新会话首条消息确定性拉用户偏好/硬规则（不依赖当前消息检索命中，
         // 堵灾难性遗忘入口：任务初期约束/偏好不再等 LLM 自觉调检索）
-        // P1 审查#2：硬规则独立段注入 system prompt 头部（身份之后、通用记忆之前），
-        // 不再 push 到 knowledge 尾部——"请始终遵守"的强调力度不打折。
+        // P1 审查#2：prefs 独立段置于 system prompt 最前——用户硬规则优先级显性
+        // 高于身份设定（约束优先，防 LLM 把硬规则当普通背景忽略）。
         let mut prefs_block: Option<String> = None;
         if history.is_empty() {
             prefs_block = self.load_user_prefs_for_session(session_id).await;
@@ -3648,9 +3648,16 @@ impl AgentCore {
             return cached.map(|(_, t, _)| t);
         }
         let new_text = new_part.unwrap_or_default();
-        let merged = match cached {
-            Some((_, old, _)) => Some(format!("{old}\n\n{new_text}")),
-            None => Some(new_text),
+        // 内容未被替换（正常增量）→ 合并旧摘要 + 新增量；
+        // 外部历史被替换（content_unchanged=false）→ 旧摘要描述的是被替换的历史，直接丢弃，
+        // 全量重摘结果作为新基线（防「过期旧摘要 + 新摘要」混合污染）。
+        let merged = if content_unchanged {
+            match cached {
+                Some((_, old, _)) => Some(format!("{old}\n\n{new_text}")),
+                None => Some(new_text),
+            }
+        } else {
+            Some(new_text)
         };
         // 摘要防无限膨胀：合并后截断（保留头部目标/约束 + 尾部最新增量）
         let bounded = merged.map(|s| {
@@ -3672,11 +3679,10 @@ impl AgentCore {
         });
         if let Some(s) = &bounded {
             let mut cache = self.history_summary_cache.lock().await;
-            // 并发防护：await LLM 期间可能已有更新的条目（upto >= old_len 且指纹新），有则用 fresher 不覆盖
-            if let Some((fresh_upto, fresh_text, fresh_fp)) = cache.get(session_id) {
-                let fresh_ok = *fresh_upto >= old_len
-                    && *fresh_fp == Self::history_fingerprint(history, *fresh_upto);
-                if fresh_ok {
+            // 并发防护：await LLM 期间可能已有更新的条目（另一并发调用基于更长历史刚写入），
+            // 有则用 fresher 不覆盖。fresh 条目自身指纹完备（基于其更长历史），无需重算校验。
+            if let Some((fresh_upto, fresh_text, _)) = cache.get(session_id) {
+                if *fresh_upto >= old_len {
                     return Some(fresh_text.clone());
                 }
             }
