@@ -2813,10 +2813,11 @@ impl AgentCore {
         // ⚠️ 摘要源于用户可控对话，属不可信数据：注入时显式声明不改变系统指令优先级
         let token_win = Self::token_window_len(&history, HISTORY_TOKEN_BUDGET);
         let summary = self.maybe_history_summary(session_id, &history, token_win).await;
-        // 降级保底：摘要不可用（LLM 失败/冷缓存 None）但有窗口外内容 → 用固定窗口上限原文保留，
-        // 避免「窗口塌缩到 1 条 + 无摘要」导致早期上下文无痕丢失（预算约束在降级路径让位于完整性）。
+        // 降级保底：摘要不可用（LLM 失败/冷缓存 None）但有窗口外内容 → 用**放宽 2 倍预算**
+        // 重算窗口保留更多原文。注意不能用固定 HISTORY_WINDOW：token_win 小正是因为消息长
+        // （20 条长消息可 ~50k token），固定 20 条会直接超模型上下文；放宽预算仍受约束。
         let window_len = if summary.is_none() && history.len() > token_win {
-            HISTORY_WINDOW.min(history.len())
+            Self::token_window_len(&history, HISTORY_TOKEN_BUDGET * 2)
         } else {
             token_win
         };
