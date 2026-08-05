@@ -4053,7 +4053,7 @@ async fn handle_admin_quota_put(
             s.get_policy(&req.namespace)
         };
         if let Some(v) = req.max_tool_rounds {
-            policy.max_tool_rounds = v;
+            policy.max_tool_rounds_per_day = v;
         }
         if let Some(v) = req.daily_token_budget {
             policy.daily_token_budget = v;
@@ -4066,7 +4066,7 @@ async fn handle_admin_quota_put(
             "ok": true,
             "namespace": req.namespace,
             "policy": {
-                "max_tool_rounds": policy.max_tool_rounds,
+                "max_tool_rounds": policy.max_tool_rounds_per_day,
                 "daily_token_budget": policy.daily_token_budget,
                 "max_concurrent_sessions": policy.max_concurrent_sessions,
             }

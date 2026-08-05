@@ -1,7 +1,7 @@
 //! P2-1：命名空间级配额与成本管控
 //!
 //! 按「调用者命名空间」(caller ns) 维度记账，提供三层配额：
-//! - `max_tool_rounds`：每命名空间当日工具调用轮次上限
+//! - `max_tool_rounds_per_day`：每命名空间当日工具调用轮次上限
 //! - `daily_token_budget`：每命名空间当日 token 预算（估算 = 字符数 / 4）
 //! - `max_concurrent_sessions`：每命名空间并发会话上限
 //!
@@ -16,7 +16,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize)]
 pub struct NsQuotaPolicy {
     /// 当日工具调用轮次上限
-    pub max_tool_rounds: u32,
+    pub max_tool_rounds_per_day: u32,
     /// 当日 token 预算（估算单位：字符数 / 4）
     pub daily_token_budget: u64,
     /// 并发会话上限
@@ -26,7 +26,7 @@ pub struct NsQuotaPolicy {
 impl Default for NsQuotaPolicy {
     fn default() -> Self {
         NsQuotaPolicy {
-            max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
+            max_tool_rounds_per_day: DEFAULT_MAX_TOOL_ROUNDS_PER_DAY,
             daily_token_budget: DEFAULT_DAILY_TOKEN_BUDGET,
             max_concurrent_sessions: DEFAULT_MAX_CONCURRENT_SESSIONS,
         }
@@ -63,7 +63,7 @@ impl NsQuotaUsage {
 }
 
 /// 默认配额常量（可在 `agent.toml` 经未来配置项覆盖；当前以代码常量兜底）
-pub const DEFAULT_MAX_TOOL_ROUNDS: u32 = 200;
+pub const DEFAULT_MAX_TOOL_ROUNDS_PER_DAY: u32 = 200;
 pub const DEFAULT_DAILY_TOKEN_BUDGET: u64 = 500_000;
 pub const DEFAULT_MAX_CONCURRENT_SESSIONS: u32 = 8;
 
@@ -88,7 +88,7 @@ impl NsQuotaStore {
         // 16 会在几轮报表后耗尽，导致整天无法调用工具而退化成记忆编造）。可用环境变量调高/调低。
         if let Ok(v) = std::env::var("AGENT_MAX_TOOL_ROUNDS_PER_DAY") {
             if let Ok(n) = v.parse::<u32>() {
-                default_policy.max_tool_rounds = n.max(1);
+                default_policy.max_tool_rounds_per_day = n.max(1);
             }
         }
         NsQuotaStore {
@@ -131,10 +131,10 @@ impl NsQuotaStore {
     pub fn check_tool_round(&mut self, ns: &str) -> Result<(), String> {
         let policy = self.get_policy(ns);
         let u = self.usage_mut(ns);
-        if u.tool_rounds >= policy.max_tool_rounds {
+        if u.tool_rounds >= policy.max_tool_rounds_per_day {
             return Err(format!(
                 "已达当日工具轮次上限 {}（已用 {}）",
-                policy.max_tool_rounds, u.tool_rounds
+                policy.max_tool_rounds_per_day, u.tool_rounds
             ));
         }
         u.tool_rounds += 1;
@@ -195,7 +195,7 @@ impl NsQuotaStore {
                 "namespace": ns,
                 "day": u.day,
                 "tool_rounds": u.tool_rounds,
-                "tool_rounds_limit": policy.max_tool_rounds,
+                "tool_rounds_limit": policy.max_tool_rounds_per_day,
                 "token_used": u.token_used,
                 "token_budget": policy.daily_token_budget,
                 "active_sessions": u.active_sessions,
@@ -209,7 +209,7 @@ impl NsQuotaStore {
             .map(|(ns, p)| {
                 serde_json::json!({
                     "namespace": ns,
-                    "max_tool_rounds": p.max_tool_rounds,
+                    "max_tool_rounds": p.max_tool_rounds_per_day,
                     "daily_token_budget": p.daily_token_budget,
                     "max_concurrent_sessions": p.max_concurrent_sessions,
                 })
@@ -222,7 +222,7 @@ impl NsQuotaStore {
         });
         serde_json::json!({
             "default_policy": {
-                "max_tool_rounds": self.default_policy.max_tool_rounds,
+                "max_tool_rounds": self.default_policy.max_tool_rounds_per_day,
                 "daily_token_budget": self.default_policy.daily_token_budget,
                 "max_concurrent_sessions": self.default_policy.max_concurrent_sessions,
             },
@@ -240,7 +240,7 @@ mod tests {
     #[test]
     fn tool_rounds_enforce_and_reset_on_new_day() {
         let mut s = NsQuotaStore::new();
-        for _ in 0..DEFAULT_MAX_TOOL_ROUNDS {
+        for _ in 0..DEFAULT_MAX_TOOL_ROUNDS_PER_DAY {
             assert!(s.check_tool_round("ns/a").is_ok());
         }
         // 第 N+1 次应被拒
@@ -277,7 +277,7 @@ mod tests {
         s.set_policy(
             "ns/d",
             NsQuotaPolicy {
-                max_tool_rounds: 2,
+                max_tool_rounds_per_day: 2,
                 ..Default::default()
             },
         );
