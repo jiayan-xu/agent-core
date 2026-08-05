@@ -28,6 +28,23 @@ const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 /// 握手失败后的冷却窗口（秒）：避免热路径（list_tools 路由刷新/健康检查）反复打失败请求
 const INIT_RETRY_COOLDOWN_SECS: u64 = 30;
 
+/// 解析 MCP 响应体：兼容纯 JSON 与 SSE（`event: message\ndata: {...}\n\n`）两种格式。
+/// Streamable HTTP 规范允许 server 对带 `Accept: ... text/event-stream` 的请求回 SSE，
+/// client 必须两种都能解析，否则广告 SSE 却只认 JSON 会造成契约不匹配。
+fn parse_mcp_response_body(raw: &str) -> Result<serde_json::Value, String> {
+    let t = raw.trim_start();
+    if t.starts_with("event:") || t.contains("\ndata:") {
+        for line in raw.lines() {
+            if let Some(d) = line.strip_prefix("data:") {
+                return serde_json::from_str(d.trim()).map_err(|e| format!("SSE data JSON: {}", e));
+            }
+        }
+        Err("SSE 响应中未找到 data 行".to_string())
+    } else {
+        serde_json::from_str(raw).map_err(|e| format!("JSON 解析失败: {}", e))
+    }
+}
+
 /// HTTP MCP 客户端（原 McpClient）
 #[derive(Clone)]
 pub struct HttpMcpClient {
@@ -74,7 +91,7 @@ impl HttpMcpClient {
     /// MCP 协议握手（stateless 一次性，实例级）：每个 server client 独立握手一次。
     /// - 成功：仅当 HTTP 2xx 且响应体无 JSON-RPC `error`（严格 server 拒绝初始化时
     ///   常见 HTTP 200 + error payload，仅看状态码会永久误置位）。
-    /// - 失败：记录冷却时间（INIT_RETRY_COOLDOWN_SECS 内不重试），不阻断调用——
+    /// - 失败：原子冷却（INIT_RETRY_COOLDOWN_SECS 内不重试），不阻断调用——
     ///   向后兼容宽松服务端（如 memoria 不强制握手）；对严格要求握手的标准服务端
     ///   保证首次调用前已完成协商。
     async fn ensure_initialized(&self) {
@@ -85,11 +102,9 @@ impl HttpMcpClient {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let last = self.last_init_attempt.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < INIT_RETRY_COOLDOWN_SECS {
-            return;
+        if !self.try_acquire_init_slot(now) {
+            return; // 冷却期内，跳过本轮
         }
-        self.last_init_attempt.store(now, Ordering::Relaxed);
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
@@ -106,25 +121,32 @@ impl HttpMcpClient {
             .header("X-Agent-Id", &self.agent_id)
             .header("X-Agent-Key", &self.badge_token)
             .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
-            .header("Accept", "application/json")
+            .header("Accept", "application/json, text/event-stream")
             .send()
             .await;
         match resp {
-            Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
-                Ok(v) if v.get("error").is_none() => {
-                    let _ = self.initialized.set(());
-                    tracing::info!(
-                        target: "mcp", base_url = %self.base_url,
-                        "MCP initialize 握手完成（stateless 一次性）"
-                    );
-                }
-                Ok(v) => tracing::warn!(
-                    target: "mcp", err = ?v.get("error"),
-                    "MCP initialize 返回 JSON-RPC error，不置位（冷却期内不重试）"
-                ),
+            Ok(r) if r.status().is_success() => match r.text().await {
+                Ok(t) => match parse_mcp_response_body(&t) {
+                    // 顶层 error = JSON-RPC 协议错误（拒绝握手），仅 result 才算成功
+                    Ok(v) if v.get("error").is_none() => {
+                        let _ = self.initialized.set(());
+                        tracing::info!(
+                            target: "mcp", base_url = %self.base_url,
+                            "MCP initialize 握手完成（stateless 一次性）"
+                        );
+                    }
+                    Ok(v) => tracing::warn!(
+                        target: "mcp", err = ?v.get("error"),
+                        "MCP initialize 返回 JSON-RPC error，不置位（冷却期内不重试）"
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: "mcp", err = %e,
+                        "MCP initialize 响应解析失败，不置位（冷却期内不重试）"
+                    ),
+                },
                 Err(e) => tracing::warn!(
                     target: "mcp", err = %e,
-                    "MCP initialize 响应解析失败，不置位（冷却期内不重试）"
+                    "MCP initialize 读响应失败，不置位（冷却期内不重试）"
                 ),
             },
             Ok(r) => tracing::warn!(
@@ -135,6 +157,26 @@ impl HttpMcpClient {
                 target: "mcp", err = %e,
                 "MCP initialize 传输失败（冷却期内不重试）"
             ),
+        }
+    }
+
+    /// 原子冷却闸（CAS）：仅当距上次握手尝试 ≥ 冷却窗口时占位并放行，
+    /// 并发调用下保证只有一个发起请求（消除 check-then-act 竞态）。
+    fn try_acquire_init_slot(&self, now: u64) -> bool {
+        let mut last = self.last_init_attempt.load(Ordering::Relaxed);
+        loop {
+            if now.saturating_sub(last) < INIT_RETRY_COOLDOWN_SECS {
+                return false;
+            }
+            match self.last_init_attempt.compare_exchange_weak(
+                last,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(cur) => last = cur,
+            }
         }
     }
 
@@ -156,7 +198,7 @@ impl HttpMcpClient {
                 .header("X-Agent-Id", &self.agent_id)
                 .header("X-Agent-Key", &self.badge_token)
                 .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
-                .header("Accept", "application/json")
+                .header("Accept", "application/json, text/event-stream")
                 .header("x-trace-id", &trace_id)
                 .send()
                 .await;
@@ -171,11 +213,22 @@ impl HttpMcpClient {
                         }
                         return Err(last_err);
                     }
-                    // HTTP 200 — 解析 JSON-RPC 信封
-                    let data: serde_json::Value = match resp.json().await {
+                    // HTTP 200 — 解析 JSON-RPC 信封（兼容 SSE 与纯 JSON 响应体）
+                    let raw = match resp.text().await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            last_err = format!("read body: {}", e);
+                            if attempt < 2 {
+                                tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
+                                continue;
+                            }
+                            return Err(last_err);
+                        }
+                    };
+                    let data: serde_json::Value = match parse_mcp_response_body(&raw) {
                         Ok(d) => d,
                         Err(e) => {
-                            last_err = format!("json parse: {}", e);
+                            last_err = e;
                             if attempt < 2 {
                                 tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
                                 continue;
@@ -227,14 +280,15 @@ impl HttpMcpClient {
             .header("X-Agent-Id", &self.agent_id)
             .header("X-Agent-Key", &self.badge_token)
             .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
-            .header("Accept", "application/json")
+            .header("Accept", "application/json, text/event-stream")
             .send()
             .await
             .map_err(|e| format!("tools/list: {}", e))?;
-        let data: serde_json::Value = resp
-            .json()
+        let raw = resp
+            .text()
             .await
-            .map_err(|e| format!("tools/list JSON: {}", e))?;
+            .map_err(|e| format!("tools/list read: {}", e))?;
+        let data = parse_mcp_response_body(&raw).map_err(|e| format!("tools/list: {}", e))?;
         Ok(extract_tools(&data))
     }
 
