@@ -253,6 +253,8 @@ pub struct AgentCore {
     in_progress_step_results: Arc<Mutex<HashMap<u32, String>>>,
     /// P1-5: 降级收缩监视器（MCP 源健康 + Kill switch + 模式推导）
     pub degrade: Arc<DegradeMonitor>,
+    /// P1-1: 会话历史摘要缓存（session_id → (已摘要条数, 摘要文本)）——滑动窗口+摘要层
+    history_summary_cache: tokio::sync::Mutex<HashMap<String, (usize, String)>>,
     /// P2-1: 命名空间级配额与成本（tool 轮次 / 日 token 预算 / 并发会话）
     pub quota: Arc<std::sync::Mutex<NsQuotaStore>>,
     /// 白龙马 A3: Focus Stack → Thread 模型 —— 已归档话题（episode）软隐藏索引
@@ -486,6 +488,7 @@ impl AgentCore {
             execution_log: Arc::new(Mutex::new(Vec::new())),
             inbox_cache: tokio::sync::Mutex::new(InboxCache::new()),
             session_manager: SessionManager::new(),
+            history_summary_cache: tokio::sync::Mutex::new(HashMap::new()),
             audit_logger: AuditLogger::new(mcp_for_audit),
             tool_route_cache: tokio::sync::Mutex::new(HashMap::new()),
             namespace_registry: std::sync::Mutex::new(NamespaceRegistry::new()),
@@ -2760,12 +2763,29 @@ impl AgentCore {
                 .await
         };
 
+        // ── P1-2: 会话级主动记忆预热 ──
+        // 新会话首条消息确定性拉用户偏好/硬规则注入 knowledge（不依赖当前消息检索命中，
+        // 堵灾难性遗忘入口：任务初期约束/偏好不再等 LLM 自觉调检索）
+        if history.is_empty() {
+            if let Some(prefs) = self.load_user_prefs_for_session(session_id).await {
+                knowledge.push(prefs);
+            }
+        }
+
         // ── 4. 构建消息列表 ──
         let mut system_prompt = self.build_system_prompt(&knowledge);
         // 白龙马 Phase C: 条件式本地资源门控（仅消息命中 ssh/git/部署 等规则才注入）
         self.inject_resources_if_relevant(&mut system_prompt, message);
         // HY3 1.3：技能库注入（features.skill_library=false 时 skill_registry=None → 不生效）
         self.augment_with_skills(&mut system_prompt, message);
+        // ── P1-1: 滑动窗口+摘要——历史超阈值时旧对话压缩注入 system prompt 后部 ──
+        // 三明治结构：[System Prompt + 会话摘要] + [最近 20 条原文] + [当前输入]
+        if let Some(summary) = self.maybe_history_summary(session_id, &history).await {
+            system_prompt.push_str(&format!(
+                "\n\n## 历史会话摘要（早期对话已压缩，保留目标/约束/状态）\n{}",
+                summary
+            ));
+        }
         let mut messages = Vec::new();
         messages.push(Message {
             role: "system".to_string(),
@@ -3496,6 +3516,154 @@ impl AgentCore {
         match self.llm.chat(&[msg], &[]).await {
             Ok(r) if !r.text.trim().is_empty() => Some(r.text.trim().to_string()),
             _ => None,
+        }
+    }
+
+    /// P1-1: 滑动窗口+摘要——历史超过窗口+阈值时，把窗口外更旧部分增量压缩为会话摘要
+    /// （四要素模板：目标/实体状态/约束/待办），注入 System Prompt 后部。
+    /// 缓存避免每轮全量重算；LLM 失败降级（不注入、不阻断主流程）。
+    async fn maybe_history_summary(&self, session_id: &str, history: &[Message]) -> Option<String> {
+        const WINDOW: usize = 20; // 与 history take(20) 对齐：窗口内保留原文
+        const TRIGGER: usize = 32; // 超过 32 条才触发摘要（窗口 20 + 增量 12）
+        if history.len() <= TRIGGER {
+            return None;
+        }
+        let old_len = history.len() - WINDOW;
+        let mut cache = self.history_summary_cache.lock().await;
+        let cached = cache.get(session_id).cloned();
+        if let Some((upto, text)) = &cached {
+            if *upto >= old_len {
+                return Some(text.clone());
+            }
+        }
+        // 增量转录：只摘上次摘要之后的新增旧历史（截断控制 token 成本）
+        let start = cached.as_ref().map(|(n, _)| *n).unwrap_or(0);
+        let mut transcript = String::new();
+        for m in history.iter().skip(start).take(old_len.saturating_sub(start)) {
+            let line: String = m
+                .content
+                .clone()
+                .unwrap_or_default()
+                .chars()
+                .take(300)
+                .collect();
+            if !line.is_empty() {
+                transcript.push_str(&format!("[{}] {}\n", m.role, line));
+            }
+        }
+        if transcript.trim().is_empty() {
+            return cached.map(|(_, t)| t);
+        }
+        let new_part = self.summarize_history_llm(&transcript).await;
+        let merged = match (cached, new_part) {
+            (Some((_, old)), Some(new)) => Some(format!("{old}\n\n{new}")),
+            (Some((_, old)), None) => Some(old),
+            (None, Some(new)) => Some(new),
+            (None, None) => None,
+        };
+        if let Some(s) = &merged {
+            cache.insert(session_id.to_string(), (old_len, s.clone()));
+        }
+        merged
+    }
+
+    /// P1-1: LLM 四要素结构化摘要（当前目标/关键实体状态/核心约束/待办）
+    async fn summarize_history_llm(&self, transcript: &str) -> Option<String> {
+        let prompt = format!(
+            "你是上下文压缩专家。请将以下 Agent 与用户的历史对话压缩为结构化摘要。\n\
+             【必须保留】用户核心意图、已确认关键实体（人名/项目/参数）、任务进度状态、明确约束（如'不要用X'）。\n\
+             【必须丢弃】寒暄、重复确认、已解决的报错细节、工具返回的原始冗长数据。\n\
+             【输出格式】（严格按此结构）\n\
+             - 当前目标：...\n\
+             - 关键实体与状态：...\n\
+             - 核心约束：...\n\
+             - 已完成步骤：...\n\
+             - 待办/未决问题：...\n\n\
+             【历史对话】\n{}",
+            transcript
+        );
+        let msg = crate::llm::Message {
+            role: "user".to_string(),
+            content: Some(prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        match self.llm.chat(&[msg], &[]).await {
+            Ok(r) if !r.text.trim().is_empty() => Some(r.text.trim().to_string()),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(target: "agent.summary", err = %e, "P1-1 历史摘要 LLM 失败（降级不注入）");
+                None
+            }
+        }
+    }
+
+    /// P1-2: 会话级主动记忆预热——新会话首条消息确定性拉用户偏好/硬规则注入 knowledge，
+    /// 不依赖当前消息检索命中（堵灾难性遗忘入口）。返回格式化偏好文本，无则 None。
+    async fn load_user_prefs_for_session(&self, session_id: &str) -> Option<String> {
+        let ns = self.caller_ns(session_id);
+        let args = serde_json::json!({ "namespace": ns });
+        let resp = self.mcp.call_json("memory_user_prefs", &args).await.ok()?;
+        let arr = resp.get("prefs").and_then(|p| p.as_array())?;
+        if arr.is_empty() {
+            return None;
+        }
+        let mut lines = Vec::new();
+        for p in arr.iter().take(8) {
+            let key = p.get("key").and_then(|k| k.as_str()).unwrap_or("");
+            let value = p.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            let tag = p.get("tag").and_then(|t| t.as_str()).unwrap_or("");
+            if !key.is_empty() && !value.is_empty() {
+                lines.push(format!("- [{}] {}：{}", tag, key, value));
+            }
+        }
+        if lines.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "【用户偏好与硬规则（会话预热，请始终遵守）】\n{}",
+                lines.join("\n")
+            ))
+        }
+    }
+
+    /// P1-3: 失败情境召回——工具名+错误摘要查历史失败教训，命中返回教训文本；
+    /// 检索失败静默降级，不影响主流程（受 max_tool_rounds 轮次上限保护）。
+    async fn recall_failure_lesson(&self, tool: &str, err: &str, allowed_ns: &[String]) -> Option<String> {
+        let err_preview: String = err.chars().take(150).collect();
+        let query = format!("{} 执行失败: {}", tool, err_preview);
+        let ns = allowed_ns
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.config.identity.ns());
+        let args = serde_json::json!({ "query": query, "namespace": ns, "max_results": 3 });
+        let resp = self.mcp.call_json("memory_search_v2", &args).await.ok()?;
+        let arr = resp.get("results").and_then(|r| r.as_array())?;
+        let mut lessons = Vec::new();
+        for item in arr.iter().take(3) {
+            let content = item.get("content").and_then(|c| c.as_str()).unwrap_or("").trim();
+            let category = item.get("category").and_then(|c| c.as_str()).unwrap_or("");
+            let is_lesson = matches!(
+                category,
+                "lesson" | "failure" | "decision" | "constraint" | "preference"
+            ) || content.contains("教训")
+                || content.contains("失败")
+                || content.contains("报错");
+            if is_lesson && !content.is_empty() {
+                lessons.push(format!(
+                    "[{}] {}",
+                    category,
+                    content.chars().take(400).collect::<String>()
+                ));
+                if lessons.len() >= 2 {
+                    break;
+                }
+            }
+        }
+        if lessons.is_empty() {
+            None
+        } else {
+            Some(lessons.join("\n"))
         }
     }
 
@@ -4603,7 +4771,17 @@ impl AgentCore {
                         executed_any = true;
                     text
                 }
-                Err(e) => format!("执行失败: {}", e),
+                Err(e) => {
+                    // P1-3: 失败情境召回——用错误摘要查历史教训，命中追加注入（防重蹈覆辙）
+                    let mut text = format!("执行失败: {}", e);
+                    if let Some(lesson) = self
+                        .recall_failure_lesson(&tc.name, &e, allowed_ns)
+                        .await
+                    {
+                        text.push_str(&format!("\n\n💡 历史教训参考（情境召回）：{}", lesson));
+                    }
+                    text
+                }
             };
 
             // 记录执行日志（供蒸馏）
