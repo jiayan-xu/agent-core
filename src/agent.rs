@@ -2859,7 +2859,7 @@ impl AgentCore {
         // ③ 失败记录 warn 日志（原静默吞错）；④ period 留空由 nl_query 从问题内识别，
         // 配合 is_data_query_intent 过滤 follow-up（「那7月呢」不含数据名词 → 不触发）。
         let mut fast_query_result: Option<String> = None;
-            if is_easy_query {
+        if is_easy_query {
             let fast_intent = Self::classify_intent(message);
             if fast_intent.data_query && !fast_intent.attachment {
                 let args = serde_json::json!({
@@ -2871,18 +2871,25 @@ impl AgentCore {
                     .await
                 {
                     Ok(t) => {
-                        // 结构化成功判定（ocr 修复）：优先 success==true；若返回非严格 JSON
-                        // （MCP 文本化/包装），退化检查 answer 存在且非空——两种都算查询成功
+                        // 结构化成功判定（ocr 修复）：
+                        // - JSON 可解析：success==true 成功；success==false 明确失败；
+                        //   无 success 字段时退化检查 answer 非空（nl_query 老格式）
+                        // - 非 JSON（MCP 文本化）：保守判失败 + warn（可观测），
+                        //   宁回退 LLM 工具循环也不把未知文本当成功数据
                         let ok = match serde_json::from_str::<serde_json::Value>(&t) {
                             Ok(v) => match v.get("success").and_then(|s| s.as_bool()) {
                                 Some(true) => true,
-                                _ => v
+                                Some(false) => false,
+                                None => v
                                     .get("answer")
                                     .and_then(|a| a.as_str())
                                     .map(|s| !s.trim().is_empty())
                                     .unwrap_or(false),
                             },
-                            Err(_) => t.contains("查询结果：") && !t.contains("success\": false"),
+                            Err(_) => {
+                                tracing::warn!(target = "agent.fastpath", "快速通道 nl_query 返回非 JSON，保守回退 LLM 工具循环");
+                                false
+                            }
                         };
                         if ok {
                             fast_query_result = Some(t);
