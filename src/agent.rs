@@ -1092,6 +1092,45 @@ impl AgentCore {
         allowed_ns: &[String],
         external_history: Option<Vec<(String, String)>>,
     ) -> String {
+        self.chat_inner(message, user_id, session_id, allowed_ns, external_history, None)
+            .await
+    }
+
+    /// P2-6：流式聊天——快速通道命中时总结轮走 provider 真流式（首 token 秒出），
+    /// 其余场景完整生成后伪流式推 chunk。返回完整回复文本（历史记录用）。
+    pub async fn chat_stream(
+        &self,
+        message: &str,
+        user_id: &str,
+        session_id: &str,
+        allowed_ns: &[String],
+        external_history: Option<Vec<(String, String)>>,
+        sender: &tokio::sync::mpsc::UnboundedSender<crate::llm::SseEvent>,
+    ) -> Result<String, String> {
+        let full = self
+            .chat_inner(
+                message,
+                user_id,
+                session_id,
+                allowed_ns,
+                external_history,
+                Some(sender),
+            )
+            .await;
+        Ok(full)
+    }
+
+    /// 聊天内部实现：`stream_sender` 为 Some 时（stream 请求），快速通道命中 → 真流式总结；
+    /// 未命中 → llm_loop 完整生成后伪流式推 chunk（保持 SSE 契约）。None 时走原逻辑。
+    async fn chat_inner(
+        &self,
+        message: &str,
+        user_id: &str,
+        session_id: &str,
+        allowed_ns: &[String],
+        external_history: Option<Vec<(String, String)>>,
+        stream_sender: Option<&tokio::sync::mpsc::UnboundedSender<crate::llm::SseEvent>>,
+    ) -> String {
         let confirm_words = [            "确认",
             "确认添加",
             "确认执行",
@@ -1227,6 +1266,7 @@ impl AgentCore {
                     allowed_ns,
                     &trace_id,
                     external_history.clone(),
+                    stream_sender,
                 )
                 .await,
             );
@@ -1385,6 +1425,7 @@ impl AgentCore {
                             allowed_ns,
                             &trace_id,
                             external_history.clone(),
+                            stream_sender,
                         )
                         .await,
                     );
@@ -1412,6 +1453,7 @@ impl AgentCore {
                             allowed_ns,
                             &trace_id,
                             external_history.clone(),
+                            stream_sender,
                         )
                         .await,
                     );
@@ -1438,6 +1480,7 @@ impl AgentCore {
                         allowed_ns,
                         &trace_id,
                         external_history.clone(),
+                        stream_sender,
                     )
                     .await,
                 );
@@ -1470,6 +1513,7 @@ impl AgentCore {
                         allowed_ns,
                         &trace_id,
                         external_history.clone(),
+                        stream_sender,
                     )
                     .await,
                 );
@@ -2499,6 +2543,7 @@ impl AgentCore {
         allowed_ns: &[String],
         trace_id: &str,
         external_history: Option<Vec<(String, String)>>,
+        stream_sender: Option<&tokio::sync::mpsc::UnboundedSender<crate::llm::SseEvent>>,
     ) -> String {
         let engineer_intent = crate::dept_ops::is_engineer_intent(message);
         tracing::info!(
@@ -2949,6 +2994,21 @@ impl AgentCore {
         });
 
         // ── 5. LLM 调用循环（P2-1: 工作记忆收敛进 AgentRunContext）──
+        // P2-6 真流式：快速通道命中 + stream 请求 → 总结轮走 provider 流式（首 token 秒出）。
+        // 数据已注入且明确「禁止再调用工具」，故 tools=[] 纯文本生成；失败降级 llm_loop。
+        if let Some(sender) = stream_sender {
+            if fast_query_result.is_some() {
+                match self.routed_llm.chat_stream(&messages, &[], sender.clone()).await {
+                    Ok(full) => {
+                        self.save_to_history(session_id, message, &full).await;
+                        return full;
+                    }
+                    Err(e) => {
+                        tracing::warn!(err = %e, "P2-6 流式总结失败，降级 llm_loop（伪流式兜底）");
+                    }
+                }
+            }
+        }
         let result = self
             .llm_loop(
                 AgentRunContext {
@@ -2966,6 +3026,20 @@ impl AgentCore {
                 fast_query_result.is_some(),
             )
             .await;
+
+        // P2-6：stream 请求未走真流式（快速通道未命中/流式失败降级）→ 伪流式推 chunk
+        // （完整生成后 3 字/20ms，保持 SSE 契约，首 token 感知改善有限）
+        if let Some(sender) = stream_sender {
+            let chars: Vec<char> = result.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                let end = (i + 3).min(chars.len());
+                let chunk: String = chars[i..end].iter().collect();
+                let _ = sender.send(crate::llm::SseEvent::TextEvt { content: chunk });
+                i = end;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
 
         // 直接返回结果，不再向用户泄露内部执行步骤标记
         result

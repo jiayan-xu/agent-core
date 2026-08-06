@@ -616,12 +616,13 @@ impl RoutedLlm {
 
     /// 注意：此处仅做「难度路由选择 provider」，真·SSE token 流由选中 provider 的
     /// `LlmClient::chat_stream` 完成（RoutedLlm 不重新切片）。对外文档勿写成「RoutedLlm 假流切片」。
+    /// 返回 Ok(完整拼接文本)——流式推 chunk 的同时收集全文（历史记录/降级复用）。
     pub async fn chat_stream(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
         sender: mpsc::UnboundedSender<SseEvent>,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         let d = classify_difficulty(&self.policy, messages).await;
         tracing::info!(difficulty = ?d, "difficulty_route_stream");
         self.select(d).chat_stream(messages, tools, sender).await
@@ -1413,7 +1414,7 @@ impl LlmClient {
         messages: &[Message],
         tools: &[ToolDef],
         sender: mpsc::UnboundedSender<SseEvent>,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         // P2-6: 主 Provider 失败时尝试备用 Provider
         let mut providers: Vec<LlmProvider> = Vec::new();
         providers.push(LlmProvider {
@@ -1438,7 +1439,7 @@ impl LlmClient {
                 .chat_stream_single(base_url, model, api_key, chat_path, messages, tools, &sender)
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(full) => return Ok(full),
                 Err(e) => {
                     if idx == 0 {
                         tracing::warn!("流式主 Provider 失败，尝试 failover: {}", e);
@@ -1470,7 +1471,7 @@ impl LlmClient {
         messages: &[Message],
         tools: &[ToolDef],
         sender: &mpsc::UnboundedSender<SseEvent>,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         let url = format!("{}{}", base_url.trim_end_matches('/'), chat_path);
         tracing::warn!(url = %url, chat_path = %chat_path, "LLM request url (chat_path applied)");
 
@@ -1516,6 +1517,7 @@ impl LlmClient {
 
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
+        let mut full_text = String::new(); // 2026-08-06：真流式同时收集完整文本（历史记录/降级用）
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result.map_err(|e| format!("stream read: {}", e))?;
@@ -1528,7 +1530,7 @@ impl LlmClient {
                 let data = &line[6..];
                 if data == "[DONE]" {
                     let _ = sender.send(SseEvent::DoneEvt);
-                    return Ok(());
+                    return Ok(full_text);
                 }
 
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
@@ -1550,6 +1552,7 @@ impl LlmClient {
                         // text
                         if let Some(tc) = delta.get("content").and_then(|c| c.as_str()) {
                             if !tc.is_empty() {
+                                full_text.push_str(tc);
                                 let _ = sender.send(SseEvent::TextEvt {
                                     content: tc.to_string(),
                                 });
@@ -1578,7 +1581,7 @@ impl LlmClient {
         }
 
         let _ = sender.send(SseEvent::DoneEvt);
-        Ok(())
+        Ok(full_text)
     }
 }
 

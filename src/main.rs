@@ -4259,6 +4259,56 @@ async fn handle_v1_chat(
         c.interrupt();
     }
     let agent_guard = st.agent.lock().await;
+    // PFAiX 强制上下文隔离：每个安装实例 + 每个对话独立 session（提到 if 外，stream 分支共用）。
+    // x-user-tag 是壳首次启动生成的随机 install_id；x-conversation-id 是壳内当前对话 id。
+    let user_tag = headers
+        .get("x-user-tag")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            s.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    let conversation_id = headers
+        .get("x-conversation-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            s.chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    let session_id = format!("jan/{}/{}/{}", ctx.agent_id, user_tag, conversation_id);
+    if session_id.len() > 128
+        || !session_id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '/' || c == '-' || c == '_')
+    {
+        return axum::response::Json(serde_json::json!({
+            "error": "invalid session_id"
+        }))
+        .into_response();
+    }
+    // 折叠 OpenAI messages 提到 if 外（stream 分支需要 user_text/external_history）
+    let pairs: Vec<(String, String)> = req
+        .messages
+        .iter()
+        .filter_map(|m| {
+            m.content
+                .as_ref()
+                .map(|c| (m.role.clone(), c.as_text()))
+        })
+        .collect();
+    let folded = agent_core::v1_compat::fold_v1_messages(&pairs);
+    let user_text = folded.user_message;
+    let external_history = if folded.history.is_empty() {
+        None
+    } else {
+        Some(folded.history)
+    };
     let reply = if let Some(ref agent) = *agent_guard {
         // 输入校验：消息长度限制 32KB，消息数限制 100
         if req.messages.len() > 100 {
@@ -4267,55 +4317,10 @@ async fn handle_v1_chat(
             }))
             .into_response();
         }
-        // PFAiX 强制上下文隔离：每个安装实例 + 每个对话独立 session。
-        // x-user-tag 是壳首次启动生成的随机 install_id；x-conversation-id
-        // 是壳内当前对话 id。两者缺省时向后兼容旧客户端。
-        let user_tag = headers
-            .get("x-user-tag")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| {
-                s.chars()
-                    .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-                    .collect::<String>()
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "default".to_string());
-        let conversation_id = headers
-            .get("x-conversation-id")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| {
-                s.chars()
-                    .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-                    .collect::<String>()
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "default".to_string());
-
-        let session_id = format!("jan/{}/{}/{}", ctx.agent_id, user_tag, conversation_id);
-        if session_id.len() > 128
-            || !session_id
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '/' || c == '-' || c == '_')
-        {
-            return axum::response::Json(serde_json::json!({
-                "error": "invalid session_id"
-            }))
-            .into_response();
-        }
-        // 折叠 OpenAI messages：保留 system（缀到 user），history 仅 user/assistant。
-        // 不再静默丢弃 system（Jan 附件/指令常放 system）。
-        let pairs: Vec<(String, String)> = req
-            .messages
-            .iter()
-            .filter_map(|m| {
-                m.content
-                    .as_ref()
-                    .map(|c| (m.role.clone(), c.as_text()))
-            })
-            .collect();
-        let folded = agent_core::v1_compat::fold_v1_messages(&pairs);
-        let user_text = folded.user_message;
-        if user_text.trim().is_empty() {
+        // P2-6：stream=true 时跳过预生成（reply 由 stream 分支真流式产出，避免重复 LLM 调用）
+        if req.stream.unwrap_or(false) {
+            String::new()
+        } else if user_text.trim().is_empty() {
             "请输入消息".to_string()
         } else {
             if !folded.system_ctx.is_empty() {
@@ -4324,18 +4329,13 @@ async fn handle_v1_chat(
                     "v1_chat: folded client system into user message"
                 );
             }
-            let external_history = if folded.history.is_empty() {
-                None
-            } else {
-                Some(folded.history)
-            };
             agent
                 .chat(
                     &user_text,
                     &ctx.agent_id,
                     &session_id,
                     &ctx.allowed_ns,
-                    external_history,
+                    external_history.clone(),
                 )
                 .await
         }
@@ -4368,21 +4368,66 @@ async fn handle_v1_chat(
                 })
                 .to_string(),
             )));
-            // 内容分块（与 /api/chat/stream 一致的 3 字/20ms 节奏）
-            let chars: Vec<char> = reply.chars().collect();
-            let mut i = 0;
-            while i < chars.len() {
-                let end = (i + 3).min(chars.len());
-                let chunk: String = chars[i..end].iter().collect();
-                let _ = tx.send(Ok(SseEvent::default().data(serde_json::json!({
-                    "id": &id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": &model,
-                    "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": null}]
-                }).to_string())));
-                i = end;
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            // P2-6 真流式：快速通道命中 → provider 流式逐 chunk（首 token 秒出）；
+            // 未命中/失败 → agent.chat_stream 内部降级伪流式（完整生成后分块推）。
+            let agent = {
+                let g = st.agent.lock().await;
+                g.as_ref().map(|a| a.clone())
+            };
+            if let Some(agent) = agent {
+                // llm 事件 → chat.completion.chunk 格式的转发层
+                let (tx_llm, mut rx_llm): (
+                    tokio::sync::mpsc::UnboundedSender<agent_core::llm::SseEvent>,
+                    tokio::sync::mpsc::UnboundedReceiver<agent_core::llm::SseEvent>,
+                ) = tokio::sync::mpsc::unbounded_channel();
+                let tx_fwd = tx.clone();
+                let fwd_id = id.clone(); // id/model 已被外层 async move 捕获，转发 task 用 clone
+                let fwd_model = model.clone();
+                tokio::spawn(async move {
+                    while let Some(ev) = rx_llm.recv().await {
+                        let out: Option<String> = match ev {
+                            agent_core::llm::SseEvent::TextEvt { content } => Some(
+                                serde_json::json!({
+                                    "id": &fwd_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": &fwd_model,
+                                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": null}]
+                                })
+                                .to_string(),
+                            ),
+                            agent_core::llm::SseEvent::ThinkingEvt { content } => Some(
+                                serde_json::json!({
+                                    "id": &fwd_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": &fwd_model,
+                                    "choices": [{"index": 0, "delta": {"reasoning_content": content}, "finish_reason": null}]
+                                })
+                                .to_string(),
+                            ),
+                            agent_core::llm::SseEvent::DoneEvt | agent_core::llm::SseEvent::ErrorEvt { .. } => None,
+                            _ => None,
+                        };
+                        if let Some(data) = out {
+                            let _ = tx_fwd.send(Ok(SseEvent::default().data(data)));
+                        }
+                    }
+                });
+                let _ = agent
+                    .chat_stream(&user_text, &ctx.agent_id, &session_id, &ctx.allowed_ns, external_history.clone(), &tx_llm)
+                    .await;
+            } else {
+                let _ = tx.send(Ok(SseEvent::default().data(
+                    serde_json::json!({
+                        "id": &id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": &model,
+                        "choices": [{"index": 0, "delta": {"content": "Agent 未就绪"}, "finish_reason": null}]
+                    })
+                    .to_string(),
+                )));
             }
             // finish_reason
             let _ = tx.send(Ok(SseEvent::default().data(
