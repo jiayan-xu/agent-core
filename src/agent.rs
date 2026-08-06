@@ -2161,17 +2161,26 @@ impl AgentCore {
         if !starts_with_digit || !answer.contains("进厂") || !answer.contains("车次") {
             return None;
         }
-        // 复杂维度校验（防截胡）
+        // 复杂维度校验（防截胡）：
+        // 「占比/比例」是答案格式词（不是维度词），单独检查——占比类问题 answer 必须含「占比」；
+        // 非工作类维度词（下班/夜间/周末/节假日…）→ answer 必须含统一标识「非工作」
+        // （query_skill 非工作类 answer 模板固定含此词，等效证明该维度被真处理）。
         let nonwork_asked = [
-            "非工作", "下班", "夜间", "凌晨", "周末", "节假日", "假期", "加班", "占比", "比例",
+            "非工作", "下班", "夜间", "凌晨", "周末", "节假日", "假期", "加班",
         ]
         .iter()
         .any(|w| question.contains(w));
-        if nonwork_asked && (!answer.contains("非工作") || !answer.contains("占比")) {
+        if nonwork_asked && !answer.contains("非工作") {
             return None;
         }
+        let ratio_asked = ["占比", "比例"].iter().any(|w| question.contains(w));
+        if ratio_asked && !answer.contains("占比") {
+            return None;
+        }
+        // 需多轮推理/多实体维度 → 一律回退 llm_loop（不冒险直答）。
+        // 「最多/最少」有歧义（「一天最多能进厂几车」是容量问法非排名），不拦截。
         let multi_dim_asked = [
-            "对比", "分别", "排名", "排行", "每天", "每日", "按日", "趋势", "最多", "最少",
+            "对比", "分别", "排名", "排行", "每天", "每日", "按日", "趋势",
         ]
         .iter()
         .any(|w| question.contains(w));
@@ -9106,6 +9115,8 @@ mod whitelist_preroute_tests {
         assert!(AgentCore::extract_final_answer(tmpl, "对比一下天越和利合7月").is_none());
         assert!(AgentCore::extract_final_answer(tmpl, "天越7月每天进厂趋势").is_none());
         assert!(AgentCore::extract_final_answer(tmpl, "7月哪些公司排名前5").is_none());
+        // 「最多/最少」歧义（容量问法非排名）→ 不拦截
+        assert!(AgentCore::extract_final_answer(tmpl, "一天最多能进厂几车").is_some());
         // 简单问法不受影响
         assert!(AgentCore::extract_final_answer(tmpl, "7月天越进厂多少车").is_some());
     }
