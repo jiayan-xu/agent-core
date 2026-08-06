@@ -1517,7 +1517,10 @@ impl LlmClient {
 
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
-        let mut full_text = String::new(); // 2026-08-06：真流式同时收集完整文本（历史记录/降级用）
+        // 2026-08-06：真流式同时收集完整文本（历史记录/降级用）。
+        // 注：仅累积 delta.content（与 TextEvt 一致）；reasoning_content 经 ThinkingEvt
+        // 单独推送、不进历史（历史记录只需最终回答），tool_calls 参数增量同理。
+        let mut full_text = String::new();
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result.map_err(|e| format!("stream read: {}", e))?;

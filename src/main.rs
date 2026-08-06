@@ -4368,6 +4368,31 @@ async fn handle_v1_chat(
                 })
                 .to_string(),
             )));
+            // 空消息校验（与非 stream 路径一致，防空消息跑完整 agent 管线）
+            if user_text.trim().is_empty() {
+                let _ = tx.send(Ok(SseEvent::default().data(
+                    serde_json::json!({
+                        "id": &id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": &model,
+                        "choices": [{"index": 0, "delta": {"content": "请输入消息"}, "finish_reason": null}]
+                    })
+                    .to_string(),
+                )));
+                let _ = tx.send(Ok(SseEvent::default().data(
+                    serde_json::json!({
+                        "id": &id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": &model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    })
+                    .to_string(),
+                )));
+                let _ = tx.send(Ok(SseEvent::default().data("[DONE]")));
+                return;
+            }
             // P2-6 真流式：快速通道命中 → provider 流式逐 chunk（首 token 秒出）；
             // 未命中/失败 → agent.chat_stream 内部降级伪流式（完整生成后分块推）。
             let agent = {
@@ -4383,7 +4408,9 @@ async fn handle_v1_chat(
                 let tx_fwd = tx.clone();
                 let fwd_id = id.clone(); // id/model 已被外层 async move 捕获，转发 task 用 clone
                 let fwd_model = model.clone();
-                tokio::spawn(async move {
+                // 转发 task：llm 事件 → chat.completion.chunk；ErrorEvt 转发为 finish_reason:error
+                let fwd = tokio::spawn(async move {
+                    let mut errored = false;
                     while let Some(ev) = rx_llm.recv().await {
                         let out: Option<String> = match ev {
                             agent_core::llm::SseEvent::TextEvt { content } => Some(
@@ -4406,17 +4433,46 @@ async fn handle_v1_chat(
                                 })
                                 .to_string(),
                             ),
-                            agent_core::llm::SseEvent::DoneEvt | agent_core::llm::SseEvent::ErrorEvt { .. } => None,
-                            _ => None,
+                            agent_core::llm::SseEvent::ErrorEvt { message } => {
+                                errored = true;
+                                Some(
+                                    serde_json::json!({
+                                        "id": &fwd_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": &fwd_model,
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                                        "error": message,
+                                    })
+                                    .to_string(),
+                                )
+                            }
+                            agent_core::llm::SseEvent::DoneEvt | _ => None,
                         };
                         if let Some(data) = out {
                             let _ = tx_fwd.send(Ok(SseEvent::default().data(data)));
                         }
                     }
+                    errored
                 });
                 let _ = agent
                     .chat_stream(&user_text, &ctx.agent_id, &session_id, &ctx.allowed_ns, external_history.clone(), &tx_llm)
                     .await;
+                // 关闭 tx_llm 并等待转发 task flush 完（防 finish 截断最后内容）
+                drop(tx_llm);
+                let stream_errored = fwd.await.unwrap_or(false);
+                // finish_reason：流式出错用 "error"，否则 "stop"
+                let finish = if stream_errored { "error" } else { "stop" };
+                let _ = tx.send(Ok(SseEvent::default().data(
+                    serde_json::json!({
+                        "id": &id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": &model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]
+                    })
+                    .to_string(),
+                )));
             } else {
                 let _ = tx.send(Ok(SseEvent::default().data(
                     serde_json::json!({
@@ -4429,17 +4485,6 @@ async fn handle_v1_chat(
                     .to_string(),
                 )));
             }
-            // finish_reason
-            let _ = tx.send(Ok(SseEvent::default().data(
-                serde_json::json!({
-                    "id": &id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": &model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-                })
-                .to_string(),
-            )));
             // [DONE]
             let _ = tx.send(Ok(SseEvent::default().data("[DONE]")));
         });
