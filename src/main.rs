@@ -4468,18 +4468,18 @@ async fn handle_v1_chat(
                 // pushed: Option<usize>（None=未知）；已推与否 = pushed.map_or(true, |p| p>0)
                 let pushed_any = pushed.map_or(true, |p| p > 0);
                 if stream_errored && pushed_any {
-                    // 中途失败（已推部分内容）：项目自有协议发 error 事件（可区分失败/成功，
-                    // 不注入内部错误原文）+ 标准内容提示不完整 + done
+                    // 中途失败（已推部分内容）：error 事件（可区分失败/成功；中性措辞覆盖
+                    // 认证/限流/连接/内部异常等所有来源）+ 内容提示不完整 + stop
                     let _ = tx.send(Ok(SseEvent::default()
                         .event("error")
-                        .data("连接中断，本次回复可能不完整")));
+                        .data("流式响应异常，本次回复可能不完整")));
                     let _ = tx.send(Ok(SseEvent::default().data(
                         serde_json::json!({
                             "id": &id,
                             "object": "chat.completion.chunk",
                             "created": created,
                             "model": &model,
-                            "choices": [{"index": 0, "delta": {"content": "\n\n⚠️ 以上内容可能不完整：连接中断。请重试。"}, "finish_reason": null}]
+                            "choices": [{"index": 0, "delta": {"content": "\n\n⚠️ 流式响应异常，本次回复可能不完整。请重试。"}, "finish_reason": null}]
                         })
                         .to_string(),
                     )));
@@ -4495,8 +4495,7 @@ async fn handle_v1_chat(
                     )));
                 } else if !pushed_any {
                     // 未推任何内容（首包失败/流式未命中/正常 fallback）→ 伪流式补推 llm_loop
-                    // 的完整结果（真实降级答案，诚实呈现——即使 full 是错误文本也如实展示，
-                    // 不伪装、不丢弃）；此前若收到 ErrorEvt，错误细节已记日志，不外泄给用户
+                    // 的完整结果（真实降级答案，诚实呈现——即使 full 是错误文本也如实展示）
                     let mut chars = full.chars();
                     loop {
                         let mut chunk = String::new();
@@ -4521,6 +4520,12 @@ async fn handle_v1_chat(
                             break; // 客户端断开立即退出
                         }
                         tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    // 首包失败：补推内容后标注降级（error 事件，可区分、不伪装成功）
+                    if stream_errored {
+                        let _ = tx.send(Ok(SseEvent::default()
+                            .event("error")
+                            .data("流式响应异常，已切换普通模式返回。")));
                     }
                     let _ = tx.send(Ok(SseEvent::default().data(
                         serde_json::json!({
