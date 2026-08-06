@@ -2187,13 +2187,12 @@ impl AgentCore {
             return None;
         }
         // 「最多/最少」歧义（2026-08-06 ocr 意见）：排名意图（「哪家进厂最多」）须拦截
-        // 防截胡成单公司汇总；容量问法（「一天最多能进厂几车」「每日最多」）放行——
-        // 仅当问句含容量短语（一天/每日/每天/一次/最多能/最多可/最少需要/最少能）才视为容量问法。
+        // 防截胡成单公司汇总；容量问法放行——仅当「最多/最少」与明确容量动词连用
+        // （最多能/最多可/最少需要/最少能），如「一天最多能进厂几车」。单独「一天/一次」
+        // 只是时间/次数词（「哪家公司一天进厂最多」仍是排名意图），不作为容量判据。
         if question.contains("最多") || question.contains("最少") {
-            let capacity_phrases = [
-                "一天", "每日", "每天", "一次", "最多能", "最多可", "最少需要", "最少能",
-            ];
-            let is_capacity = capacity_phrases.iter().any(|w| question.contains(w));
+            let capacity_verbs = ["最多能", "最多可", "最少需要", "最少能"];
+            let is_capacity = capacity_verbs.iter().any(|w| question.contains(w));
             if !is_capacity {
                 return None;
             }
