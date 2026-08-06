@@ -1,7 +1,7 @@
 # agent-core CI 门禁通过操作手册
 
 > 给 reasonix（或任何操作 agent-core 的 agent/同事）的实操说明。
-> 适用仓库：GitHub `jiayan-xu/agent-core`（本地工作副本见 AGENTS.md 的 canonical 目录说明）
+> 适用仓库：`C:\Users\user\agent-core`（GitHub: `jiayan-xu/agent-core`）
 > 更新日期：2026-08-06
 
 ---
@@ -25,7 +25,7 @@
 ## P0 提交前必做（每次 commit 之前）
 
 ```bash
-cd <仓库根目录>
+cd C:/Users/user/agent-core
 
 # 1. 编译 + 单测（必须全绿）
 cargo check
