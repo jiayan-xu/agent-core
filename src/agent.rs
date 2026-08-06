@@ -9000,6 +9000,12 @@ mod whitelist_preroute_tests {
         assert!(AgentCore::is_data_query_intent("查询7月的进厂记录"));
         assert!(AgentCore::is_data_query_intent("对比一下这两份文件的差异"));
         assert!(AgentCore::is_data_query_intent("帮我查询一下固废入库重量"));
+        // 2026-08-06：口语数量问法（回归：7月利合进了几车 此前漏词走 llm_loop）
+        assert!(AgentCore::is_data_query_intent("7月利合进了几车"));
+        assert!(AgentCore::is_data_query_intent("进了几吨"));
+        assert!(AgentCore::is_data_query_intent("昨天进了多少车"));
+        assert!(AgentCore::is_data_query_intent("天越这个月几辆"));
+        assert!(AgentCore::is_data_query_intent("7月农林垃圾几批次"));
         // 非数据意图：闲聊/确认/空泛 → 不得命中
         assert!(!AgentCore::is_data_query_intent("你好"));
         assert!(!AgentCore::is_data_query_intent("谢谢"));
