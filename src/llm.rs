@@ -1272,7 +1272,11 @@ impl LlmClient {
         tracing::info!("llm.complete start");
         // 2026-08-05 慢查询诊断：记录请求体总字符数（system+历史+工具 schema）
         let msgs_chars: usize = messages.iter().map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0) + 80).sum();
-        let tools_chars: usize = tools.iter().map(|t| serde_json::to_string(t).unwrap_or_default().len()).sum();
+        // 轻量估算：工具 schema 体积 ≈ 名称+描述字符数 + 固定开销，避免每请求全量序列化（ocr low 意见）
+        let tools_chars: usize = tools
+            .iter()
+            .map(|t| t.function.name.len() + t.function.description.len() + 256)
+            .sum();
         tracing::info!(target = "agent.llm", msgs_chars, tools_chars, total_chars = msgs_chars + tools_chars, "llm request size");
 
         for (idx, p) in providers.iter().enumerate() {
@@ -1284,7 +1288,8 @@ impl LlmClient {
             let mut body = serde_json::json!({
                 "model": model,
                 "messages": messages,
-                "max_tokens": self.config.max_tokens,                "temperature": self.config.temperature,
+                "max_tokens": self.config.max_tokens,
+                "temperature": self.config.temperature,
             });
 
             if !tools.is_empty() {
