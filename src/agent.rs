@@ -2138,13 +2138,26 @@ impl AgentCore {
 
     /// 2026-08-06：快速通道直答——从 nl_query 返回 JSON 提取可直接作为最终回答的 answer。
     /// query_skill 模板生成的 answer 是自然语言事实（如「2026年7月，天越进厂 239 车次，总重
-    /// 5687.98 吨。」）；含「查询结果：」内部标记（旧格式/非模板路径）说明不是最终答案，
-    /// 返回 None 让调用方回退 LLM 总结。answer 为空也回退。
+    /// 5687.98 吨。」）。严格判别（防泄漏非模板内容给用户/历史）：
+    /// - 缺失/空 answer → None；含「查询结果：」内部标记（旧格式）→ None；
+    /// - 不以数字开头或不含「进厂/车次/吨」模板特征 → None（非模板路径，回退 LLM 总结）。
     fn extract_final_answer(raw: &str) -> Option<String> {
         let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-        let answer = v.get("answer")?.as_str()?;
-        let answer = answer.trim();
+        let answer = v.get("answer")?.as_str()?.trim();
         if answer.is_empty() || answer.starts_with("查询结果：") {
+            return None;
+        }
+        // 只认 query_skill 聚合快路径的模板句特征：数字开头 + 进厂 + 车次 + 吨
+        let starts_with_digit = answer
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false);
+        if !starts_with_digit
+            || !answer.contains("进厂")
+            || !answer.contains("车次")
+            || !answer.contains("吨")
+        {
             return None;
         }
         Some(answer.to_string())
@@ -9040,6 +9053,29 @@ mod whitelist_preroute_tests {
         assert!(!AgentCore::is_data_query_intent("今天天气怎么样"));
         assert!(!AgentCore::is_data_query_intent("统计一下"));
         assert!(!AgentCore::is_data_query_intent("好的，就按这个方案执行"));
+    }
+
+    #[test]
+    fn extract_final_answer_gating() {
+        // 模板 answer（数字开头 + 进厂/车次/吨）→ 直答可用
+        let tmpl = r#"{"success":true,"answer":"2026年7月，天越进厂 239 车次，总重 5687.98 吨。"}"#;
+        assert_eq!(
+            AgentCore::extract_final_answer(tmpl).as_deref(),
+            Some("2026年7月，天越进厂 239 车次，总重 5687.98 吨。")
+        );
+        // 旧格式「查询结果：」内部标记 → 回退 LLM
+        let old = r#"{"success":true,"answer":"查询结果：车次 = 239，总重 = 5687.98 吨（2026-07，公司含「天越」）。"}"#;
+        assert!(AgentCore::extract_final_answer(old).is_none());
+        // 空 answer / 缺 answer 字段 → 回退
+        assert!(AgentCore::extract_final_answer(r#"{"success":true,"answer":""}"#).is_none());
+        assert!(AgentCore::extract_final_answer(r#"{"success":true}"#).is_none());
+        // 非模板自由文本（不以数字开头/缺关键特征）→ 回退，防泄漏内部内容
+        assert!(AgentCore::extract_final_answer(
+            r#"{"success":true,"answer":"车次 = 239 吨 = 5687.98 吨（来自日志转储）"}"#
+        )
+        .is_none());
+        // 非 JSON → 回退
+        assert!(AgentCore::extract_final_answer("not json").is_none());
     }
 
     #[test]
