@@ -2161,6 +2161,26 @@ impl AgentCore {
         if !starts_with_digit || !answer.contains("进厂") || !answer.contains("车次") {
             return None;
         }
+        // 2026-08-06 P0：长文本分析型提问不直答（规则引擎无法解析长分析提示词——
+        // 曾把「…2月份为22.6%…我需要7月的数据」误判成「2月天越」）。多公司/排除公司同回退。
+        const ANALYSIS_TEXT_CAP: usize = 80;
+        if question.chars().count() > ANALYSIS_TEXT_CAP {
+            return None;
+        }
+        let company_names = [
+            "天越", "利合", "克劳丽", "世索科", "佳士能", "华衍", "苏再投", "东升", "雷博尔",
+            "苏新", "金源", "理文",
+        ];
+        let comp_hits = company_names.iter().filter(|cn| question.contains(**cn)).count();
+        if comp_hits >= 2 {
+            return None;
+        }
+        let exclude_asked = ["去除", "排除", "不含", "剔除", "去掉", "除去"]
+            .iter()
+            .any(|w| question.contains(w));
+        if exclude_asked && comp_hits >= 1 {
+            return None;
+        }
         // 复杂维度校验（防截胡）：
         // 「占比/比例」是答案格式词（不是维度词），单独检查——占比类问题 answer 必须含「占比」；
         // 非工作类维度词（下班/夜间/周末/节假日…）→ answer 必须含统一标识「非工作」
@@ -9137,6 +9157,13 @@ mod whitelist_preroute_tests {
         assert!(AgentCore::extract_final_answer(tmpl, "每日最多进厂多少车").is_none());
         // 简单问法不受影响
         assert!(AgentCore::extract_final_answer(tmpl, "7月天越进厂多少车").is_some());
+        // 2026-08-06 P0：长文本分析型提问 → 不直答（防误判成单公司单月）
+        let long_analysis = "非工作时间入厂车辆占比较高，本月非工作时间（16:30后及08:30前）去除周末及节假日同时去除克劳丽公司，占全月总车次的24.1%，2月份为22.6%…这些是6月的固废数据，我需要7月的数据，帮我统计出来";
+        assert!(AgentCore::extract_final_answer(tmpl, long_analysis).is_none());
+        // 排除公司问法 → 不直答
+        assert!(AgentCore::extract_final_answer(tmpl, "7月去除克劳丽后进厂多少车").is_none());
+        // 多公司（≥2）→ 不直答
+        assert!(AgentCore::extract_final_answer(tmpl, "天越和利合7月分别进了多少车").is_none());
     }
 
     #[test]
