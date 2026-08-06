@@ -2147,7 +2147,7 @@ impl AgentCore {
             return true;
         }
         const QUERY_VERBS: &[&str] = &[
-            "查询", "统计", "算", "多少", "对比", "分析", "汇总", "帮我看", "分别",
+            "查询", "统计", "计算", "算一下", "多少", "对比", "分析", "汇总", "帮我看", "分别",
         ];
         message.chars().count() > Self::ANALYSIS_TEXT_CAP
             && QUERY_VERBS.iter().any(|v| message.contains(v))
@@ -3083,7 +3083,7 @@ impl AgentCore {
             format!(
                 "{}
 
-[系统已完成数据查询（nl_query 实时执行）。请直接基于下方数据作答{}{}
+[系统已完成数据查询（nl_query 实时执行）。请直接基于下方数据作答{}
 
 输出格式要求（必须严格遵守，违反即为不合格回答）：
 1. 首句必须严格按模板输出（数字从下方数据中准确抄录，禁止改动/漏位）：「X年X月，[公司简称]进厂 X 车次，总重 X 吨」
@@ -3105,7 +3105,7 @@ impl AgentCore {
                 } else {
                     "（预取数据可能不完整：如需对比其他月份/按日/其他公司等补充维度，可继续调用 nl_query 等查询工具）"
                 },
-                "", fence, qr_capped, fence
+                fence, qr_capped, fence
             )
         } else {
             enriched_message
