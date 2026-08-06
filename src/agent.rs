@@ -2153,6 +2153,47 @@ impl AgentCore {
             && QUERY_VERBS.iter().any(|v| message.contains(v))
     }
 
+    /// 2026-08-06：确定性表格渲染——解析 nl_query 返回 JSON 的 columns/rows，rows≥2 生成
+    /// Markdown 表格（绕开 LLM 风格：deepseek-flash 列表惯性极强，prompt 手段实测全无效）。
+    /// 数字直接来自数据库（LLM 零抄录）。行数上限 50 防撑爆 prompt；列/行结构不匹配跳过。
+    fn render_rows_table(raw: &str) -> Option<String> {
+        let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+        let columns: Vec<String> = v
+            .get("columns")?
+            .as_array()?
+            .iter()
+            .filter_map(|c| c.as_str())
+            .map(|s| s.to_string())
+            .collect();
+        let rows = v.get("rows")?.as_array()?;
+        if columns.is_empty() || rows.len() < 2 {
+            return None;
+        }
+        let mut out = format!("| {} |\n", columns.join(" | "));
+        out.push_str(&format!(
+            "|{}|\n",
+            columns.iter().map(|_| "---").collect::<Vec<_>>().join(" | ")
+        ));
+        for row in rows.iter().take(50) {
+            let Some(arr) = row.as_array() else { continue };
+            let cells: Vec<String> = arr
+                .iter()
+                .map(|c| match c {
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => c.to_string(),
+                })
+                .collect();
+            if cells.len() >= columns.len() {
+                out.push_str(&format!(
+                    "| {} |\n",
+                    cells.iter().take(columns.len()).cloned().collect::<Vec<_>>().join(" | ")
+                ));
+            }
+        }
+        Some(out)
+    }
+
     /// 2026-08-06：快速通道直答——从 nl_query 返回 JSON 提取可直接作为最终回答的 answer。
     /// query_skill 模板生成的 answer 是自然语言事实（如「2026年7月，天越进厂 239 车次，总重
     /// 5687.98 吨。」）。严格判别（防泄漏非模板内容给用户/历史）：
@@ -3080,6 +3121,22 @@ impl AgentCore {
                     s.replace(&fence, "[…]")
                 }
             };
+            // 2026-08-06：确定性表格渲染——分析型（非 Easy）且 nl_query 返回 rows≥2 时，
+            // agent 直接渲染 Markdown 表格注入数据块（绕开 LLM 列表惯性），LLM 必须原样保留。
+            let table_section = if !is_easy_query {
+                Self::render_rows_table(qr).map(|t| {
+                    format!(
+                        "\n\n【数据表格】以下表格由系统从查询结果渲染，是最终数据呈现。回答时必须**原样保留**该表格块（禁止改写为列表或段落，表格内数字不得改动），可在表格前后补充说明：\n{}",
+                        t
+                    )
+                })
+            } else {
+                None
+            };
+            let injected = match &table_section {
+                Some(t) => format!("{}{}", qr_capped, t),
+                None => qr_capped,
+            };
             format!(
                 "{}
 
@@ -3105,13 +3162,13 @@ impl AgentCore {
                 } else {
                     "（预取数据可能不完整：如需对比其他月份/按日/其他公司等补充维度，可继续调用 nl_query 等查询工具）"
                 },
-                // 第 4 条按场景区分：Easy 单条结论禁一切 Markdown；分析型多行数据允许数据表格
+                // 第 4 条按场景区分：Easy 单条结论禁一切 Markdown；分析型保留系统渲染表格
                 if is_easy_query {
                     "4. 禁止使用任何 Markdown 格式（表格、代码块、加粗、列表符号），用纯文本自然语言"
                 } else {
-                    "4. 多行数据（≥2 行）可用简单 Markdown 表格呈现（| 表头 | 数据行 |），数字与数据一致；禁止无关表格、代码块、整段 Markdown 渲染"
+                    "4. 数据块中系统渲染的【数据表格】必须原样保留（禁止改写为列表/段落）；未提供表格时禁止自造 Markdown 表格/代码块"
                 },
-                fence, qr_capped, fence
+                fence, injected, fence
             )
         } else {
             enriched_message
@@ -7878,13 +7935,7 @@ impl AgentCore {
 - 🔴【对普通人的语言】所有回复一律用自然中文，禁止把工具返回的 JSON、代码块、XML 等原样输出给用户（工具原始输出是给你看的，不是给用户看的）
 - 🔴【结论先行】先一句话给答案（如"苏EBS569 今天进厂 3 次，共 89.6 吨"），再按需补充细节；数据为空就说"没有查到相关记录"并简述可能原因
 - 🔴【查询回答格式】基于查询结果作答时：首句直接给结论（如"7月天越进厂 239 车次，总重 5687.98 吨"），数字必须准确；只回答用户所问的对象（公司/车辆/种类），不得擅自扩大汇总
-- 🔴【数据表格】多行查询结果（排名、种类分布、多公司对比、按日趋势等 ≥2 行数据）**必须**用简单 Markdown 表格呈现（| 表头 | 数据行 |），数字必须与查询结果一致；但禁止：①与查询结果无关的自由发挥表格 ②整段 Markdown 渲染/代码块 ③单条结论（1 行数据）用一句话，不用表格。示例（排名场景必须照此格式）：
-```
-| 排名 | 公司 | 车次 |
-|---|---|---|
-| 1 | 天越 | 239 |
-| 2 | 理文造纸 | 172 |
-```
+- 🔴【数据表格】若数据中已含系统渲染的 Markdown 表格（【数据表格】标记），回答时必须**原样保留**该表格块（禁止改写为列表或段落，表格内数字不得改动），可在表格前后补充说明；未提供表格时禁止自造 Markdown 表格/代码块（2026-08-07：表格由系统确定性渲染，LLM 不再负责造表格）
 
         ## 工具使用
         你可用的工具由系统按当前身份和命名空间动态提供，完整的真实工具名与描述见对话中
@@ -9155,6 +9206,26 @@ mod whitelist_preroute_tests {
         assert!(!AgentCore::is_data_query_intent("今天天气怎么样"));
         assert!(!AgentCore::is_data_query_intent("统计一下"));
         assert!(!AgentCore::is_data_query_intent("好的，就按这个方案执行"));
+    }
+
+    #[test]
+    fn render_rows_table_gating() {
+        // rows≥2 → Markdown 表格（列头 + 分隔 + 数据行）
+        let json = r#"{"success":true,"columns":["公司","车次"],"rows":[["天越",239],["利合",73]]}"#;
+        let t = AgentCore::render_rows_table(json).expect("应渲染表格");
+        assert!(t.contains("| 公司 | 车次 |"));
+        assert!(t.contains("| 天越 | 239 |"));
+        assert!(t.contains("| 利合 | 73 |"));
+        // rows<2 → None（单行走一句话）
+        let single = r#"{"success":true,"columns":["公司","车次"],"rows":[["天越",239]]}"#;
+        assert!(AgentCore::render_rows_table(single).is_none());
+        // 缺 columns/rows / 非 JSON → None
+        assert!(AgentCore::render_rows_table(r#"{"success":true}"#).is_none());
+        assert!(AgentCore::render_rows_table("not json").is_none());
+        // 单元格数字/字符串混合
+        let mixed = r#"{"success":true,"columns":["对象","总车次","占比"],"rows":[["全厂",683,24.9],["天越",239,38.5]]}"#;
+        let m = AgentCore::render_rows_table(mixed).expect("应渲染表格");
+        assert!(m.contains("| 全厂 | 683 | 24.9 |"));
     }
 
     #[test]
