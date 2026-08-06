@@ -4408,22 +4408,26 @@ async fn handle_v1_chat(
                 let tx_fwd = tx.clone();
                 let fwd_id = id.clone(); // id/model 已被外层 async move 捕获，转发 task 用 clone
                 let fwd_model = model.clone();
-                // 转发 task：llm 事件 → chat.completion.chunk；ErrorEvt 转发 error 字段
-                // （终态 finish_reason 由下方统一发送，避免双终结 chunk）
+                // 转发 task：llm 事件 → chat.completion.chunk；ErrorEvt 转发 error 字段；
+                // 统计已推送的 TextEvt 数（pushed==0 时下方补推全文，防中途失败重复）
                 let fwd = tokio::spawn(async move {
                     let mut errored = false;
+                    let mut pushed = 0usize;
                     while let Some(ev) = rx_llm.recv().await {
                         let out: Option<String> = match ev {
-                            agent_core::llm::SseEvent::TextEvt { content } => Some(
-                                serde_json::json!({
-                                    "id": &fwd_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": &fwd_model,
-                                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": null}]
-                                })
-                                .to_string(),
-                            ),
+                            agent_core::llm::SseEvent::TextEvt { content } => {
+                                pushed += 1;
+                                Some(
+                                    serde_json::json!({
+                                        "id": &fwd_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": &fwd_model,
+                                        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": null}]
+                                    })
+                                    .to_string(),
+                                )
+                            }
                             agent_core::llm::SseEvent::ThinkingEvt { content } => Some(
                                 serde_json::json!({
                                     "id": &fwd_id,
@@ -4454,23 +4458,56 @@ async fn handle_v1_chat(
                             let _ = tx_fwd.send(Ok(SseEvent::default().data(data)));
                         }
                     }
-                    errored
+                    (errored, pushed)
                 });
-                let _ = agent
+                let full = agent
                     .chat_stream(&user_text, &ctx.agent_id, &session_id, &ctx.allowed_ns, external_history.clone(), &tx_llm)
                     .await;
                 // 关闭 tx_llm 并等待转发 task flush 完（防 finish 截断最后内容）
                 drop(tx_llm);
-                // JoinError（转发 task panic/abort）→ 记为错误，客户端收到 finish_reason:"error"
-                let stream_errored = match fwd.await {
-                    Ok(errored) => errored,
+                let (stream_errored, pushed) = match fwd.await {
+                    Ok(r) => r,
                     Err(je) => {
                         tracing::warn!(err = %je, "SSE 转发 task 异常结束");
-                        true
+                        (true, 0)
                     }
                 };
-                // 终态 finish_reason（流式出错用 "error"，否则 "stop"）——唯一终结 chunk
-                let finish = if stream_errored { "error" } else { "stop" };
+                // pushed==0：未推任何内容（真流式首包失败/快速通道未命中/Agent 未就绪外）→
+                // 伪流式推完整回复（3 字/20ms），保证客户端总有答案；pushed>0 不推（防中途失败重复）。
+                if pushed == 0 {
+                    let mut chars = full.chars();
+                    loop {
+                        let mut chunk = String::new();
+                        for _ in 0..3 {
+                            match chars.next() {
+                                Some(c) => chunk.push(c),
+                                None => break,
+                            }
+                        }
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        let data = serde_json::json!({
+                            "id": &id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": &model,
+                            "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": null}]
+                        })
+                        .to_string();
+                        if tx.send(Ok(SseEvent::default().data(data))).is_err() {
+                            break; // 客户端断开立即退出
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+                // 终态 finish_reason（唯一终结 chunk）：未推内容补推全文 → stop（内容完整）；
+                // 已推部分但出错 → error；其余 stop
+                let finish = if stream_errored && pushed > 0 {
+                    "error"
+                } else {
+                    "stop"
+                };
                 let _ = tx.send(Ok(SseEvent::default().data(
                     serde_json::json!({
                         "id": &id,

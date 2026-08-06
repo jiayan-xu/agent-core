@@ -2994,8 +2994,9 @@ impl AgentCore {
 
         // ── 5. LLM 调用循环（P2-1: 工作记忆收敛进 AgentRunContext）──
         // P2-6 真流式：快速通道命中 + stream 请求 → 总结轮走 provider 流式（首 token 秒出）。
-        // 数据已注入且明确「禁止再调用工具」，故 tools=[] 纯文本生成；失败降级 llm_loop，
-        // 降级后下方伪流式推全文（保证客户端总能拿到完整答案——首包失败/中途失败都覆盖）。
+        // 数据已注入且明确「禁止再调用工具」，故 tools=[] 纯文本生成。
+        // 失败/未命中 → llm_loop 完整生成并返回；**伪流式推送由 main.rs 统一负责**
+        // （main.rs 按「已推 chunk 数」决定是否补推全文：pushed==0 才推，防中途失败重复）。
         if let Some(sender) = stream_sender {
             if fast_query_result.is_some() {
                 match self.routed_llm.chat_stream(&messages, &[], sender.clone()).await {
@@ -3004,7 +3005,7 @@ impl AgentCore {
                         return full;
                     }
                     Err(e) => {
-                        tracing::warn!(err = %e, "P2-6 流式总结失败，降级 llm_loop（伪流式推全文）");
+                        tracing::warn!(err = %e, "P2-6 流式总结失败，降级 llm_loop（main.rs 决定是否补推）");
                     }
                 }
             }
@@ -3026,32 +3027,6 @@ impl AgentCore {
                 fast_query_result.is_some(),
             )
             .await;
-
-        // P2-6：stream 请求未走真流式（快速通道未命中/流式失败降级）→ 伪流式推 chunk
-        // （完整生成后 3 字/20ms，保持 SSE 契约；保证客户端有完整内容）
-        if let Some(sender) = stream_sender {
-            let mut chars = result.chars();
-            loop {
-                let mut chunk = String::new();
-                for _ in 0..3 {
-                    match chars.next() {
-                        Some(c) => chunk.push(c),
-                        None => break,
-                    }
-                }
-                if chunk.is_empty() {
-                    break;
-                }
-                // 客户端断开（receiver dropped）→ send 失败立即退出，不再 sleep+空转
-                if sender
-                    .send(crate::llm::SseEvent::TextEvt { content: chunk })
-                    .is_err()
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        }
 
         // 直接返回结果，不再向用户泄露内部执行步骤标记
         result
