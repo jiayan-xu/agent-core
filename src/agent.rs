@@ -2146,6 +2146,11 @@ impl AgentCore {
     ///     （证明 query_skill 真的处理了该维度），否则 None——避免「非工作时间占比」被月度汇总截胡；
     ///   · 问句含「对比/分别/排名/排行/每天/每日/按日/趋势」等需多轮推理维度 → 一律 None
     ///     （回退 llm_loop 完整工具循环，不冒险直答）。
+    /// 公司简称表：与 dashboard skills/query_skill.py _COMPANY_SHORT_NAMES 对齐（单一来源，加公司须同步两边）。
+    const COMPANY_SHORT_NAMES: &[&str] = &[
+        "天越", "利合", "克劳丽", "世索科", "佳士能", "华衍", "苏再投", "东升", "雷博尔", "苏新",
+        "金源", "理文",
+    ];
     fn extract_final_answer(raw: &str, question: &str) -> Option<String> {
         let v: serde_json::Value = serde_json::from_str(raw).ok()?;
         let answer = v.get("answer")?.as_str()?.trim();
@@ -2167,10 +2172,7 @@ impl AgentCore {
         if question.chars().count() > ANALYSIS_TEXT_CAP {
             return None;
         }
-        let company_names = [
-            "天越", "利合", "克劳丽", "世索科", "佳士能", "华衍", "苏再投", "东升", "雷博尔",
-            "苏新", "金源", "理文",
-        ];
+        let company_names = Self::COMPANY_SHORT_NAMES;
         let comp_hits = company_names.iter().filter(|cn| question.contains(**cn)).count();
         if comp_hits >= 2 {
             return None;
@@ -9160,10 +9162,13 @@ mod whitelist_preroute_tests {
         // 2026-08-06 P0：长文本分析型提问 → 不直答（防误判成单公司单月）
         let long_analysis = "非工作时间入厂车辆占比较高，本月非工作时间（16:30后及08:30前）去除周末及节假日同时去除克劳丽公司，占全月总车次的24.1%，2月份为22.6%…这些是6月的固废数据，我需要7月的数据，帮我统计出来";
         assert!(AgentCore::extract_final_answer(tmpl, long_analysis).is_none());
+        // 隔离验证长度门禁：>80 字但不含任何公司名/排除词/维度词（仅靠长度触发）
+        let long_no_company = "请帮我分析一下这个月所有车辆进厂的详细情况，按照时间分布、重量分布、频率分布等多个维度进行全面的统计和对比，我需要一份完整的分析报告来说明整体的运营状况和趋势变化，请给出详细的结论和建议";
+        assert!(AgentCore::extract_final_answer(tmpl, long_no_company).is_none());
+        // 隔离验证多公司门禁：两公司但不含 对比/分别/排名/趋势 等维度词
+        assert!(AgentCore::extract_final_answer(tmpl, "天越利合7月进厂多少车").is_none());
         // 排除公司问法 → 不直答
         assert!(AgentCore::extract_final_answer(tmpl, "7月去除克劳丽后进厂多少车").is_none());
-        // 多公司（≥2）→ 不直答
-        assert!(AgentCore::extract_final_answer(tmpl, "天越和利合7月分别进了多少车").is_none());
     }
 
     #[test]
