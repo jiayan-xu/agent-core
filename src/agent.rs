@@ -2994,9 +2994,8 @@ impl AgentCore {
 
         // ── 5. LLM 调用循环（P2-1: 工作记忆收敛进 AgentRunContext）──
         // P2-6 真流式：快速通道命中 + stream 请求 → 总结轮走 provider 流式（首 token 秒出）。
-        // 数据已注入且明确「禁止再调用工具」，故 tools=[] 纯文本生成；失败降级 llm_loop。
-        // ⚠️ 流式失败时可能已向 sender 推过部分 chunk——降级后不得再推伪流式（防重复内容）。
-        let mut stream_failed = false;
+        // 数据已注入且明确「禁止再调用工具」，故 tools=[] 纯文本生成；失败降级 llm_loop，
+        // 降级后下方伪流式推全文（保证客户端总能拿到完整答案——首包失败/中途失败都覆盖）。
         if let Some(sender) = stream_sender {
             if fast_query_result.is_some() {
                 match self.routed_llm.chat_stream(&messages, &[], sender.clone()).await {
@@ -3005,8 +3004,7 @@ impl AgentCore {
                         return full;
                     }
                     Err(e) => {
-                        stream_failed = true;
-                        tracing::warn!(err = %e, "P2-6 流式总结失败，降级 llm_loop（不再推流，防重复）");
+                        tracing::warn!(err = %e, "P2-6 流式总结失败，降级 llm_loop（伪流式推全文）");
                     }
                 }
             }
@@ -3029,28 +3027,29 @@ impl AgentCore {
             )
             .await;
 
-        // P2-6：stream 请求未走真流式（快速通道未命中）→ 伪流式推 chunk
-        // （完整生成后 3 字/20ms，保持 SSE 契约；流式失败降级场景不推，防重复）
+        // P2-6：stream 请求未走真流式（快速通道未命中/流式失败降级）→ 伪流式推 chunk
+        // （完整生成后 3 字/20ms，保持 SSE 契约；保证客户端有完整内容）
         if let Some(sender) = stream_sender {
-            if !stream_failed {
-                let mut chars = result.chars().peekable(); // 不物化整个 reply
-                loop {
-                    let mut chunk = String::new();
-                    for _ in 0..3 {
-                        match chars.next() {
-                            Some(c) => chunk.push(c),
-                            None => break,
-                        }
+            let mut chars = result.chars();
+            loop {
+                let mut chunk = String::new();
+                for _ in 0..3 {
+                    match chars.next() {
+                        Some(c) => chunk.push(c),
+                        None => break,
                     }
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    // 客户端断开（receiver dropped）→ send 失败立即退出，不再 sleep+空转
-                    if sender.send(crate::llm::SseEvent::TextEvt { content: chunk }).is_err() {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
+                if chunk.is_empty() {
+                    break;
+                }
+                // 客户端断开（receiver dropped）→ send 失败立即退出，不再 sleep+空转
+                if sender
+                    .send(crate::llm::SseEvent::TextEvt { content: chunk })
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         }
 

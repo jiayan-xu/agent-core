@@ -4408,7 +4408,8 @@ async fn handle_v1_chat(
                 let tx_fwd = tx.clone();
                 let fwd_id = id.clone(); // id/model 已被外层 async move 捕获，转发 task 用 clone
                 let fwd_model = model.clone();
-                // 转发 task：llm 事件 → chat.completion.chunk；ErrorEvt 转发为 finish_reason:error
+                // 转发 task：llm 事件 → chat.completion.chunk；ErrorEvt 转发 error 字段
+                // （终态 finish_reason 由下方统一发送，避免双终结 chunk）
                 let fwd = tokio::spawn(async move {
                     let mut errored = false;
                     while let Some(ev) = rx_llm.recv().await {
@@ -4441,7 +4442,7 @@ async fn handle_v1_chat(
                                         "object": "chat.completion.chunk",
                                         "created": created,
                                         "model": &fwd_model,
-                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
                                         "error": message,
                                     })
                                     .to_string(),
@@ -4460,8 +4461,15 @@ async fn handle_v1_chat(
                     .await;
                 // 关闭 tx_llm 并等待转发 task flush 完（防 finish 截断最后内容）
                 drop(tx_llm);
-                let stream_errored = fwd.await.unwrap_or(false);
-                // finish_reason：流式出错用 "error"，否则 "stop"
+                // JoinError（转发 task panic/abort）→ 记为错误，客户端收到 finish_reason:"error"
+                let stream_errored = match fwd.await {
+                    Ok(errored) => errored,
+                    Err(je) => {
+                        tracing::warn!(err = %je, "SSE 转发 task 异常结束");
+                        true
+                    }
+                };
+                // 终态 finish_reason（流式出错用 "error"，否则 "stop"）——唯一终结 chunk
                 let finish = if stream_errored { "error" } else { "stop" };
                 let _ = tx.send(Ok(SseEvent::default().data(
                     serde_json::json!({
@@ -4481,6 +4489,17 @@ async fn handle_v1_chat(
                         "created": created,
                         "model": &model,
                         "choices": [{"index": 0, "delta": {"content": "Agent 未就绪"}, "finish_reason": null}]
+                    })
+                    .to_string(),
+                )));
+                // Agent 未就绪分支也发终态 finish_reason（客户端依赖 finish 终结）
+                let _ = tx.send(Ok(SseEvent::default().data(
+                    serde_json::json!({
+                        "id": &id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": &model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                     })
                     .to_string(),
                 )));
