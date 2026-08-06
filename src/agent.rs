@@ -2873,7 +2873,8 @@ impl AgentCore {
                     Ok(t) => {
                         // 结构化成功判定（ocr 修复）：
                         // - JSON 可解析：success==true 成功；success==false 明确失败；
-                        //   无 success 字段时退化检查 answer 以「查询结果：」开头（nl_query 老格式）
+                        //   无 success 字段时退化检查 answer 以「查询结果：」开头——防御性兼容
+                        //   （nl_query 正常路径始终返回 success 字段，此分支仅防老格式/代理改写）
                         // - 非 JSON（MCP 文本化）：保守判失败 + warn（可观测），
                         //   宁回退 LLM 工具循环也不把未知文本当成功数据
                         let ok = match serde_json::from_str::<serde_json::Value>(&t) {
@@ -2917,7 +2918,7 @@ impl AgentCore {
                 Some(suffix) if !suffix.is_empty() => format!("FAST_QUERY_DATA_{}", suffix),
                 _ => format!("FAST_QUERY_DATA_{:08x}", trace_id.len()),
             };
-            // 数据不含 fence 时直接 move 原串（零拷贝）；含才替换清洗
+            // 数据不含 fence 时仅一次 clone（qr 是引用无法 move，避免无条件 replace 的二次分配）
             let qr_sanitized: String = if qr.contains(&fence) {
                 qr.replace(&fence, "[…]")
             } else {
