@@ -2136,6 +2136,20 @@ impl AgentCore {
         has_noun || (has_verb && message.chars().count() >= 6)
     }
 
+    /// 2026-08-06：快速通道直答——从 nl_query 返回 JSON 提取可直接作为最终回答的 answer。
+    /// query_skill 模板生成的 answer 是自然语言事实（如「2026年7月，天越进厂 239 车次，总重
+    /// 5687.98 吨。」）；含「查询结果：」内部标记（旧格式/非模板路径）说明不是最终答案，
+    /// 返回 None 让调用方回退 LLM 总结。answer 为空也回退。
+    fn extract_final_answer(raw: &str) -> Option<String> {
+        let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+        let answer = v.get("answer")?.as_str()?;
+        let answer = answer.trim();
+        if answer.is_empty() || answer.starts_with("查询结果：") {
+            return None;
+        }
+        Some(answer.to_string())
+    }
+
     /// P1 guardrail：输入级硬拦截（OpenAI Agents SDK 输入 guardrail 语义，确定性规则）。
     /// 返回 `Some(拒绝文案)` = 拦截；`None` = 放行。在 LLM 之前直接拒绝（省一次 LLM 调用）。
     /// 两类高危输入：
@@ -3002,6 +3016,18 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         });
+
+        // ── 4.6 快速通道直接作答（2026-08-06）：nl_query 返回的 answer 已是最终事实文本
+        // （query_skill 生成的自然语言模板，数字来自数据库——零 LLM 抄录错误，且无 Markdown/
+        // 内部细节/跑题）。answer 不含「查询结果：」内部标记 = 模板直答可用 → 直接返回，
+        // 跳过 LLM 总结：更快（省一次 LLM 调用）+ 100% 数字准确。stream 场景由 main.rs
+        // pushed==0 伪流式补推全文（30 字内 200ms 推完，感知无差别）。
+        if let Some(qr) = &fast_query_result {
+            if let Some(answer) = Self::extract_final_answer(qr) {
+                self.save_to_history(session_id, message, &answer).await;
+                return answer;
+            }
+        }
 
         // ── 5. LLM 调用循环（P2-1: 工作记忆收敛进 AgentRunContext）──
         // P2-6 真流式：快速通道命中 + stream 请求 → 总结轮走 provider 流式（首 token 秒出）。
