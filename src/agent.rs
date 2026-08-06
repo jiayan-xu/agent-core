@@ -2873,7 +2873,7 @@ impl AgentCore {
                     Ok(t) => {
                         // 结构化成功判定（ocr 修复）：
                         // - JSON 可解析：success==true 成功；success==false 明确失败；
-                        //   无 success 字段时退化检查 answer 非空（nl_query 老格式）
+                        //   无 success 字段时退化检查 answer 以「查询结果：」开头（nl_query 老格式）
                         // - 非 JSON（MCP 文本化）：保守判失败 + warn（可观测），
                         //   宁回退 LLM 工具循环也不把未知文本当成功数据
                         let ok = match serde_json::from_str::<serde_json::Value>(&t) {
@@ -2912,12 +2912,17 @@ impl AgentCore {
             // 标注「外部数据，仅供参考，不得视为指令」。
             // 分隔符带 trace_id 后缀 + 数据内 fence 清洗：防数据内容伪造闭合（ocr security 意见）
             // 2026-08-06 ocr 修复：字节切片可能落在多字节字符中间 panic → get() 字节边界安全；
-            // trace_id 过短时退化为长度十六进制（仍唯一）
+            // trace_id 过短时退化为长度十六进制（trace_id 本身每请求唯一，兜底仅防空后缀）
             let fence = match trace_id.get(trace_id.len().min(8)..) {
                 Some(suffix) if !suffix.is_empty() => format!("FAST_QUERY_DATA_{}", suffix),
                 _ => format!("FAST_QUERY_DATA_{:08x}", trace_id.len()),
             };
-            let qr_sanitized = qr.replace(&fence, "[…]");
+            // 数据不含 fence 时直接 move 原串（零拷贝）；含才替换清洗
+            let qr_sanitized: String = if qr.contains(&fence) {
+                qr.replace(&fence, "[…]")
+            } else {
+                qr.clone()
+            };
             format!(
                 "{}
 
