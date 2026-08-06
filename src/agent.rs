@@ -2907,7 +2907,8 @@ impl AgentCore {
             // 真正的安全边界是工具白名单 + 受控写审批 + 只读查询，数据本身来自受信业务库。
             let fence = match trace_id.get(trace_id.len().min(8)..) {
                 Some(suffix) if !suffix.is_empty() => format!("FAST_QUERY_DATA_{}", suffix),
-                _ => format!("FAST_QUERY_DATA_{:08x}", trace_id.len()),
+                // 极端兜底：直接用整个 trace_id（每请求唯一，比长度十六进制更抗碰撞）
+                _ => format!("FAST_QUERY_DATA_{}", trace_id),
             };
             // fence 清洗：直接 replace（单次遍历；fence 含随机后缀，数据命中概率≈0，
             // 未命中时 replace 等价一次克隆——预检查反而多一次扫描）
