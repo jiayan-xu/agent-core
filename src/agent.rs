@@ -2217,6 +2217,17 @@ impl AgentCore {
         if answer.is_empty() || answer.starts_with("查询结果：") {
             return None;
         }
+        // 2026-08-07：多行数据确定性表格直答——nl_query 返回 rows≥2 时 agent 渲染 Markdown
+        // 表格，绕开 LLM 列表惯性（deepseek-flash 会把注入表格重写为列表，prompt 强化实测
+        // 4 轮无效：允许/必须/few-shot/强保留指令全失败）。**先于模板特征检查**（主路径
+        // answer 可能非模板格式）。answer 已含表格（分析型路径）→ 直接返回；否则 answer
+        // 说明 + agent 渲染表格。单行数据（rows<2）不受影响走原逻辑。
+        if let Some(table_md) = Self::render_rows_table(raw) {
+            if answer.contains("| ") {
+                return Some(answer.to_string());
+            }
+            return Some(format!("{}\n\n{}", answer, table_md));
+        }
         // 只认 query_skill 模板句特征：数字开头 + 进厂 + 车次
         let starts_with_digit = answer
             .chars()
@@ -9273,6 +9284,17 @@ mod whitelist_preroute_tests {
         assert!(AgentCore::extract_final_answer(tmpl, "每日最多进厂多少车").is_none());
         // 简单问法不受影响
         assert!(AgentCore::extract_final_answer(tmpl, "7月天越进厂多少车").is_some());
+        // 2026-08-07 多行数据确定性表格直答：rows≥2 → agent 渲染表格直答（绕开 LLM 列表惯性）
+        let multi = r#"{"success":true,"columns":["公司","车次"],"rows":[["天越",239],["利合",73]],"answer":"按公司统计 2 项。"}"#;
+        let m = AgentCore::extract_final_answer(multi, "7月哪些公司进厂最多排前5").expect("多行应直答表格");
+        assert!(m.contains("| 公司 | 车次 |") && m.contains("| 天越 | 239 |"), "{}", m);
+        // 分析型 answer 已含表格 → 原样返回
+        let analytic = r#"{"success":true,"columns":["对象","总车次"],"rows":[["全厂",683],["天越",239]],"answer":"2026年7月非工作时间统计：\n| 对象 | 总车次 |\n|---|---|\n| 全厂 | 683 |\n（口径：8:30前/16:30后）"}"#;
+        let a = AgentCore::extract_final_answer(analytic, "非工作时间入厂车辆占比较高…我需要7月的数据").expect("分析型应直答");
+        assert!(a.contains("| 全厂 | 683 |") && a.contains("口径"), "{}", a);
+        // 单行（rows<2）→ 不触发表格直答，走原逻辑
+        let single_multi = r#"{"success":true,"columns":["公司","车次"],"rows":[["天越",239]],"answer":"2026年7月，天越进厂 239 车次。"}"#;
+        assert!(AgentCore::extract_final_answer(single_multi, "7月天越进厂多少车").is_some());
         // 2026-08-06 P0：长文本分析型提问 → 不直答（防误判成单公司单月）
         let long_analysis = "非工作时间入厂车辆占比较高，本月非工作时间（16:30后及08:30前）去除周末及节假日同时去除克劳丽公司，占全月总车次的24.1%，2月份为22.6%…这些是6月的固废数据，我需要7月的数据，帮我统计出来";
         assert!(AgentCore::extract_final_answer(tmpl, long_analysis).is_none());
