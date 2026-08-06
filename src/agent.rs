@@ -2136,6 +2136,19 @@ impl AgentCore {
         has_noun || (has_verb && message.chars().count() >= 6)
     }
 
+    /// 2026-08-06：分析型查询识别——长文本/非工作占比类问法即使难度分类非 Easy 也做 nl_query
+    /// 预取（数据注入首轮，减少 llm_loop 轮数：137s → 预计大幅下降）。预取后 extract_final_answer
+    /// 门禁（长文本/多公司/排除词 → None）仍拦截直答，保证走 LLM 完整理解。
+    fn is_analysis_query(message: &str) -> bool {
+        const ANALYSIS_WORDS: &[&str] = &[
+            "非工作", "占比", "比例", "下班", "夜间", "凌晨", "周末", "节假日", "假期", "加班",
+        ];
+        if ANALYSIS_WORDS.iter().any(|w| message.contains(w)) {
+            return true;
+        }
+        message.chars().count() > 80 && Self::is_data_query_intent(message)
+    }
+
     /// 2026-08-06：快速通道直答——从 nl_query 返回 JSON 提取可直接作为最终回答的 answer。
     /// query_skill 模板生成的 answer 是自然语言事实（如「2026年7月，天越进厂 239 车次，总重
     /// 5687.98 吨。」）。严格判别（防泄漏非模板内容给用户/历史）：
@@ -2992,7 +3005,9 @@ impl AgentCore {
         // ③ 失败记录 warn 日志（原静默吞错）；④ period 留空由 nl_query 从问题内识别，
         // 配合 is_data_query_intent 过滤 follow-up（「那7月呢」不含数据名词 → 不触发）。
         let mut fast_query_result: Option<String> = None;
-        if is_easy_query {
+        // 2026-08-06：分析型问法（非工作占比类/长文本数据查询）即使难度分类非 Easy 也预取
+        // ——数据注入首轮减少 llm_loop 轮数；直答门禁（长文本/多公司/排除词）仍拦截，保 LLM 理解
+        if is_easy_query || Self::is_analysis_query(message) {
             let fast_intent = Self::classify_intent(message);
             if fast_intent.data_query && !fast_intent.attachment {
                 let args = serde_json::json!({
