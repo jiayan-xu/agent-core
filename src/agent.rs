@@ -9130,6 +9130,9 @@ mod whitelist_preroute_tests {
         assert!(AgentCore::extract_final_answer(tmpl, "一次最多能进厂几车").is_some());
         assert!(AgentCore::extract_final_answer(tmpl, "哪家公司进厂最多").is_none());
         assert!(AgentCore::extract_final_answer(tmpl, "天越进厂是不是最多").is_none());
+        // 时间/次数词不构成容量判据（回归：防止误加回导致排名问题被截胡）
+        assert!(AgentCore::extract_final_answer(tmpl, "哪家公司一天进厂最多").is_none());
+        assert!(AgentCore::extract_final_answer(tmpl, "一天最多进厂几车").is_none());
         // 「每日最多」含趋势维度词「每日」→ 拦截走 llm_loop（保守）
         assert!(AgentCore::extract_final_answer(tmpl, "每日最多进厂多少车").is_none());
         // 简单问法不受影响
