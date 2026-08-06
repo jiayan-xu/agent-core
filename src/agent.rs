@@ -2871,22 +2871,11 @@ impl AgentCore {
                     .await
                 {
                     Ok(t) => {
-                        // 结构化成功判定（ocr 修复）：
-                        // - JSON 可解析：success==true 成功；success==false 明确失败；
-                        //   无 success 字段时退化检查 answer 以「查询结果：」开头——防御性兼容
-                        //   （nl_query 正常路径始终返回 success 字段，此分支仅防老格式/代理改写）
-                        // - 非 JSON（MCP 文本化）：保守判失败 + warn（可观测），
-                        //   宁回退 LLM 工具循环也不把未知文本当成功数据
+                        // 结构化成功判定（ocr 修复，七轮）：只认 success==true 为成功——
+                        // success==false、缺 success 字段、非 JSON 一律保守失败回退 LLM 工具循环。
+                        // nl_query 正常路径始终返回 success 字段；缺失即视为未知/异常，不猜成功。
                         let ok = match serde_json::from_str::<serde_json::Value>(&t) {
-                            Ok(v) => match v.get("success").and_then(|s| s.as_bool()) {
-                                Some(true) => true,
-                                Some(false) => false,
-                                None => v
-                                    .get("answer")
-                                    .and_then(|a| a.as_str())
-                                    .map(|s| s.trim_start().starts_with("查询结果："))
-                                    .unwrap_or(false),
-                            },
+                            Ok(v) => v.get("success").and_then(|s| s.as_bool()).unwrap_or(false),
                             Err(e) => {
                                 tracing::warn!(target = "agent.fastpath", err = %e, "快速通道 nl_query 返回非 JSON，保守回退 LLM 工具循环");
                                 false
@@ -2918,12 +2907,9 @@ impl AgentCore {
                 Some(suffix) if !suffix.is_empty() => format!("FAST_QUERY_DATA_{}", suffix),
                 _ => format!("FAST_QUERY_DATA_{:08x}", trace_id.len()),
             };
-            // 数据不含 fence 时仅一次 clone（qr 是引用无法 move，避免无条件 replace 的二次分配）
-            let qr_sanitized: String = if qr.contains(&fence) {
-                qr.replace(&fence, "[…]")
-            } else {
-                qr.clone()
-            };
+            // fence 清洗：直接 replace（单次遍历；fence 含随机后缀，数据命中概率≈0，
+            // 未命中时 replace 等价一次克隆——预检查反而多一次扫描）
+            let qr_sanitized: String = qr.replace(&fence, "[…]");
             format!(
                 "{}
 
