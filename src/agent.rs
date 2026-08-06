@@ -2178,7 +2178,6 @@ impl AgentCore {
             return None;
         }
         // 需多轮推理/多实体维度 → 一律回退 llm_loop（不冒险直答）。
-        // 「最多/最少」有歧义（「一天最多能进厂几车」是容量问法非排名），不拦截。
         let multi_dim_asked = [
             "对比", "分别", "排名", "排行", "每天", "每日", "按日", "趋势",
         ]
@@ -2186,6 +2185,18 @@ impl AgentCore {
         .any(|w| question.contains(w));
         if multi_dim_asked {
             return None;
+        }
+        // 「最多/最少」歧义（2026-08-06 ocr 意见）：排名意图（「哪家进厂最多」）须拦截
+        // 防截胡成单公司汇总；容量问法（「一天最多能进厂几车」「每日最多」）放行——
+        // 仅当问句含容量短语（一天/每日/每天/一次/最多能/最多可/最少需要/最少能）才视为容量问法。
+        if question.contains("最多") || question.contains("最少") {
+            let capacity_phrases = [
+                "一天", "每日", "每天", "一次", "最多能", "最多可", "最少需要", "最少能",
+            ];
+            let is_capacity = capacity_phrases.iter().any(|w| question.contains(w));
+            if !is_capacity {
+                return None;
+            }
         }
         Some(answer.to_string())
     }
@@ -9115,8 +9126,13 @@ mod whitelist_preroute_tests {
         assert!(AgentCore::extract_final_answer(tmpl, "对比一下天越和利合7月").is_none());
         assert!(AgentCore::extract_final_answer(tmpl, "天越7月每天进厂趋势").is_none());
         assert!(AgentCore::extract_final_answer(tmpl, "7月哪些公司排名前5").is_none());
-        // 「最多/最少」歧义（容量问法非排名）→ 不拦截
+        // 「最多/最少」歧义（容量问法放行 / 排名意图拦截）
         assert!(AgentCore::extract_final_answer(tmpl, "一天最多能进厂几车").is_some());
+        assert!(AgentCore::extract_final_answer(tmpl, "一次最多能进厂几车").is_some());
+        assert!(AgentCore::extract_final_answer(tmpl, "哪家公司进厂最多").is_none());
+        assert!(AgentCore::extract_final_answer(tmpl, "天越进厂是不是最多").is_none());
+        // 「每日最多」含趋势维度词「每日」→ 拦截走 llm_loop（保守）
+        assert!(AgentCore::extract_final_answer(tmpl, "每日最多进厂多少车").is_none());
         // 简单问法不受影响
         assert!(AgentCore::extract_final_answer(tmpl, "7月天越进厂多少车").is_some());
     }
