@@ -44,7 +44,7 @@ pub struct LlmProvider {
 
 /// LlmConfig 缺省 max_tokens（供 serde(default) 使用，避免用户删字段导致解析失败）
 fn default_max_tokens() -> u32 {
-    4096
+    8192
 }
 
 /// LlmConfig 缺省 chat_path
@@ -79,7 +79,7 @@ impl Default for LlmConfig {
             model: "deepseek-v4-flash".to_string(),
             api_key: String::new(),
             chat_path: "/v1/chat/completions".to_string(),
-            max_tokens: 4096,
+            max_tokens: 8192,
             temperature: 0.0,
             fallbacks: Vec::new(),
             difficulty: DifficultyPolicy::default(),
@@ -153,7 +153,7 @@ impl LlmConfig {
             model: p.model.clone(),
             api_key: p.api_key.clone(),
             chat_path: p.chat_path.clone(),
-            max_tokens: 4096,
+            max_tokens: 8192,
             temperature: 0.0,
             fallbacks: Vec::new(),
             difficulty: DifficultyPolicy::default(),
