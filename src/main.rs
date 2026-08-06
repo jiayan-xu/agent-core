@@ -4412,7 +4412,7 @@ async fn handle_v1_chat(
                 // （延迟到主流程决定：补推全文时混推 error 会语义混乱）；统计已推 TextEvt 数。
                 let fwd = tokio::spawn(async move {
                     let mut errored = false;
-                    let mut pushed = 0usize;
+                    let mut pushed: usize = 0;
                     let mut err_msg: Option<String> = None;
                     while let Some(ev) = rx_llm.recv().await {
                         let out: Option<String> = match ev {
@@ -4450,7 +4450,7 @@ async fn handle_v1_chat(
                             let _ = tx_fwd.send(Ok(SseEvent::default().data(data)));
                         }
                     }
-                    (errored, pushed, err_msg)
+                    (errored, Some(pushed), err_msg)
                 });
                 let full = agent
                     .chat_stream(&user_text, &ctx.agent_id, &session_id, &ctx.allowed_ns, external_history.clone(), &tx_llm)
@@ -4460,14 +4460,41 @@ async fn handle_v1_chat(
                 let (stream_errored, pushed, err_msg) = match fwd.await {
                     Ok(r) => r,
                     Err(je) => {
-                        // 转发 task panic/abort：无法得知已推数量，保守视为「已推」（不补推防重复）
+                        // 转发 task panic/abort：pushed 未知（None）→ 保守视为已推（不补推防重复）
                         tracing::warn!(err = %je, "SSE 转发 task 异常结束");
-                        (true, usize::MAX, None)
+                        (true, None, Some("SSE 转发任务异常".to_string()))
                     }
                 };
-                // pushed==0：未推任何内容（首包失败/未命中/正常 fallback）→ 伪流式补推全文，
-                // 保证客户端总有完整答案；此时不推 error（内容完整，finish 用 stop）。
-                if pushed == 0 {
+                // pushed: Option<usize>（None=未知）；已推与否 = pushed.map_or(true, |p| p>0)
+                let pushed_any = pushed.map_or(true, |p| p > 0);
+                if stream_errored {
+                    // 流式失败（认证/限流/连接中断）：不伪装成功——以标准格式输出错误提示内容
+                    // （delta.content + finish:stop，OpenAI 兼容，客户端无需改协议）
+                    let msg = err_msg.unwrap_or_else(|| "流式连接失败".to_string());
+                    let prefix = if pushed_any { "\n\n" } else { "" };
+                    let _ = tx.send(Ok(SseEvent::default().data(
+                        serde_json::json!({
+                            "id": &id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": &model,
+                            "choices": [{"index": 0, "delta": {"content": format!("{}⚠️ 流式连接中断：{}。以上内容可能不完整，请重试。", prefix, msg)}, "finish_reason": null}]
+                        })
+                        .to_string(),
+                    )));
+                    let _ = tx.send(Ok(SseEvent::default().data(
+                        serde_json::json!({
+                            "id": &id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": &model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                        })
+                        .to_string(),
+                    )));
+                } else if !pushed_any {
+                    // 未推任何内容且无错误（快速通道未命中/正常 fallback）→ 伪流式补推全文，
+                    // 保证客户端总有完整答案。
                     let mut chars = full.chars();
                     loop {
                         let mut chunk = String::new();
@@ -4500,31 +4527,6 @@ async fn handle_v1_chat(
                             "created": created,
                             "model": &model,
                             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-                        })
-                        .to_string(),
-                    )));
-                } else if stream_errored {
-                    // 已推部分内容且中途出错：转发 error + finish:error（用户看到部分 + 明确错误，可重试）
-                    if let Some(msg) = err_msg {
-                        let _ = tx.send(Ok(SseEvent::default().data(
-                            serde_json::json!({
-                                "id": &id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": &model,
-                                "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
-                                "error": msg,
-                            })
-                            .to_string(),
-                        )));
-                    }
-                    let _ = tx.send(Ok(SseEvent::default().data(
-                        serde_json::json!({
-                            "id": &id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": &model,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}]
                         })
                         .to_string(),
                     )));
