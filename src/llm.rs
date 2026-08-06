@@ -1272,10 +1272,16 @@ impl LlmClient {
         tracing::info!("llm.complete start");
         // 2026-08-05 慢查询诊断：记录请求体总字符数（system+历史+工具 schema）
         let msgs_chars: usize = messages.iter().map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0) + 80).sum();
-        // 轻量估算：工具 schema 体积 ≈ 名称+描述字符数 + 固定开销，避免每请求全量序列化（ocr low 意见）
+        // 轻量估算（ocr 修复）：名称+描述+参数 schema（parameters 是 JSON-schema 主体，
+        // 用 to_string 近似体积；查询类工具参数通常 <500 字符，避免全量序列化）
         let tools_chars: usize = tools
             .iter()
-            .map(|t| t.function.name.len() + t.function.description.len() + 256)
+            .map(|t| {
+                t.function.name.len()
+                    + t.function.description.len()
+                    + t.function.parameters.to_string().len()
+                    + 128
+            })
             .sum();
         tracing::info!(target = "agent.llm", msgs_chars, tools_chars, total_chars = msgs_chars + tools_chars, "llm request size");
 
