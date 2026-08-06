@@ -2140,24 +2140,42 @@ impl AgentCore {
     /// query_skill 模板生成的 answer 是自然语言事实（如「2026年7月，天越进厂 239 车次，总重
     /// 5687.98 吨。」）。严格判别（防泄漏非模板内容给用户/历史）：
     /// - 缺失/空 answer → None；含「查询结果：」内部标记（旧格式）→ None；
-    /// - 不以数字开头或不含「进厂/车次/吨」模板特征 → None（非模板路径，回退 LLM 总结）。
-    fn extract_final_answer(raw: &str) -> Option<String> {
+    /// - 不以数字开头或不含「进厂/车次」模板特征 → None（非模板路径，回退 LLM 总结）；
+    /// - 复杂维度问法（2026-08-06 防截胡）：
+    ///   · 问句含「非工作/下班/夜间/周末/节假日/占比/比例」→ answer 必须含「非工作」+「占比」
+    ///     （证明 query_skill 真的处理了该维度），否则 None——避免「非工作时间占比」被月度汇总截胡；
+    ///   · 问句含「对比/分别/排名/排行/每天/每日/按日/趋势」等需多轮推理维度 → 一律 None
+    ///     （回退 llm_loop 完整工具循环，不冒险直答）。
+    fn extract_final_answer(raw: &str, question: &str) -> Option<String> {
         let v: serde_json::Value = serde_json::from_str(raw).ok()?;
         let answer = v.get("answer")?.as_str()?.trim();
         if answer.is_empty() || answer.starts_with("查询结果：") {
             return None;
         }
-        // 只认 query_skill 聚合快路径的模板句特征：数字开头 + 进厂 + 车次 + 吨
+        // 只认 query_skill 模板句特征：数字开头 + 进厂 + 车次
         let starts_with_digit = answer
             .chars()
             .next()
             .map(|c| c.is_ascii_digit())
             .unwrap_or(false);
-        if !starts_with_digit
-            || !answer.contains("进厂")
-            || !answer.contains("车次")
-            || !answer.contains("吨")
-        {
+        if !starts_with_digit || !answer.contains("进厂") || !answer.contains("车次") {
+            return None;
+        }
+        // 复杂维度校验（防截胡）
+        let nonwork_asked = [
+            "非工作", "下班", "夜间", "凌晨", "周末", "节假日", "假期", "加班", "占比", "比例",
+        ]
+        .iter()
+        .any(|w| question.contains(w));
+        if nonwork_asked && (!answer.contains("非工作") || !answer.contains("占比")) {
+            return None;
+        }
+        let multi_dim_asked = [
+            "对比", "分别", "排名", "排行", "每天", "每日", "按日", "趋势", "最多", "最少",
+        ]
+        .iter()
+        .any(|w| question.contains(w));
+        if multi_dim_asked {
             return None;
         }
         Some(answer.to_string())
@@ -3036,7 +3054,7 @@ impl AgentCore {
         // 跳过 LLM 总结：更快（省一次 LLM 调用）+ 100% 数字准确。stream 场景由 main.rs
         // pushed==0 伪流式补推全文（30 字内 200ms 推完，感知无差别）。
         if let Some(qr) = &fast_query_result {
-            if let Some(answer) = Self::extract_final_answer(qr) {
+            if let Some(answer) = Self::extract_final_answer(qr, message) {
                 self.save_to_history(session_id, message, &answer).await;
                 return answer;
             }
@@ -9057,25 +9075,39 @@ mod whitelist_preroute_tests {
 
     #[test]
     fn extract_final_answer_gating() {
-        // 模板 answer（数字开头 + 进厂/车次/吨）→ 直答可用
+        // 模板 answer（数字开头 + 进厂/车次）→ 直答可用（简单问法）
         let tmpl = r#"{"success":true,"answer":"2026年7月，天越进厂 239 车次，总重 5687.98 吨。"}"#;
         assert_eq!(
-            AgentCore::extract_final_answer(tmpl).as_deref(),
+            AgentCore::extract_final_answer(tmpl, "7月天越进厂多少车").as_deref(),
             Some("2026年7月，天越进厂 239 车次，总重 5687.98 吨。")
         );
         // 旧格式「查询结果：」内部标记 → 回退 LLM
         let old = r#"{"success":true,"answer":"查询结果：车次 = 239，总重 = 5687.98 吨（2026-07，公司含「天越」）。"}"#;
-        assert!(AgentCore::extract_final_answer(old).is_none());
+        assert!(AgentCore::extract_final_answer(old, "7月天越多少车").is_none());
         // 空 answer / 缺 answer 字段 → 回退
-        assert!(AgentCore::extract_final_answer(r#"{"success":true,"answer":""}"#).is_none());
-        assert!(AgentCore::extract_final_answer(r#"{"success":true}"#).is_none());
+        assert!(AgentCore::extract_final_answer(r#"{"success":true,"answer":""}"#, "q").is_none());
+        assert!(AgentCore::extract_final_answer(r#"{"success":true}"#, "q").is_none());
         // 非模板自由文本（不以数字开头/缺关键特征）→ 回退，防泄漏内部内容
         assert!(AgentCore::extract_final_answer(
-            r#"{"success":true,"answer":"车次 = 239 吨 = 5687.98 吨（来自日志转储）"}"#
+            r#"{"success":true,"answer":"车次 = 239 吨 = 5687.98 吨（来自日志转储）"}"#,
+            "q"
         )
         .is_none());
         // 非 JSON → 回退
-        assert!(AgentCore::extract_final_answer("not json").is_none());
+        assert!(AgentCore::extract_final_answer("not json", "q").is_none());
+
+        // 2026-08-06 防截胡：
+        // 非工作时间问法 + answer 含「非工作」「占比」→ 直答
+        let nw = r#"{"success":true,"answer":"2026年7月，天越进厂 239 车次，其中非工作时间 126 车次，占比 52.7%。"}"#;
+        assert!(AgentCore::extract_final_answer(nw, "7月天越非工作时间进厂占比").is_some());
+        // 非工作时间问法 + answer 是月度汇总（无「非工作」）→ 回退，防截胡
+        assert!(AgentCore::extract_final_answer(tmpl, "7月天越非工作时间占比多少").is_none());
+        // 对比/趋势/排名等需多轮推理维度 → 一律回退，即使 answer 是模板
+        assert!(AgentCore::extract_final_answer(tmpl, "对比一下天越和利合7月").is_none());
+        assert!(AgentCore::extract_final_answer(tmpl, "天越7月每天进厂趋势").is_none());
+        assert!(AgentCore::extract_final_answer(tmpl, "7月哪些公司排名前5").is_none());
+        // 简单问法不受影响
+        assert!(AgentCore::extract_final_answer(tmpl, "7月天越进厂多少车").is_some());
     }
 
     #[test]
