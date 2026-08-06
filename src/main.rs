@@ -4408,11 +4408,12 @@ async fn handle_v1_chat(
                 let tx_fwd = tx.clone();
                 let fwd_id = id.clone(); // id/model 已被外层 async move 捕获，转发 task 用 clone
                 let fwd_model = model.clone();
-                // 转发 task：llm 事件 → chat.completion.chunk；ErrorEvt 转发 error 字段；
-                // 统计已推送的 TextEvt 数（pushed==0 时下方补推全文，防中途失败重复）
+                // 转发 task：llm 事件 → chat.completion.chunk。ErrorEvt 不立即转发
+                // （延迟到主流程决定：补推全文时混推 error 会语义混乱）；统计已推 TextEvt 数。
                 let fwd = tokio::spawn(async move {
                     let mut errored = false;
                     let mut pushed = 0usize;
+                    let mut err_msg: Option<String> = None;
                     while let Some(ev) = rx_llm.recv().await {
                         let out: Option<String> = match ev {
                             agent_core::llm::SseEvent::TextEvt { content } => {
@@ -4440,17 +4441,8 @@ async fn handle_v1_chat(
                             ),
                             agent_core::llm::SseEvent::ErrorEvt { message } => {
                                 errored = true;
-                                Some(
-                                    serde_json::json!({
-                                        "id": &fwd_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": &fwd_model,
-                                        "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
-                                        "error": message,
-                                    })
-                                    .to_string(),
-                                )
+                                err_msg = Some(message);
+                                None // 延迟转发，避免与补推全文混推
                             }
                             agent_core::llm::SseEvent::DoneEvt | _ => None,
                         };
@@ -4458,22 +4450,23 @@ async fn handle_v1_chat(
                             let _ = tx_fwd.send(Ok(SseEvent::default().data(data)));
                         }
                     }
-                    (errored, pushed)
+                    (errored, pushed, err_msg)
                 });
                 let full = agent
                     .chat_stream(&user_text, &ctx.agent_id, &session_id, &ctx.allowed_ns, external_history.clone(), &tx_llm)
                     .await;
                 // 关闭 tx_llm 并等待转发 task flush 完（防 finish 截断最后内容）
                 drop(tx_llm);
-                let (stream_errored, pushed) = match fwd.await {
+                let (stream_errored, pushed, err_msg) = match fwd.await {
                     Ok(r) => r,
                     Err(je) => {
+                        // 转发 task panic/abort：无法得知已推数量，保守视为「已推」（不补推防重复）
                         tracing::warn!(err = %je, "SSE 转发 task 异常结束");
-                        (true, 0)
+                        (true, usize::MAX, None)
                     }
                 };
-                // pushed==0：未推任何内容（真流式首包失败/快速通道未命中/Agent 未就绪外）→
-                // 伪流式推完整回复（3 字/20ms），保证客户端总有答案；pushed>0 不推（防中途失败重复）。
+                // pushed==0：未推任何内容（首包失败/未命中/正常 fallback）→ 伪流式补推全文，
+                // 保证客户端总有完整答案；此时不推 error（内容完整，finish 用 stop）。
                 if pushed == 0 {
                     let mut chars = full.chars();
                     loop {
@@ -4500,24 +4493,54 @@ async fn handle_v1_chat(
                         }
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
-                }
-                // 终态 finish_reason（唯一终结 chunk）：未推内容补推全文 → stop（内容完整）；
-                // 已推部分但出错 → error；其余 stop
-                let finish = if stream_errored && pushed > 0 {
-                    "error"
+                    let _ = tx.send(Ok(SseEvent::default().data(
+                        serde_json::json!({
+                            "id": &id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": &model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                        })
+                        .to_string(),
+                    )));
+                } else if stream_errored {
+                    // 已推部分内容且中途出错：转发 error + finish:error（用户看到部分 + 明确错误，可重试）
+                    if let Some(msg) = err_msg {
+                        let _ = tx.send(Ok(SseEvent::default().data(
+                            serde_json::json!({
+                                "id": &id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": &model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
+                                "error": msg,
+                            })
+                            .to_string(),
+                        )));
+                    }
+                    let _ = tx.send(Ok(SseEvent::default().data(
+                        serde_json::json!({
+                            "id": &id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": &model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}]
+                        })
+                        .to_string(),
+                    )));
                 } else {
-                    "stop"
-                };
-                let _ = tx.send(Ok(SseEvent::default().data(
-                    serde_json::json!({
-                        "id": &id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": &model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]
-                    })
-                    .to_string(),
-                )));
+                    // 真流式成功（已推完整内容）→ 仅终态 finish:stop
+                    let _ = tx.send(Ok(SseEvent::default().data(
+                        serde_json::json!({
+                            "id": &id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": &model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                        })
+                        .to_string(),
+                    )));
+                }
             } else {
                 let _ = tx.send(Ok(SseEvent::default().data(
                     serde_json::json!({
