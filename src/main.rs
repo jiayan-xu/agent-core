@@ -4457,7 +4457,7 @@ async fn handle_v1_chat(
                     .await;
                 // 关闭 tx_llm 并等待转发 task flush 完（防 finish 截断最后内容）
                 drop(tx_llm);
-                let (stream_errored, pushed, err_msg) = match fwd.await {
+                let (stream_errored, pushed, _err_msg) = match fwd.await {
                     Ok(r) => r,
                     Err(je) => {
                         // 转发 task panic/abort：pushed 未知（None）→ 保守视为已推（不补推防重复）
@@ -4467,18 +4467,19 @@ async fn handle_v1_chat(
                 };
                 // pushed: Option<usize>（None=未知）；已推与否 = pushed.map_or(true, |p| p>0)
                 let pushed_any = pushed.map_or(true, |p| p > 0);
-                if stream_errored {
-                    // 流式失败（认证/限流/连接中断）：不伪装成功——以标准格式输出错误提示内容
-                    // （delta.content + finish:stop，OpenAI 兼容，客户端无需改协议）
-                    let msg = err_msg.unwrap_or_else(|| "流式连接失败".to_string());
-                    let prefix = if pushed_any { "\n\n" } else { "" };
+                if stream_errored && pushed_any {
+                    // 中途失败（已推部分内容）：项目自有协议发 error 事件（可区分失败/成功，
+                    // 不注入内部错误原文）+ 标准内容提示不完整 + done
+                    let _ = tx.send(Ok(SseEvent::default()
+                        .event("error")
+                        .data("连接中断，本次回复可能不完整")));
                     let _ = tx.send(Ok(SseEvent::default().data(
                         serde_json::json!({
                             "id": &id,
                             "object": "chat.completion.chunk",
                             "created": created,
                             "model": &model,
-                            "choices": [{"index": 0, "delta": {"content": format!("{}⚠️ 流式连接中断：{}。以上内容可能不完整，请重试。", prefix, msg)}, "finish_reason": null}]
+                            "choices": [{"index": 0, "delta": {"content": "\n\n⚠️ 以上内容可能不完整：连接中断。请重试。"}, "finish_reason": null}]
                         })
                         .to_string(),
                     )));
@@ -4493,8 +4494,9 @@ async fn handle_v1_chat(
                         .to_string(),
                     )));
                 } else if !pushed_any {
-                    // 未推任何内容且无错误（快速通道未命中/正常 fallback）→ 伪流式补推全文，
-                    // 保证客户端总有完整答案。
+                    // 未推任何内容（首包失败/流式未命中/正常 fallback）→ 伪流式补推 llm_loop
+                    // 的完整结果（真实降级答案，诚实呈现——即使 full 是错误文本也如实展示，
+                    // 不伪装、不丢弃）；此前若收到 ErrorEvt，错误细节已记日志，不外泄给用户
                     let mut chars = full.chars();
                     loop {
                         let mut chunk = String::new();
