@@ -2256,12 +2256,21 @@ impl AgentCore {
             }
             dash_cell
         };
-        // 取最后一个有效分隔行作为表的基准（从尾部找，天然忽略其后的第二个表/小表）
+        // 锚定「其后确实仍有含 | 数据行」的最后一个分隔行；跳过表尾孤立装饰分隔行
+        // （如收尾边框 `| --- |` 或 `| 合计 |\n| --- |` 图例块），避免把真实结果表误判为
+        // 「无表」而重复追接 render_rows_table 的 DB 表（见 extract_final_answer 的
+        // true→直接用 / false→追接逻辑）。
         let sep_idx = raw
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, line)| is_sep(line))
+            .find(|(idx, line)| {
+                is_sep(line)
+                    && raw
+                        .iter()
+                        .skip(*idx + 1)
+                        .any(|l| l.contains('|') && !is_sep(l))
+            })
             .map(|(idx, _)| idx);
         let i = match sep_idx {
             Some(x) => x,
@@ -2271,10 +2280,8 @@ impl AgentCore {
         if i == 0 || !raw[i - 1].contains('|') || is_sep(raw[i - 1]) {
             return false;
         }
-        // 分隔行之后至少存在一行含 | 的数据行（确有数据，而非只有表头 + 分隔）
-        raw.iter()
-            .skip(i + 1)
-            .any(|line| line.contains('|') && !is_sep(line))
+        // 分隔行之后确有数据行（上面 find 已保证；此处显式返回，语义清晰）
+        true
     }
 
     /// 2026-08-06：快速通道直答——从 nl_query 返回 JSON 提取可直接作为最终回答的 answer。
@@ -9378,6 +9385,18 @@ mod whitelist_preroute_tests {
         assert!(
             !AgentCore::answer_has_markdown_table(head_sep_only),
             "仅表头+分隔无数据不应判为真"
+        );
+        // 2026-08-07 修复 ocr[medium]：表尾装饰分隔行（收尾边框 / 图例块）不应使真实结果表
+        // 被误判为无表而重复追接 DB 表——须锚定其后确有数据行的最后一个分隔行
+        let trailing_border = "| 公司 | 车次 |\n| --- | --- |\n| 天越 | 239 |\n| --- |";
+        assert!(
+            AgentCore::answer_has_markdown_table(trailing_border),
+            "表尾装饰分隔行不应误判为无表（避免重复追接 DB 表）"
+        );
+        let with_legend = "| 公司 | 车次 |\n| --- | --- |\n| 天越 | 239 |\n| 合计 |\n| --- |";
+        assert!(
+            AgentCore::answer_has_markdown_table(with_legend),
+            "表后图例块装饰分隔行不应误判为无表"
         );
     }
 
