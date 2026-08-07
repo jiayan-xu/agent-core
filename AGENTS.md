@@ -20,17 +20,19 @@ a `.NO_PUSH` file and its `pre-push` hook blocks all pushes. Do not edit or push
 public branch is `master` only.
 
 ## Hard rules (P0)
-1. **Before ANY `git push`:** confirm (a) `git remote -v` shows the canonical GitHub URL (not gitee),
-   and (b) the target branch is `master`. If unsure, STOP and ask the user.
-2. **Never push to a branch other than `master`.** A `pre-push` hook enforces this mechanically.
+1. **ALL changes go through Pull Requests.** Direct push to `master` is BLOCKED by the `pre-push`
+   hook (see `docs/PR_PROCESS.md` for the full workflow). Push to a `feat/*` branch and open a PR.
+2. **Before ANY `git push`:** confirm (a) `git remote -v` shows the canonical GitHub URL (not gitee).
+   If unsure, STOP and ask the user.
 3. **Never push to the `gitee` remote** — it is the closed-source mirror. The hook blocks it.
 4. **Never push secrets or private data.** No hardcoded API keys, tokens, passwords, or
    `C:/Users/<name>/...` absolute paths. Keep `.env` gitignored; read keys from env vars only.
 5. **Rotate, don't commit.** If a secret must change, write it to `.env` (gitignored) or env vars —
    never into tracked files or commit messages.
 6. A safety `pre-push` hook ships in `.githooks/pre-push`. After cloning, run
-   `git config core.hooksPath .githooks` to activate it. It blocks wrong-branch, wrong-remote,
-   branch-deletion, and `.NO_PUSH` checkouts.
+   `git config core.hooksPath .githooks` to activate it. It blocks direct-to-master, wrong-remote,
+   branch-deletion, and `.NO_PUSH` checkouts; on feature branches it also runs ocr-review
+   (OCR_GATE=1 blocks on findings).
 
 ## Privacy history
 On 2026-07-08 the repo was scrubbed: admin key rotated, agent API key rotated, hardcoded
