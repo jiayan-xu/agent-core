@@ -40,7 +40,7 @@ while [ $# -gt 0 ]; do
 done
 
 # 默认排除噪声（build 产物 / 备份 / 数据 / 缓存），避免无谓消耗 token
-DEFAULT_EXCLUDE=".github/**,**/__pycache__/**,**/*.bak,**/*.exe,**/*.csv,**/target/**"
+DEFAULT_EXCLUDE=".github/**,.githooks/**,scripts/ocr-review.sh,**/__pycache__/**,**/*.bak,**/*.exe,**/*.csv,**/target/**"
 has_exclude=0
 for a in "${ARGS[@]:-}"; do [ "$a" = "--exclude" ] && has_exclude=1; done
 if [ "$has_exclude" = "0" ]; then ARGS+=("--exclude" "$DEFAULT_EXCLUDE"); fi
@@ -55,14 +55,19 @@ if [ $RC -ne 0 ]; then
   echo "[ocr] review 进程异常退出(rc=$RC)"; exit 2
 fi
 
-# 解析评论数：容忍多种输出格式（`N finding(s)` / `N findings` / `N 条评论` / `N comments`），
-# 取最后一次匹配（tail -1）以锚定最终汇总行，避免进度行干扰。
+# 解析评论数：容忍多种输出格式（`N finding(s)` / `N findings` / `N 条评论` / `N comments`）。
+# 逐行扫描、跨全部 pattern 取"最后一个匹配数字"，锚定最终汇总行——
+# 避免进度行（如 `0 findings`）干扰，也避免 break 在首个匹配处漏掉真实汇总。
 # 若完全无法解析，fail-closed（exit 2）而非静默 0。
 FINDINGS=""
-for pat in '[0-9]+ finding(s)?' '[0-9]+ 条评论' '[0-9]+ comments?' '[0-9]+ issues?'; do
-  m=$(printf '%s\n' "$OUT" | grep -oiE "$pat" | grep -oE '[0-9]+' | tail -1)
-  if [ -n "$m" ]; then FINDINGS="$m"; break; fi
-done
+last_num=""
+while IFS= read -r line; do
+  for pat in '[0-9]+ finding(s)?' '[0-9]+ 条评论' '[0-9]+ comments?' '[0-9]+ issues?'; do
+    m=$(printf '%s\n' "$line" | grep -oiE "$pat" | grep -oE '[0-9]+' | tail -1)
+    if [ -n "$m" ]; then last_num="$m"; fi
+  done
+done <<< "$OUT"
+FINDINGS="$last_num"
 if [ -z "$FINDINGS" ]; then
   echo "[ocr] 无法解析评论数，fail-closed 拦截"; exit 2
 fi

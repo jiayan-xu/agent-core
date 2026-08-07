@@ -64,10 +64,15 @@ GATE_FLAG=""
 while read lref loid rref roid || [ -n "$lref" ]; do
   case "$lref" in refs/heads/*) ;; *) continue;; esac
   if [ "$roid" = "$ZERO" ]; then
-    base="$(git rev-parse --verify origin/main 2>/dev/null \
+    # 新建分支：对比默认可达主干，优先用推送 remote（$1）的 ref
+    push_remote="$1"
+    base="$(git rev-parse --verify "$push_remote/HEAD" 2>/dev/null \
+        || git rev-parse --verify "$push_remote/main" 2>/dev/null \
+        || git rev-parse --verify "$push_remote/master" 2>/dev/null \
+        || git rev-parse --verify origin/main 2>/dev/null \
         || git rev-parse --verify origin/master 2>/dev/null || echo "")"
     if [ -z "$base" ]; then
-      echo "[ocr] 新分支且无 origin/main|master 可对比，跳过审查"; continue
+      echo "[ocr] 新分支且无可对比主干，跳过审查"; continue
     fi
     echo "[ocr] 新分支 -> 审查 $base..$loid"
     range_args=(--from "$base" --to "$loid")
