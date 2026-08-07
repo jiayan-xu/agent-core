@@ -2545,6 +2545,8 @@ impl AgentCore {
         for m in ["公司是", "公司为", "属于", "归属", "企业是", "公司：", "公司:"] {
             if let Some(p) = msg.find(m) {
                 let rest = &msg[p + m.len()..];
+                // 2026-08-07 修复：跳过前导空白，否则「公司是 佳士能」被 take_while 的空格立即截断
+                let rest = rest.trim_start();
                 let s: String = rest
                     .chars()
                     .take_while(|c| {
