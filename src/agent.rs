@@ -5513,14 +5513,9 @@ impl AgentCore {
                         };
                         self.checkpoint_pending_approval(session_id, &aid, &pa)
                             .await;
-                        // 修复 2026-08-07（feishui_reconcile_backfill 审批死循环，第二轮）：
-                        // 此路径此前只写 checkpoint 不写 session_manager.pending_action，
-                        // 用户「确认」时 take_pending_action 取不到 → 落入 execute_chat →
-                        // LLM 重新选中同一工具 → 又提交新审批 → 新单 → 用户批的永远追不上。
-                        // → 与 checkpoint 同步设置 pending_action，让「确认」能走到工具级确认分支。
-                        self.session_manager
-                            .set_pending_action(session_id, pa.clone())
-                            .await;
+                        // 注：checkpoint_pending_approval 内部已写 session_manager.pending_action
+                        //（含 approval_id 补全），此处无需重复调用。真正的循环修复点是
+                        // 确认分支（is_confirm → take_pending_action → check_response None → 恢复 action）。
                         let summary = Self::summarize_args(&tc.arguments);
                         let reply = format!(
                             "AWAITING_APPROVAL:危险/红线工具「{}」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续\n参数：{}",
