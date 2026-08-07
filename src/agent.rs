@@ -2697,7 +2697,10 @@ impl AgentCore {
                 "action": "query",
                 "plate": plate,
             });
-            let ns_vec = self.current_ns_paths().unwrap_or_default();
+            let mut ns_vec = self.current_ns_paths().unwrap_or_default();
+            // ns 需含固废业务命名空间：current_ns_paths 只有 agent 自身 ns，
+            // 用 enrich_allowed_ns 扩展出部门工具包 ns（与 llm_loop 组合路由一致）
+            crate::dept_ops::enrich_allowed_ns(&mut ns_vec);
             let result = self
                 .call_tool_routed(
                     "manage_whitelist",
