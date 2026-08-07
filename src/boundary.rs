@@ -1335,24 +1335,22 @@ fn needs_dept_ops_write_approval(tool_name: &str, args: &serde_json::Value) -> b
 /// reconcile/update_company/update_waste_type）仍走危险地板审批。
 ///
 /// 安全设计（ocr-review security·high，v5）：
-/// - **仅内部确定性预路由调用可豁免**（internal_only=true）：agent.rs 的
-///   extract_whitelist_membership_query 生成的精确查询；任何外部/LLM 直接调用
-///   不豁免（无法验证外部 MCP handler 无写副作用 → fail-closed）
+/// - **只读动作 allow-list 直接免审批**（不依赖任何调用方提供的信任标记）：
+///   manage_whitelist query / sync_whitelist_plates query_oplog 为内部已知只读操作，
+///   经严格参数白名单 + 值类型校验约束，写参数无法走私（白名单外键一律走审批）；
+///   写动作（add / remove / update_company 等）不在白名单 → 走危险地板审批。
 /// - allow-list 按工具定义精确参数集 + **值类型校验**（plate 必须字符串、
 ///   limit 必须 1..=MAX_PAGE_LIMIT），拒绝对象/数组/超界值
 /// - 其余任何键/任何非标值 → 不豁免，走审批
 const MAX_PAGE_LIMIT: u64 = 1000;
 fn is_whitelist_readonly_action(tool_name: &str, args: &serde_json::Value) -> bool {
-    // security·high：仅内部确定性预路由（带 _internal_preroute 标记）可豁免，
-    // 外部/LLM 直接调用不带此标记 → 仍走危险地板审批（无法验证外部 handler 无写副作用）
-    if args.get("_internal_preroute").and_then(|v| v.as_bool()) != Some(true) {
-        return false;
-    }
+    // 只读动作 allow-list 直接免审批：不信任任何调用方提供的标记，仅按 action + 参数白名单
+    // + 值类型判定，从源头消除「调用方伪造标记跳过审批」的攻击面（ocr-review security·medium）。
     let action = args
         .get("action")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    // 按工具定义只读动作的允许参数集（action + 内部标记始终允许）
+    // 按工具定义只读动作的允许参数集
     let allowed_plain_keys: &[&str] = match tool_name {
         // query: plate(查询条件, 字符串) + limit(分页, 1..=1000)
         "manage_whitelist" if action == "query" => &["plate", "limit"],
@@ -1364,8 +1362,8 @@ fn is_whitelist_readonly_action(tool_name: &str, args: &serde_json::Value) -> bo
         return false;
     };
     obj.iter().all(|(k, v)| {
-        // 内部标记 / action 始终允许
-        if k == "_internal_preroute" || k == "action" {
+        // action 始终允许
+        if k == "action" {
             return true;
         }
         if !allowed_plain_keys.contains(&k.as_str()) {
@@ -2189,7 +2187,7 @@ mod tests {
         // ① manage_whitelist query（纯查询，无写参数）→ 放行
         let r = boundary.check_tool(
             "manage_whitelist",
-            &serde_json::json!({"action": "query", "plate": "苏B12345", "_internal_preroute": true}),
+            &serde_json::json!({"action": "query", "plate": "苏B12345"}),
             "test-agent",
             "admin",
             &PermissionLevel::Admin,
@@ -2232,7 +2230,7 @@ mod tests {
         // ④ sync_whitelist_plates query_oplog（纯查询）→ 放行
         let r = boundary.check_tool(
             "sync_whitelist_plates",
-            &serde_json::json!({"action": "query_oplog", "_internal_preroute": true}),
+            &serde_json::json!({"action": "query_oplog"}),
             "test-agent",
             "admin",
             &PermissionLevel::Admin,
@@ -2307,7 +2305,7 @@ mod tests {
         // ⑨ query_oplog 携带 limit（只读分页参数）→ 放行（allow-list 含 limit）
         let r = boundary.check_tool(
             "sync_whitelist_plates",
-            &serde_json::json!({"action": "query_oplog", "limit": 50, "_internal_preroute": true}),
+            &serde_json::json!({"action": "query_oplog", "limit": 50}),
             "test-agent",
             "admin",
             &PermissionLevel::Admin,
@@ -2367,7 +2365,7 @@ mod tests {
         // ⑬ query 携带 limit 为负/对象 → 黄线（值类型校验）
         let r = boundary.check_tool(
             "manage_whitelist",
-            &serde_json::json!({"action": "query", "plate": "苏B12345", "limit": -1, "_internal_preroute": true}),
+            &serde_json::json!({"action": "query", "plate": "苏B12345", "limit": -1}),
             "test-agent",
             "admin",
             &PermissionLevel::Admin,
@@ -2380,8 +2378,8 @@ mod tests {
             r
         );
 
-        // ⑭ 无 _internal_preroute 标记的 query（外部/LLM 直接调用）→ 黄线
-        // （security·high：豁免仅限内部确定性预路由，外部调用无法验证 handler 无写副作用）
+        // ⑭ query 免审批不依赖来源标记（纯 allow-list）：无标记也直接放行，
+        // 消除「调用方伪造标记跳过审批」的攻击面（ocr security·medium 已修复）
         let r = boundary.check_tool(
             "manage_whitelist",
             &serde_json::json!({"action": "query", "plate": "苏B12345"}),
@@ -2390,17 +2388,16 @@ mod tests {
             &PermissionLevel::Admin,
             None,
         );
-        assert_eq!(
-            r.level,
-            Some(BlockLevel::Yellow),
-            "无内部标记的 query 不得豁免（仅内部预路由可豁免）: {:?}",
+        assert!(
+            r.allow,
+            "query 应免审批放行（纯 allow-list 不依赖来源标记）: {:?}",
             r
         );
 
         // ⑮ limit 超上限（>1000）→ 黄线（批量拉全量防护）
         let r = boundary.check_tool(
             "manage_whitelist",
-            &serde_json::json!({"action": "query", "plate": "苏B12345", "limit": 1001, "_internal_preroute": true}),
+            &serde_json::json!({"action": "query", "plate": "苏B12345", "limit": 1001}),
             "test-agent",
             "admin",
             &PermissionLevel::Admin,

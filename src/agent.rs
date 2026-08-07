@@ -1164,6 +1164,17 @@ impl AgentCore {
             if t.chars().count() > 8 {
                 return false;
             }
+            // 收窄（ocr-review bug·medium）：含查询/疑问动词的短消息不是确认，
+            // 避免「可以查」「查一下」「去查」被误吞（应走预路由/execute_chat 当新请求）。
+            if t.contains('查')
+                || t.contains('问')
+                || t.contains('看')
+                || t.contains("什么")
+                || t.contains('哪')
+                || t.contains('吗')
+            {
+                return false;
+            }
             confirm_words.iter().any(|w| t.contains(*w))
         };
         let is_cancel = |m: &str| {
@@ -1275,7 +1286,8 @@ impl AgentCore {
         if is_confirm(trimmed) {
             if let Some(mut action) = self.session_manager.take_pending_action(session_id).await {
                 // 任务 652 前置修复：捕获 approval_id，供执行后消费审批项（防残留被全局扫描重执行）
-                let approval_id_opt = action.approval_id.clone();                // L2 安全修复：若待确认操作需人工审批，必须先获得审批人批准，防用户自批绕过
+                let approval_id_opt = action.approval_id.clone();
+                // L2 安全修复：若待确认操作需人工审批，必须先获得审批人批准，防用户自批绕过
                 if let Some(aid) = &action.approval_id {
                     match self.approval_manager.check_response(aid).await {
                         Some(resp) if resp.approved => {
@@ -2693,12 +2705,11 @@ impl AgentCore {
         // 直答（无工具调用，曾编造"白名单 115 条"）。这里确定性识别并直接精确查询，
         // 绕开快速通道与 LLM 幻觉。查不到 = 不在白名单（manage_whitelist query 按车牌唯一匹配）。
         if let Some(plate) = Self::extract_whitelist_membership_query(message) {
-            // _internal_preroute 标记：仅内部确定性预路由设置，check_tool 据此豁免
-            // 只读审批（外部/LLM 调用不带此标记 → 仍走危险地板审批，security·high 缓解）
+            // 确定性预路由直接走 call_tool_routed（不经 check_tool），天然免审批；
+            // 不依赖任何 args 信任标记（避免调用方伪造标记绕过审批，ocr security·medium）。
             let args = serde_json::json!({
                 "action": "query",
                 "plate": plate,
-                "_internal_preroute": true,
             });
             let mut ns_vec = self.current_ns_paths().unwrap_or_default();
             // ns 需含固废业务命名空间：current_ns_paths 只有 agent 自身 ns，
@@ -2710,14 +2721,23 @@ impl AgentCore {
                     &self.persona_for_session(session_id),
                     &args,
                     &ns_vec,
-                    &"preroute-whitelist-query".to_string(),
+                    "preroute-whitelist-query",
                 )
                 .await;
             let reply = match result {
-                Ok(t) if t.contains("在白名单") || t.contains("命中") || !t.contains("未找到") && !t.contains("不存在") && !t.contains("无记录") && !t.contains("0 条") => {
-                    format!("✅ {} 在白名单中。\n\n{}", plate, t.chars().take(300).collect::<String>())
+                Ok(t) => {
+                    // default-deny：仅明确正面标记（且不含否定词）才算在白名单。
+                    // 避免「X 不在白名单中」含「在白名单」子串误判，或「未命中」含「命中」误判
+                    // （ocr-review bug·high 修复）。
+                    let is_member = (t.contains("在白名单中") || t.contains("命中"))
+                        && !t.contains("不在")
+                        && !t.contains("未命中");
+                    if is_member {
+                        format!("✅ {} 在白名单中。\n\n{}", plate, t.chars().take(300).collect::<String>())
+                    } else {
+                        format!("❌ {} 不在白名单中。\n\n{}", plate, t.chars().take(200).collect::<String>())
+                    }
                 }
-                Ok(t) => format!("❌ {} 不在白名单中。\n\n{}", plate, t.chars().take(200).collect::<String>()),
                 Err(e) => format!("⚠️ 查询失败：{}", e),
             };
             self.save_to_history(session_id, message, &reply).await;
