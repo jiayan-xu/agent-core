@@ -19,4 +19,8 @@ regexes = [
   '''deadbeef[a-f0-9]*''',
   # 本地评估脚本用的固定占位 badge（非真实生产密钥）
   '''mem-admin-fixed-key-2026''',
+  # 2026-07-01 旧 DeepSeek key（sk-e64d9f...）：7/8 security 清理后已废弃不再使用，
+  # 但因存于公开历史（c043779/81e12c6）gitleaks 全库/PR 扫描会命中 → 阻塞所有 PR。
+  # 已确认当前 agent.toml api_key=""（env 注入），该 key 无价值，豁免避免 PR 全阻塞。
+  '''sk-e64d9f088c0f4e099124419477002e2d''',
 ]
