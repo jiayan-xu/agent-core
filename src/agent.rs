@@ -4601,6 +4601,11 @@ impl AgentCore {
         "nl_query",
         "check_media_files",
         "query_today",
+        // 2026-08-07：补录/重填核心工具常驻——「数据不对，重新拉取源数据并重新填写日志」
+        // 是固废高频写任务；此前不在常驻、Easy 只暴露 12 工具时被相关性裁剪掉，
+        // LLM 有查询工具（nl_query/query_today）却无写工具 → 任务无法完成。
+        "fill_excel_log",
+        "feishui_reconcile_backfill",
     ];
 
     fn prefetch_tokens(s: &str) -> Vec<String> {
@@ -4633,8 +4638,22 @@ impl AgentCore {
         hit as f64 / (q.len().min(t.len())) as f64
     }
 
+    /// 2026-08-07：写/补录意图检测——「数据不对，重新拉取源数据并重新填写日志」类
+    /// 多步写任务。命中则 llm_loop 里 Easy 也把工具暴露 cap 提到 EXPOSE_TOOL_CAP(30)，
+    /// 否则写类工具（除常驻的 fill_excel_log/feishui_reconcile_backfill 外）被 12 上限裁掉。
+    fn has_write_intent(q: &str) -> bool {
+        const WRITE_KEYS: &[&str] = &[
+            "重新拉取", "重新填写", "重新同步", "重新导入",
+            "重填", "补录", "回填", "补写", "重跑", "重算",
+            "修正", "修改", "纠正", "更新", "修复", "对账",
+            "写入", "录入", "导入", "同步", "删除", "新增",
+        ];
+        WRITE_KEYS.iter().any(|k| q.contains(k))
+    }
+
     /// 白龙马 ACI 的 selectTools 等价物：按当前消息(task_context)从全量工具中选 top-K 暴露给 LLM。
-    /// 其余工具本轮不进 schema（模型仍可经 find_tool 被动发现，复用现有机制）。
+    /// 其余工具本轮不进 schema，仅不参与 LLM 提示（execute_tool_calls 对子集外工具跳过 schema
+    /// 校验、直接走 call_tool_routed 全量路由——不会 Tool Not Found；见 5648 附近）。
     async fn select_exposed_tools(&self, message: &str, allowed_ns: &[String], cap: usize) -> Vec<ToolDef> {
         let all = self.fetch_tools_filtered(allowed_ns).await;
         let total = all.len();
@@ -4709,7 +4728,15 @@ impl AgentCore {
 
         // 从 Memoria 取可用工具列表（A1: 白龙马 ACI 请求前按 task_context 选暴露子集）
         // 2026-08-05 提速：Easy 查询只暴露 12 工具（8 常驻 + 4 相关性），Hard 30
-        let expose_cap = if is_easy_query { 12usize } else { Self::EXPOSE_TOOL_CAP };
+        // 2026-08-07：写/补录意图（重新拉取/重新填写/补录/修正…）即使判 Easy 也提 cap 到 30，
+        // 否则写类工具（fill_excel_log 等已常驻，但 sync_exception_correction/execute_sql/diagnose_*
+        // 仍靠相关性）被 12 上限裁掉，写任务无法完成（08-05 曾因 30 不够慢、现 30 是 Hard 档，
+        // 仅写意图触发，纯查询仍 12，prompt 体积不受影响）。
+        let expose_cap = if is_easy_query && !Self::has_write_intent(raw_message) {
+            12usize
+        } else {
+            Self::EXPOSE_TOOL_CAP
+        };
         let tools = self.select_exposed_tools(raw_message, allowed_ns, expose_cap).await;
         // P1-4: 构建工具名 → JSON Schema 映射，用于参数校验
         ctx.tool_schemas = tools
