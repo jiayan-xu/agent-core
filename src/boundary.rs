@@ -907,9 +907,9 @@ impl ComplianceBoundary {
             // 2026-08-07 修复：白名单混合工具的只读动作（query / query_oplog）免审批。
             // manage_whitelist / sync_whitelist_plates 被 HARD_DANGEROUS 强制危险地板，
             // 但纯查询场景（如「XX 在不在白名单」）不该弹审批 —— 查询无写副作用。
-            // 取反条件：非只读动作（或携带写参数）才走危险地板审批，避免空分支。
-            if !is_whitelist_readonly_action(tool_name, args)
-                && (tool_level == "dangerous" || self.is_dangerous_floor(tool_name))
+            // 危险判断在前：非危险工具不调用 helper（性能）；危险工具才检查只读豁免。
+            if (tool_level == "dangerous" || self.is_dangerous_floor(tool_name))
+                && !is_whitelist_readonly_action(tool_name, args)
             {
                 return ToolCheck::yellow(&format!("{} 需要审批，请等待审批人确认", tool_name));
             }
@@ -1334,31 +1334,42 @@ fn needs_dept_ops_write_approval(tool_name: &str, args: &serde_json::Value) -> b
 /// 但 query / query_oplog 是纯查询（无写副作用），免审批。写动作（add/remove/
 /// reconcile/update_company/update_waste_type）仍走危险地板审批。
 ///
-/// 安全设计（ocr-review security·medium，从 deny-list 改为 allow-list）：
-/// - deny-list 会漂移：工具新增写参数后漏加 → 查询被静默豁免成写
-/// - allow-list 天然 fail-closed：只读动作仅允许精确的只读参数集
-///   （manage_whitelist query: plate 查询条件 + limit 分页；
-///     sync_whitelist_plates query_oplog: limit 分页）
-/// - 其余任何参数（含嵌套对象内的写参数）→ 不豁免，走审批
+/// 安全设计（ocr-review security·high，v4）：
+/// - deny-list 会漂移；allow-list 天然 fail-closed
+/// - 按工具定义精确的只读参数集 + **值类型校验**（plate 必须字符串、limit 必须非负整数），
+///   拒绝对象/数组——嵌套在允许键下的写意图（如 plate:{"confirmed":true}）无法逃逸
+/// - 其余任何键/任何非标值 → 不豁免，走审批
 fn is_whitelist_readonly_action(tool_name: &str, args: &serde_json::Value) -> bool {
     let action = args
         .get("action")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    // 只读动作集合
-    let allowed = match tool_name {
-        "manage_whitelist" => action == "query",
-        "sync_whitelist_plates" => action == "query_oplog",
-        _ => false,
+    // 按工具定义只读动作的允许参数集（action 始终允许）
+    let allowed_plain_keys: &[&str] = match tool_name {
+        // query: plate(查询条件, 字符串) + limit(分页, 非负整数)
+        "manage_whitelist" if action == "query" => &["plate", "limit"],
+        // query_oplog: limit(分页, 非负整数) 仅此（plate 不用于 oplog 查询）
+        "sync_whitelist_plates" if action == "query_oplog" => &["limit"],
+        _ => return false,
     };
-    if !allowed {
+    let Some(obj) = args.as_object() else {
         return false;
-    }
-    // allow-list：仅允许以下只读参数，其余键一律视为写意图 → 不豁免
-    const READONLY_KEYS: &[&str] = &["action", "plate", "limit"];
-    args.as_object()
-        .map(|obj| obj.keys().all(|k| READONLY_KEYS.contains(&k.as_str())))
-        .unwrap_or(false)
+    };
+    obj.iter().all(|(k, v)| {
+        // 任何不在允许集的键 → 不豁免
+        if k == "action" {
+            return true; // action 已在上面校验为只读动作
+        }
+        if !allowed_plain_keys.contains(&k.as_str()) {
+            return false;
+        }
+        // 值类型校验：plate 必须字符串；limit 必须非负整数；对象/数组一律拒绝
+        match k.as_str() {
+            "plate" => v.is_string(),
+            "limit" => v.as_u64().is_some(),
+            _ => false,
+        }
+    })
 }
 
 /// 判断工具是否「危险」（落入红线/高危前缀）。
@@ -2313,7 +2324,7 @@ mod tests {
             r
         );
 
-        // ⑪ query_oplog 携带 plate（allow-list 键）→ 放行
+        // ⑪ query_oplog 携带 plate → 黄线（v4：query_oplog 仅允许 limit，plate 非只读参数）
         let r = boundary.check_tool(
             "sync_whitelist_plates",
             &serde_json::json!({"action": "query_oplog", "plate": "苏B12345"}),
@@ -2322,6 +2333,43 @@ mod tests {
             &PermissionLevel::Admin,
             None,
         );
-        assert!(r.allow, "query_oplog + plate 应免审批: {:?}", r);
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "query_oplog + plate 非只读参数，不得豁免: {:?}",
+            r
+        );
+
+        // ⑫ query 携带嵌套写意图于允许键值（plate 是对象）→ 黄线（值类型校验）
+        let r = boundary.check_tool(
+            "manage_whitelist",
+            &serde_json::json!({"action": "query", "plate": {"confirmed": true}}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "plate 值为对象（嵌套写意图）不得豁免: {:?}",
+            r
+        );
+
+        // ⑬ query 携带 limit 为负/对象 → 黄线（值类型校验）
+        let r = boundary.check_tool(
+            "manage_whitelist",
+            &serde_json::json!({"action": "query", "plate": "苏B12345", "limit": -1}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "limit 为负值不得豁免: {:?}",
+            r
+        );
     }
 }

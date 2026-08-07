@@ -1794,6 +1794,41 @@ impl AgentCore {
         Some(rest[..sc].iter().collect())
     }
 
+    /// 识别「某车牌是否在白名单」查询意图 → 车牌号。
+    /// 匹配：『XX 在不在白名单』『白名单有 XX 吗』『XX 是不是白名单』『查 XX 在白名单吗』。
+    /// 2026-08-08：确定性预路由，绕开 data_query 快速通道（LLM 无工具直答会编造数据）。
+    fn extract_whitelist_membership_query(message: &str) -> Option<String> {
+        let m = message.trim();
+        // 附件正文块内是数据，不是指令
+        if Self::has_attachment_block(m) {
+            return None;
+        }
+        // 含写动词（添加/删除/修改/公司名）→ 不是查询，交给对应预路由
+        let write_verbs = ["添加", "新增", "登记", "录入", "删除", "移除", "改为", "改成", "公司名", "固废种类"];
+        if write_verbs.iter().any(|v| m.contains(*v)) {
+            return None;
+        }
+        // 查询句式：在不在白名单 / 白名单有吗 / 是不是白名单 / 在白名单吗
+        let has_membership_phrase = [
+            "在不在白名单", "在不在白名单里", "白名单里有", "白名单有", "白名单里有吗",
+            "是不是白名单", "在白名单吗", "在白名单里吗", "在白名单中吗", "查一下.*白名单",
+        ]
+        .iter()
+        .any(|p| {
+            if p.contains('*') {
+                // 简化：把「查一下」前缀与「白名单」组合视为命中
+                m.contains("白名单") && (m.contains("查") || m.contains("在不在") || m.contains("是不是") || m.contains("有没有"))
+            } else {
+                m.contains(p)
+            }
+        });
+        if !has_membership_phrase {
+            return None;
+        }
+        // 提取车牌（优先带空格的宽松匹配，如「皖 NB7691」）
+        Self::extract_plate(m).or_else(|| Self::extract_plate_spaced(m))
+    }
+
     /// 识别「添加/登记白名单新车」意图，抽取 (车牌, 公司提示)。
     /// 公司提示可为简称/全称（skill 经 _resolve_company_name 解析为全称）。
     fn extract_whitelist_add(message: &str) -> Option<(String, String)> {
@@ -2653,6 +2688,36 @@ impl AgentCore {
     /// 确定性预路由表（重构阶段 2 抽取，行为与内联一致）：白名单 5 类受控写 +
     /// 异常/取样同步，命中即构造审批闸。返回 Some(已处理回复)。
     async fn try_preroute(&self, message: &str, session_id: &str) -> Option<String> {
+        // ── 白名单单牌查询 → manage_whitelist query（精确匹配）──
+        // 2026-08-08 修复：『XX 在不在白名单』会命中 data_query 快速通道，LLM 凭记忆
+        // 直答（无工具调用，曾编造"白名单 115 条"）。这里确定性识别并直接精确查询，
+        // 绕开快速通道与 LLM 幻觉。查不到 = 不在白名单（manage_whitelist query 按车牌唯一匹配）。
+        if let Some(plate) = Self::extract_whitelist_membership_query(message) {
+            let args = serde_json::json!({
+                "action": "query",
+                "plate": plate,
+            });
+            let ns_vec = self.current_ns_paths().unwrap_or_default();
+            let result = self
+                .call_tool_routed(
+                    "manage_whitelist",
+                    &self.persona_for_session(session_id),
+                    &args,
+                    &ns_vec,
+                    &"preroute-whitelist-query".to_string(),
+                )
+                .await;
+            let reply = match result {
+                Ok(t) if t.contains("在白名单") || t.contains("命中") || !t.contains("未找到") && !t.contains("不存在") && !t.contains("无记录") && !t.contains("0 条") => {
+                    format!("✅ {} 在白名单中。\n\n{}", plate, t.chars().take(300).collect::<String>())
+                }
+                Ok(t) => format!("❌ {} 不在白名单中。\n\n{}", plate, t.chars().take(200).collect::<String>()),
+                Err(e) => format!("⚠️ 查询失败：{}", e),
+            };
+            self.save_to_history(session_id, message, &reply).await;
+            return Some(reply);
+        }
+
         // ── 白名单公司名变更 → sync_whitelist_plates update_company ──
         // 绕过 LLM 规划器对 memory 工具的顽固误路由（详见 extract_whitelist_update）。
         if let Some((plate, company)) = Self::extract_whitelist_update(message) {
