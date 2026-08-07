@@ -2693,9 +2693,12 @@ impl AgentCore {
         // 直答（无工具调用，曾编造"白名单 115 条"）。这里确定性识别并直接精确查询，
         // 绕开快速通道与 LLM 幻觉。查不到 = 不在白名单（manage_whitelist query 按车牌唯一匹配）。
         if let Some(plate) = Self::extract_whitelist_membership_query(message) {
+            // _internal_preroute 标记：仅内部确定性预路由设置，check_tool 据此豁免
+            // 只读审批（外部/LLM 调用不带此标记 → 仍走危险地板审批，security·high 缓解）
             let args = serde_json::json!({
                 "action": "query",
                 "plate": plate,
+                "_internal_preroute": true,
             });
             let mut ns_vec = self.current_ns_paths().unwrap_or_default();
             // ns 需含固废业务命名空间：current_ns_paths 只有 agent 自身 ns，
