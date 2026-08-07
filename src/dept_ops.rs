@@ -58,9 +58,9 @@ pub fn org_ns() -> String {
 }
 
 /// 固废部门工具包 ns（与 agent.toml [[mcp_source]] dashboard.namespace 对齐），
-/// 随 org_ns 派生。
+/// 随 org_ns 派生。部门=engineering(工程部)，项目=gufei(固废)。
 pub fn dept_toolkit_ns() -> String {
-    format!("{}/dept/gufei", org_ns())
+    format!("{}/dept/engineering/proj/gufei", org_ns())
 }
 
 /// 是否关闭部门工具包自动 enrichment（默认开启；`DEPT_TOOLKIT_ENRICH=0` 关闭）

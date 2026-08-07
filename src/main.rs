@@ -4777,7 +4777,7 @@ async fn handle_documents_archive(
     }
 
     let namespace = if req.namespace.trim().is_empty() {
-        "org/cs-pufa-2nd-thermal/dept/gufei".to_string()
+        "org/cs-pufa-2nd-thermal/dept/engineering/proj/gufei".to_string()
     } else {
         req.namespace.trim().to_string()
     };
@@ -5634,9 +5634,9 @@ mod collab_policy_tests {
 
     #[test]
     fn dept_requires_scope_id_and_membership() {
-        let ns = vec!["org/cs-pufa-2nd-thermal/dept/gufei".to_string()];
+        let ns = vec!["org/cs-pufa-2nd-thermal/dept/engineering/proj/gufei".to_string()];
         assert!(collab_reachability("u1", &ns, "dept", "", "notify").is_err());
-        assert!(collab_reachability("u1", &ns, "dept", "gufei", "notify").is_ok());
+        assert!(collab_reachability("u1", &ns, "dept", "engineering", "notify").is_ok());
         assert!(collab_reachability("u1", &ns, "dept", "finance", "notify").is_err());
     }
 
