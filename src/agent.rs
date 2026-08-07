@@ -1275,8 +1275,7 @@ impl AgentCore {
         if is_confirm(trimmed) {
             if let Some(mut action) = self.session_manager.take_pending_action(session_id).await {
                 // 任务 652 前置修复：捕获 approval_id，供执行后消费审批项（防残留被全局扫描重执行）
-                let approval_id_opt = action.approval_id.clone();
-                // L2 安全修复：若待确认操作需人工审批，必须先获得审批人批准，防用户自批绕过
+                let approval_id_opt = action.approval_id.clone();                // L2 安全修复：若待确认操作需人工审批，必须先获得审批人批准，防用户自批绕过
                 if let Some(aid) = &action.approval_id {
                     match self.approval_manager.check_response(aid).await {
                         Some(resp) if resp.approved => {
@@ -1403,6 +1402,17 @@ impl AgentCore {
                 }
                 // 审批消费后清 checkpoint 终态，避免恢复出空 pending
                 self.checkpoint_terminal(session_id, CheckpointState::Done)
+                    .await;
+                return reply;
+            } else {
+                // 修复 2026-08-07：用户回「确认」但当前没有待确认的操作时，
+                // 直接明确告知，不再落入 execute_chat —— 否则 LLM 会基于脏历史
+                // 上下文回答不相干内容（实测：白名单查询后回「确认」答了「天越7月车次」）。
+                let reply = "当前没有待确认的操作。如果您是回应上一条查询结果，可以直接重新说明需要确认的内容；如需审批，请先在审批台批准后回复「确认」。".to_string();
+                let ns = self.caller_ns(session_id);
+                let db_path = self.harness.lock().await.db_path();
+                self.session_manager
+                    .save_to_history(session_id, &ns, &db_path, message, &reply)
                     .await;
                 return reply;
             }

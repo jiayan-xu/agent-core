@@ -904,7 +904,12 @@ impl ComplianceBoundary {
             let tool_level = with_classifier(&self.classifier, "read".to_string(), |c| {
                 c.classify(tool_name).to_string()
             });
-            if tool_level == "dangerous" || self.is_dangerous_floor(tool_name) {
+            // 2026-08-07 修复：白名单混合工具的只读动作（query / query_oplog）免审批。
+            // manage_whitelist / sync_whitelist_plates 被 HARD_DANGEROUS 强制危险地板，
+            // 但纯查询场景（如「XX 在不在白名单」）不该弹审批 —— 查询无写副作用。
+            if is_whitelist_readonly_action(tool_name, args) {
+                // 视为只读，跳过危险地板审批检查
+            } else if tool_level == "dangerous" || self.is_dangerous_floor(tool_name) {
                 return ToolCheck::yellow(&format!("{} 需要审批，请等待审批人确认", tool_name));
             }
             // 固废整理/归档写操作：非 dry_run 时走黄线（可控写改）
@@ -1289,6 +1294,21 @@ impl ToolClassifier {
 }
 
 /// 固废部门写文件类工具：非 dry_run 时需要人工确认（HumanInLoop 黄线）。
+/// 白名单混合工具的只读动作判定（2026-08-07）：这些工具被 HARD_DANGEROUS 强制危险地板，
+/// 但 query / query_oplog 是纯查询（无写副作用），免审批。写动作（add/remove/reconcile/
+/// update_company/update_waste_type）仍走危险地板审批。
+fn is_whitelist_readonly_action(tool_name: &str, args: &serde_json::Value) -> bool {
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match tool_name {
+        "manage_whitelist" => action == "query",
+        "sync_whitelist_plates" => action == "query_oplog",
+        _ => false,
+    }
+}
+
 fn needs_dept_ops_write_approval(tool_name: &str, args: &serde_json::Value) -> bool {
     const OPS_WRITE: &[&str] = &[
         "organize_folders",
