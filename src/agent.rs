@@ -2160,8 +2160,12 @@ impl AgentCore {
     /// （如 company_name）直接当表头吐出，render_rows_table 原样渲染 → 英文表头。这里做一层
     /// 安全映射：**仅命中已知原始列名才转中文，中文列名/未知列名原样透传**（不会误改已有中文表头）。
     fn map_column_name(col: &str) -> String {
-        let c = col.trim();
-        let mapped = match c {
+        // 先规范化（去空格 + 转小写）再匹配：原始库列名大小写敏感，COUNT(*)/count(*) 都要覆盖。
+        // 仅精确匹配已观察到的拼写；其余 COUNT/SUM 变体（如 COUNT(DISTINCT x)、
+        // SUM(...)/COUNT(*) 平均值）原样透传，不静默误标——避免把「计数公司」错标成「车次」、
+        // 把「平均值」错标成「总重」。缺口由人审补充。中文/未知列名原样透传（不误改已有中文表头）。
+        let c = col.trim().to_lowercase();
+        let mapped = match c.as_str() {
             "company_name" => "公司名",
             "entrance_date" => "进厂日期",
             "entrance_time" => "进厂时间",
@@ -2172,9 +2176,12 @@ impl AgentCore {
             "total_weight" => "总重_吨",
             "vehicle_count" => "车次",
             "ym" => "月份",
-            // 通用计数表达式 → 车次（本域 vehicle_entrance 的 COUNT 即车次）
-            "COUNT(*)" | "count(*)" | "COUNT(1)" | "count(1)" => "车次",
-            _ => c,
+            // 计数表达式 → 车次（仅精确拼写，避免 COUNT(DISTINCT x) 误标）
+            "count(*)" | "count(1)" => "车次",
+            // 重量聚合（精确拼写，避免 SUM(...)/COUNT(*) 平均值误标为总重）
+            "sum(weight)" => "重量_吨",
+            "sum(total_weight)" => "总重_吨",
+            _ => col.trim(),
         };
         mapped.to_string()
     }
@@ -2185,7 +2192,7 @@ impl AgentCore {
             .as_array()?
             .iter()
             .filter_map(|c| c.as_str())
-            .map(|s| Self::map_column_name(s))
+            .map(Self::map_column_name)
             .collect();
         let rows = v.get("rows")?.as_array()?;
         if columns.is_empty() || rows.len() < 2 {
@@ -2216,6 +2223,43 @@ impl AgentCore {
         Some(out)
     }
 
+    /// 精确判定 answer 是否已含完整 Markdown 表格（块级：分隔行 `---` 单元格须前后各有非分隔
+    /// 的 `|` 行即表头 + 数据行，且全文至少 2 个非分隔 `|` 行）。替代脆弱的 `answer.contains("| ")`：
+    /// - 分隔行需 3+ 短横线单元格紧邻 `|`（匹配本代码与 query_skill 产出的 `---` 格式；
+    ///   先去掉对齐冒号 `:` 以兼容 `|:---:|` / `| :---: |`）；
+    /// - 块级邻接约束：分隔行必须夹在表头行与数据行之间，避免把孤立/引用分隔行、散文带 `|`、
+    ///   或 `|:---:|` 装饰行误判为已含表格而静默丢弃 render_rows_table 本应追加的多行数据。
+    fn answer_has_markdown_table(answer: &str) -> bool {
+        let lines: Vec<String> = answer
+            .lines()
+            .map(|l| l.trim().replace(':', "")) // 归一化对齐冒号（|:---:| → |---|）
+            .collect();
+        let is_sep = |t: &str| {
+            (t.contains("|---")
+                || t.contains("---|")
+                || t.contains("| ---")
+                || t.contains("--- |"))
+                && t
+                    .chars()
+                    .all(|c| c == '|' || c == '-' || c.is_whitespace())
+        };
+        let n = lines.len();
+        // 块级：分隔行须前后各有非分隔的 | 行（表头在上、数据在下）
+        let mut sep_sandwiched = 0;
+        for i in 0..n {
+            if is_sep(&lines[i]) {
+                let prev_ok = i > 0 && lines[i - 1].contains('|') && !is_sep(&lines[i - 1]);
+                let next_ok =
+                    i + 1 < n && lines[i + 1].contains('|') && !is_sep(&lines[i + 1]);
+                if prev_ok && next_ok {
+                    sep_sandwiched += 1;
+                }
+            }
+        }
+        let pipe_lines = lines.iter().filter(|l| l.contains('|') && !is_sep(l)).count();
+        sep_sandwiched >= 1 && pipe_lines >= 2
+    }
+
     /// 2026-08-06：快速通道直答——从 nl_query 返回 JSON 提取可直接作为最终回答的 answer。
     /// query_skill 模板生成的 answer 是自然语言事实（如「2026年7月，天越进厂 239 车次，总重
     /// 5687.98 吨。」）。严格判别（防泄漏非模板内容给用户/历史）：
@@ -2239,13 +2283,29 @@ impl AgentCore {
         if answer.is_empty() || answer.starts_with("查询结果：") {
             return None;
         }
-        // 2026-08-07：多行数据确定性表格直答——nl_query 返回 rows≥2 时 agent 渲染 Markdown
-        // 表格，绕开 LLM 列表惯性（deepseek-flash 会把注入表格重写为列表，prompt 强化实测
-        // 4 轮无效：允许/必须/few-shot/强保留指令全失败）。**先于模板特征检查**（主路径
-        // answer 可能非模板格式）。answer 已含表格（分析型路径）→ 直接返回；否则 answer
-        // 说明 + agent 渲染表格。单行数据（rows<2）不受影响走原逻辑。
+        // 2026-08-07 修复 ocr(medium)：问题级分析门禁（长文本/多公司/排除）必须先于「多行直答」，
+        // 否则长分析问法（>ANALYSIS_TEXT_CAP）会绕过 2026-08-06 P0 修复直接出表（数据可能为
+        // partial，曾误判）。仅短、单公司(或无)、无排除的简单问法才进入下方直答分支。
+        let company_names = Self::COMPANY_SHORT_NAMES;
+        let comp_hits = company_names.iter().filter(|cn| question.contains(**cn)).count();
+        if question.chars().count() > Self::ANALYSIS_TEXT_CAP {
+            return None;
+        }
+        if comp_hits >= 2 {
+            return None;
+        }
+        let exclude_asked = ["去除", "排除", "不含", "剔除", "去掉", "除去"]
+            .iter()
+            .any(|w| question.contains(w));
+        if exclude_asked && comp_hits >= 1 {
+            return None;
+        }
+        // 2026-08-07：多行数据确定性表格直答（先于模板特征检查）。answer 已含 Markdown
+        // 表格（含 |---| 分隔行）→ 直接返回；否则 answer 说明 + agent 渲染表格。
+        // 用分隔行精确判定，替代脆弱的 `answer.contains("| ")`：散文含 `| ` 不误判，
+        // 无空格表格也能识别，避免丢弃多行数据或重复追加。
         if let Some(table_md) = Self::render_rows_table(raw) {
-            if answer.contains("| ") {
+            if Self::answer_has_markdown_table(answer) {
                 return Some(answer.to_string());
             }
             return Some(format!("{}\n\n{}", answer, table_md));
@@ -2257,22 +2317,6 @@ impl AgentCore {
             .map(|c| c.is_ascii_digit())
             .unwrap_or(false);
         if !starts_with_digit || !answer.contains("进厂") || !answer.contains("车次") {
-            return None;
-        }
-        // 2026-08-06 P0：长文本分析型提问不直答（规则引擎无法解析长分析提示词——
-        // 曾把「…2月份为22.6%…我需要7月的数据」误判成「2月天越」）。多公司/排除公司同回退。
-        if question.chars().count() > Self::ANALYSIS_TEXT_CAP {
-            return None;
-        }
-        let company_names = Self::COMPANY_SHORT_NAMES;
-        let comp_hits = company_names.iter().filter(|cn| question.contains(**cn)).count();
-        if comp_hits >= 2 {
-            return None;
-        }
-        let exclude_asked = ["去除", "排除", "不含", "剔除", "去掉", "除去"]
-            .iter()
-            .any(|w| question.contains(w));
-        if exclude_asked && comp_hits >= 1 {
             return None;
         }
         // 复杂维度校验（防截胡）：
@@ -9268,6 +9312,38 @@ mod whitelist_preroute_tests {
         let cn = r#"{"success":true,"columns":["公司","车次"],"rows":[["天越",239],["利合",73]]}"#;
         let c = AgentCore::render_rows_table(cn).expect("应渲染表格");
         assert!(c.contains("| 公司 | 车次 |"), "{}", c);
+        // 2026-08-07 修复 ocr 意见：大小写不敏感 + SUM 聚合变体
+        let ci = r#"{"success":true,"columns":["COUNT(*)","Sum(Weight)"],"rows":[["239","5687.98"],["73","1691.00"]]}"#;
+        let ci_r = AgentCore::render_rows_table(ci).expect("应渲染表格");
+        assert!(ci_r.contains("| 车次 | 重量_吨 |"), "{}", ci_r);
+    }
+
+    #[test]
+    fn answer_has_markdown_table_tests() {
+        // 标准表格（前导 | 分隔行） → 判定为真
+        let with_lead = "统计如下：\n| 公司 | 车次 |\n| --- | --- |\n| 天越 | 239 |";
+        assert!(AgentCore::answer_has_markdown_table(with_lead), "应识别前导|表格");
+        // 无前导 | 的分隔行（--- | ---） → 仍判定为真（ocr 意见：补齐 pipe-less 形式）
+        let no_lead = "统计如下：\n| 公司 | 车次 |\n--- | ---\n| 天越 | 239 |";
+        assert!(AgentCore::answer_has_markdown_table(no_lead), "应识别无前导|表格");
+        // 散文含 | 但无 --- → 判定为假（不误丢多行数据）
+        let prose = "天越进厂 239 | 总重 5687.98 吨，详见下表";
+        assert!(!AgentCore::answer_has_markdown_table(prose), "散文含|不应误判");
+        // 纯散文无 | → 假
+        let plain = "天越 7 月进厂 239 车次";
+        assert!(!AgentCore::answer_has_markdown_table(plain));
+        // 孤立分隔行（无数据/表头行）→ 假（ocr 意见：需表格上下文，避免丢多行数据）
+        let lone = "| --- | --- |";
+        assert!(!AgentCore::answer_has_markdown_table(lone), "孤立分隔行不应误判");
+        // 表头 + 分隔行但无数据行 → 假（ocr 意见：非完整表格，不应短路丢多行数据）
+        let head_only = "| 公司 | 车次 |\n| --- | --- |";
+        assert!(!AgentCore::answer_has_markdown_table(head_only), "仅表头+分隔无数据不应误判");
+        // 对齐冒号分隔行（|:---:| / | :---: |）→ 真（ocr 意见：归一化冒号后识别）
+        let align = "| 公司 | 车次 |\n|:---:|---:|\n| 天越 | 239 |\n| 利合 | 73 |";
+        assert!(AgentCore::answer_has_markdown_table(align), "应识别对齐冒号分隔行");
+        // 块级邻接：孤立分隔行夹在非表格散文中（前后非 | 行）→ 假（ocr 意见：需表头+数据块）
+        let stray = "总表如下：\n一些说明文字\n| --- | --- |\n更多说明\n再来一行 | 带 | 竖线";
+        assert!(!AgentCore::answer_has_markdown_table(stray), "非表格块级上下文不应误判");
     }
 
     #[test]
