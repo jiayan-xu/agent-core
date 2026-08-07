@@ -1297,18 +1297,33 @@ impl ToolClassifier {
 /// 白名单混合工具的只读动作判定（2026-08-07）：这些工具被 HARD_DANGEROUS 强制危险地板，
 /// 但 query / query_oplog 是纯查询（无写副作用），免审批。写动作（add/remove/reconcile/
 /// update_company/update_waste_type）仍走危险地板审批。
+///
+/// 安全约束（2026-08-07 ocr-review security·medium）：
+/// 仅当 action 为只读动作 **且未携带任何写参数** 时才豁免——防止外部工具扩展后
+/// 用 query 携带写参数（plates/company_name/waste_type/reason/confirmed）静默绕过审批。
 fn is_whitelist_readonly_action(tool_name: &str, args: &serde_json::Value) -> bool {
     let action = args
         .get("action")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    match tool_name {
+    let is_readonly_action = match tool_name {
         "manage_whitelist" => action == "query",
         "sync_whitelist_plates" => action == "query_oplog",
         _ => false,
+    };
+    if !is_readonly_action {
+        return false;
     }
+    // 写参数白名单：任一存在即视为可能携带写意图 → 不豁免（走审批）
+    const WRITE_PARAMS: &[&str] = &[
+        "plates", "company_name", "waste_type", "reason", "confirmed", "effective_date",
+    ];
+    WRITE_PARAMS
+        .iter()
+        .all(|p| args.get(*p).is_none())
 }
 
+/// 固废部门写文件类工具：非 dry_run 时需要人工确认（HumanInLoop 黄线）。
 fn needs_dept_ops_write_approval(tool_name: &str, args: &serde_json::Value) -> bool {
     const OPS_WRITE: &[&str] = &[
         "organize_folders",
@@ -2134,5 +2149,89 @@ mod tests {
             None,
         );
         assert!(r2.allow, "query_plate 应放行: {:?}", r2);
+    }
+
+    #[test]
+    fn test_whitelist_readonly_action_exemption() {
+        // 2026-08-07 修复：白名单混合工具的只读动作免审批，
+        // 写动作 / 带写参数的 query 仍走危险地板黄线（审批闸）。
+        let mut boundary = ComplianceBoundary::new(None);
+        boundary
+            .perm_chain
+            .lock()
+            .unwrap()
+            .register("test-agent", None, PermissionLevel::Admin);
+        boundary.register_tool("manage_whitelist", "read");
+        boundary.register_tool("sync_whitelist_plates", "read");
+
+        // ① manage_whitelist query（纯查询，无写参数）→ 放行
+        let r = boundary.check_tool(
+            "manage_whitelist",
+            &serde_json::json!({"action": "query", "plate": "苏B12345"}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert!(r.allow, "manage_whitelist query 应免审批放行: {:?}", r);
+
+        // ② manage_whitelist query 但携带写参数（confirmed）→ 仍黄线（防绕过）
+        let r = boundary.check_tool(
+            "manage_whitelist",
+            &serde_json::json!({"action": "query", "plate": "苏B12345", "confirmed": true}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "带写参数的 query 不得豁免，仍须审批: {:?}",
+            r
+        );
+
+        // ③ manage_whitelist add（写动作）→ 黄线
+        let r = boundary.check_tool(
+            "manage_whitelist",
+            &serde_json::json!({"action": "add", "plate": "苏B12345", "waste_type": "装修垃圾"}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "add 写动作仍须审批: {:?}",
+            r
+        );
+
+        // ④ sync_whitelist_plates query_oplog（纯查询）→ 放行
+        let r = boundary.check_tool(
+            "sync_whitelist_plates",
+            &serde_json::json!({"action": "query_oplog"}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert!(r.allow, "query_oplog 应免审批放行: {:?}", r);
+
+        // ⑤ sync_whitelist_plates update_company（写动作）→ 黄线
+        let r = boundary.check_tool(
+            "sync_whitelist_plates",
+            &serde_json::json!({"action": "update_company", "plate": "苏B12345", "company_name": "佳士能"}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "update_company 写动作仍须审批: {:?}",
+            r
+        );
     }
 }
