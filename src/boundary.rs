@@ -1295,41 +1295,6 @@ impl ToolClassifier {
 }
 
 /// 固废部门写文件类工具：非 dry_run 时需要人工确认（HumanInLoop 黄线）。
-/// 白名单混合工具的只读动作判定（2026-08-07）：这些工具被 HARD_DANGEROUS 强制危险地板，
-/// 但 query / query_oplog 是纯查询（无写副作用），免审批。写动作（add/remove/reconcile/
-/// update_company/update_waste_type）仍走危险地板审批。
-///
-/// 安全约束（2026-08-07 ocr-review security·medium + test·medium）：
-/// 仅当 action 为只读动作 **且未携带任何写参数** 时才豁免——防止外部工具扩展后
-/// 用 query 携带写参数静默绕过审批。deny-list 覆盖工具真实写参数全集：
-///   manage_whitelist: plate(查询用，豁免) / company_name / waste_type / effective_date
-///   sync_whitelist_plates: plates / company_name / waste_type / reason / confirmed / limit
-/// 未知/未识别 action 一律视为写（fail-closed），不豁免。
-fn is_whitelist_readonly_action(tool_name: &str, args: &serde_json::Value) -> bool {
-    let action = args
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let is_readonly_action = match tool_name {
-        "manage_whitelist" => action == "query",
-        "sync_whitelist_plates" => action == "query_oplog",
-        _ => false,
-    };
-    if !is_readonly_action {
-        return false;
-    }
-    // 写参数白名单：任一存在即视为可能携带写意图 → 不豁免（走审批）
-    // （manage_whitelist query 也接受 plate 作筛选条件，故 plate 不在 deny-list；
-    //   但 write 动作参数全覆盖，防 action 漂移后 query 携带写参数绕过）
-    const WRITE_PARAMS: &[&str] = &[
-        "plates", "company_name", "waste_type", "reason", "confirmed", "effective_date", "limit",
-    ];
-    WRITE_PARAMS
-        .iter()
-        .all(|p| args.get(*p).is_none())
-}
-
-/// 固废部门写文件类工具：非 dry_run 时需要人工确认（HumanInLoop 黄线）。
 fn needs_dept_ops_write_approval(tool_name: &str, args: &serde_json::Value) -> bool {
     const OPS_WRITE: &[&str] = &[
         "organize_folders",
@@ -1362,6 +1327,38 @@ fn needs_dept_ops_write_approval(tool_name: &str, args: &serde_json::Value) -> b
         }
     }
     true
+}
+
+/// 白名单混合工具的只读动作判定（2026-08-07，allow-list 方案 v3）：
+/// manage_whitelist / sync_whitelist_plates 被 HARD_DANGEROUS 强制危险地板，
+/// 但 query / query_oplog 是纯查询（无写副作用），免审批。写动作（add/remove/
+/// reconcile/update_company/update_waste_type）仍走危险地板审批。
+///
+/// 安全设计（ocr-review security·medium，从 deny-list 改为 allow-list）：
+/// - deny-list 会漂移：工具新增写参数后漏加 → 查询被静默豁免成写
+/// - allow-list 天然 fail-closed：只读动作仅允许精确的只读参数集
+///   （manage_whitelist query: plate 查询条件 + limit 分页；
+///     sync_whitelist_plates query_oplog: limit 分页）
+/// - 其余任何参数（含嵌套对象内的写参数）→ 不豁免，走审批
+fn is_whitelist_readonly_action(tool_name: &str, args: &serde_json::Value) -> bool {
+    let action = args
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    // 只读动作集合
+    let allowed = match tool_name {
+        "manage_whitelist" => action == "query",
+        "sync_whitelist_plates" => action == "query_oplog",
+        _ => false,
+    };
+    if !allowed {
+        return false;
+    }
+    // allow-list：仅允许以下只读参数，其余键一律视为写意图 → 不豁免
+    const READONLY_KEYS: &[&str] = &["action", "plate", "limit"];
+    args.as_object()
+        .map(|obj| obj.keys().all(|k| READONLY_KEYS.contains(&k.as_str())))
+        .unwrap_or(false)
 }
 
 /// 判断工具是否「危险」（落入红线/高危前缀）。
@@ -2287,5 +2284,44 @@ mod tests {
             "未知 action 应 fail-closed 走审批: {:?}",
             r
         );
+
+        // ⑨ query_oplog 携带 limit（只读分页参数）→ 放行（allow-list 含 limit）
+        let r = boundary.check_tool(
+            "sync_whitelist_plates",
+            &serde_json::json!({"action": "query_oplog", "limit": 50}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert!(r.allow, "query_oplog + limit 分页应免审批: {:?}", r);
+
+        // ⑩ query 携带嵌套对象写参数（filters.company_name）→ 仍黄线（allow-list 只查顶层键，
+        //    嵌套键不在 READONLY_KEYS → 整对象不豁免 → 走审批）
+        let r = boundary.check_tool(
+            "manage_whitelist",
+            &serde_json::json!({"action": "query", "plate": "苏B12345", "filters": {"company_name": "佳士能"}}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "query 携带嵌套写参数不得豁免: {:?}",
+            r
+        );
+
+        // ⑪ query_oplog 携带 plate（allow-list 键）→ 放行
+        let r = boundary.check_tool(
+            "sync_whitelist_plates",
+            &serde_json::json!({"action": "query_oplog", "plate": "苏B12345"}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert!(r.allow, "query_oplog + plate 应免审批: {:?}", r);
     }
 }
