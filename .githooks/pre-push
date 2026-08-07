@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # Safe-push guardrail for jiayan-xu/agent-core (public open-source repo).
 # Installed via `git config core.hooksPath .githooks` (canonical checkout) or copied to
 # .git/hooks/pre-push (stale checkouts). See AGENTS.md for the full policy.
