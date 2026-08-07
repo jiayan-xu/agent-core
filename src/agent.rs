@@ -2223,41 +2223,58 @@ impl AgentCore {
         Some(out)
     }
 
-    /// 精确判定 answer 是否已含完整 Markdown 表格（块级：分隔行 `---` 单元格须前后各有非分隔
-    /// 的 `|` 行即表头 + 数据行，且全文至少 2 个非分隔 `|` 行）。替代脆弱的 `answer.contains("| ")`：
-    /// - 分隔行需 3+ 短横线单元格紧邻 `|`（匹配本代码与 query_skill 产出的 `---` 格式；
-    ///   先去掉对齐冒号 `:` 以兼容 `|:---:|` / `| :---: |`）；
-    /// - 块级邻接约束：分隔行必须夹在表头行与数据行之间，避免把孤立/引用分隔行、散文带 `|`、
-    ///   或 `|:---:|` 装饰行误判为已含表格而静默丢弃 render_rows_table 本应追加的多行数据。
+    /// 精确判定 answer 是否已含完整 Markdown 结果表（仅认「尾部表」）。
+    /// 调用方据此决定：true → 直接采用 answer（其已自带完整表，不再追加 render_rows_table
+    /// 的 DB 表）；false → 由调用方把 DB 表追接到 answer 之后。
+    ///
+    /// 修复 ocr 2026-08-07 两条意见：
+    /// - [low] 分隔行判定「严格化」且冒号归一化只在本函数内局部进行，绝不污染数据行：
+    ///   每非空单元格须为 `:?-{3,}:?`（仅允许前/后冒号 + ≥3 连续短横），拒绝 `| - | - |` 这类
+    ///   单短横行，也避免 `08:30` 之类数据被全局去冒号误伤。
+    /// - [medium] 仅认「最后一个分隔行」构成的夹心表，且其后须确有数据行：避免分析型 answer
+    ///   中段/末段夹杂的小表格（仍满足旧「夹心」条件）被误判为「已含完整结果表」，从而静默
+    ///   丢弃 render_rows_table 本应追加的 DB 多行数据（同类数据丢失回归）。
     fn answer_has_markdown_table(answer: &str) -> bool {
-        let lines: Vec<String> = answer
-            .lines()
-            .map(|l| l.trim().replace(':', "")) // 归一化对齐冒号（|:---:| → |---|）
-            .collect();
-        let is_sep = |t: &str| {
-            (t.contains("|---")
-                || t.contains("---|")
-                || t.contains("| ---")
-                || t.contains("--- |"))
-                && t
-                    .chars()
-                    .all(|c| c == '|' || c == '-' || c.is_whitespace())
-        };
-        let n = lines.len();
-        // 块级：分隔行须前后各有非分隔的 | 行（表头在上、数据在下）
-        let mut sep_sandwiched = 0;
-        for i in 0..n {
-            if is_sep(&lines[i]) {
-                let prev_ok = i > 0 && lines[i - 1].contains('|') && !is_sep(&lines[i - 1]);
-                let next_ok =
-                    i + 1 < n && lines[i + 1].contains('|') && !is_sep(&lines[i + 1]);
-                if prev_ok && next_ok {
-                    sep_sandwiched += 1;
-                }
+        let raw: Vec<&str> = answer.lines().map(|l| l.trim()).collect();
+        // 严格分隔行：含 |，且每个非空单元格仅由 ≥3 个连续 '-'（可选首尾冒号）组成。
+        // 冒号归一化只在判定时局部发生，不影响任何数据行（不污染 08:30 等时间值）。
+        let is_sep = |t: &str| -> bool {
+            let norm = t.replace(':', "");
+            if !norm.contains('|') {
+                return false;
             }
+            let mut dash_cell = false;
+            for c in norm.split('|').map(|x| x.trim()) {
+                if c.is_empty() {
+                    continue;
+                }
+                let body = c.trim_matches(':');
+                if body.is_empty() || body.chars().any(|x| x != '-') || body.len() < 3 {
+                    return false;
+                }
+                dash_cell = true;
+            }
+            dash_cell
+        };
+        // 取最后一个有效分隔行作为表的基准（从尾部找，天然忽略其后的第二个表/小表）
+        let sep_idx = raw
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, line)| is_sep(line))
+            .map(|(idx, _)| idx);
+        let i = match sep_idx {
+            Some(x) => x,
+            None => return false,
+        };
+        // 夹心：表头行（含 |、非分隔）须紧邻分隔行上方
+        if i == 0 || !raw[i - 1].contains('|') || is_sep(raw[i - 1]) {
+            return false;
         }
-        let pipe_lines = lines.iter().filter(|l| l.contains('|') && !is_sep(l)).count();
-        sep_sandwiched >= 1 && pipe_lines >= 2
+        // 分隔行之后至少存在一行含 | 的数据行（确有数据，而非只有表头 + 分隔）
+        raw.iter()
+            .skip(i + 1)
+            .any(|line| line.contains('|') && !is_sep(line))
     }
 
     /// 2026-08-06：快速通道直答——从 nl_query 返回 JSON 提取可直接作为最终回答的 answer。
@@ -9344,6 +9361,24 @@ mod whitelist_preroute_tests {
         // 块级邻接：孤立分隔行夹在非表格散文中（前后非 | 行）→ 假（ocr 意见：需表头+数据块）
         let stray = "总表如下：\n一些说明文字\n| --- | --- |\n更多说明\n再来一行 | 带 | 竖线";
         assert!(!AgentCore::answer_has_markdown_table(stray), "非表格块级上下文不应误判");
+        // 2026-08-07 修复 ocr[low]：单短横分隔行（| - | - |）不应判为表（严格 ≥3 短横）
+        let single_dash = "| 公司 | 车次 |\n| - | - |\n| 天越 | 239 |";
+        assert!(
+            !AgentCore::answer_has_markdown_table(single_dash),
+            "单短横分隔行不应判为表"
+        );
+        // 2026-08-07 修复 ocr[medium]：表后跟无 | 散文（如数据来源）仍应判为真（非第二个表）
+        let trailing_prose = "| 公司 | 车次 |\n| --- | --- |\n| 天越 | 239 |\n数据来源：SNMIS。";
+        assert!(
+            AgentCore::answer_has_markdown_table(trailing_prose),
+            "表后散文不应误判为无表"
+        );
+        // 2026-08-07 修复 ocr[medium]：仅表头+分隔无数据行 → 假（避免空壳表误判丢数据）
+        let head_sep_only = "| 公司 | 车次 |\n| --- | --- |";
+        assert!(
+            !AgentCore::answer_has_markdown_table(head_sep_only),
+            "仅表头+分隔无数据不应判为真"
+        );
     }
 
     #[test]
