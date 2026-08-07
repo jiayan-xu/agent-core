@@ -30,7 +30,11 @@ ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --gate) GATE=1; shift;;
-    --ocr-bin) OCR_BIN="$2"; shift 2;;
+    --ocr-bin)
+      if [ $# -lt 2 ]; then
+        echo "[ocr] 错误: --ocr-bin 需要参数"; exit 2
+      fi
+      OCR_BIN="$2"; shift 2;;
     *) ARGS+=("$1"); shift;;
   esac
 done
@@ -49,8 +53,13 @@ if [ $RC -ne 0 ]; then
   echo "[ocr] review 进程异常退出(rc=$RC)"; exit 2
 fi
 
-FINDINGS=$(echo "$OUT" | grep -oE '[0-9]+ finding\(s\)' | grep -oE '[0-9]+' | head -1)
-FINDINGS=${FINDINGS:-0}
+# 解析评论数：容忍多种输出格式（`N finding(s)` / `N findings` / `N 条评论` / `N comments`），
+# 避免输出格式漂移时 FINDINGS 静默回落 0 导致门禁 fail-open。
+FINDINGS=0
+for pat in '[0-9]+ finding(s)?' '[0-9]+ 条评论' '[0-9]+ comments?' '[0-9]+ issues?'; do
+  m=$(echo "$OUT" | grep -oiE "$pat" | grep -oE '[0-9]+' | head -1)
+  if [ -n "$m" ]; then FINDINGS="$m"; break; fi
+done
 echo "[ocr] 评论数 = $FINDINGS"
 
 if [ "$GATE" = "1" ] && [ "$FINDINGS" -gt 0 ]; then
