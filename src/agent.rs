@@ -1317,11 +1317,13 @@ impl AgentCore {
                             // 审批人尚未批准时，take_pending_action 已把 action 从 session_manager 消费掉，
                             // 若不恢复，用户再次「确认」会取不到 pending → 落入 Confirmed → execute_chat →
                             // LLM 重新选中同一工具 → 再次 submit_controlled_write_approval → 新审批 → 无限循环。
-                            // → 把 action 放回 session_manager，保持等待审批，直到审批人在审批台批准。
+                            // → 把 action 放回 session_manager，保持等待审批，直到审批人决定。
                             self.session_manager
                                 .set_pending_action(session_id, action)
                                 .await;
-                            let reply = "⏳ 该操作仍在等待审批人决定（dashboard-admin 尚未在审批台批准），无法执行。请先在审批台批准该审批单，再回复「确认」继续。".to_string();
+                            // 文案通用化（2026-08-07 ocr-review）：审批可能走 dashboard 审批台，
+                            // 也可能走 a2a/approver_id 路径（另一 agent 审批，无审批台），不硬编码审批人身份。
+                            let reply = "⏳ 该操作仍在等待审批人决定，尚未批准，无法执行。请等待审批通过后再回复「确认」继续。".to_string();
                             let ns = self.caller_ns(session_id);
                             let db_path = self.harness.lock().await.db_path();
                             self.session_manager
