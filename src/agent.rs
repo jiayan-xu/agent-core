@@ -2256,32 +2256,34 @@ impl AgentCore {
             }
             dash_cell
         };
-        // 锚定「其后确实仍有含 | 数据行」的最后一个分隔行；跳过表尾孤立装饰分隔行
-        // （如收尾边框 `| --- |` 或 `| 合计 |\n| --- |` 图例块），避免把真实结果表误判为
-        // 「无表」而重复追接 render_rows_table 的 DB 表（见 extract_final_answer 的
-        // true→直接用 / false→追接逻辑）。
+        // 锚定「其后确有与表头同列数的真实数据行」的最后一个分隔行。
+        // 要求：紧邻表头（含 |、非分隔）、且其后存在「非分隔、且单元格数与表头一致」的行，
+        // 才认作结果表。这样同时避开两类假象：
+        //  (a) 表尾孤立装饰分隔行（收尾边框 `| --- |`、图例块 `| 合计 |\n| --- |`）→ 其后无同列数数据行；
+        //  (b) 空壳表 + 图例块（如 `| 公司 | 车次 |\n| --- | --- |\n| 合计 |\n| --- |`）→
+        //      图例头 `| 合计 |` 列数与真实表头不一致，不计为数据行，避免误判为真而漏追 DB 表丢数据。
+        let cell_count = |t: &str| -> usize {
+            t.split('|').filter(|c| !c.trim().is_empty()).count()
+        };
         let sep_idx = raw
             .iter()
             .enumerate()
             .rev()
             .find(|(idx, line)| {
-                is_sep(line)
-                    && raw
-                        .iter()
-                        .skip(*idx + 1)
-                        .any(|l| l.contains('|') && !is_sep(l))
+                if *idx == 0 || !is_sep(line) {
+                    return false;
+                }
+                let header = raw[*idx - 1];
+                if !header.contains('|') || is_sep(header) {
+                    return false;
+                }
+                let hc = cell_count(header);
+                raw.iter()
+                    .skip(*idx + 1)
+                    .any(|l| l.contains('|') && !is_sep(l) && cell_count(l) == hc)
             })
             .map(|(idx, _)| idx);
-        let i = match sep_idx {
-            Some(x) => x,
-            None => return false,
-        };
-        // 夹心：表头行（含 |、非分隔）须紧邻分隔行上方
-        if i == 0 || !raw[i - 1].contains('|') || is_sep(raw[i - 1]) {
-            return false;
-        }
-        // 分隔行之后确有数据行（上面 find 已保证；此处显式返回，语义清晰）
-        true
+        sep_idx.is_some()
     }
 
     /// 2026-08-06：快速通道直答——从 nl_query 返回 JSON 提取可直接作为最终回答的 answer。
@@ -9397,6 +9399,13 @@ mod whitelist_preroute_tests {
         assert!(
             AgentCore::answer_has_markdown_table(with_legend),
             "表后图例块装饰分隔行不应误判为无表"
+        );
+        // 2026-08-07 修复 ocr[medium]：空壳表 + 图例块（图例头列数与真实表头不同）不应误判为
+        // 真（否则调用方跳过 DB 表 → 丢数据）。须要求数据行列数与表头一致。
+        let shell_plus_legend = "| 公司 | 车次 |\n| --- | --- |\n| 合计 |\n| --- |";
+        assert!(
+            !AgentCore::answer_has_markdown_table(shell_plus_legend),
+            "空壳表+图例块不应误判为真（避免丢数据）"
         );
     }
 
