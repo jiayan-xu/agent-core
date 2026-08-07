@@ -1313,7 +1313,17 @@ impl AgentCore {
                                     .await;
                                 return reply;
                             }
-                            let reply = "⏳ 该操作仍在等待审批人决定，尚未批准，无法执行。".to_string();
+                            // 修复 2026-08-07（feishui_reconcile_backfill 审批死循环）：
+                            // 审批人尚未批准时，take_pending_action 已把 action 从 session_manager 消费掉，
+                            // 若不恢复，用户再次「确认」会取不到 pending → 落入 Confirmed → execute_chat →
+                            // LLM 重新选中同一工具 → 再次 submit_controlled_write_approval → 新审批 → 无限循环。
+                            // → 把 action 放回 session_manager，保持等待审批，直到审批人决定。
+                            self.session_manager
+                                .set_pending_action(session_id, action)
+                                .await;
+                            // 文案通用化（2026-08-07 ocr-review）：审批可能走 dashboard 审批台，
+                            // 也可能走 a2a/approver_id 路径（另一 agent 审批，无审批台），不硬编码审批人身份。
+                            let reply = "⏳ 该操作仍在等待审批人决定，尚未批准，无法执行。请等待审批通过后再回复「确认」继续。".to_string();
                             let ns = self.caller_ns(session_id);
                             let db_path = self.harness.lock().await.db_path();
                             self.session_manager
@@ -5505,6 +5515,9 @@ impl AgentCore {
                         };
                         self.checkpoint_pending_approval(session_id, &aid, &pa)
                             .await;
+                        // 注：checkpoint_pending_approval 内部已写 session_manager.pending_action
+                        //（含 approval_id 补全），此处无需重复调用。真正的循环修复点是
+                        // 确认分支（is_confirm → take_pending_action → check_response None → 恢复 action）。
                         let summary = Self::summarize_args(&tc.arguments);
                         let reply = format!(
                             "AWAITING_APPROVAL:危险/红线工具「{}」已提交人工审批台(dashboard-admin)，请在审批台批准后回复「确认」继续\n参数：{}",
