@@ -2156,6 +2156,28 @@ impl AgentCore {
     /// 2026-08-06：确定性表格渲染——解析 nl_query 返回 JSON 的 columns/rows，rows≥2 生成
     /// Markdown 表格（绕开 LLM 风格：deepseek-flash 列表惯性极强，prompt 手段实测全无效）。
     /// 数字直接来自数据库（LLM 零抄录）。行数上限 50 防撑爆 prompt；列/行结构不匹配跳过。
+    /// 2026-08-07：表格列名中文映射——query_skill 通用 SQL 路径（_build_sql）会把原始库列名
+    /// （如 company_name）直接当表头吐出，render_rows_table 原样渲染 → 英文表头。这里做一层
+    /// 安全映射：**仅命中已知原始列名才转中文，中文列名/未知列名原样透传**（不会误改已有中文表头）。
+    fn map_column_name(col: &str) -> String {
+        let c = col.trim();
+        let mapped = match c {
+            "company_name" => "公司名",
+            "entrance_date" => "进厂日期",
+            "entrance_time" => "进厂时间",
+            "license_plate" => "车牌号",
+            "waste_type" => "废物类型",
+            "weight" => "重量_吨",
+            "trip_count" => "车次",
+            "total_weight" => "总重_吨",
+            "vehicle_count" => "车次",
+            "ym" => "月份",
+            // 通用计数表达式 → 车次（本域 vehicle_entrance 的 COUNT 即车次）
+            "COUNT(*)" | "count(*)" | "COUNT(1)" | "count(1)" => "车次",
+            _ => c,
+        };
+        mapped.to_string()
+    }
     fn render_rows_table(raw: &str) -> Option<String> {
         let v: serde_json::Value = serde_json::from_str(raw).ok()?;
         let columns: Vec<String> = v
@@ -2163,7 +2185,7 @@ impl AgentCore {
             .as_array()?
             .iter()
             .filter_map(|c| c.as_str())
-            .map(|s| s.to_string())
+            .map(|s| Self::map_column_name(s))
             .collect();
         let rows = v.get("rows")?.as_array()?;
         if columns.is_empty() || rows.len() < 2 {
@@ -9237,6 +9259,15 @@ mod whitelist_preroute_tests {
         let mixed = r#"{"success":true,"columns":["对象","总车次","占比"],"rows":[["全厂",683,24.9],["天越",239,38.5]]}"#;
         let m = AgentCore::render_rows_table(mixed).expect("应渲染表格");
         assert!(m.contains("| 全厂 | 683 | 24.9 |"));
+        // 2026-08-07 表格列名中文映射：原始库列名 company_name / COUNT(*) → 公司名 / 车次
+        let raw_cols = r#"{"success":true,"columns":["company_name","COUNT(*)"],"rows":[["天越",239],["利合",73]]}"#;
+        let r = AgentCore::render_rows_table(raw_cols).expect("应渲染表格");
+        assert!(r.contains("| 公司名 | 车次 |"), "{}", r);
+        assert!(r.contains("| 天越 | 239 |") && r.contains("| 利合 | 73 |"), "{}", r);
+        // 中文列名原样透传（不误改已有中文表头）
+        let cn = r#"{"success":true,"columns":["公司","车次"],"rows":[["天越",239],["利合",73]]}"#;
+        let c = AgentCore::render_rows_table(cn).expect("应渲染表格");
+        assert!(c.contains("| 公司 | 车次 |"), "{}", c);
     }
 
     #[test]
