@@ -907,9 +907,10 @@ impl ComplianceBoundary {
             // 2026-08-07 修复：白名单混合工具的只读动作（query / query_oplog）免审批。
             // manage_whitelist / sync_whitelist_plates 被 HARD_DANGEROUS 强制危险地板，
             // 但纯查询场景（如「XX 在不在白名单」）不该弹审批 —— 查询无写副作用。
-            if is_whitelist_readonly_action(tool_name, args) {
-                // 视为只读，跳过危险地板审批检查
-            } else if tool_level == "dangerous" || self.is_dangerous_floor(tool_name) {
+            // 取反条件：非只读动作（或携带写参数）才走危险地板审批，避免空分支。
+            if !is_whitelist_readonly_action(tool_name, args)
+                && (tool_level == "dangerous" || self.is_dangerous_floor(tool_name))
+            {
                 return ToolCheck::yellow(&format!("{} 需要审批，请等待审批人确认", tool_name));
             }
             // 固废整理/归档写操作：非 dry_run 时走黄线（可控写改）
@@ -1298,9 +1299,12 @@ impl ToolClassifier {
 /// 但 query / query_oplog 是纯查询（无写副作用），免审批。写动作（add/remove/reconcile/
 /// update_company/update_waste_type）仍走危险地板审批。
 ///
-/// 安全约束（2026-08-07 ocr-review security·medium）：
+/// 安全约束（2026-08-07 ocr-review security·medium + test·medium）：
 /// 仅当 action 为只读动作 **且未携带任何写参数** 时才豁免——防止外部工具扩展后
-/// 用 query 携带写参数（plates/company_name/waste_type/reason/confirmed）静默绕过审批。
+/// 用 query 携带写参数静默绕过审批。deny-list 覆盖工具真实写参数全集：
+///   manage_whitelist: plate(查询用，豁免) / company_name / waste_type / effective_date
+///   sync_whitelist_plates: plates / company_name / waste_type / reason / confirmed / limit
+/// 未知/未识别 action 一律视为写（fail-closed），不豁免。
 fn is_whitelist_readonly_action(tool_name: &str, args: &serde_json::Value) -> bool {
     let action = args
         .get("action")
@@ -1315,8 +1319,10 @@ fn is_whitelist_readonly_action(tool_name: &str, args: &serde_json::Value) -> bo
         return false;
     }
     // 写参数白名单：任一存在即视为可能携带写意图 → 不豁免（走审批）
+    // （manage_whitelist query 也接受 plate 作筛选条件，故 plate 不在 deny-list；
+    //   但 write 动作参数全覆盖，防 action 漂移后 query 携带写参数绕过）
     const WRITE_PARAMS: &[&str] = &[
-        "plates", "company_name", "waste_type", "reason", "confirmed", "effective_date",
+        "plates", "company_name", "waste_type", "reason", "confirmed", "effective_date", "limit",
     ];
     WRITE_PARAMS
         .iter()
@@ -2231,6 +2237,54 @@ mod tests {
             r.level,
             Some(BlockLevel::Yellow),
             "update_company 写动作仍须审批: {:?}",
+            r
+        );
+
+        // ⑥ manage_whitelist query 携带写参数（effective_date）→ 仍黄线
+        let r = boundary.check_tool(
+            "manage_whitelist",
+            &serde_json::json!({"action": "query", "plate": "苏B12345", "effective_date": "2026-08-01"}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "query 携带 effective_date 写参数不得豁免: {:?}",
+            r
+        );
+
+        // ⑦ sync_whitelist_plates query_oplog 携带 plates 数组 → 仍黄线
+        let r = boundary.check_tool(
+            "sync_whitelist_plates",
+            &serde_json::json!({"action": "query_oplog", "plates": ["苏B12345", "皖NB7691"]}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "query_oplog 携带 plates 写参数不得豁免: {:?}",
+            r
+        );
+
+        // ⑧ 未知 action（非 query/query_oplog）→ fail-closed 黄线
+        let r = boundary.check_tool(
+            "manage_whitelist",
+            &serde_json::json!({"action": "export", "plate": "苏B12345"}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "未知 action 应 fail-closed 走审批: {:?}",
             r
         );
     }
