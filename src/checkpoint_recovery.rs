@@ -426,11 +426,20 @@ mod tests {
             "PendingApproval 恢复后必须落 Confirmed，孤儿审批单才能被 execute_approved_request 闭环消费"
         );
 
-        // pending_action 必须回填，且 approval_id 完好（供 execute_approved_request 消费）
-        assert!(
-            session_manager.has_pending_action("s_pa").await,
-            "pending_action 必须回填"
+        // pending_action 必须回填，且 approval_id【原样保留】——这是 P0 核心不变式：execute_approved_request
+        // 全局扫描按 approval_id 匹配消费，若恢复时丢/空 approval_id（如删除 PendingApproval 分支的
+        // approval_id.clone()），孤儿单无法闭环，但仅查 has_pending_action 布尔存在会静默通过。
+        // → 用 take_pending_action 断言实际 approval_id 值 + tool_name 完好。
+        let pa = session_manager
+            .take_pending_action("s_pa")
+            .await
+            .expect("pending_action 必须回填");
+        assert_eq!(
+            pa.approval_id.as_deref(),
+            Some("apr_e2e_orphan_001"),
+            "approval_id 必须原样保留，供 execute_approved_request 按 id 消费闭环孤儿单"
         );
+        assert_eq!(pa.tool_name, "manage_whitelist");
 
         // 恢复计数：按 PendingApproval 分桶
         let snap = metrics.snapshot(serde_json::json!({}), serde_json::json!({}));
