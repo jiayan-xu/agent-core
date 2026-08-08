@@ -906,9 +906,9 @@ impl ComplianceBoundary {
             });
             // ocr-review security·high(v11)：移除 LLM 工具循环的只读豁免。
             // 背景：manage_whitelist / sync_whitelist_plates 被 HARD_DANGEROUS 强制危险地板，
-            // 其正常用户查询（「XX 在不在白名单」）已由 agent.rs 确定性预路由（try_preroute 的
-            // extract_whitelist_membership_query 分支，agent.rs:2893-2951）直接走 call_tool_routed
-            // 天然免审批（agent.rs:2902 call_tool_routed），无需此处豁免。
+            // 其正常用户查询（「XX 在不在白名单」）已由 agent.rs 确定性预路由（try_preroute 内
+            // extract_whitelist_membership_query 分支）直接走 call_tool_routed 天然免审批，
+            // 无需此处豁免（注：不用行号引用，agent.rs 同 PR 会变，行号易漂移误导审计）。
             // 此 check_tool 分支服务的是【LLM 工具循环】——若对 LLM 传的 action=query 也豁免，
             // 一旦外部 MCP handler 的 query 存在未察觉副作用或 query_oplog 泄漏全量操作日志，
             // 就构成对危险地板的静默绕过（外部 handler 契约本仓库无法验证）。移除豁免 → dangerous
