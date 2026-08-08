@@ -1853,9 +1853,13 @@ impl AgentCore {
         // 含写动词（添加/删除/修改/公司名/加类）→ 不是纯查询，交给对应预路由。
         // ocr-review bug·medium(v9)：删单字「加」——「加急/加班/参加/增加」会误伤成员查询；
         // 多字变体（加入/加进/加一下/加上）已覆盖写意图。`记录`过宽（「查XX的记录」是查询）也删。
+        // ocr-review bug·high(v9)：补全 extract_whitelist_remove 认可的移除动词（删掉/去掉/移出/作废/
+        // 注销/软删/踢出/清掉），否则「把皖A12345从白名单删掉，它在白名单吗」这类「写意图+成员句式」
+        // 混合消息不拦截 → 移除操作被成员查询预路由静默吞掉。
         let write_verbs = [
             "添加", "新增", "登记", "录入", "删除", "移除", "改为", "改成", "公司名", "固废种类",
             "加入", "加进", "加一下", "加上",
+            "删掉", "去掉", "移出", "作废", "注销", "软删", "踢出", "清掉",
         ];
         if write_verbs.iter().any(|v| m.contains(*v)) {
             return None;
@@ -2829,7 +2833,8 @@ impl AgentCore {
                         && !t_norm.contains("无此车牌")
                         && !t_norm.contains("无该车牌")
                         && !t_norm.contains("查无此车")
-                        && !t_norm.contains("命中0");
+                        && !t_norm.contains("命中0")
+                        && !t_norm.contains("尚未在");
                     if is_member {
                         format!("✅ {} 在白名单中。\n\n{}", plate, t.chars().take(300).collect::<String>())
                     } else {

@@ -2445,7 +2445,7 @@ mod tests {
             r
         );
 
-        // ⑮ limit 超上限（>1000）→ 黄线（批量拉全量防护）
+        // ⑰ limit 超上限（>1000）→ 黄线（批量拉全量防护）
         let r = boundary.check_tool(
             "manage_whitelist",
             &serde_json::json!({"action": "query", "plate": "苏B12345", "limit": 1001}),
