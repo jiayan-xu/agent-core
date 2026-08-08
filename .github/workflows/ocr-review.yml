@@ -3,7 +3,8 @@ name: ocr-review
 # OpenCodeReview 代码审查门禁
 # - PR：审查 base..head 的 diff
 # - 推送到默认分支：审查 HEAD~1..HEAD
-# 需要仓库 Secret：DEEPSEEK_API_KEY（在 Settings > Secrets 添加）
+# 需要仓库 Secret：ARK_API_KEY（火山方舟，在 Settings > Secrets 添加）
+# LLM provider：volcengine（内置 OpenAI 兼容端点 https://ark.cn-beijing.volces.com/api/v3）
 # 默认门禁：发现评论即 fail CI（见 scripts/ocr-review.sh 的 --gate）
 
 on:
@@ -28,17 +29,19 @@ jobs:
       - name: Install OpenCodeReview
         run: npm install -g @alibaba-group/open-code-review
 
-      - name: Configure LLM (DeepSeek)
+      - name: Configure LLM (Volcengine Ark)
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
         run: |
-          if [ -z "$DEEPSEEK_API_KEY" ]; then
-            echo "::error::缺少 Secret DEEPSEEK_API_KEY，请在仓库 Settings > Secrets 配置"
+          if [ -z "$ARK_API_KEY" ]; then
+            echo "::error::缺少 Secret ARK_API_KEY，请在仓库 Settings > Secrets 配置"
             exit 1
           fi
-          ocr config set provider deepseek
-          ocr config set model deepseek-v4-flash
-          ocr config set providers.deepseek.api_key "$DEEPSEEK_API_KEY"
+          ocr config set provider volcengine
+          # 模型 ID：改为火山方舟控制台开通的模型 ID（如 deepseek-v3.x / doubao-xxx）
+          # 注意：此值必须替换为真实模型 ID，否则 CI 会因模型不存在而失败
+          ocr config set model "ARK_MODEL_ID_PLACEHOLDER"
+          ocr config set providers.volcengine.api_key "$ARK_API_KEY"
 
       - name: Run review (gate)
         run: |
