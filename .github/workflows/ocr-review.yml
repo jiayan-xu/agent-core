@@ -14,6 +14,12 @@ on:
   push:
     branches: [main, master]
 
+# statuses: write 用于把 check-run 结果显式同步成 legacy commit status
+# （否则分支保护 required_status_checks 匹配不到 context，合并永远 BLOCKED）
+permissions:
+  contents: read
+  statuses: write
+
 jobs:
   # job 名即 check context 名，必须与分支保护 required_status_checks 的
   # context "ocr-review" 完全一致，否则门禁永不生效（BLOCKED 但检查全绿）
@@ -68,3 +74,24 @@ jobs:
             exit 1
           fi
           echo "[ocr] 未发现评论"
+
+      # 把 check-run 结果显式同步成 legacy commit status。
+      # 分支保护 required_status_checks 匹配的是 legacy status context（/statuses/{sha}），
+      # 而 Actions check-run 从不自动生成它 → 不写这步则合并永远 BLOCKED（检查全绿也 BLOCKED）。
+      # context 名必须与分支保护完全一致("ocr-review")。
+      - name: Sync check result to commit status
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            STATE="success"; DESC="ocr-review passed"
+          else
+            STATE="failure"; DESC="ocr-review failed"
+          fi
+          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          curl -sS -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/statuses/$SHA" \
+            -d "{\"state\":\"$STATE\",\"context\":\"ocr-review\",\"description\":\"$DESC\"}"
