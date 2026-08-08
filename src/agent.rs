@@ -1161,17 +1161,19 @@ impl AgentCore {
         // 长消息（>8 字，如附件对比/查询请求）绝不命中确认。
         let is_confirm = |m: &str| {
             let t = m.trim();
-            if t.chars().count() > 8 {
+            // ocr-review bug·low：强确认词开头必须优先于长度守卫判断，
+            // 否则「确认，麻烦帮我查一下…」(10+字) 的合法审批回复会被 >8 直接吞掉。
+            let strong_confirm = t.starts_with("确认")
+                || t.starts_with("同意")
+                || t.starts_with("批准")
+                || t.starts_with("执行");
+            if t.chars().count() > 8 && !strong_confirm {
                 return false;
             }
             // 收窄（ocr-review bug·medium）：含查询/疑问动词的短消息不是确认，
             // 避免「可以查」「查一下」「去查」被误吞（应走预路由/execute_chat 当新请求）。
             // 但以强确认词开头的合法审批回复（「确认，去查吧」「同意，看看」）必须仍算确认，
             // 否则待确认操作既不执行也不消费，用户不会意识到批准被丢弃。
-            let strong_confirm = t.starts_with("确认")
-                || t.starts_with("同意")
-                || t.starts_with("批准")
-                || t.starts_with("执行");
             if !strong_confirm
                 && (t.contains('查')
                     || t.contains('问')
@@ -2600,28 +2602,35 @@ impl AgentCore {
 
     /// 统计消息中出现的车牌总数（宽松匹配，容忍空格）。用于多车牌提问判定：
     /// 白名单成员查询预路由只处理单牌，多牌放弃预路由交常规流程（ocr-review bug·low）。
+    /// ocr-review bug·medium：与 extract_plate_spaced 对齐——CJK 后跳过空白再找大写字母，
+    /// 否则「皖 NB7691 和 鲁 H736A7」这种空格分隔车牌会数不到，多牌守卫失效。
     fn count_plates(msg: &str) -> usize {
         let chars: Vec<char> = msg.chars().collect();
         let mut count = 0usize;
         let mut i = 0;
         while i < chars.len() {
             let c = chars[i];
-            // 中文字符 + 后续大写字母 + 4~6 位字母数字 = 一个车牌
-            if ('\u{4e00}'..='\u{9fff}').contains(&c) && i + 1 < chars.len() {
-                let d = chars[i + 1];
-                if d.is_ascii_uppercase() {
+            // 中文字符 + (可选空白) + 大写字母 + 4~6 位字母数字 = 一个车牌
+            if ('\u{4e00}'..='\u{9fff}').contains(&c) {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j].is_ascii_uppercase() {
                     let mut digits = 0usize;
-                    let mut j = i + 2;
-                    while j < chars.len()
-                        && chars[j].is_ascii_alphanumeric()
-                        && digits < 6
-                    {
-                        digits += 1;
-                        j += 1;
+                    let mut k = j + 1;
+                    while k < chars.len() && digits < 6 {
+                        let ch = chars[k];
+                        if ch.is_ascii_alphanumeric() {
+                            digits += 1;
+                        } else if !ch.is_whitespace() {
+                            break;
+                        }
+                        k += 1;
                     }
                     if digits >= 4 {
                         count += 1;
-                        i = j;
+                        i = k;
                         continue;
                     }
                 }
@@ -2770,22 +2779,27 @@ impl AgentCore {
                     "preroute-whitelist-query",
                 )
                 .await;
+            let exec_ok = result.is_ok();
             let reply = match result {
                 Ok(t) => {
                     // default-deny：仅明确正面标记（且不含任何否定词）才算在白名单。
-                    // 否定词表覆盖：不在 / 未命中 / 未 / 没 / 无 / 零 / 不存在 / 未找到 / 无记录 / 0 条
-                    // （ocr-review bug·medium 扩展），避免「未在白名单中」「零命中」「白名单中无此车牌」误判。
-                    let is_member = (t.contains("在白名单中") || t.contains("命中"))
-                        && !t.contains("不在")
-                        && !t.contains("未命中")
-                        && !t.contains("不存在")
-                        && !t.contains("未找到")
-                        && !t.contains("无记录")
-                        && !t.contains("0 条")
-                        && !t.contains("未在白名单")
-                        && !t.contains("没在白名单")
-                        && !t.contains("零命中")
-                        && !t.contains("无此车牌");
+                    // ocr-review bug·high：先归一化空白再匹配，避免「0 条」vs「0条」/「命中0条」
+                    // 因空格差异漏判；否定词表扩展「0条/无该车牌/查无此车/命中0」等。
+                    let t_norm = t.replace(' ', "").replace('\u{3000}', "");
+                    let is_member = (t_norm.contains("在白名单中") || t_norm.contains("命中"))
+                        && !t_norm.contains("不在")
+                        && !t_norm.contains("未命中")
+                        && !t_norm.contains("不存在")
+                        && !t_norm.contains("未找到")
+                        && !t_norm.contains("无记录")
+                        && !t_norm.contains("0条")
+                        && !t_norm.contains("未在白名单")
+                        && !t_norm.contains("没在白名单")
+                        && !t_norm.contains("零命中")
+                        && !t_norm.contains("无此车牌")
+                        && !t_norm.contains("无该车牌")
+                        && !t_norm.contains("查无此车")
+                        && !t_norm.contains("命中0");
                     if is_member {
                         format!("✅ {} 在白名单中。\n\n{}", plate, t.chars().take(300).collect::<String>())
                     } else {
@@ -2795,6 +2809,16 @@ impl AgentCore {
                 Err(e) => format!("⚠️ 查询失败：{}", e),
             };
             self.save_to_history(session_id, message, &reply).await;
+            // ocr-review security·low：预路由绕过 check_tool 无审计，这里补一条工具调用审计，
+            // 保证只读查询也留痕（成功才标记 executed）。
+            self.audit_logger
+                .log_tool_call(
+                    &self.config.identity.agent_id,
+                    "manage_whitelist",
+                    &args,
+                    exec_ok,
+                )
+                .await;
             return Some(reply);
         }
 

@@ -1379,9 +1379,17 @@ fn is_whitelist_readonly_action(tool_name: &str, args: &serde_json::Value) -> bo
         if !allowed_plain_keys.contains(&k.as_str()) {
             return false;
         }
-        // 值类型校验：plate 必须非空字符串；limit 必须 1..=MAX_PAGE_LIMIT；对象/数组一律拒绝
+        // 值类型校验：plate 必须非空字符串且不含 SQL/通配符（% _ * ?），防止 LIKE 枚举；
+        // limit 必须 1..=MAX_PAGE_LIMIT；对象/数组一律拒绝
         match k.as_str() {
-            "plate" => v.as_str().is_some_and(|s| !s.trim().is_empty()),
+            "plate" => v.as_str().is_some_and(|s| {
+                let s = s.trim();
+                !s.is_empty()
+                    && !s.contains('%')
+                    && !s.contains('_')
+                    && !s.contains('*')
+                    && !s.contains('?')
+            }),
             "limit" => v.as_u64().is_some_and(|n| n >= 1 && n <= MAX_PAGE_LIMIT),
             _ => false,
         }
