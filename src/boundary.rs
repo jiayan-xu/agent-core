@@ -2174,7 +2174,7 @@ mod tests {
         assert_eq!(
             r.level,
             Some(BlockLevel::Yellow),
-            "带写参数的 query 不得豁免，仍须审批: {:?}",
+            "query 携带写参数仍须审批（dangerous 工具一律审批）: {:?}",
             r
         );
 
@@ -2239,7 +2239,7 @@ mod tests {
         assert_eq!(
             r.level,
             Some(BlockLevel::Yellow),
-            "query 携带 effective_date 写参数不得豁免: {:?}",
+            "query 携带写参数仍须审批（dangerous 一律审批）: {:?}",
             r
         );
 
@@ -2255,7 +2255,7 @@ mod tests {
         assert_eq!(
             r.level,
             Some(BlockLevel::Yellow),
-            "query_oplog 携带 plates 写参数不得豁免: {:?}",
+            "query_oplog 携带写参数仍须审批（dangerous 一律审批）: {:?}",
             r
         );
 
@@ -2271,7 +2271,7 @@ mod tests {
         assert_eq!(
             r.level,
             Some(BlockLevel::Yellow),
-            "未知 action 应 fail-closed 走审批: {:?}",
+            "未知 action 也属于 dangerous 工具，一律审批: {:?}",
             r
         );
 
@@ -2290,7 +2290,7 @@ mod tests {
         assert_eq!(
             r.level,
             Some(BlockLevel::Yellow),
-            "query 携带嵌套写参数不得豁免: {:?}",
+            "query 携带嵌套写参数仍须审批（dangerous 一律审批）: {:?}",
             r
         );
 
@@ -2306,7 +2306,7 @@ mod tests {
         assert_eq!(
             r.level,
             Some(BlockLevel::Yellow),
-            "query_oplog + plate 非只读参数，不得豁免: {:?}",
+            "query_oplog 携带 plate 参数仍须审批（dangerous 一律审批）: {:?}",
             r
         );
 
@@ -2322,7 +2322,7 @@ mod tests {
         assert_eq!(
             r.level,
             Some(BlockLevel::Yellow),
-            "plate 值为对象（嵌套写意图）不得豁免: {:?}",
+            "plate 值为对象仍须审批（dangerous 一律审批）: {:?}",
             r
         );
 
@@ -2338,7 +2338,7 @@ mod tests {
         assert_eq!(
             r.level,
             Some(BlockLevel::Yellow),
-            "limit 为负值不得豁免: {:?}",
+            "limit 为负值仍须审批（dangerous 一律审批）: {:?}",
             r
         );
 
@@ -2354,7 +2354,7 @@ mod tests {
         assert_eq!(
             r.level,
             Some(BlockLevel::Yellow),
-            "query 缺 plate 不得豁免（fail-closed）: {:?}",
+            "query 缺 plate 仍须审批（dangerous 一律审批）: {:?}",
             r
         );
 
@@ -2370,7 +2370,7 @@ mod tests {
         assert_eq!(
             r.level,
             Some(BlockLevel::Yellow),
-            "query_oplog 缺 limit 不得豁免（fail-closed）: {:?}",
+            "query_oplog 缺 limit 仍须审批（dangerous 一律审批）: {:?}",
             r
         );
 
@@ -2386,7 +2386,7 @@ mod tests {
         assert_eq!(
             r.level,
             Some(BlockLevel::Yellow),
-            "空车牌不得豁免: {:?}",
+            "空车牌仍须审批（dangerous 一律审批）: {:?}",
             r
         );
 
@@ -2402,7 +2402,7 @@ mod tests {
         assert_eq!(
             r.level,
             Some(BlockLevel::Yellow),
-            "limit 超上限不得豁免: {:?}",
+            "limit 超上限仍须审批（dangerous 一律审批）: {:?}",
             r
         );
     }

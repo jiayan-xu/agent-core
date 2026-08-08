@@ -1207,8 +1207,34 @@ impl AgentCore {
             // 此前 confirm_words.contains 匹配「执行/确定/去查/查吧」等命令动词短句（如「执行一下查询」6字），
             // 会误判为确认 → 0a 分支 take_pending_action 误执行待审批写操作（正是此前修复想避免的误执行）。
             // 短消息只能由强确认词（确认/同意/批准/执行吧）触发；命令/查询动词一律不构成确认。
+            // ocr-review bug·high(v14)：纯强确认词开头仍不够——「确认，不执行」「确认，先别执行」
+            // 「确认吗？」等带拒绝/疑问后缀的短句也会被误判为确认 → 0a 误执行 pending 写。
+            // → 短消息必须【整句为纯强确认词】才构成确认：拒绝词/疑问词/后缀出现即 false。
             if t.chars().count() <= 8 {
-                return strong_confirm;
+                if !strong_confirm {
+                    return false;
+                }
+                // 拒绝/疑问/取消后缀：这些词出现即非批准（「确认，不执行/先别执行/等一下/确认吗」）
+                let refusal = [
+                    "不执行",
+                    "先别",
+                    "别执行",
+                    "等一下",
+                    "吗",
+                    "？",
+                    "?",
+                    "确认一下",
+                    "确认下",
+                    "确认后",
+                    "确认是否",
+                    "不确认",
+                    "不同意",
+                    "不批准",
+                    "不确定",
+                ]
+                .iter()
+                .any(|w| t.contains(*w));
+                return strong_confirm && !refusal;
             }
             // 长消息(>8字)且以强确认词开头：允许「确认，麻烦…」等合法审批回复带后续说明。
             // fallback 保持 confirm_words 包含匹配（用户常回“对的，好的，执行”等变体），
@@ -1541,11 +1567,11 @@ impl AgentCore {
                 // 在不在白名单」），用户真实意图是查询，不是批准上一计划。若在此处被 is_confirm 拦截，
                 // 会把 original message 重执行（违背查询意图，且可能重复触发写操作）。
                 // → 在 is_confirm 之前放行为新查询请求（走 execute_chat(message) 而非 original）。
+                // ocr-review bug·medium(v14)：应答查询时【不得】把状态改为 Confirmed 并 checkpoint——
+                // 那会覆盖待确认计划，使后续裸「确认」落入「当前没有待确认的操作」而静默丢弃计划。
+                // → 保持 AwaitingConfirmation，仅应答成员查询（execute_chat 内部经 try_preroute
+                // 走确定性成员查询），计划仍可后续确认。
                 if confirm_but_query {
-                    self.session_manager
-                        .set_state(session_id, SessionState::Confirmed)
-                        .await;
-                    self.checkpoint_confirmed(session_id).await;
                     return crate::reply_polish::polish_llm_reply(
                         self.execute_chat(
                             message,
@@ -1997,29 +2023,51 @@ impl AgentCore {
             || t_norm.contains("未在白名单");
         // 弱否定：零命中计数（锚定，避免「命中10条」被「0条」子串误伤）。
         // ocr-review bug·medium(v13)：固定锚点表仍有遗漏——「命中记录0条」「命中数量0」因 0 与
-        // 「命中」间夹其他字不命中「命中0/共0条」。补「命中…0」「…0条」形状：命中后跟零计数 token，
-        // 或任意零计数后跟「条」；同时排除「命中1/命中10」等非零计数。
+        // 「命中」间夹其他字不命中「命中0/共0条」。补「命中…0」形状。
+        // ocr-review bug·high(v14)：废弃「含0不含1」启发式——无「命中」时 fallback 全串会把
+        // 「共10条/错误码404/HTTP500」误判为零命中。改为：仅当「命中」存在时，解析其后首个
+        // 数字 token，若为 0 才算零命中；该 token 前可有任意量词名词（记录/数量/数/条数）。
         let hit_zero = t_norm.contains("命中0")
             || t_norm.contains("0命中")
             || t_norm.contains("零命中")
             || t_norm.contains("无命中");
+        // 命中…0形状：仅当「命中」存在，解析其后首个数字 token 是否为 0（命中记录0/命中数量0/命中数0）
+        let hit_gap_zero = {
+            match t_norm.find("命中") {
+                None => false,
+                Some(i) => {
+                    let rest = &t_norm[i + "命中".len()..];
+                    // 找到首个数字 token 的起始
+                    match rest.find(|c: char| c.is_ascii_digit()) {
+                        None => false,
+                        Some(d) => {
+                            // 该 token 是纯 0（后随非数字或「条」），且全是 0（非 20/500 等）
+                            let tail = &rest[d..];
+                            let digits: String =
+                                tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+                            digits.chars().all(|c| c == '0') && !digits.is_empty()
+                        }
+                    }
+                }
+            }
+        };
+        // 数值化零计数：匹配「共0/0条结果/命中数为0/命中数0/命中条数为0/命中条数0/无记录」等明确零值。
+        // 「0条」须为【独立零】——前一个字符非数字，避免「共10条/共20条」被「0条」子串误伤
+        // （「10条」含「0条」但 count=10）。用 match_indices 检查「0条」前字符。
+        let standalone_zero_tiao = t_norm.match_indices("0条").any(|(i, _)| {
+            // i 是「0」的字节偏移，前一个字节处不应是数字
+            i == 0 || !t_norm[..i].chars().last().map_or(false, |c| c.is_ascii_digit())
+        });
         let count_zero = t_norm.contains("共0")
-            || t_norm.contains("0条")
             || t_norm.contains("0条结果")
             || t_norm.contains("无记录")
             || t_norm.contains("命中数为0")
             || t_norm.contains("命中数0")
             || t_norm.contains("命中条数为0")
-            || t_norm.contains("命中条数0");
-        // 命中…0形状：命中与 0 之间仅夹量词/名词（命中记录0/命中数量0/命中数0/命中条数0）
-        let hit_gap_zero = {
-            // 「命中」是2个汉字=6字节，find 返回字节偏移，+6 恰好是命中后的字符边界
-            let rest = &t_norm[t_norm.find("命中").map_or(0, |i| i + "命中".len())..];
-            rest.contains('0') && !rest.contains('1')
-        };
-        let zero_count_negative = hit_zero
-            || (count_zero && !t_norm.contains("命中1"))
-            || (hit_gap_zero && !t_norm.contains("命中1"));
+            || t_norm.contains("命中条数0")
+            || standalone_zero_tiao;
+        let zero_count_negative =
+            hit_zero || count_zero || hit_gap_zero;
         // 判定：强否定 > 正面；弱否定（零计数）仅当无强否定时判负——即使正面词存在，
         // 零计数命中也是明确「不在」（如「命中数量0」虽含「命中」但计数为0）。
         // 区分：非零计数（命中1/命中10）→ member；零计数 → not_member（无需再依赖 !positive）。
@@ -10244,8 +10292,15 @@ mod whitelist_v11_tests {
         // 不再靠固定锚点表，命中后跟零计数 token 即判不在
         assert_eq!(AgentCore::classify_membership("查询成功，命中记录0条"), NotInList);
         assert_eq!(AgentCore::classify_membership("查询成功，命中数量0"), NotInList);
-        // 非零命中（命中1/命中10）不受「命中…0」影响，仍 Whitelisted
+        // 非零命中（命中1/命中10/命中20）不受「命中…0」影响，仍 Whitelisted
         assert_eq!(AgentCore::classify_membership("查询成功，命中1条"), Whitelisted);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中20条"), Whitelisted);
+        // ocr-review bug·high(v14)：零计数须数值解析，非「含0不含1」启发式——
+        // 「共10条」是「0条」子串但 count=10，不得判 NotInList（无明确正面词 → Unknown，宁缺毋滥）；
+        // 错误码404/HTTP500 无正负标记应 Unknown
+        assert_eq!(AgentCore::classify_membership("查询成功，共10条"), Unknown);
+        assert_eq!(AgentCore::classify_membership("查询失败，错误码404"), Unknown);
+        assert_eq!(AgentCore::classify_membership("服务器错误 HTTP500"), Unknown);
         // 无法识别串 → Unknown（不得判 ❌ 假阴性）
         assert_eq!(AgentCore::classify_membership("查询超时，请稍后重试"), Unknown);
         assert_eq!(AgentCore::classify_membership("参数错误：缺少plate字段"), Unknown);
