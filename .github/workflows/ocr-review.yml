@@ -12,7 +12,9 @@ on:
     branches: [main, master]
 
 jobs:
-  ocr:
+  # job 名即 check context 名，必须与分支保护 required_status_checks 的
+  # context "ocr-review" 完全一致，否则门禁永不生效（BLOCKED 但检查全绿）
+  ocr-review:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
