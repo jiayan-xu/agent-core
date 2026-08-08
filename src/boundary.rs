@@ -2138,10 +2138,13 @@ mod tests {
             .lock()
             .unwrap()
             .register("test-agent", None, PermissionLevel::Admin);
+        // ocr-review test·low(v21)：manage_whitelist 注册为 "read"（仅走 is_dangerous_floor 分支），
+        // sync_whitelist_plates 注册为 "dangerous"（走 tool_level=="dangerous" 分类器分支）——
+        // 两条真实生产路径（floor ∪ classifier）都被覆盖，避免 16 行参数全落在同一条 floor 早退。
         boundary.register_tool("manage_whitelist", "read");
-        boundary.register_tool("sync_whitelist_plates", "read");
+        boundary.register_tool("sync_whitelist_plates", "dangerous");
 
-        // ocr-review test·medium(v20)：①-⑯ 十六个 near-identical check_tool+Yellow 块折叠为
+        // ocr-review test·medium(v18/v20/v21)：①-⑯ 十六个 near-identical check_tool+Yellow 块折叠为
         // 统一表驱动（含纯查询/写动作/嵌套/缺参/空值/越界代表形状），单一保证「HARD_DANGEROUS
         // 工具一律审批（与参数内容无关）」，消除重复样板。
         let dangerous_shapes: Vec<(&str, serde_json::Value, &str)> = vec![
@@ -2187,10 +2190,20 @@ mod tests {
                 &PermissionLevel::Admin,
                 None,
             );
+            assert!(
+                !r.allow,
+                "{label} 应被拦截（dangerous 一律审批，allow 必须为 false）: {:?}",
+                r
+            );
             assert_eq!(
                 r.level,
                 Some(BlockLevel::Yellow),
                 "{label} 仍须审批（dangerous 一律审批）: {:?}",
+                r
+            );
+            assert!(
+                !r.reason.is_empty(),
+                "{label} 拦截原因不应为空: {:?}",
                 r
             );
         }
