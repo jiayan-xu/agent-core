@@ -1215,6 +1215,14 @@ impl AgentCore {
                 "确认没有",
                 "取消",
                 "算了",
+                // ocr-review bug·high(v25)：中间否定词——approval 检测用 contains("同意")/contains("批准")，
+                // 「确认，我不同意」「确认一下，不同意」的「不同意/不批准」子串仍会命中 approval token →
+                // 用户明确拒绝却被当批准执行 pending 写。refusal 补「不同意/不批准」及变体，统一在
+                // 长度分支前拦截（if strong_confirm && refusal → return false）。
+                "不同意",
+                "不批准",
+                "不同意执行",
+                "不批准执行",
             ]
             .iter()
             .any(|w| t.contains(*w));
@@ -2123,9 +2131,17 @@ impl AgentCore {
         m.match_indices(noun).any(|(i, _)| {
             let after = &m[i + noun.len()..];
             let probe = after.chars().take(12).collect::<String>();
+            // ocr-review bug·medium(v25)：裸「前」过宽——「改为前卫环保」含「前」误判叙述性 →
+            // 写意图被跳过。只接受「变/改/更/删/移+前」紧邻组合（改名前/变更前/删除前）。
+            let qian_adjacent = probe
+                .char_indices()
+                .any(|(j, c)| c == '前' && {
+                    let prev_char = probe[..j].chars().last();
+                    matches!(prev_char, Some('变') | Some('改') | Some('更') | Some('删') | Some('移'))
+                });
             probe.contains("后") || probe.contains("过") || probe.contains("了")
                 || probe.contains("之前") || probe.contains("已") || probe.contains("完")
-                || probe.contains("前")
+                || qian_adjacent
         })
     }
 
@@ -2164,12 +2180,21 @@ impl AgentCore {
                 // → extract_whitelist_membership_query 返回 None → 确定性成员查询被跳过，落入 LLM 快道
                 // （原幻觉 bug）；「公司名改成XX后还在不在」还会误触发 extract_whitelist_update 生成
                 // 虚假写审批流。→ 放宽为动词后至多 12 字符内出现后缀即视为时间背景。
+                // ocr-review bug·medium(v25)：裸「前」过宽——「改为前卫环保」的「前卫环保」含「前」
+                // 被误判叙述性 → update 写意图被跳过。→ 只保留「之前」与「变/改/更/删/移+前」紧邻
+                // 组合（改名前/变更前/删除前），裸「前」不再作为完成态后缀。
                 let need_check = m.match_indices(v).any(|(i, _)| {
                     let after = &m[i + v.len()..];
                     let probe = after.chars().take(12).collect::<String>();
+                    let qian_adjacent = probe
+                        .char_indices()
+                        .any(|(j, c)| c == '前' && {
+                            let prev_char = probe[..j].chars().last();
+                            matches!(prev_char, Some('变') | Some('改') | Some('更') | Some('删') | Some('移'))
+                        });
                     !(probe.contains("后") || probe.contains("过") || probe.contains("了")
                         || probe.contains("之前") || probe.contains("已") || probe.contains("完")
-                        || probe.contains("前"))
+                        || qian_adjacent)
                 });
                 if need_check {
                     return true;
@@ -10592,6 +10617,17 @@ mod whitelist_v11_tests {
             "皖A12345公司名改成新能源，它在白名单里吗",
         );
         assert_eq!(r2, None, "「公司名改成...」无完成态后缀是写意图，应拦截");
+        // ocr-review bug·medium(v25)：裸「前」不得作为完成态后缀——「改为前卫环保」的「前卫环保」
+        // 含「前」但那是公司名，应判 update 写意图而非叙述性查询（否则 update 写被静默跳过）。
+        let r3 = AgentCore::extract_whitelist_membership_query(
+            "皖A12345公司名改为前卫环保，它在白名单里吗",
+        );
+        assert_eq!(r3, None, "「改为前卫环保」含裸「前」但非时间背景，应判写意图拦截");
+        // 「改名前」紧邻组合（变/改/更/删/移+前）仍是叙述性 → 查询
+        let r4 = AgentCore::extract_whitelist_membership_query(
+            "皖A12345公司改名前的状态，它在白名单里吗",
+        );
+        assert!(r4.is_some(), "「改名前」是时间背景，应提取车牌: {r4:?}");
     }
 
     // ocr-review bug·medium(v17)：confirm-prefix fallback 的命令式写动词二次拦截——

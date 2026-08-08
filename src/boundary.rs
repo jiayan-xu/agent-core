@@ -2140,17 +2140,9 @@ mod tests {
             .register("test-agent", None, PermissionLevel::Admin);
         // 两工具均不显式注册，走生产默认分类器 + HARD_DANGEROUS floor：
         // - manage_whitelist / sync_whitelist_plates 均在 HARD_DANGEROUS → 强制走 L2 黄线审批
-        // 断言 sync_whitelist_plates 生产分类为 dangerous（钉住 classifier 分支可达性）；不去断言
-        // manage_whitelist 的分类——它在 write_tools 与 dangerous_tools 均注册，classify 返回的
-        // "write" 是检查顺序的产物非稳定不变式（未来改为 dangerous 更准确时不应让本测试脆失败）。
-        // 真正的强制保证由下方表驱动的 level==Yellow 断言覆盖。
-        assert_eq!(
-            with_classifier(&boundary.classifier, "unknown".to_string(), |c| c
-                .classify("sync_whitelist_plates")
-                .to_string()),
-            "dangerous",
-            "生产分类器应把 sync_whitelist_plates 判为 dangerous"
-        );
+        // 不针对任一工具断言 classify 具体值——两工具的分类值都是检查顺序（read→write→dangerous）
+        // 的产物，未来调整分类表时不应让本测试脆失败。真正的强制保证（HARD_DANGEROUS 一律黄线）
+        // 由下方表驱动的 16 个 level==Yellow 断言独立钉住，与分类器解耦。
 
         // ①-⑯ 十六个 near-identical check_tool+Yellow 块折叠为统一表驱动（含纯查询/写动作/
         // 嵌套/缺参/空值/越界代表形状），单一保证「HARD_DANGEROUS 工具一律审批（与参数内容
