@@ -1210,6 +1210,7 @@ impl AgentCore {
                 "吗",
                 "？",
                 "?",
+                "是否", // ocr-review bug·high(v19)：疑问词「是否」出现即不算确认（「确认是否同意」是问要不要同意）
                 "确认一遍",
                 "确认没有",
                 "取消",
@@ -1230,12 +1231,15 @@ impl AgentCore {
             // 确认 token（explicit_approve_after_review）才算。
             // ocr-review bug·medium(v18)：仅强前缀会漏掉【非前缀式】明确批准——「我确认」「好的确认」
             // 「可以确认」是日常审批回复，须识别为确认，否则 pending 写悬空。→ 补明确批准词集。
+            // ocr-review bug·high(v19)：explicit 词须 gate 在 !refusal——「可以确认吗」含「吗」refusal，
+            // strong_confirm=false 走不到上方 refusal 守卫，会误判确认。→ 词集匹配须 !refusal。
             if t.chars().count() <= 8 {
                 return (strong_confirm && !review_prefix)
                     || explicit_approve_after_review
-                    || ["我确认", "好的确认", "可以确认", "确认完毕", "确认无误"]
-                        .iter()
-                        .any(|w| t.contains(*w));
+                    || (!refusal
+                        && ["我确认", "好的确认", "可以确认", "确认完毕", "确认无误"]
+                            .iter()
+                            .any(|w| t.contains(*w)));
             }
             // ocr-review bug·high(v16)：长消息(>8字) fallback 不能靠 confirm_words.contains("确认")——
             // 该词被确认前缀本身满足（「确认，把皖A12345加到白名单」以确认开头即误判确认 → 0a 误执行
@@ -2000,14 +2004,15 @@ impl AgentCore {
         // 变更为/改名为/设成/调整为/修改/更新/变更)、waste_type(设为/换成)、remove(删掉/去掉/移出/
         // 作废/注销/软删/踢出/清掉)。注意「修改/更新/变更」本身较宽，但它们明确表写意图，宁可多拦。
         // maintainability·low(v11)：去重「改为/改成」（1878 首行已含），避免冗余掩盖匹配语义。
-        let write_verbs = [
-            "添加", "新增", "登记", "录入", "删除", "移除", "改为", "改成", "公司名", "固废种类",
-            "加入", "加进", "加一下", "加上", "收录", "补录",
-            "统一为", "统一成", "换为", "更新为", "变更为", "改名为", "设成", "调整为",
-            "修改", "更新", "变更", "设为", "换成",
-            "删掉", "去掉", "移出", "作废", "注销", "软删", "踢出", "清掉",
-        ];
-        if write_verbs.iter().any(|v| m.contains(*v)) {
+        // 写意图拦截：用 has_command_write_verb（叙述性动词带完成态后缀视为查询，裸命令才拦），
+        // 使「皖A12345更新后还在不在白名单里」这类时间背景查询不被拦（ocr-review bug·medium(v19)）。
+        // 注意：strict extractor 语义仍是「遇写意图返回 None」——更新/修改/变更 裸词或移除/新增/
+        // 设为等命令都拦；「公司名/固废种类」是 extract_whitelist_update/waste_type 的宾语词，
+        // 出现即表写意图，单独补判（has_command_write_verb 不含宾语名词）。
+        if Self::has_command_write_verb(m)
+            || m.contains("公司名")
+            || m.contains("固废种类")
+        {
             return None;
         }
         // 查询句式：收紧为明确的成员查询句式（ocr bug·medium），
@@ -2044,27 +2049,31 @@ impl AgentCore {
     }
 
     /// 判断消息是否含【命令式写动词】（真实写意图），供 try_preroute 的 confirm-prefix fallback
-    /// 二次拦截用（ocr-review bug·medium(v17)）。write_verbs 中「更新/修改/变更/改为/改成」常作
-    /// 时间背景（「更新后在不在白名单里」是查询），仅当带完成态后缀（后/过/了/之前/已/完）才算
-    /// 叙述性；其余动词（添加/加进/删掉/设为/收录 等）一律命令式——出现即真实写意图，不得被
-    /// 成员查询预路由静默吞掉。
+    /// 二次拦截用（ocr-review bug·medium(v17)）。「更新/修改/变更/改为/改成」及移除动词
+    /// （删除/删掉/移除/去掉/移出/作废/注销/软删/踢出/清掉）常作时间背景（「更新后在不在白名单里」
+    /// 「删除后还在不在」是查询），仅当带完成态后缀（后/过/了/之前/已/完）才算叙述性；无后缀的
+    /// 裸命令（删掉/加入/设为/收录 等）是真实写意图，不得被成员查询预路由静默吞掉。
+    /// ocr-review bug·medium(v19)：移除动词也纳入叙述性豁免——「确认，皖A12345删除后还在不在
+    /// 白名单里」是查询，此前被当写意图误送入 extract_whitelist_remove 提交删除审批。
     fn has_command_write_verb(message: &str) -> bool {
         let m = message.trim();
-        // 命令式动词（真实写意图）：直接匹配即拦截
+        // 命令式动词（真实写意图）：直接匹配即拦截（无叙述性豁免）
         let imperative = [
-            "添加", "新增", "登记", "录入", "删除", "移除",
+            "添加", "新增", "登记", "录入",
             "加入", "加进", "加一下", "加上", "收录", "补录",
             "统一为", "统一成", "换为", "更新为", "变更为", "改名为", "设成", "调整为",
             "设为", "换成",
-            "删掉", "去掉", "移出", "作废", "注销", "软删", "踢出", "清掉",
         ];
         if imperative.iter().any(|v| m.contains(*v)) {
             return true;
         }
-        // 叙述性动词（更新/修改/变更/改为/改成）：仅不带动词本身即拦截；带完成态后缀视为时间背景
-        // （「更新后在不在白名单里」「修改过公司名」是查询）。「公司名/固废种类」是宾语名词非动词，
-        // 由 extract_whitelist_update 等专用 extractor 判断写意图，此处不管。
-        let narrative = ["更新", "修改", "变更", "改为", "改成"];
+        // 叙述性动词（更新/修改/变更/改为/改成 + 移除动词）：带完成态后缀视为时间背景
+        // （「更新后在不在白名单里」「修改过公司名」「删除后还在不在」是查询）；裸命令仍算写意图。
+        // 「公司名/固废种类」是宾语名词非动词，由 extract_whitelist_update 等专用 extractor 判断。
+        let narrative = [
+            "更新", "修改", "变更", "改为", "改成",
+            "删除", "删掉", "移除", "去掉", "移出", "作废", "注销", "软删", "踢出", "清掉",
+        ];
         for v in narrative.iter() {
             if m.contains(*v) {
                 // 找到最后一次出现，检查其后是否紧邻完成态后缀
@@ -2971,7 +2980,15 @@ impl AgentCore {
             // 中文字符 + (可选空白) + 大写字母 + 字母数字体(≥3 位) = 一个车牌。
             // ocr-review bug·low(v9)：与 extract_plate_spaced 阈值一致（body≥4 即字母+≥3 数字），
             // 否则「皖A123 和 鲁B456」这种短牌 count_plates==0 导致多牌守卫失效。
-            if ('\u{4e00}'..='\u{9fff}').contains(&c) {
+            // ocr-review bug·low(v19)：收紧词边界——CJK 前非 CJK 才算车牌起始（省份字在词边界），
+            // 「编号B10086」的「号」前邻「编」CJK → 不计为车牌；但保留连接词（和/与/及）后的
+            // 车牌（「皖A123 和 鲁B456」的「鲁」前是「和」），防误伤多牌检测。
+            fn is_connector(ch: char) -> bool {
+                matches!(ch, '和' | '与' | '及' | '或' | '、' | '，' | ',' | '(' | '（')
+            }
+            let prev = if i > 0 { Some(chars[i - 1]) } else { None };
+            let prev_is_cjk = prev.map_or(false, |p| ('\u{4e00}'..='\u{9fff}').contains(&p) && !is_connector(p));
+            if !prev_is_cjk && ('\u{4e00}'..='\u{9fff}').contains(&c) {
                 let mut j = i + 1;
                 while j < chars.len() && chars[j].is_whitespace() {
                     j += 1;
@@ -10435,6 +10452,17 @@ mod whitelist_v11_tests {
         assert!(!AgentCore::has_command_write_verb(
             "皖A12345修改过公司名，它在白名单里吗"
         ), "「修改过」是时间背景，不算命令式写");
+        // ocr-review bug·medium(v19)：移除动词带完成态后缀 → 叙述性（「删除后还在不在」是查询）
+        assert!(!AgentCore::has_command_write_verb(
+            "确认，皖A12345删除后还在不在白名单里"
+        ), "「删除后」是时间背景，不算命令式写");
+        assert!(!AgentCore::has_command_write_verb(
+            "皖A12345被移出过白名单，它在白名单里吗"
+        ), "「移出过」是时间背景，不算命令式写");
+        // 裸移除命令 → 命令式（真实写意图）
+        assert!(AgentCore::has_command_write_verb(
+            "把皖A12345从白名单删掉"
+        ), "裸「删掉」是命令式写意图");
         // 无任何写动词 → false
         assert!(!AgentCore::has_command_write_verb(
             "皖A12345在不在白名单里"
@@ -10449,8 +10477,12 @@ mod whitelist_v11_tests {
         // ocr-review bug·medium(v10)：count_plates 宽松匹配会把「编号B10086」数成车牌，
         // 单牌查询夹杂编号文本时 count>1 会误弃预路由。此为已知限制（退回 LLM 通道，非安全风险）。
         // 但确认纯单牌仍 count==1。
+        // ocr-review bug·low(v19)：收紧词边界（CJK 前非 CJK/连接词）——「编号B10086」的「号」
+        // 前邻「编」CJK 不再计为车牌；「皖A12345 和 鲁H736A7」的「鲁」前是连接词「和」仍计为车牌。
         assert_eq!(AgentCore::count_plates("皖A12345在白名单吗"), 1);
         assert_eq!(AgentCore::count_plates("皖A12345 和 鲁H736A7 在白名单吗"), 2);
+        assert_eq!(AgentCore::count_plates("编号B10086 在不在白名单"), 0, "「编号B10086」的号前邻编CJK，非车牌");
+        assert_eq!(AgentCore::count_plates("皖A12345 编号B10086 在白名单吗"), 1, "仅皖A12345 计为车牌");
     }
 
     // ocr-review bug·medium(v12)：三态分类器抽成纯函数后的单测——

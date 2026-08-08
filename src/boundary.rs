@@ -904,14 +904,13 @@ impl ComplianceBoundary {
             let tool_level = with_classifier(&self.classifier, "read".to_string(), |c| {
                 c.classify(tool_name).to_string()
             });
-            // ocr-review security·high(v11)：移除 LLM 工具循环的只读豁免。
-            // 背景：manage_whitelist / sync_whitelist_plates 被 HARD_DANGEROUS 强制危险地板，
-            // 其正常用户查询（「XX 在不在白名单」）已由 agent.rs 确定性预路由（try_preroute 内
-            // extract_whitelist_membership_query 分支）直接走 call_tool_routed 天然免审批，
-            // 无需此处豁免（注：不用行号引用，agent.rs 同 PR 会变，行号易漂移误导审计）。
-            // 此 check_tool 分支服务的是【LLM 工具循环】——若对 LLM 传的 action=query 也豁免，
-            // 一旦外部 MCP handler 的 query 存在未察觉副作用或 query_oplog 泄漏全量操作日志，
-            // 就构成对危险地板的静默绕过（外部 handler 契约本仓库无法验证）。移除豁免 → dangerous
+            // ocr-review security·high(v11) + doc·low(v19)：本 check_tool 分支逻辑未变——
+            // HARD_DANGEROUS 工具（manage_whitelist / sync_whitelist_plates）在此 dangerous-floor
+            // 早退返回黄线，与参数内容无关。危险工具在 LLM 工具循环的审批门禁由 agent.rs 对每次
+            // 工具调用都走本 check_tool 保证；正常用户成员查询由 agent.rs 确定性预路由
+            // （try_preroute 内 extract_whitelist_membership_query → call_tool_routed）天然免审批，
+            // 不依赖本分支的豁免。此处不留 query 豁免，避免外部 MCP handler 的 query 存在未察觉
+            // 副作用或 query_oplog 泄漏全量操作日志时，构成对危险地板的静默绕过。
             // 工具一律走审批门禁，杜绝该攻击面。正常查询体验不受影响（预路由已覆盖）。
             if tool_level == "dangerous" || self.is_dangerous_floor(tool_name) {
                 return ToolCheck::yellow(&format!("{} 需要审批，请等待审批人确认", tool_name));
