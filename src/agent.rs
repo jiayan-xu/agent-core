@@ -1262,6 +1262,15 @@ impl AgentCore {
                     .replace(',', "")
                     .replace(' ', "")
                     .replace('\u{3000}', "");
+                // ocr-review bug·high(v28)：explicit_short 的 starts_with 会误伤复核后缀——
+                // 「我确认一下」「好的确认下」「可以确认一下」以「我确认/好的确认/可以确认」开头，
+                // 但用户意图是【核对细节】而非批准。REVIEW_PREFIXES 只匹配【开头】，这些消息不以
+                // 「确认一下」等开头（是「我确认一下」），review_prefix=false → 误判确认 → 0a 误执行
+                // pending 写（正是 v10/v17 复核前缀防护想防的场景）。→ 归一化文本含复核后缀
+                // （确认一下/确认下/确认后）即 gate 掉 explicit_short/combo 的批准匹配。
+                let has_review_suffix = ["确认一下", "确认下", "确认后"]
+                    .iter()
+                    .any(|p| t_norm_short.contains(p));
                 let explicit_short = [
                     "我确认", "好的确认", "可以确认", "确认完毕", "确认无误",
                     "好的执行", "可以查吧", "可以执行", "行没问题", "对的",
@@ -1276,6 +1285,7 @@ impl AgentCore {
                 return (strong_confirm && !review_prefix)
                     || explicit_approve_after_review
                     || (!refusal
+                        && !has_review_suffix
                         && (explicit_short
                             .iter()
                             .any(|w| t_norm_short.starts_with(w))
@@ -2133,12 +2143,13 @@ impl AgentCore {
             let probe = after.chars().take(12).collect::<String>();
             // ocr-review bug·medium(v25)：裸「前」过宽——「改为前卫环保」含「前」误判叙述性 →
             // 写意图被跳过。只接受「变/改/更/删/移+前」紧邻组合（改名前/变更前/删除前）。
-            let qian_adjacent = probe
-                .char_indices()
-                .any(|(j, c)| c == '前' && {
-                    let prev_char = probe[..j].chars().last();
-                    matches!(prev_char, Some('变') | Some('改') | Some('更') | Some('删') | Some('移'))
-                });
+            // ocr-review bug·medium(v29)：原 qian_adjacent 检查【「前」紧邻前一个字符】为 变/改/更/删/移，
+            // 但「改名前」前一个是「名」、「删除前」前一个是「除」→ 实际只匹配「变更前」与字面
+            // 「改前/删前/移前」。改为匹配完整「动词+前」词组（改名前/删除前/变更前/修改前/移除前/移出前），
+            // 使「皖A12345公司改名前的状态」「删除前在不在白名单」正确识别为时间背景查询。
+            let qian_adjacent = ["改名前", "删除前", "变更前", "修改前", "移除前", "移出前"]
+                .iter()
+                .any(|w| probe.contains(w));
             probe.contains("后") || probe.contains("过") || probe.contains("了")
                 || probe.contains("之前") || probe.contains("已") || probe.contains("完")
                 || qian_adjacent
@@ -2186,12 +2197,15 @@ impl AgentCore {
                 let need_check = m.match_indices(v).any(|(i, _)| {
                     let after = &m[i + v.len()..];
                     let probe = after.chars().take(12).collect::<String>();
-                    let qian_adjacent = probe
-                        .char_indices()
-                        .any(|(j, c)| c == '前' && {
-                            let prev_char = probe[..j].chars().last();
-                            matches!(prev_char, Some('变') | Some('改') | Some('更') | Some('删') | Some('移'))
-                        });
+                    // ocr-review bug·medium(v29)：qian_adjacent 需识别「动词+前」紧邻组合
+                    // （删除前/改名前/变更前…）为叙述性时间背景。分两种形态：
+                    // ① 动词后【紧跟】「前」→「删除前」中 after 以「前」开头（probe 不含动词本身）；
+                    // ② 隔宾语后的「变/改/更/删/移+前」→「皖A12345公司改名前的状态」probe 含「改名前」。
+                    // 原实现只查 probe 内「前」的紧邻前字符，漏掉①（after 以「前」开头时前字符在动词里）。
+                    let qian_adjacent = after.trim_start().starts_with('前')
+                        || ["改名前", "删除前", "变更前", "修改前", "移除前", "移出前"]
+                            .iter()
+                            .any(|w| probe.contains(w));
                     !(probe.contains("后") || probe.contains("过") || probe.contains("了")
                         || probe.contains("之前") || probe.contains("已") || probe.contains("完")
                         || qian_adjacent)
@@ -10628,6 +10642,14 @@ mod whitelist_v11_tests {
             "皖A12345公司改名前的状态，它在白名单里吗",
         );
         assert!(r4.is_some(), "「改名前」是时间背景，应提取车牌: {r4:?}");
+        // ocr-review bug·medium(v29)：「删除前」也是时间背景——「皖A12345删除前在不在白名单」
+        // 是查询（问删除之前的状态），不是删除写意图。has_command_write_verb 须识别「删除前」
+        // 为叙述性，否则落入 remove 写 extractor 生成虚假删除审批流。
+        let r5 = AgentCore::extract_whitelist_membership_query(
+            "皖A12345删除前在不在白名单里",
+        );
+        assert!(r5.is_some(), "「删除前」是时间背景查询，应提取车牌: {r5:?}");
+        assert_eq!(r5.unwrap(), "皖A12345");
     }
 
     // ocr-review bug·medium(v17)：confirm-prefix fallback 的命令式写动词二次拦截——
