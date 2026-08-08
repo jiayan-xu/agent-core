@@ -232,7 +232,7 @@ pub struct EpisodeArchive {
 /// 成员查询结果三态（白名单预路由用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MembershipVerdict {
-    WhiteListed,
+    Whitelisted,
     NotInList,
     Unknown,
 }
@@ -1203,9 +1203,16 @@ impl AgentCore {
             if t.chars().count() > 8 && !strong_confirm {
                 return false;
             }
-            // ocr-review bug·medium(v9)：「查吧/去查/查一下」是确认词，但含「查」——
-            // 是否算查询意图由调用处根据 pending 有无判断（无 pending 时当新查询），
-            // 此处不再做查询词黑名单，避免死词 + 误拦合法审批「可以，查吧」。
+            // ocr-review bug·high(v13)：短消息(≤8字) fallback 收窄为【仅强确认词】。
+            // 此前 confirm_words.contains 匹配「执行/确定/去查/查吧」等命令动词短句（如「执行一下查询」6字），
+            // 会误判为确认 → 0a 分支 take_pending_action 误执行待审批写操作（正是此前修复想避免的误执行）。
+            // 短消息只能由强确认词（确认/同意/批准/执行吧）触发；命令/查询动词一律不构成确认。
+            if t.chars().count() <= 8 {
+                return strong_confirm;
+            }
+            // 长消息(>8字)且以强确认词开头：允许「确认，麻烦…」等合法审批回复带后续说明。
+            // fallback 保持 confirm_words 包含匹配（用户常回“对的，好的，执行”等变体），
+            // 但长消息本身已排除纯短命令动词场景。
             confirm_words.iter().any(|w| t.contains(*w))
         };
         // 查询/疑问意图判定（供调用处判断：无 pending 时含此词的消息当新请求，不做罐头回复）
@@ -1340,10 +1347,16 @@ impl AgentCore {
         // → 凡「确认/同意/批准 开头 + is_query_intent」，一律视为查询请求，跳过 pending 执行，
         // 落入下方 is_query_intent 分支走成员查询预路由/execute_chat。纯确认（「确认，执行吧」不含
         // 查询句式）不受影响，仍正常执行 pending。
-        let confirm_but_query = is_query_intent(trimmed)
-            && (trimmed.starts_with("确认")
-                || trimmed.starts_with("同意")
-                || trimmed.starts_with("批准"));
+        // ocr-review bug·low(v13)：is_query_intent 词表过宽（看/怎么/如何/有没有…），
+        // 「同意，怎么执行都行」「确认，看看有没有问题」等真·确认句会被误判为查询，导致 pending 写
+        // 既不执行也不取消（后续裸「确认」意外执行 → 审批丢失+延迟执行隐患）。
+        // → 收窄为【成员查询意图】：确认前缀 + 能提取到车牌的成员查询句（如「确认，皖A12345在不在
+        // 白名单」）。纯确认句无成员查询，confirm_but_query=false，正常执行 pending。
+        let confirm_but_query = trimmed.starts_with("确认")
+            || trimmed.starts_with("同意")
+            || trimmed.starts_with("批准");
+        let confirm_but_query = confirm_but_query
+            && Self::extract_whitelist_membership_query(trimmed).is_some();
         if is_confirm(trimmed) && !confirm_but_query {
             if let Some(mut action) = self.session_manager.take_pending_action(session_id).await {
                 // 任务 652 前置修复：捕获 approval_id，供执行后消费审批项（防残留被全局扫描重执行）
@@ -1523,6 +1536,28 @@ impl AgentCore {
                 if is_cancel(trimmed) {
                     self.cancel_plan(session_id).await;
                     return "✅ 已取消该计划。如需重新开始，请告诉我新的需求。".to_string();
+                }
+                // ocr-review bug·medium(v13)：确认前缀 + 明确查询意图的消息（如「确认，查一下皖A
+                // 在不在白名单」），用户真实意图是查询，不是批准上一计划。若在此处被 is_confirm 拦截，
+                // 会把 original message 重执行（违背查询意图，且可能重复触发写操作）。
+                // → 在 is_confirm 之前放行为新查询请求（走 execute_chat(message) 而非 original）。
+                if confirm_but_query {
+                    self.session_manager
+                        .set_state(session_id, SessionState::Confirmed)
+                        .await;
+                    self.checkpoint_confirmed(session_id).await;
+                    return crate::reply_polish::polish_llm_reply(
+                        self.execute_chat(
+                            message,
+                            user_id,
+                            session_id,
+                            allowed_ns,
+                            &trace_id,
+                            external_history.clone(),
+                            stream_sender,
+                        )
+                        .await,
+                    );
                 }
                 if is_confirm(trimmed) {
                     let original = self
@@ -1936,7 +1971,7 @@ impl AgentCore {
         Self::extract_plate(m).or_else(|| Self::extract_plate_spaced(m))
     }
 
-    /// 成员查询结果三态分类：WhiteListed / NotInList / Unknown。
+    /// 成员查询结果三态分类：Whitelisted / NotInList / Unknown。
     /// 输入为 manage_whitelist query 的原始返回串（未归一化）。
     /// 抽成纯函数便于单测（ocr-review bug·medium，v12 子串碰撞修复）。
     fn classify_membership(raw: &str) -> MembershipVerdict {
@@ -1960,27 +1995,40 @@ impl AgentCore {
             || t_norm.contains("尚未在")
             || t_norm.contains("没在白名单")
             || t_norm.contains("未在白名单");
-        // 弱否定：零命中计数（锚定，避免「命中10条」被「0条」子串误伤）
-        let zero_count_negative = t_norm.contains("共0条")
-            || t_norm.contains("命中0")
+        // 弱否定：零命中计数（锚定，避免「命中10条」被「0条」子串误伤）。
+        // ocr-review bug·medium(v13)：固定锚点表仍有遗漏——「命中记录0条」「命中数量0」因 0 与
+        // 「命中」间夹其他字不命中「命中0/共0条」。补「命中…0」「…0条」形状：命中后跟零计数 token，
+        // 或任意零计数后跟「条」；同时排除「命中1/命中10」等非零计数。
+        let hit_zero = t_norm.contains("命中0")
             || t_norm.contains("0命中")
             || t_norm.contains("零命中")
-            || t_norm.contains("无命中")
+            || t_norm.contains("无命中");
+        let count_zero = t_norm.contains("共0")
+            || t_norm.contains("0条")
+            || t_norm.contains("0条结果")
+            || t_norm.contains("无记录")
             || t_norm.contains("命中数为0")
             || t_norm.contains("命中数0")
-            || t_norm.contains("命中条数0")
             || t_norm.contains("命中条数为0")
-            || t_norm.contains("无记录")
-            || t_norm.contains("0条结果")
-            || t_norm.contains("共0");
-        // 判定：强否定 > 正面；弱否定仅当无强否定且正面不清时判负
+            || t_norm.contains("命中条数0");
+        // 命中…0形状：命中与 0 之间仅夹量词/名词（命中记录0/命中数量0/命中数0/命中条数0）
+        let hit_gap_zero = {
+            // 「命中」是2个汉字=6字节，find 返回字节偏移，+6 恰好是命中后的字符边界
+            let rest = &t_norm[t_norm.find("命中").map_or(0, |i| i + "命中".len())..];
+            rest.contains('0') && !rest.contains('1')
+        };
+        let zero_count_negative = hit_zero
+            || (count_zero && !t_norm.contains("命中1"))
+            || (hit_gap_zero && !t_norm.contains("命中1"));
+        // 判定：强否定 > 正面；弱否定（零计数）仅当无强否定时判负——即使正面词存在，
+        // 零计数命中也是明确「不在」（如「命中数量0」虽含「命中」但计数为0）。
+        // 区分：非零计数（命中1/命中10）→ member；零计数 → not_member（无需再依赖 !positive）。
         let member = positive
             && !strong_negative
-            && !(zero_count_negative && !t_norm.contains("命中1"));
-        let not_member = strong_negative
-            || (zero_count_negative && !member && !positive);
+            && !zero_count_negative;
+        let not_member = strong_negative || zero_count_negative;
         if member {
-            MembershipVerdict::WhiteListed
+            MembershipVerdict::Whitelisted
         } else if not_member {
             MembershipVerdict::NotInList
         } else {
@@ -2923,7 +2971,7 @@ impl AgentCore {
                 Ok(t) => {
                     // 三态分类（default-deny + 强否定优先 + 零计数锚定，抽成纯函数便于单测）
                     match Self::classify_membership(&t) {
-                        MembershipVerdict::WhiteListed => {
+                        MembershipVerdict::Whitelisted => {
                             format!("✅ {} 在白名单中。\n\n{}", plate, t.chars().take(300).collect::<String>())
                         }
                         MembershipVerdict::NotInList => {
@@ -10179,19 +10227,25 @@ mod whitelist_v11_tests {
     }
 
     // ocr-review bug·medium(v12)：三态分类器抽成纯函数后的单测——
-    // 明确正面→WhiteListed；明确否定→NotInList；无法识别串→Unknown（宁缺毋滥，防假阴性）。
+    // 明确正面→Whitelisted；明确否定→NotInList；无法识别串→Unknown（宁缺毋滥，防假阴性）。
     #[test]
     fn test_classify_membership_tri_state() {
         use MembershipVerdict::*;
         // 明确正面
-        assert_eq!(AgentCore::classify_membership("皖A12345在白名单中，命中1条"), WhiteListed);
-        assert_eq!(AgentCore::classify_membership("查询成功，命中10条记录"), WhiteListed);
+        assert_eq!(AgentCore::classify_membership("皖A12345在白名单中，命中1条"), Whitelisted);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中10条记录"), Whitelisted);
         // 明确否定（强否定优先，覆盖「不在白名单中」正负词共存）
         assert_eq!(AgentCore::classify_membership("皖A12345不在白名单中"), NotInList);
         assert_eq!(AgentCore::classify_membership("未命中，查无此车牌"), NotInList);
         assert_eq!(AgentCore::classify_membership("查询成功，共0条结果"), NotInList);
         // 零计数锚定：不用裸「0条」（是「10条」子串），避免「命中10条」被误判为不在
-        assert_eq!(AgentCore::classify_membership("查询成功，命中10条"), WhiteListed);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中10条"), Whitelisted);
+        // ocr-review bug·medium(v13)：补「命中…0」形状——0 与命中间夹其他字（命中记录0/命中数量0）
+        // 不再靠固定锚点表，命中后跟零计数 token 即判不在
+        assert_eq!(AgentCore::classify_membership("查询成功，命中记录0条"), NotInList);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中数量0"), NotInList);
+        // 非零命中（命中1/命中10）不受「命中…0」影响，仍 Whitelisted
+        assert_eq!(AgentCore::classify_membership("查询成功，命中1条"), Whitelisted);
         // 无法识别串 → Unknown（不得判 ❌ 假阴性）
         assert_eq!(AgentCore::classify_membership("查询超时，请稍后重试"), Unknown);
         assert_eq!(AgentCore::classify_membership("参数错误：缺少plate字段"), Unknown);
