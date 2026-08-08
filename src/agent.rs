@@ -1167,18 +1167,23 @@ impl AgentCore {
             // starts_with("执行") 会误判为确认并绕过守卫（可能误执行待审批操作）。
             // 只保留明确批准语义的「确认/同意/批准」开头 + 「确认执行/执行吧」组合。
             // ocr-review bug·medium(v10)：排除核查前缀「确认一下/确认下/确认后」——
-            // 「确认一下皖A12345在白名单里吗」(>8字) 用户是想核对信息，starts_with("确认")
+            // 「确认一下皖A12345在白名单里吗」用户是想核对信息，starts_with("确认")
             // 会误判为批准；若此刻有 pending_action（0a 分支 take_pending_action→执行）会误执行
             // 待审批写操作。核查前缀一律不构成确认，走 is_query_intent 新请求路径。
-            let confirm_prefix = t.starts_with("确认一下")
+            // ocr-review bug·medium(v11)：确认前缀必须【无条件】early return false——
+            // 若只挡 strong_confirm，短消息(≤8字，如「确认一下」)不触发长度守卫，
+            // 会 falls through 到下方 confirm_words.contains("确认") 仍误判为确认。无条件截断最稳。
+            if t.starts_with("确认一下")
                 || t.starts_with("确认下")
                 || t.starts_with("确认后")
-                || t.starts_with("确认是否");
-            let strong_confirm = !confirm_prefix
-                && (t.starts_with("确认")
-                    || t.starts_with("同意")
-                    || t.starts_with("批准")
-                    || t.starts_with("执行吧"));
+                || t.starts_with("确认是否")
+            {
+                return false;
+            }
+            let strong_confirm = t.starts_with("确认")
+                || t.starts_with("同意")
+                || t.starts_with("批准")
+                || t.starts_with("执行吧");
             if t.chars().count() > 8 && !strong_confirm {
                 return false;
             }
@@ -1188,6 +1193,8 @@ impl AgentCore {
             confirm_words.iter().any(|w| t.contains(*w))
         };
         // 查询/疑问意图判定（供调用处判断：无 pending 时含此词的消息当新请求，不做罐头回复）
+        // ocr-review maintainability·low(v11)：删裸「少」——「至少/减少/年少」非查询意图，
+        // 裸「少」过宽会把这些词误判为查询；「多少」已由「吗/什么/哪」覆盖大部分疑问句式。
         let is_query_intent = |m: &str| {
             let t = m.trim();
             t.contains('查')
@@ -1196,7 +1203,6 @@ impl AgentCore {
                 || t.contains("什么")
                 || t.contains('哪')
                 || t.contains('吗')
-                || t.contains('少')
         };
         let is_cancel = |m: &str| {
             let kws = [
@@ -1868,10 +1874,11 @@ impl AgentCore {
         // 被成员查询分支先命中而静默吞掉写操作。覆盖：add(收录/补录)、update(统一为/换为/更新为/
         // 变更为/改名为/设成/调整为/修改/更新/变更)、waste_type(设为/换成)、remove(删掉/去掉/移出/
         // 作废/注销/软删/踢出/清掉)。注意「修改/更新/变更」本身较宽，但它们明确表写意图，宁可多拦。
+        // maintainability·low(v11)：去重「改为/改成」（1878 首行已含），避免冗余掩盖匹配语义。
         let write_verbs = [
             "添加", "新增", "登记", "录入", "删除", "移除", "改为", "改成", "公司名", "固废种类",
             "加入", "加进", "加一下", "加上", "收录", "补录",
-            "统一为", "统一成", "换为", "更新为", "变更为", "改名为", "设成", "调整为", "改为", "改成",
+            "统一为", "统一成", "换为", "更新为", "变更为", "改名为", "设成", "调整为",
             "修改", "更新", "变更", "设为", "换成",
             "删掉", "去掉", "移出", "作废", "注销", "软删", "踢出", "清掉",
         ];
@@ -2840,31 +2847,39 @@ impl AgentCore {
                         .replace(':', "")
                         .replace('，', "")
                         .replace(',', "");
-                    let is_member = (t_norm.contains("在白名单中") || t_norm.contains("命中"))
-                        && !t_norm.contains("不在")
-                        && !t_norm.contains("未命中")
-                        && !t_norm.contains("不存在")
-                        && !t_norm.contains("未找到")
-                        && !t_norm.contains("无记录")
-                        && !t_norm.contains("0条")
-                        && !t_norm.contains("未在白名单")
-                        && !t_norm.contains("没在白名单")
-                        && !t_norm.contains("零命中")
-                        && !t_norm.contains("无命中")
-                        && !t_norm.contains("0命中")
-                        && !t_norm.contains("命中数为0")
-                        && !t_norm.contains("命中数0")
-                        && !t_norm.contains("命中条数0")
-                        && !t_norm.contains("命中条数为0")
-                        && !t_norm.contains("无此车牌")
-                        && !t_norm.contains("无该车牌")
-                        && !t_norm.contains("查无此车")
-                        && !t_norm.contains("命中0")
-                        && !t_norm.contains("尚未在");
+                    // ocr-review bug·medium(v11)：加「无法确认」第三态——若输出既不含明确正面词（在白名单中/命中）
+                    // 也不含明确否定词（不在/未命中/0条/无此车牌等），说明是 Ok 包裹的错误串（查询超时/参数
+                    // 错误）或无法识别的原始行 dump。此时绝不能判「❌ 不在白名单」（假阴性会让用户误以为该车
+                    // 不在而重复加白），应如实报「⚠️ 无法确认」。
+                    let positive = t_norm.contains("在白名单中") || t_norm.contains("命中");
+                    let negative = t_norm.contains("不在")
+                        || t_norm.contains("未命中")
+                        || t_norm.contains("不存在")
+                        || t_norm.contains("未找到")
+                        || t_norm.contains("无记录")
+                        || t_norm.contains("0条")
+                        || t_norm.contains("未在白名单")
+                        || t_norm.contains("没在白名单")
+                        || t_norm.contains("零命中")
+                        || t_norm.contains("无命中")
+                        || t_norm.contains("0命中")
+                        || t_norm.contains("命中数为0")
+                        || t_norm.contains("命中数0")
+                        || t_norm.contains("命中条数0")
+                        || t_norm.contains("命中条数为0")
+                        || t_norm.contains("无此车牌")
+                        || t_norm.contains("无该车牌")
+                        || t_norm.contains("查无此车")
+                        || t_norm.contains("命中0")
+                        || t_norm.contains("尚未在");
+                    let is_member = positive && !negative;
+                    let is_explicit_not_member = negative && !positive;
                     if is_member {
                         format!("✅ {} 在白名单中。\n\n{}", plate, t.chars().take(300).collect::<String>())
-                    } else {
+                    } else if is_explicit_not_member {
                         format!("❌ {} 不在白名单中。\n\n{}", plate, t.chars().take(200).collect::<String>())
+                    } else {
+                        format!("⚠️ 无法确认 {} 是否在白名单：查询返回了无法识别的格式。\n\n{}", plate, t.chars().take(200).collect::<String>())
                     }
                 }
                 Err(e) => format!("⚠️ 查询失败：{}", e),
@@ -10099,10 +10114,11 @@ mod whitelist_v11_tests {
         assert_eq!(r.unwrap(), "皖A12345");
     }
 
-    // ocr-review bug·medium(v10)：strong_confirm 排除「确认一下/确认下」核查前缀，
-    // 归并到 is_confirm 的确认词判定由调用处按 pending 有无分流，此处验证 extract 不受影响。
+    // ocr-review test·low(v11)：测试名从 test_count_plates_ignores_code_like_text 改为
+    // test_count_plates_multi_plate——原名利误导（count_plates 实际会把「编号B10086」这类
+    // 代码文本数成车牌，并非 ignore），且断言只验证多牌计数。改名如实反映行为。
     #[test]
-    fn test_count_plates_ignores_code_like_text() {
+    fn test_count_plates_multi_plate() {
         // ocr-review bug·medium(v10)：count_plates 宽松匹配会把「编号B10086」数成车牌，
         // 单牌查询夹杂编号文本时 count>1 会误弃预路由。此为已知限制（退回 LLM 通道，非安全风险）。
         // 但确认纯单牌仍 count==1。

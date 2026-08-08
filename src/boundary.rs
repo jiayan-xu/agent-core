@@ -904,13 +904,15 @@ impl ComplianceBoundary {
             let tool_level = with_classifier(&self.classifier, "read".to_string(), |c| {
                 c.classify(tool_name).to_string()
             });
-            // 2026-08-07 修复：白名单混合工具的只读动作（query / query_oplog）免审批。
-            // manage_whitelist / sync_whitelist_plates 被 HARD_DANGEROUS 强制危险地板，
-            // 但纯查询场景（如「XX 在不在白名单」）不该弹审批 —— 查询无写副作用。
-            // 危险判断在前：非危险工具不调用 helper（性能）；危险工具才检查只读豁免。
-            if (tool_level == "dangerous" || self.is_dangerous_floor(tool_name))
-                && !is_whitelist_readonly_action(tool_name, args)
-            {
+            // ocr-review security·high(v11)：移除 LLM 工具循环的只读豁免。
+            // 背景：manage_whitelist / sync_whitelist_plates 被 HARD_DANGEROUS 强制危险地板，
+            // 其正常用户查询（「XX 在不在白名单」）已由 agent.rs 确定性预路由直接走 call_tool_routed
+            // 天然免审批（agent.rs:2816），无需此处豁免。
+            // 此 check_tool 分支服务的是【LLM 工具循环】——若对 LLM 传的 action=query 也豁免，
+            // 一旦外部 MCP handler 的 query 存在未察觉副作用或 query_oplog 泄漏全量操作日志，
+            // 就构成对危险地板的静默绕过（外部 handler 契约本仓库无法验证）。移除豁免 → dangerous
+            // 工具一律走审批门禁，杜绝该攻击面。正常查询体验不受影响（预路由已覆盖）。
+            if tool_level == "dangerous" || self.is_dangerous_floor(tool_name) {
                 return ToolCheck::yellow(&format!("{} 需要审批，请等待审批人确认", tool_name));
             }
             // 固废整理/归档写操作：非 dry_run 时走黄线（可控写改）
@@ -1342,63 +1344,8 @@ fn needs_dept_ops_write_approval(tool_name: &str, args: &serde_json::Value) -> b
 /// - allow-list 按工具定义精确参数集 + **值类型校验**（plate 必须字符串、
 ///   limit 必须 1..=MAX_PAGE_LIMIT），拒绝对象/数组/超界值
 /// - 其余任何键/任何非标值 → 不豁免，走审批
-const MAX_PAGE_LIMIT: u64 = 1000;
-fn is_whitelist_readonly_action(tool_name: &str, args: &serde_json::Value) -> bool {
-    // 只读动作 allow-list 直接免审批：不信任任何调用方提供的标记，仅按 action + 参数白名单
-    // + 值类型判定，从源头消除「调用方伪造标记跳过审批」的攻击面（ocr-review security·medium）。
-    let action = args
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    // 按工具定义只读动作的允许参数集
-    let allowed_plain_keys: &[&str] = match tool_name {
-        // query: plate(查询条件, 字符串) + limit(分页, 1..=1000)
-        "manage_whitelist" if action == "query" => &["plate", "limit"],
-        // query_oplog: limit(分页, 1..=1000) 仅此（plate 不用于 oplog 查询）
-        "sync_whitelist_plates" if action == "query_oplog" => &["limit"],
-        _ => return false,
-    };
-    let Some(obj) = args.as_object() else {
-        return false;
-    };
-    // ocr-review security·high：空参 query/query_oplog 会空跑 all() 直接返回 true 绕过审批。
-    // → 必备参数缺失即视为非只读（fail-closed），避免 MCP 缺参默认拉全量白名单/操作日志。
-    let required_keys: &[&str] = match (tool_name, action) {
-        ("manage_whitelist", "query") => &["plate"],
-        ("sync_whitelist_plates", "query_oplog") => &["limit"],
-        _ => &[],
-    };
-    if !required_keys.iter().all(|rk| obj.contains_key(*rk)) {
-        return false;
-    }
-    obj.iter().all(|(k, v)| {
-        // action 始终允许
-        if k == "action" {
-            return true;
-        }
-        if !allowed_plain_keys.contains(&k.as_str()) {
-            return false;
-        }
-        // 值类型校验：plate 必须非空字符串且不含 SQL/通配符（% _ * ?），防止 LIKE 枚举；
-        // ocr-review security·medium(v10)：补拦 SQL 元字符（' ; --），防注入穿透只读豁免；
-        // limit 必须 1..=MAX_PAGE_LIMIT；对象/数组一律拒绝
-        match k.as_str() {
-            "plate" => v.as_str().is_some_and(|s| {
-                let s = s.trim();
-                !s.is_empty()
-                    && !s.contains('%')
-                    && !s.contains('_')
-                    && !s.contains('*')
-                    && !s.contains('?')
-                    && !s.contains('\'')
-                    && !s.contains(';')
-                    && !s.contains("--")
-            }),
-            "limit" => v.as_u64().is_some_and(|n| n >= 1 && n <= MAX_PAGE_LIMIT),
-            _ => false,
-        }
-    })
-}
+// 注：MAX_PAGE_LIMIT 与 is_whitelist_readonly_action 已于 v11 移除（ocr security·high，
+// LLM 工具循环不再豁免只读 action，dangerous 工具一律走审批；正常查询由确定性预路由覆盖）。
 
 /// 判断工具是否「危险」（落入红线/高危前缀）。
 ///
@@ -2206,7 +2153,10 @@ mod tests {
         boundary.register_tool("manage_whitelist", "read");
         boundary.register_tool("sync_whitelist_plates", "read");
 
-        // ① manage_whitelist query（纯查询，无写参数）→ 放行
+        // ① manage_whitelist query（纯查询，无写参数）→ 黄线审批
+        // ocr-review security·high(v11)：移除 LLM 工具循环只读豁免后，dangerous 工具
+        // （manage_whitelist 在 HARD_DANGEROUS）query 也走审批门禁；正常用户查询由确定性
+        // 预路由（agent.rs:2816 走 call_tool_routed）天然免审批，不受影响。
         let r = boundary.check_tool(
             "manage_whitelist",
             &serde_json::json!({"action": "query", "plate": "苏B12345"}),
@@ -2215,7 +2165,12 @@ mod tests {
             &PermissionLevel::Admin,
             None,
         );
-        assert!(r.allow, "manage_whitelist query 应免审批放行: {:?}", r);
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "manage_whitelist query 属 HARD_DANGEROUS，须走审批: {:?}",
+            r
+        );
 
         // ② manage_whitelist query 但携带写参数（confirmed）→ 仍黄线（防绕过）
         let r = boundary.check_tool(
@@ -2249,7 +2204,8 @@ mod tests {
             r
         );
 
-        // ④ sync_whitelist_plates query_oplog（纯查询，带 limit 分页）→ 放行
+        // ④ sync_whitelist_plates query_oplog（纯查询，带 limit 分页）→ 黄线审批
+        // （v11：移除 LLM 工具循环只读豁免，dangerous 工具 query 一律走审批）
         let r = boundary.check_tool(
             "sync_whitelist_plates",
             &serde_json::json!({"action": "query_oplog", "limit": 50}),
@@ -2258,7 +2214,12 @@ mod tests {
             &PermissionLevel::Admin,
             None,
         );
-        assert!(r.allow, "query_oplog 带 limit 应免审批放行: {:?}", r);
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "query_oplog 属 HARD_DANGEROUS，须走审批: {:?}",
+            r
+        );
 
         // ⑤ sync_whitelist_plates update_company（写动作）→ 黄线
         let r = boundary.check_tool(
@@ -2324,8 +2285,8 @@ mod tests {
             r
         );
 
-        // ⑩ query 携带嵌套对象写参数（filters.company_name）→ 仍黄线（allow-list 只查顶层键，
-        //    嵌套键不在 READONLY_KEYS → 整对象不豁免 → 走审批）
+        // ⑨ query 携带嵌套对象写参数（filters.company_name）→ 仍黄线（只读豁免仅查顶层键白名单，
+        //    嵌套键不在豁免键集 → 整对象不豁免 → 走审批）
         let r = boundary.check_tool(
             "manage_whitelist",
             &serde_json::json!({"action": "query", "plate": "苏B12345", "filters": {"company_name": "佳士能"}}),
