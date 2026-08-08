@@ -229,6 +229,14 @@ pub struct EpisodeArchive {
     pub archived_at: i64,
 }
 
+/// 成员查询结果三态（白名单预路由用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipVerdict {
+    WhiteListed,
+    NotInList,
+    Unknown,
+}
+
 /// Agent 核心
 pub struct AgentCore {
     pub config: AgentConfig,
@@ -1173,10 +1181,18 @@ impl AgentCore {
             // ocr-review bug·medium(v11)：确认前缀必须【无条件】early return false——
             // 若只挡 strong_confirm，短消息(≤8字，如「确认一下」)不触发长度守卫，
             // 会 falls through 到下方 confirm_words.contains("确认") 仍误判为确认。无条件截断最稳。
+            // ocr-review bug·medium(v12)：补否定确认词——「不确认/不同意/不批准/不执行/不确定」
+            // 是用户明确拒绝，若不排除会 falls through 到 confirm_words 误判为确认；在 0a 分支
+            // （is_confirm 先于 is_cancel 检查）会把用户拒绝的 pending 写操作误执行。否定词开头一律 false。
             if t.starts_with("确认一下")
                 || t.starts_with("确认下")
                 || t.starts_with("确认后")
                 || t.starts_with("确认是否")
+                || t.starts_with("不确认")
+                || t.starts_with("不同意")
+                || t.starts_with("不批准")
+                || t.starts_with("不执行")
+                || t.starts_with("不确定")
             {
                 return false;
             }
@@ -1195,6 +1211,9 @@ impl AgentCore {
         // 查询/疑问意图判定（供调用处判断：无 pending 时含此词的消息当新请求，不做罐头回复）
         // ocr-review maintainability·low(v11)：删裸「少」——「至少/减少/年少」非查询意图，
         // 裸「少」过宽会把这些词误判为查询；「多少」已由「吗/什么/哪」覆盖大部分疑问句式。
+        // ocr-review bug·medium(v12)：补成员/疑问句式——「在不在/是不是/有没有/怎么/如何/为什么」
+        // 是极常见查询形式，缺了会漏判「确认，皖A12345在不在白名单」这类无 吗/查/看 的纯查询，
+        // 使其落入罐头回复而非成员查询预路由。
         let is_query_intent = |m: &str| {
             let t = m.trim();
             t.contains('查')
@@ -1203,6 +1222,12 @@ impl AgentCore {
                 || t.contains("什么")
                 || t.contains('哪')
                 || t.contains('吗')
+                || t.contains("在不在")
+                || t.contains("是不是")
+                || t.contains("有没有")
+                || t.contains("怎么")
+                || t.contains("如何")
+                || t.contains("为什么")
         };
         let is_cancel = |m: &str| {
             let kws = [
@@ -1310,7 +1335,16 @@ impl AgentCore {
         }
 
         // ── 0a. 工具级确认（现有）：pending_actions 中的操作等待确认 ──
-        if is_confirm(trimmed) {
+        // ocr-review bug·high(v12)：确认前缀 + 明确查询意图的消息（如「确认，帮我查一下皖A在不在
+        // 白名单」）用户真实意图是查询，不是批准写。若直接 take_pending_action 会把 pending 写操作误执行。
+        // → 凡「确认/同意/批准 开头 + is_query_intent」，一律视为查询请求，跳过 pending 执行，
+        // 落入下方 is_query_intent 分支走成员查询预路由/execute_chat。纯确认（「确认，执行吧」不含
+        // 查询句式）不受影响，仍正常执行 pending。
+        let confirm_but_query = is_query_intent(trimmed)
+            && (trimmed.starts_with("确认")
+                || trimmed.starts_with("同意")
+                || trimmed.starts_with("批准"));
+        if is_confirm(trimmed) && !confirm_but_query {
             if let Some(mut action) = self.session_manager.take_pending_action(session_id).await {
                 // 任务 652 前置修复：捕获 approval_id，供执行后消费审批项（防残留被全局扫描重执行）
                 let approval_id_opt = action.approval_id.clone();
@@ -1900,6 +1934,58 @@ impl AgentCore {
         }
         // 提取车牌（优先带空格的宽松匹配，如「皖 NB7691」）
         Self::extract_plate(m).or_else(|| Self::extract_plate_spaced(m))
+    }
+
+    /// 成员查询结果三态分类：WhiteListed / NotInList / Unknown。
+    /// 输入为 manage_whitelist query 的原始返回串（未归一化）。
+    /// 抽成纯函数便于单测（ocr-review bug·medium，v12 子串碰撞修复）。
+    fn classify_membership(raw: &str) -> MembershipVerdict {
+        // 归一化：去空白(半/全角)、全/半角冒号、逗号，使「命中：0」→「命中0」可匹配
+        let t_norm = raw
+            .replace(' ', "")
+            .replace('\u{3000}', "")
+            .replace('：', "")
+            .replace(':', "")
+            .replace('，', "")
+            .replace(',', "");
+        let positive = t_norm.contains("在白名单中") || t_norm.contains("命中");
+        // 强否定：出现即明确不在（优先级最高，覆盖「不在白名单中」这类正负词共存）
+        let strong_negative = t_norm.contains("不在白名单")
+            || t_norm.contains("未命中")
+            || t_norm.contains("不存在")
+            || t_norm.contains("未找到")
+            || t_norm.contains("无此车牌")
+            || t_norm.contains("无该车牌")
+            || t_norm.contains("查无此车")
+            || t_norm.contains("尚未在")
+            || t_norm.contains("没在白名单")
+            || t_norm.contains("未在白名单");
+        // 弱否定：零命中计数（锚定，避免「命中10条」被「0条」子串误伤）
+        let zero_count_negative = t_norm.contains("共0条")
+            || t_norm.contains("命中0")
+            || t_norm.contains("0命中")
+            || t_norm.contains("零命中")
+            || t_norm.contains("无命中")
+            || t_norm.contains("命中数为0")
+            || t_norm.contains("命中数0")
+            || t_norm.contains("命中条数0")
+            || t_norm.contains("命中条数为0")
+            || t_norm.contains("无记录")
+            || t_norm.contains("0条结果")
+            || t_norm.contains("共0");
+        // 判定：强否定 > 正面；弱否定仅当无强否定且正面不清时判负
+        let member = positive
+            && !strong_negative
+            && !(zero_count_negative && !t_norm.contains("命中1"));
+        let not_member = strong_negative
+            || (zero_count_negative && !member && !positive);
+        if member {
+            MembershipVerdict::WhiteListed
+        } else if not_member {
+            MembershipVerdict::NotInList
+        } else {
+            MembershipVerdict::Unknown
+        }
     }
 
     /// 识别「添加/登记白名单新车」意图，抽取 (车牌, 公司提示)。
@@ -2835,51 +2921,17 @@ impl AgentCore {
             let exec_ok = result.is_ok();
             let reply = match result {
                 Ok(t) => {
-                    // default-deny：仅明确正面标记（且不含任何否定词）才算在白名单。
-                    // ocr-review bug·high：先归一化空白再匹配，避免「0 条」vs「0条」/「命中0条」
-                    // 因空格差异漏判；否定词表扩展「0条/无该车牌/查无此车/命中0」等。
-                    // ocr-review bug·high(v10)：归一化同时去掉全角/半角冒号与逗号，使「命中：0」
-                    // 「命中,0」「命中:0」→「命中0」命中否定词，避免「命中：0」被误判为在白名单。
-                    let t_norm = t
-                        .replace(' ', "")
-                        .replace('\u{3000}', "")
-                        .replace('：', "")
-                        .replace(':', "")
-                        .replace('，', "")
-                        .replace(',', "");
-                    // ocr-review bug·medium(v11)：加「无法确认」第三态——若输出既不含明确正面词（在白名单中/命中）
-                    // 也不含明确否定词（不在/未命中/0条/无此车牌等），说明是 Ok 包裹的错误串（查询超时/参数
-                    // 错误）或无法识别的原始行 dump。此时绝不能判「❌ 不在白名单」（假阴性会让用户误以为该车
-                    // 不在而重复加白），应如实报「⚠️ 无法确认」。
-                    let positive = t_norm.contains("在白名单中") || t_norm.contains("命中");
-                    let negative = t_norm.contains("不在")
-                        || t_norm.contains("未命中")
-                        || t_norm.contains("不存在")
-                        || t_norm.contains("未找到")
-                        || t_norm.contains("无记录")
-                        || t_norm.contains("0条")
-                        || t_norm.contains("未在白名单")
-                        || t_norm.contains("没在白名单")
-                        || t_norm.contains("零命中")
-                        || t_norm.contains("无命中")
-                        || t_norm.contains("0命中")
-                        || t_norm.contains("命中数为0")
-                        || t_norm.contains("命中数0")
-                        || t_norm.contains("命中条数0")
-                        || t_norm.contains("命中条数为0")
-                        || t_norm.contains("无此车牌")
-                        || t_norm.contains("无该车牌")
-                        || t_norm.contains("查无此车")
-                        || t_norm.contains("命中0")
-                        || t_norm.contains("尚未在");
-                    let is_member = positive && !negative;
-                    let is_explicit_not_member = negative && !positive;
-                    if is_member {
-                        format!("✅ {} 在白名单中。\n\n{}", plate, t.chars().take(300).collect::<String>())
-                    } else if is_explicit_not_member {
-                        format!("❌ {} 不在白名单中。\n\n{}", plate, t.chars().take(200).collect::<String>())
-                    } else {
-                        format!("⚠️ 无法确认 {} 是否在白名单：查询返回了无法识别的格式。\n\n{}", plate, t.chars().take(200).collect::<String>())
+                    // 三态分类（default-deny + 强否定优先 + 零计数锚定，抽成纯函数便于单测）
+                    match Self::classify_membership(&t) {
+                        MembershipVerdict::WhiteListed => {
+                            format!("✅ {} 在白名单中。\n\n{}", plate, t.chars().take(300).collect::<String>())
+                        }
+                        MembershipVerdict::NotInList => {
+                            format!("❌ {} 不在白名单中。\n\n{}", plate, t.chars().take(200).collect::<String>())
+                        }
+                        MembershipVerdict::Unknown => {
+                            format!("⚠️ 无法确认 {} 是否在白名单：查询返回了无法识别的格式。\n\n{}", plate, t.chars().take(200).collect::<String>())
+                        }
                     }
                 }
                 Err(e) => format!("⚠️ 查询失败：{}", e),
@@ -10124,6 +10176,25 @@ mod whitelist_v11_tests {
         // 但确认纯单牌仍 count==1。
         assert_eq!(AgentCore::count_plates("皖A12345在白名单吗"), 1);
         assert_eq!(AgentCore::count_plates("皖A12345 和 鲁H736A7 在白名单吗"), 2);
+    }
+
+    // ocr-review bug·medium(v12)：三态分类器抽成纯函数后的单测——
+    // 明确正面→WhiteListed；明确否定→NotInList；无法识别串→Unknown（宁缺毋滥，防假阴性）。
+    #[test]
+    fn test_classify_membership_tri_state() {
+        use MembershipVerdict::*;
+        // 明确正面
+        assert_eq!(AgentCore::classify_membership("皖A12345在白名单中，命中1条"), WhiteListed);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中10条记录"), WhiteListed);
+        // 明确否定（强否定优先，覆盖「不在白名单中」正负词共存）
+        assert_eq!(AgentCore::classify_membership("皖A12345不在白名单中"), NotInList);
+        assert_eq!(AgentCore::classify_membership("未命中，查无此车牌"), NotInList);
+        assert_eq!(AgentCore::classify_membership("查询成功，共0条结果"), NotInList);
+        // 零计数锚定：不用裸「0条」（是「10条」子串），避免「命中10条」被误判为不在
+        assert_eq!(AgentCore::classify_membership("查询成功，命中10条"), WhiteListed);
+        // 无法识别串 → Unknown（不得判 ❌ 假阴性）
+        assert_eq!(AgentCore::classify_membership("查询超时，请稍后重试"), Unknown);
+        assert_eq!(AgentCore::classify_membership("参数错误：缺少plate字段"), Unknown);
     }
 }
 

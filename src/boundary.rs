@@ -1331,21 +1331,9 @@ fn needs_dept_ops_write_approval(tool_name: &str, args: &serde_json::Value) -> b
     true
 }
 
-/// 白名单混合工具的只读动作判定（2026-08-08，allow-list 方案 v5）：
-/// manage_whitelist / sync_whitelist_plates 被 HARD_DANGEROUS 强制危险地板，
-/// 但 query / query_oplog 是纯查询（无写副作用），免审批。写动作（add/remove/
-/// reconcile/update_company/update_waste_type）仍走危险地板审批。
-///
-/// 安全设计（ocr-review security·high，v5）：
-/// - **只读动作 allow-list 直接免审批**（不依赖任何调用方提供的信任标记）：
-///   manage_whitelist query / sync_whitelist_plates query_oplog 为内部已知只读操作，
-///   经严格参数白名单 + 值类型校验约束，写参数无法走私（白名单外键一律走审批）；
-///   写动作（add / remove / update_company 等）不在白名单 → 走危险地板审批。
-/// - allow-list 按工具定义精确参数集 + **值类型校验**（plate 必须字符串、
-///   limit 必须 1..=MAX_PAGE_LIMIT），拒绝对象/数组/超界值
-/// - 其余任何键/任何非标值 → 不豁免，走审批
-// 注：MAX_PAGE_LIMIT 与 is_whitelist_readonly_action 已于 v11 移除（ocr security·high，
-// LLM 工具循环不再豁免只读 action，dangerous 工具一律走审批；正常查询由确定性预路由覆盖）。
+// 注（v11，ocr security·high）：白名单只读动作豁免已移除——manage_whitelist / sync_whitelist_plates
+// 属 HARD_DANGEROUS，check_tool 中无论 query 还是写动作一律返回黄线审批；正常成员查询由
+// agent.rs 确定性预路由（call_tool_routed）覆盖，不依赖此处豁免。
 
 /// 判断工具是否「危险」（落入红线/高危前缀）。
 ///
@@ -2141,9 +2129,10 @@ mod tests {
     }
 
     #[test]
-    fn test_whitelist_readonly_action_exemption() {
-        // 2026-08-07 修复：白名单混合工具的只读动作免审批，
-        // 写动作 / 带写参数的 query 仍走危险地板黄线（审批闸）。
+    fn test_whitelist_dangerous_tools_require_approval() {
+        // 2026-08-07 v11：白名单混合工具（manage_whitelist / sync_whitelist_plates）在
+        // HARD_DANGEROUS，无论 query 还是写动作一律走审批闸（黄线）。v11 移除 LLM 工具循环
+        // 只读豁免后，query/query_oplog 也须审批；正常用户查询由确定性预路由覆盖，不依赖此处。
         let mut boundary = ComplianceBoundary::new(None);
         boundary
             .perm_chain
@@ -2285,7 +2274,7 @@ mod tests {
             r
         );
 
-        // ⑨ query 携带嵌套对象写参数（filters.company_name）→ 仍黄线（只读豁免仅查顶层键白名单，
+        // ⑨ query 携带嵌套对象写参数（filters.company_name）→ 黄线（dangerous 工具一律审批）
         //    嵌套键不在豁免键集 → 整对象不豁免 → 走审批）
         let r = boundary.check_tool(
             "manage_whitelist",
@@ -2302,7 +2291,7 @@ mod tests {
             r
         );
 
-        // ⑪ query_oplog 携带 plate → 黄线（v4：query_oplog 仅允许 limit，plate 非只读参数）
+        // ⑪ query_oplog 携带 plate → 黄线（dangerous 工具一律审批）
         let r = boundary.check_tool(
             "sync_whitelist_plates",
             &serde_json::json!({"action": "query_oplog", "plate": "苏B12345"}),
@@ -2318,7 +2307,7 @@ mod tests {
             r
         );
 
-        // ⑫ query 携带嵌套写意图于允许键值（plate 是对象）→ 黄线（值类型校验）
+        // ⑫ query 携带嵌套写意图于允许键值（plate 是对象）→ 黄线（dangerous 一律审批）
         let r = boundary.check_tool(
             "manage_whitelist",
             &serde_json::json!({"action": "query", "plate": {"confirmed": true}}),
@@ -2334,7 +2323,7 @@ mod tests {
             r
         );
 
-        // ⑬ query 携带 limit 为负/对象 → 黄线（值类型校验）
+        // ⑬ query 携带 limit 为负/对象 → 黄线（dangerous 一律审批）
         let r = boundary.check_tool(
             "manage_whitelist",
             &serde_json::json!({"action": "query", "plate": "苏B12345", "limit": -1}),
@@ -2350,8 +2339,7 @@ mod tests {
             r
         );
 
-        // ⑭ 缺必备参数（query 无 plate）→ fail-closed 走审批（ocr-review security·high：
-        // 空参 query 会空跑 all() 绕过审批，必须拦截批量拉全量）
+        // ⑭ 缺必备参数（query 无 plate）→ 黄线（dangerous 工具一律审批）
         let r = boundary.check_tool(
             "manage_whitelist",
             &serde_json::json!({"action": "query"}),
@@ -2367,7 +2355,7 @@ mod tests {
             r
         );
 
-        // ⑮ query_oplog 缺 limit → fail-closed 走审批
+        // ⑮ query_oplog 缺 limit → 黄线（dangerous 一律审批）
         let r = boundary.check_tool(
             "sync_whitelist_plates",
             &serde_json::json!({"action": "query_oplog"}),
@@ -2383,7 +2371,7 @@ mod tests {
             r
         );
 
-        // ⑯ query 带空车牌 → 非只读走审批（值类型校验：plate 非空）
+        // ⑯ query 带空车牌 → 黄线（dangerous 工具一律审批）
         let r = boundary.check_tool(
             "manage_whitelist",
             &serde_json::json!({"action": "query", "plate": "  "}),
