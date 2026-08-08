@@ -396,8 +396,9 @@ fn scope_matches_persona(
         let needle = format!("dept/{}", id);
         ns.split('/').collect::<Vec<_>>().windows(2).any(|w| w.join("/") == needle)
     } else if let Some(id) = sc.strip_prefix("org:") {
+        // 与 dept 一致的段匹配：容忍前导斜杠（/dept/...）与 dual-NS（agent/{id},org/{company}）
         let needle = format!("org/{}", id);
-        ns.starts_with(&needle)
+        ns.split('/').collect::<Vec<_>>().windows(2).any(|w| w.join("/") == needle)
     } else {
         false
     }

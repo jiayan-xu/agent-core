@@ -571,12 +571,14 @@ fn caller_has_proj(caller_ns: &[String], proj: &str) -> bool {
 
 /// 会议 scope 匹配调用者 ns（会议升级 Step1）：
 /// - scope="dept:<id>" → 调用者 ns 含 `dept/<id>`（caller_has_dept）
-/// - scope="org:<company>" → 调用者 ns 含 `org/<company>`（caller_in_org）
+/// - scope="org:<company>" → 调用者 ns 含 `org/<company>`（按 scope 指定的 company，非当前 agent org）
 fn meeting_scope_matches(scope: &str, caller_ns: &[String]) -> bool {
     if scope.starts_with("dept:") {
         caller_has_dept(caller_ns, &scope["dept:".len()..])
     } else if scope.starts_with("org:") {
-        caller_in_org(caller_ns)
+        let company = &scope["org:".len()..];
+        let needle = format!("org/{}", company);
+        caller_ns.iter().any(|n| n == "*") || ns_blob(caller_ns).contains(&needle)
     } else {
         false
     }
