@@ -2146,7 +2146,8 @@ mod tests {
         // ① manage_whitelist query（纯查询，无写参数）→ 黄线审批
         // ocr-review security·high(v11)：移除 LLM 工具循环只读豁免后，dangerous 工具
         // （manage_whitelist 在 HARD_DANGEROUS）query 也走审批门禁；正常用户查询由确定性
-        // 预路由（agent.rs:2816 走 call_tool_routed）天然免审批，不受影响。
+        // 预路由（try_preroute 内 extract_whitelist_membership_query → call_tool_routed）
+        // 天然免审批，不受影响。
         let r = boundary.check_tool(
             "manage_whitelist",
             &serde_json::json!({"action": "query", "plate": "苏B12345"}),
