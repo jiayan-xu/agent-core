@@ -1361,6 +1361,16 @@ fn is_whitelist_readonly_action(tool_name: &str, args: &serde_json::Value) -> bo
     let Some(obj) = args.as_object() else {
         return false;
     };
+    // ocr-review security·high：空参 query/query_oplog 会空跑 all() 直接返回 true 绕过审批。
+    // → 必备参数缺失即视为非只读（fail-closed），避免 MCP 缺参默认拉全量白名单/操作日志。
+    let required_keys: &[&str] = match (tool_name, action) {
+        ("manage_whitelist", "query") => &["plate"],
+        ("sync_whitelist_plates", "query_oplog") => &["limit"],
+        _ => &[],
+    };
+    if !required_keys.iter().all(|rk| obj.contains_key(*rk)) {
+        return false;
+    }
     obj.iter().all(|(k, v)| {
         // action 始终允许
         if k == "action" {
@@ -1369,9 +1379,9 @@ fn is_whitelist_readonly_action(tool_name: &str, args: &serde_json::Value) -> bo
         if !allowed_plain_keys.contains(&k.as_str()) {
             return false;
         }
-        // 值类型校验：plate 必须字符串；limit 必须 1..=MAX_PAGE_LIMIT；对象/数组一律拒绝
+        // 值类型校验：plate 必须非空字符串；limit 必须 1..=MAX_PAGE_LIMIT；对象/数组一律拒绝
         match k.as_str() {
-            "plate" => v.is_string(),
+            "plate" => v.as_str().is_some_and(|s| !s.trim().is_empty()),
             "limit" => v.as_u64().is_some_and(|n| n >= 1 && n <= MAX_PAGE_LIMIT),
             _ => false,
         }
@@ -2227,16 +2237,16 @@ mod tests {
             r
         );
 
-        // ④ sync_whitelist_plates query_oplog（纯查询）→ 放行
+        // ④ sync_whitelist_plates query_oplog（纯查询，带 limit 分页）→ 放行
         let r = boundary.check_tool(
             "sync_whitelist_plates",
-            &serde_json::json!({"action": "query_oplog"}),
+            &serde_json::json!({"action": "query_oplog", "limit": 50}),
             "test-agent",
             "admin",
             &PermissionLevel::Admin,
             None,
         );
-        assert!(r.allow, "query_oplog 应免审批放行: {:?}", r);
+        assert!(r.allow, "query_oplog 带 limit 应免审批放行: {:?}", r);
 
         // ⑤ sync_whitelist_plates update_company（写动作）→ 黄线
         let r = boundary.check_tool(
@@ -2378,19 +2388,52 @@ mod tests {
             r
         );
 
-        // ⑭ query 免审批不依赖来源标记（纯 allow-list）：无标记也直接放行，
-        // 消除「调用方伪造标记跳过审批」的攻击面（ocr security·medium 已修复）
+        // ⑭ 缺必备参数（query 无 plate）→ fail-closed 走审批（ocr-review security·high：
+        // 空参 query 会空跑 all() 绕过审批，必须拦截批量拉全量）
         let r = boundary.check_tool(
             "manage_whitelist",
-            &serde_json::json!({"action": "query", "plate": "苏B12345"}),
+            &serde_json::json!({"action": "query"}),
             "test-agent",
             "admin",
             &PermissionLevel::Admin,
             None,
         );
-        assert!(
-            r.allow,
-            "query 应免审批放行（纯 allow-list 不依赖来源标记）: {:?}",
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "query 缺 plate 不得豁免（fail-closed）: {:?}",
+            r
+        );
+
+        // ⑮ query_oplog 缺 limit → fail-closed 走审批
+        let r = boundary.check_tool(
+            "sync_whitelist_plates",
+            &serde_json::json!({"action": "query_oplog"}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "query_oplog 缺 limit 不得豁免（fail-closed）: {:?}",
+            r
+        );
+
+        // ⑯ query 带空车牌 → 非只读走审批（值类型校验：plate 非空）
+        let r = boundary.check_tool(
+            "manage_whitelist",
+            &serde_json::json!({"action": "query", "plate": "  "}),
+            "test-agent",
+            "admin",
+            &PermissionLevel::Admin,
+            None,
+        );
+        assert_eq!(
+            r.level,
+            Some(BlockLevel::Yellow),
+            "空车牌不得豁免: {:?}",
             r
         );
 

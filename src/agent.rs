@@ -1166,12 +1166,19 @@ impl AgentCore {
             }
             // 收窄（ocr-review bug·medium）：含查询/疑问动词的短消息不是确认，
             // 避免「可以查」「查一下」「去查」被误吞（应走预路由/execute_chat 当新请求）。
-            if t.contains('查')
-                || t.contains('问')
-                || t.contains('看')
-                || t.contains("什么")
-                || t.contains('哪')
-                || t.contains('吗')
+            // 但以强确认词开头的合法审批回复（「确认，去查吧」「同意，看看」）必须仍算确认，
+            // 否则待确认操作既不执行也不消费，用户不会意识到批准被丢弃。
+            let strong_confirm = t.starts_with("确认")
+                || t.starts_with("同意")
+                || t.starts_with("批准")
+                || t.starts_with("执行");
+            if !strong_confirm
+                && (t.contains('查')
+                    || t.contains('问')
+                    || t.contains('看')
+                    || t.contains("什么")
+                    || t.contains('哪')
+                    || t.contains('吗'))
             {
                 return false;
             }
@@ -1416,7 +1423,10 @@ impl AgentCore {
                 self.checkpoint_terminal(session_id, CheckpointState::Done)
                     .await;
                 return reply;
-            } else {
+            // ocr-review bug·high：AwaitingConfirmation 状态机在下方 0b 分支处理（取 original 后
+            // execute_chat），若此处无 pending_action 也直接返回罐头回复，会静默打断计划确认。
+            // → 仅当会话不在 AwaitingConfirmation 时才返回罐头；否则放行给 0b 状态机。
+            } else if self.session_manager.get_state(session_id).await != SessionState::AwaitingConfirmation {
                 // 修复 2026-08-07：用户回「确认」但当前没有待确认的操作时，
                 // 直接明确告知，不再落入 execute_chat —— 否则 LLM 会基于脏历史
                 // 上下文回答不相干内容（实测：白名单查询后回「确认」答了「天越7月车次」）。
@@ -1815,25 +1825,24 @@ impl AgentCore {
         if Self::has_attachment_block(m) {
             return None;
         }
-        // 含写动词（添加/删除/修改/公司名）→ 不是查询，交给对应预路由
-        let write_verbs = ["添加", "新增", "登记", "录入", "删除", "移除", "改为", "改成", "公司名", "固废种类"];
+        // 含写动词（添加/删除/修改/公司名/加类）→ 不是纯查询，交给对应预路由。
+        // ocr-review bug·medium：补「加」类与「记录」等，避免「帮我加一下」「查XX记录」
+        // 被本只读预路由吞掉只回成员判定。
+        let write_verbs = [
+            "添加", "新增", "登记", "录入", "删除", "移除", "改为", "改成", "公司名", "固废种类",
+            "加入", "加进", "加一下", "加上", "加", "记录",
+        ];
         if write_verbs.iter().any(|v| m.contains(*v)) {
             return None;
         }
-        // 查询句式：在不在白名单 / 白名单有吗 / 是不是白名单 / 在白名单吗
+        // 查询句式：收紧为明确的成员查询句式（ocr bug·medium），
+        // 通配分支不再用「含白名单+任意查询词」这种过宽匹配（会吞掉记录查询）。
         let has_membership_phrase = [
             "在不在白名单", "在不在白名单里", "白名单里有", "白名单有", "白名单里有吗",
-            "是不是白名单", "在白名单吗", "在白名单里吗", "在白名单中吗", "查一下.*白名单",
+            "是不是白名单", "在白名单吗", "在白名单里吗", "在白名单中吗", "有没有白名单",
         ]
         .iter()
-        .any(|p| {
-            if p.contains('*') {
-                // 简化：把「查一下」前缀与「白名单」组合视为命中
-                m.contains("白名单") && (m.contains("查") || m.contains("在不在") || m.contains("是不是") || m.contains("有没有"))
-            } else {
-                m.contains(p)
-            }
-        });
+        .any(|p| m.contains(*p));
         if !has_membership_phrase {
             return None;
         }
@@ -2589,6 +2598,39 @@ impl AgentCore {
         None
     }
 
+    /// 统计消息中出现的车牌总数（宽松匹配，容忍空格）。用于多车牌提问判定：
+    /// 白名单成员查询预路由只处理单牌，多牌放弃预路由交常规流程（ocr-review bug·low）。
+    fn count_plates(msg: &str) -> usize {
+        let chars: Vec<char> = msg.chars().collect();
+        let mut count = 0usize;
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            // 中文字符 + 后续大写字母 + 4~6 位字母数字 = 一个车牌
+            if ('\u{4e00}'..='\u{9fff}').contains(&c) && i + 1 < chars.len() {
+                let d = chars[i + 1];
+                if d.is_ascii_uppercase() {
+                    let mut digits = 0usize;
+                    let mut j = i + 2;
+                    while j < chars.len()
+                        && chars[j].is_ascii_alphanumeric()
+                        && digits < 6
+                    {
+                        digits += 1;
+                        j += 1;
+                    }
+                    if digits >= 4 {
+                        count += 1;
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+        count
+    }
+
     /// 抽取添加新车的公司提示：优先引号，其次「公司是X/属于X」，再次「X的新车/X新车」。
     fn extract_company_for_add(msg: &str) -> Option<String> {
         for (o, cl) in [('「', '」'), ('“', '”'), ('‘', '’')] {
@@ -2705,6 +2747,10 @@ impl AgentCore {
         // 直答（无工具调用，曾编造"白名单 115 条"）。这里确定性识别并直接精确查询，
         // 绕开快速通道与 LLM 幻觉。查不到 = 不在白名单（manage_whitelist query 按车牌唯一匹配）。
         if let Some(plate) = Self::extract_whitelist_membership_query(message) {
+            // ocr-review bug·low：多车牌提问只取第一个会给出不完整结论 → 放弃本预路由交常规流程
+            if Self::count_plates(message) > 1 {
+                return None;
+            }
             // 确定性预路由直接走 call_tool_routed（不经 check_tool），天然免审批；
             // 不依赖任何 args 信任标记（避免调用方伪造标记绕过审批，ocr security·medium）。
             let args = serde_json::json!({
@@ -2726,12 +2772,20 @@ impl AgentCore {
                 .await;
             let reply = match result {
                 Ok(t) => {
-                    // default-deny：仅明确正面标记（且不含否定词）才算在白名单。
-                    // 避免「X 不在白名单中」含「在白名单」子串误判，或「未命中」含「命中」误判
-                    // （ocr-review bug·high 修复）。
+                    // default-deny：仅明确正面标记（且不含任何否定词）才算在白名单。
+                    // 否定词表覆盖：不在 / 未命中 / 未 / 没 / 无 / 零 / 不存在 / 未找到 / 无记录 / 0 条
+                    // （ocr-review bug·medium 扩展），避免「未在白名单中」「零命中」「白名单中无此车牌」误判。
                     let is_member = (t.contains("在白名单中") || t.contains("命中"))
                         && !t.contains("不在")
-                        && !t.contains("未命中");
+                        && !t.contains("未命中")
+                        && !t.contains("不存在")
+                        && !t.contains("未找到")
+                        && !t.contains("无记录")
+                        && !t.contains("0 条")
+                        && !t.contains("未在白名单")
+                        && !t.contains("没在白名单")
+                        && !t.contains("零命中")
+                        && !t.contains("无此车牌");
                     if is_member {
                         format!("✅ {} 在白名单中。\n\n{}", plate, t.chars().take(300).collect::<String>())
                     } else {
