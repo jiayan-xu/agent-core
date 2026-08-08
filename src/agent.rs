@@ -380,8 +380,10 @@ pub struct Meeting {
 }
 
 /// 判断分身是否匹配会议 scope。
-/// - scope="dept:<id>" → Persona 的 ns_full_path 含 `dept/<id>` 段
-/// - scope="org:<company>" → Persona 的 ns_full_path 含 `org/<company>` 段
+/// - scope="dept:<id>" → Persona 的 ns_full_path 含 `dept/<id>` 段（现代 ns）
+///                       或 `project/<id>` 段（旧 ns：部门存于 project 段）
+/// - scope="org:<company>" → Persona 的 ns_full_path 含 `org/<company>` 段（现代 ns）
+///                       或 `dept/<company>` 段（旧 ns：公司存于 dept 段）
 /// - scope=None → 恒 true（不过滤，兼容旧客户端）
 fn scope_matches_persona(
     scope: Option<&str>,
@@ -392,13 +394,16 @@ fn scope_matches_persona(
         // 无 ns_full_path 的分身：仅 owner 本人可见（不匹配任何 scope 会议）
         return false;
     };
+    // 段匹配助手：ns 连续两段 join 后等于 needle
+    let has_segment = |needle: &str| -> bool {
+        ns.split('/').collect::<Vec<_>>().windows(2).any(|w| w.join("/") == needle)
+    };
     if let Some(id) = sc.strip_prefix("dept:") {
-        let needle = format!("dept/{}", id);
-        ns.split('/').collect::<Vec<_>>().windows(2).any(|w| w.join("/") == needle)
+        // 现代 ns：dept/<id>；旧 ns：project/<id>（部门段）
+        has_segment(&format!("dept/{}", id)) || has_segment(&format!("project/{}", id))
     } else if let Some(id) = sc.strip_prefix("org:") {
-        // 与 dept 一致的段匹配：容忍前导斜杠（/dept/...）与 dual-NS（agent/{id},org/{company}）
-        let needle = format!("org/{}", id);
-        ns.split('/').collect::<Vec<_>>().windows(2).any(|w| w.join("/") == needle)
+        // 现代 ns：org/<company>；旧 ns：dept/<company>（公司段）
+        has_segment(&format!("org/{}", id)) || has_segment(&format!("dept/{}", id))
     } else {
         false
     }
@@ -928,14 +933,20 @@ impl AgentCore {
         self.save_meetings();
     }
 
-    /// 列出调用者可见的会议：公开 或 拥有者 或 admin
-    /// （scope 会议对本机始终可见：本仓库为单 agent 实例，scope 可见性由
-    ///  handler 层按调用者 ns 权威判定，此处保留基础过滤）
+    /// 列出调用者可见的会议：公开 或 拥有者 或 admin。
+    /// scope 会议视为「public within scope」：即使私有也返回，由 handler 层按
+    /// 调用者 ns 权威判定可见性（本仓库为单 agent 实例，避免在此处误剔除
+    /// scope 成员可见的私有会议）。
     pub fn list_meetings(&self, caller: &str, is_admin: bool) -> Vec<Meeting> {
         let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
         let mut out: Vec<Meeting> = v
             .iter()
-            .filter(|m| !m.is_private || is_admin || m.owner_user_id == caller)
+            .filter(|m| {
+                !m.is_private
+                    || is_admin
+                    || m.owner_user_id == caller
+                    || m.scope.is_some() // scope 会议交由 handler 判定，不在此处剔除
+            })
             .cloned()
             .collect();
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
