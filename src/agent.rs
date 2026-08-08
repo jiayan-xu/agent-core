@@ -1163,28 +1163,32 @@ impl AgentCore {
             let t = m.trim();
             // ocr-review bug·low：强确认词开头必须优先于长度守卫判断，
             // 否则「确认，麻烦帮我查一下…」(10+字) 的合法审批回复会被 >8 直接吞掉。
+            // ocr-review bug·high(v9)：去掉裸「执行」前缀——「执行一下…」是常见命令动词，
+            // starts_with("执行") 会误判为确认并绕过守卫（可能误执行待审批操作）。
+            // 只保留明确批准语义的「确认/同意/批准」开头 + 「确认执行/执行吧」组合。
             let strong_confirm = t.starts_with("确认")
                 || t.starts_with("同意")
                 || t.starts_with("批准")
-                || t.starts_with("执行");
+                || t.starts_with("确认执行")
+                || t.starts_with("执行吧");
             if t.chars().count() > 8 && !strong_confirm {
                 return false;
             }
-            // 收窄（ocr-review bug·medium）：含查询/疑问动词的短消息不是确认，
-            // 避免「可以查」「查一下」「去查」被误吞（应走预路由/execute_chat 当新请求）。
-            // 但以强确认词开头的合法审批回复（「确认，去查吧」「同意，看看」）必须仍算确认，
-            // 否则待确认操作既不执行也不消费，用户不会意识到批准被丢弃。
-            if !strong_confirm
-                && (t.contains('查')
-                    || t.contains('问')
-                    || t.contains('看')
-                    || t.contains("什么")
-                    || t.contains('哪')
-                    || t.contains('吗'))
-            {
-                return false;
-            }
+            // ocr-review bug·medium(v9)：「查吧/去查/查一下」是确认词，但含「查」——
+            // 是否算查询意图由调用处根据 pending 有无判断（无 pending 时当新查询），
+            // 此处不再做查询词黑名单，避免死词 + 误拦合法审批「可以，查吧」。
             confirm_words.iter().any(|w| t.contains(*w))
+        };
+        // 查询/疑问意图判定（供调用处判断：无 pending 时含此词的消息当新请求，不做罐头回复）
+        let is_query_intent = |m: &str| {
+            let t = m.trim();
+            t.contains('查')
+                || t.contains('问')
+                || t.contains('看')
+                || t.contains("什么")
+                || t.contains('哪')
+                || t.contains('吗')
+                || t.contains('少')
         };
         let is_cancel = |m: &str| {
             let kws = [
@@ -1429,6 +1433,25 @@ impl AgentCore {
             // execute_chat），若此处无 pending_action 也直接返回罐头回复，会静默打断计划确认。
             // → 仅当会话不在 AwaitingConfirmation 时才返回罐头；否则放行给 0b 状态机。
             } else if self.session_manager.get_state(session_id).await != SessionState::AwaitingConfirmation {
+                // ocr-review bug·medium(v9)：无 pending 但含查询意图（查/问/看/吗 等）
+                // 不是「确认」，是全新查询 → 放行给预路由/execute_chat，不做罐头回复。
+                if is_query_intent(trimmed) {
+                    if let Some(pr) = self.try_preroute(trimmed, session_id).await {
+                        return pr;
+                    }
+                    return crate::reply_polish::polish_llm_reply(
+                        self.execute_chat(
+                            trimmed,
+                            user_id,
+                            session_id,
+                            allowed_ns,
+                            &trace_id,
+                            external_history.clone(),
+                            stream_sender,
+                        )
+                        .await,
+                    );
+                }
                 // 修复 2026-08-07：用户回「确认」但当前没有待确认的操作时，
                 // 直接明确告知，不再落入 execute_chat —— 否则 LLM 会基于脏历史
                 // 上下文回答不相干内容（实测：白名单查询后回「确认」答了「天越7月车次」）。
@@ -1828,11 +1851,11 @@ impl AgentCore {
             return None;
         }
         // 含写动词（添加/删除/修改/公司名/加类）→ 不是纯查询，交给对应预路由。
-        // ocr-review bug·medium：补「加」类与「记录」等，避免「帮我加一下」「查XX记录」
-        // 被本只读预路由吞掉只回成员判定。
+        // ocr-review bug·medium(v9)：删单字「加」——「加急/加班/参加/增加」会误伤成员查询；
+        // 多字变体（加入/加进/加一下/加上）已覆盖写意图。`记录`过宽（「查XX的记录」是查询）也删。
         let write_verbs = [
             "添加", "新增", "登记", "录入", "删除", "移除", "改为", "改成", "公司名", "固废种类",
-            "加入", "加进", "加一下", "加上", "加", "记录",
+            "加入", "加进", "加一下", "加上",
         ];
         if write_verbs.iter().any(|v| m.contains(*v)) {
             return None;
@@ -2610,7 +2633,9 @@ impl AgentCore {
         let mut i = 0;
         while i < chars.len() {
             let c = chars[i];
-            // 中文字符 + (可选空白) + 大写字母 + 4~6 位字母数字 = 一个车牌
+            // 中文字符 + (可选空白) + 大写字母 + 字母数字体(≥3 位) = 一个车牌。
+            // ocr-review bug·low(v9)：与 extract_plate_spaced 阈值一致（body≥4 即字母+≥3 数字），
+            // 否则「皖A123 和 鲁B456」这种短牌 count_plates==0 导致多牌守卫失效。
             if ('\u{4e00}'..='\u{9fff}').contains(&c) {
                 let mut j = i + 1;
                 while j < chars.len() && chars[j].is_whitespace() {
@@ -2628,7 +2653,8 @@ impl AgentCore {
                         }
                         k += 1;
                     }
-                    if digits >= 4 {
+                    // body = 首字母 + 后续数字，body≥4 即 digits≥3
+                    if digits >= 3 {
                         count += 1;
                         i = k;
                         continue;
@@ -2796,6 +2822,10 @@ impl AgentCore {
                         && !t_norm.contains("未在白名单")
                         && !t_norm.contains("没在白名单")
                         && !t_norm.contains("零命中")
+                        && !t_norm.contains("无命中")
+                        && !t_norm.contains("0命中")
+                        && !t_norm.contains("命中数为0")
+                        && !t_norm.contains("命中数0")
                         && !t_norm.contains("无此车牌")
                         && !t_norm.contains("无该车牌")
                         && !t_norm.contains("查无此车")
