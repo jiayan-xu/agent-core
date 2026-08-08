@@ -1332,10 +1332,6 @@ fn needs_dept_ops_write_approval(tool_name: &str, args: &serde_json::Value) -> b
     true
 }
 
-// 注（v11，ocr security·high）：白名单只读动作豁免已移除——manage_whitelist / sync_whitelist_plates
-// 属 HARD_DANGEROUS，check_tool 中无论 query 还是写动作一律返回黄线审批；正常成员查询由
-// agent.rs 确定性预路由（call_tool_routed）覆盖，不依赖此处豁免。
-
 /// 判断工具是否「危险」（落入红线/高危前缀）。
 ///
 /// 用于蒸馏质量门控（P2-3）：含危险工具的 Harness 模板绝不自动激活，
@@ -2134,6 +2130,10 @@ mod tests {
         // 2026-08-07 v11：白名单混合工具（manage_whitelist / sync_whitelist_plates）在
         // HARD_DANGEROUS，无论 query 还是写动作一律走审批闸（黄线）。v11 移除 LLM 工具循环
         // 只读豁免后，query/query_oplog 也须审批；正常用户查询由确定性预路由覆盖，不依赖此处。
+        // ocr-review test·medium(v18)：本测试只断言【check_tool 的 dangerous-floor 行为】——
+        // 即 HARD_DANGEROUS 工具在 check_tool 早退返回黄线，与参数内容无关。它不驱动 agent.rs
+        // 的 LLM tool-loop/预路由路径（豁免移除的实际生效点）；该路径由 agent.rs 的预路由/成员
+        // 查询测试独立覆盖。此处验证的是边界层保证，勿解读为对 tool-loop 豁免的回归钳制。
         let mut boundary = ComplianceBoundary::new(None);
         boundary
             .perm_chain

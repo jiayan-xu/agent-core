@@ -18,6 +18,13 @@ const HISTORY_WINDOW: usize = 20;
 /// P2-3: 历史窗口 token 预算（估算：CJK 约 1~1.5 字符/token，用 chars/2 保守上界）。
 /// 预算保留给 system prompt + 当前输入 + 工具定义，历史窗口默认 4000 tokens。
 const HISTORY_TOKEN_BUDGET: usize = 4000;
+/// 白名单成员查询句式表（储备 extract_whitelist_membership_query 与 extract_membership_query_loose
+/// 共用，避免两处重复漂移——ocr maintainability·low(v18)）。「在不在白名单里」被「在不在白名单」
+/// 覆盖、「白名单里有吗」被「白名单里有」覆盖，故只留最短非冗余项。
+pub const MEMBERSHIP_PHRASES: &[&str] = &[
+    "在不在白名单", "白名单里有", "白名单有",
+    "是不是白名单", "在白名单吗", "在白名单里吗", "在白名单中吗", "有没有白名单",
+];
 use crate::checkpoint::{CheckpointState, CheckpointStore};
 use crate::degrade::{DegradeMode, DegradeMonitor, UNHEALTHY_THRESHOLD};
 use crate::harness::{self, ExecutionLog, HarnessStore};
@@ -1138,30 +1145,9 @@ impl AgentCore {
         external_history: Option<Vec<(String, String)>>,
         stream_sender: Option<&tokio::sync::mpsc::UnboundedSender<crate::llm::SseEvent>>,
     ) -> String {
-        let confirm_words = [            "确认",
-            "确认添加",
-            "确认执行",
-            "添加",
-            "是",
-            "是的",
-            "对",
-            "执行",
-            "确定",
-            "可以",
-            "好",
-            "好的",
-            "行",
-            "没问题",
-            "去吧",
-            "查吧",
-            "需要",
-            "去查",
-            "查一下",
-            "执行吧",
-            "同意",
-            "继续",
-            "就按这个",
-        ];
+        // 确认词判定自 v16 起改为结构化（strong_confirm/review_prefix/explicit_approve_after_review
+        // 组合），不再用 confirm_words 宽匹配（其 contains 匹配「执行/确定/去查」等命令动词会误判
+        // → 0a 误执行 pending 写）。
         // 确认词用「包含匹配」而非精确相等：用户常回“对的”“好的，执行”“可以，查吧”
         // 等变体，精确匹配会漏掉导致确认状态机死循环（反复问“方向对吗？”）。
         // ⚠️ 修复 2026-08-04：宽泛词（对/好/是/行）对长消息误伤严重——「对比一下这两份文件」
@@ -1199,16 +1185,17 @@ impl AgentCore {
                 || t.starts_with("同意")
                 || t.starts_with("批准")
                 || t.starts_with("执行吧");
-            // 复核/核查前缀（确认一下/确认下/确认后/确认是否）：单独不算确认（用户要核对信息），
+            // 复核/核查前缀（确认一下/确认下/确认后）：单独不算确认（用户要核对信息），
             // 但若后续含明确确认 token（执行吧/同意/批准）则算（「确认一下，执行吧」是批准）。
+            // ocr-review bug·medium(v18)：移出「确认是否」前缀（它是疑问不是复核），且疑问词「是否」
+            // 出现即不算确认——「确认是否同意」是问要不要同意，不是批准，0a 不得误执行 pending 写。
             let review_prefix = t.starts_with("确认一下")
                 || t.starts_with("确认下")
-                || t.starts_with("确认后")
-                || t.starts_with("确认是否");
+                || t.starts_with("确认后");
             let explicit_approve_after_review = (t.starts_with("确认一下")
                 || t.starts_with("确认下")
-                || t.starts_with("确认后")
-                || t.starts_with("确认是否"))
+                || t.starts_with("确认后"))
+                && !t.contains("是否")
                 && (t.contains("执行吧") || t.contains("同意") || t.contains("批准"));
             // ocr-review bug·high(v15)：拒绝/疑问/复核后缀检查【统一生效】于长度分支之前——
             // 此前 refusal 只在 ≤8 字分支内，长消息(>8字)以强确认词开头时绕过拒绝词守卫
@@ -1241,8 +1228,14 @@ impl AgentCore {
             // 对「确认一下/确认后/确认是否」也成立，核查前缀单独不算确认（「确认一下」是用户要核对，
             // 不是批准）。→ (strong_confirm && !review_prefix) 才是真强确认；复核前缀仅当后续含明确
             // 确认 token（explicit_approve_after_review）才算。
+            // ocr-review bug·medium(v18)：仅强前缀会漏掉【非前缀式】明确批准——「我确认」「好的确认」
+            // 「可以确认」是日常审批回复，须识别为确认，否则 pending 写悬空。→ 补明确批准词集。
             if t.chars().count() <= 8 {
-                return (strong_confirm && !review_prefix) || explicit_approve_after_review;
+                return (strong_confirm && !review_prefix)
+                    || explicit_approve_after_review
+                    || ["我确认", "好的确认", "可以确认", "确认完毕", "确认无误"]
+                        .iter()
+                        .any(|w| t.contains(*w));
             }
             // ocr-review bug·high(v16)：长消息(>8字) fallback 不能靠 confirm_words.contains("确认")——
             // 该词被确认前缀本身满足（「确认，把皖A12345加到白名单」以确认开头即误判确认 → 0a 误执行
@@ -1250,10 +1243,11 @@ impl AgentCore {
             // → 长消息须【强确认词开头 + 后续含独立确认词】，或复核前缀+明确确认token；
             // 纯粹以确认开头 + 新请求正文（加/查/改）的不再算确认，走下方新请求预路由。
             if strong_confirm {
-                // 前缀是确认/同意/批准/执行吧，后续须再含一个确认词（确认/同意/批准/执行吧/好的/可以）
-                // 才算批准（「确认，执行吧」「同意，就这么办」）；否则是「确认+新请求」→ 非确认。
-                return t.contains("执行吧")
-                    || t.contains("同意")
+                // 前缀是确认/同意/批准/执行吧，后续须再含一个【独立】确认词才算批准；
+                // ocr-review bug·high(v18)：`执行吧` 既是前缀又曾是内层确认词——「执行吧，帮我把
+                // 皖A12345加进白名单」以前缀「执行吧」开头 + 内层 contains("执行吧") 也成立 →
+                // 无条件确认 → 0a 误吞新写请求。前缀为「执行吧」时不得复用自身作二次确认。
+                let inner = t.contains("同意")
                     || t.contains("批准")
                     || t.contains("好的")
                     || t.contains("可以")
@@ -1261,6 +1255,10 @@ impl AgentCore {
                     || t.contains("就按")
                     || t.contains("没问题")
                     || t.contains("继续");
+                if t.starts_with("执行吧") {
+                    return inner;
+                }
+                return t.contains("执行吧") || inner;
             }
             explicit_approve_after_review
         };
@@ -2016,12 +2014,8 @@ impl AgentCore {
         // 通配分支不再用「含白名单+任意查询词」这种过宽匹配（会吞掉记录查询）。
         // maintainability·low(v10)：删被包含项——「在不在白名单里」被「在不在白名单」覆盖、
         // 「白名单里有吗」被「白名单里有」覆盖，冗余项掩盖真实匹配语义。
-        let has_membership_phrase = [
-            "在不在白名单", "白名单里有", "白名单有",
-            "是不是白名单", "在白名单吗", "在白名单里吗", "在白名单中吗", "有没有白名单",
-        ]
-        .iter()
-        .any(|p| m.contains(*p));
+        // maintainability·low(v18)：句式表抽为 MEMBERSHIP_PHRASES 常量，避免两处漂移。
+        let has_membership_phrase = MEMBERSHIP_PHRASES.iter().any(|p| m.contains(*p));
         if !has_membership_phrase {
             return None;
         }
@@ -2037,12 +2031,7 @@ impl AgentCore {
     /// ocr-review bug·medium(v15)：write_verbs 过度拦截会把纯查询推入审批执行路径。
     fn extract_membership_query_loose(message: &str) -> Option<String> {
         let m = message.trim();
-        let has_phrase = [
-            "在不在白名单", "白名单里有", "白名单有",
-            "是不是白名单", "在白名单吗", "在白名单里吗", "在白名单中吗", "有没有白名单",
-        ]
-        .iter()
-        .any(|p| m.contains(*p));
+        let has_phrase = MEMBERSHIP_PHRASES.iter().any(|p| m.contains(*p));
         if !has_phrase {
             return None;
         }
@@ -2109,7 +2098,7 @@ impl AgentCore {
         // 是错误/非结果文本，会被误判 Whitelisted。→ 锚定：命中后须有计数词或 N。
         let positive = t_norm.contains("在白名单中")
             || {
-                // 「命中」后紧跟数字（命中5/命中10）或计数词（命中N条/命中数量/命中记录/命中数）
+                // 「命中」后紧跟数字（命中5/命中10）或计数词（命中N条/命中数量/命中记录）
                 match t_norm.find("命中") {
                     None => false,
                     Some(i) => {
@@ -2118,8 +2107,6 @@ impl AgentCore {
                             || rest.contains("条")
                             || rest.contains("数量")
                             || rest.contains("记录")
-                            || rest.contains("个")
-                            || rest.contains("数")
                     }
                 }
             };
@@ -2127,9 +2114,16 @@ impl AgentCore {
         // ocr-review bug·medium(v16)：锚定白名单专属词——「不存在/未找到/尚未在/未命中」是通用
         // 缺席词，「查询失败：数据库不存在」「未找到该模块」「服务尚未在集群中注册」等操作/基础设施
         // 错误文本会误判 NotInList（对实际在白名单的车牌给出 ❌ 假阴性）。→ 只保留白名单语境词。
+        // ocr-review bug·high(v18)：positive 锚「在白名单中」会被否定变体也匹配——「皖A12345没有
+        // 在白名单中」「该车未曾在白名单中」含「在白名单中」但无紧邻的「没/未」→ 误判 Whitelisted。
+        // → 补齐所有否定变体（没有/未曾/并未/并非），default-deny 下凡否定变体即判 NotInList。
         let strong_negative = t_norm.contains("不在白名单")
             || t_norm.contains("未在白名单")
             || t_norm.contains("没在白名单")
+            || t_norm.contains("没有在白名单")
+            || t_norm.contains("未曾在白名单")
+            || t_norm.contains("并未在白名单")
+            || t_norm.contains("并非在白名单")
             || t_norm.contains("无此车牌")
             || t_norm.contains("无该车牌")
             || t_norm.contains("查无此车")
@@ -10500,6 +10494,16 @@ mod whitelist_v11_tests {
         // 「数量」→ 判 NotInList。
         assert_eq!(AgentCore::classify_membership("命中皖A00000"), Unknown);
         assert_eq!(AgentCore::classify_membership("查询成功，命中数量0"), NotInList);
+        // ocr-review bug·high(v18)：否定变体——「没有/未曾/并未/并非在白名单」含「在白名单中」
+        // 但须判 NotInList（default-deny，不得 Whitelisted 假阳性）
+        assert_eq!(AgentCore::classify_membership("皖A12345没有在白名单中"), NotInList);
+        assert_eq!(AgentCore::classify_membership("该车未曾在白名单中"), NotInList);
+        assert_eq!(AgentCore::classify_membership("该车并未在白名单中"), NotInList);
+        assert_eq!(AgentCore::classify_membership("此车并非在白名单中"), NotInList);
+        // ocr-review bug·medium(v18)：positive 锚定不得含宽泛「个/数」——「命中数据异常」含
+        // 「数据」但有「数」子串，不得 Whitelisted
+        assert_eq!(AgentCore::classify_membership("命中数据异常，请重试"), Unknown);
+        assert_eq!(AgentCore::classify_membership("命中这个操作无法执行"), Unknown);
     }
 }
 
