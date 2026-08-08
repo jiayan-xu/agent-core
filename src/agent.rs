@@ -1310,9 +1310,23 @@ impl AgentCore {
                 // 项——「确认什么」「确认怎么执行」(6字)以「确认」开头（strong_confirm）但用户是问
                 // 要确认什么，不含 refusal 词，绕过 query gate → 误确认执行 pending 写。且 token 列表
                 // 补「怎么/哪/哪个」。→ 统一 gate 到三项（strong 前缀 / explicit_short / combo）。
+                // ocr-review bug·medium(v32)：has_query_token 过宽——「同意怎么执行都行」(8字)含
+                // 「怎么」被 gate 误拒，但它是【执行授权】（v13 场景），非追问。→ 收窄：疑问词后跟
+                // 「都/也」授权词（怎么执行都行/怎么都成）不算追问；仅纯粹的「确认/批准词+疑问词」
+                // 追问（确认什么/确认怎么执行/对的做法是什么）才 gate。
                 let has_query_token = ["什么", "怎么", "哪个", "哪", "如何", "为什么", "咋", "怎样", "怎么样"]
                     .iter()
-                    .any(|w| t_norm_short.contains(w));
+                    .any(|w| {
+                        let idx = t_norm_short.find(w);
+                        match idx {
+                            Some(i) => {
+                                let tail = &t_norm_short[i + w.len()..];
+                                // 疑问词后段含「都/也/全」授权词 = 执行授权（怎么执行都行），非追问
+                                !tail.contains("都") && !tail.contains("也") && !tail.contains("全")
+                            }
+                            None => false,
+                        }
+                    });
                 return (strong_confirm && !review_prefix && !has_query_token)
                     || explicit_approve_after_review
                     || (!refusal
@@ -1505,7 +1519,21 @@ impl AgentCore {
                 // （无成员句式但有车牌+查询意图）自确认 → 0a 误执行无关 pending 写。→ 确认前缀+
                 // 车牌+查询意图词也算查询。保留 v13 保护：「同意，怎么执行都行」无车牌仍不算查询。
                 || (Self::extract_plate(trimmed).is_some() && is_query_intent(trimmed)));
-        if is_confirm(trimmed) && !confirm_but_query {
+        // ocr-review bug·high(v32)：0a 分支执行 pending 前须检查消息是否【携带新写请求正文】——
+        // 「确认，可以把皖A12345加进白名单」以确认开头 + 内层「可以」使 is_confirm=true，但用户
+        // 意图是【发起新写请求】（加进白名单），不是确认旧 pending。confirm_but_query 仅当含成员
+        // 句式或（车牌+查询）才 true，这里不满足 → 直接 take_pending_action 执行与用户本意无关的
+        // pending 写，并把新写请求静默丢弃（旧逻辑只在无 pending 的 else-if 分支有 has_request_body
+        // 守卫，0a 路径没有）。→ 携带新写请求时跳过 0a，放行给下方 try_preroute 走正常写审批。
+        let carries_new_write = Self::has_command_write_verb(trimmed)
+            || trimmed.contains("白名单")
+            || trimmed.contains("车牌")
+            || trimmed.contains("删除")
+            || trimmed.contains("添加")
+            || trimmed.contains("更新")
+            || trimmed.contains("改为")
+            || trimmed.contains("改成");
+        if is_confirm(trimmed) && !confirm_but_query && !carries_new_write {
             if let Some(mut action) = self.session_manager.take_pending_action(session_id).await {
                 // 任务 652 前置修复：捕获 approval_id，供执行后消费审批项（防残留被全局扫描重执行）
                 let approval_id_opt = action.approval_id.clone();
@@ -2115,11 +2143,18 @@ impl AgentCore {
         // extract_whitelist_update 把「新能源后还在不在白名单里」当公司名提交 update_company 写审批，
         // 用户确认后污染白名单。→ 宾语名词后跟完成态后缀（后/过/了/之前/已/完）视为叙述性（查询）
         // 放行（has_narrative_noun=true 即放行），与 has_command_write_verb 的叙述性豁免一致。
-        if Self::has_command_write_verb(m)
-            || ((m.contains("公司名") || m.contains("固废种类"))
-                && !Self::has_narrative_noun(m, "公司名")
-                && !Self::has_narrative_noun(m, "固废种类"))
-        {
+        // ocr-review bug·low(v32)：公司名/固废种类守卫过宽——「皖A12345公司名还在不在白名单里」
+        // 是纯成员查询（问公司名是否在白名单），含「公司名」但无变更动词，却被拦截 → 确定性查询
+        // 丢失落入 LLM 快道。extract_whitelist_update 需【变更动词】才产生虚假审批，故仅当消息确实
+        // 含变更动词（改为/改成/设为…）时才启用公司名词拦截，纯成员句式直接放行。
+        let company_noun_guard = (m.contains("公司名") || m.contains("固废种类"))
+            && ["改为", "改成", "设为", "换成", "更新为", "变更为", "改名为", "设成",
+                "调整为", "统一为", "统一成", "换为", "修改", "变更", "更新", "设为"]
+                .iter()
+                .any(|v| m.contains(v))
+            && !Self::has_narrative_noun(m, "公司名")
+            && !Self::has_narrative_noun(m, "固废种类");
+        if Self::has_command_write_verb(m) || company_noun_guard {
             return None;
         }
         // 查询句式：收紧为明确的成员查询句式（ocr bug·medium），
@@ -2342,7 +2377,20 @@ impl AgentCore {
                         let count_word_first = ["数量", "记录", "数", "条"]
                             .iter()
                             .any(|w| {
-                                rest.starts_with(w) && rest[w.len()..].chars().next().map_or(false, |c| c.is_ascii_digit())
+                                if !rest.starts_with(w) {
+                                    return false;
+                                }
+                                let after = &rest[w.len()..];
+                                let first = after.chars().next();
+                                // 数字为 0 时必须判负：数字为 0 时无论计数名词是数/条/数量/
+                                // 记录，均为「零命中」→ NotInList，不得经 count_word_first 算正面
+                                // 而 Whitelisted（ocr-review bug·low(v32)：与「命中数0」/「命中
+                                // 条数0」的 count_zero 口径对齐）。数字须 >0 才表非零命中。
+                                match first {
+                                    Some(c) if c.is_ascii_digit() && c != '0' => true,
+                                    Some('0') => false,
+                                    _ => false,
+                                }
                             });
                         digits_ok || count_word_first
                     }
@@ -2401,6 +2449,7 @@ impl AgentCore {
                                 || before.ends_with("数量")
                                 || before.ends_with("记录")
                                 || before.ends_with("数")
+                                || before.ends_with("条")
                                 || before.ends_with("共");
                             // 数值判断：首个数字 token 全部为 0（非 20/500/03 等）
                             let digits: Vec<char> = tail
@@ -3235,9 +3284,24 @@ impl AgentCore {
                     }
                     // body = 首字母 + 后续数字，body≥4 即 digits≥3
                     if digits >= 3 {
-                        count += 1;
-                        i = k;
-                        continue;
+                        // 排除组织/文号后缀：车牌 body 后紧跟「号」(京B12345号文)、
+                        // 「有限公司/科技」(北京B10086科技有限公司) 等组织/文号词 → 该
+                        // 「省份字+字母+数字」是公司名/文号而非车牌。ocr-review bug·low(v32)：
+                        // count_plates 只锚省份字+body≥4，此类被误计 → 单牌查询 count>1 被
+                        // 多牌守卫交 LLM 快道，确定性丢失。与 extract_plate 口径对齐。
+                        let tail: String = chars[k.min(chars.len())..]
+                            .iter()
+                            .take(8)
+                            .collect();
+                        let suffix_blocked = tail.starts_with("号")
+                            || tail.starts_with("文号")
+                            || tail.starts_with("有限公司")
+                            || tail.starts_with("科技");
+                        if !suffix_blocked {
+                            count += 1;
+                            i = k;
+                            continue;
+                        }
                     }
                 }
             }
@@ -10777,6 +10841,12 @@ mod whitelist_v11_tests {
         assert_eq!(AgentCore::count_plates("编号B10086 在不在白名单"), 0, "編/号非省份字，非车牌");
         assert_eq!(AgentCore::count_plates("皖A12345 编号B10086 在白名单吗"), 1, "仅皖A12345 计为车牌");
         assert_eq!(AgentCore::count_plates("帮我查皖A12345和鲁H736A7在不在白名单"), 2, "查询动词后的省份牌仍计");
+        // ocr-review bug·low(v32)：count_plates 与 extract_plate 口径对齐——排除公司/文号后缀。
+        // 「北京B10086科技有限公司」「京B12345号文」中的省份字+字母+数字是公司名/文号，非车牌；
+        // 单牌查询不再被多牌守卫 count>1 误交 LLM。
+        assert_eq!(AgentCore::count_plates("北京B10086科技有限公司在不在白名单"), 0, "公司名非车牌");
+        assert_eq!(AgentCore::count_plates("京B12345号文已归档"), 0, "文号非车牌");
+        assert_eq!(AgentCore::count_plates("北京B10086科技有限公司 皖A12345 在白名单吗"), 1, "仅真实车牌计为1");
     }
 
     // ocr-review bug·medium(v12)：三态分类器抽成纯函数后的单测——
@@ -10849,6 +10919,14 @@ mod whitelist_v11_tests {
             Unknown,
             "长前缀+未找到+在白名单中 应判 Unknown 而非 Whitelisted 假阳性"
         );
+        // ocr-review bug·low(v32)：零计数口径统一——「命中条0」与「命中数0」「命中条数0」同属
+        // 零命中，数字为 0 无论计数名词是数/条/数量/记录 均判 NotInList，不得经 count_word_first
+        // 误判 Whitelisted。
+        assert_eq!(AgentCore::classify_membership("查询成功，命中条0"), NotInList);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中记录0"), NotInList);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中数量0"), NotInList);
+        // 非零计数不受影响
+        assert_eq!(AgentCore::classify_membership("查询成功，命中条5"), Whitelisted);
     }
 }
 
