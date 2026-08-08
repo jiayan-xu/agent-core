@@ -2120,10 +2120,11 @@ async fn handle_panel_discuss(
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    let admin = is_admin(&headers, &st).await;
     let v = match body {
         Some(Json(v)) => v,
         None => return (axum::http::StatusCode::BAD_REQUEST, "missing body").into_response(),
@@ -2150,13 +2151,32 @@ async fn handle_panel_discuss(
         .and_then(|x| x.as_str())
         .map(|s| s == "public")
         .unwrap_or(false));
+    // 会议升级 Step1：层级范围（dept:<id> / org:<company>）。
+    // 提供时按 scope 过滤分身；缺省走全部（兼容旧客户端）。
+    let scope: Option<String> = v
+        .get("scope")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+
+    // 会议升级 Step1：发起者只能创建自己所属 scope 的会议（非 admin 时），
+    // 防止越权创建他人 scope 的部门/公司会议。
+    if let Some(ref sc) = scope {
+        if !admin && !agent_core::agent::scope_matches_caller(sc, &caller_ns) {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                format!("无权发起该 scope 的会议：{}", sc),
+            )
+                .into_response();
+        }
+    }
 
     // 计算实际参与者（用于会议记录），并预建会议记录（status=running）
     let g0 = st.agent.lock().await;
     let has_agent = g0.is_some();
     let mut participants: Vec<String> = Vec::new();
     if let Some(ref agent) = *g0 {
-        let mut personas = agent.list_personas();
+        let mut personas = agent.list_personas_scoped(scope.as_deref());
         personas.sort_by(|a, b| a.persona_id.cmp(&b.persona_id));
         if let Some(ids) = &selected_ids {
             personas.retain(|p| ids.contains(&p.persona_id));
@@ -2170,7 +2190,7 @@ async fn handle_panel_discuss(
     let meeting_id = {
         let g = st.agent.lock().await;
         match &*g {
-            Some(ref agent) => agent.create_meeting(&topic, &caller, participants.clone(), is_private),
+            Some(ref agent) => agent.create_meeting(&topic, &caller, participants.clone(), is_private, scope.clone()),
             None => String::new(),
         }
     };
@@ -2185,6 +2205,7 @@ async fn handle_panel_discuss(
     let chair_c = chair.clone();
     let session_c = session_id.to_string();
     let sel_c = selected_ids;
+    let scope_c = scope;
     let meeting_id_c = meeting_id.clone();
     tokio::spawn(async move {
         let g = st_clone.agent.lock().await;
@@ -2193,7 +2214,7 @@ async fn handle_panel_discuss(
             return;
         };
         let ns = agent.caller_ns(&session_c);
-        let mut personas = agent.list_personas();
+        let mut personas = agent.list_personas_scoped(scope_c.as_deref());
         personas.sort_by(|a, b| a.persona_id.cmp(&b.persona_id));
         if let Some(ids) = &sel_c {
             personas.retain(|p| ids.contains(&p.persona_id));
@@ -2247,12 +2268,12 @@ async fn handle_panel_discuss(
     Sse::new(UnboundedReceiverStream::new(rx)).into_response()
 }
 
-/// Phase 6 增强：列出调用者可见的圆桌会议（私有仅拥有者 / admin 可见）
+/// Phase 6 增强：列出调用者可见的圆桌会议（私有仅拥有者 / admin 可见；scope 会议同级成员可见）
 async fn handle_meetings_list(
     headers: axum::http::HeaderMap,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -2261,7 +2282,8 @@ async fn handle_meetings_list(
     let Some(ref agent) = *g else {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
     };
-    let list = agent.list_meetings(&caller, admin);
+    let list = agent.list_meetings(&caller, admin, &caller_ns);
+    // scope 会议的可见性已在 AgentCore::list_meetings 内权威判定（public within scope）
     let items: Vec<serde_json::Value> = list
         .iter()
         .map(|m| {
@@ -2274,6 +2296,7 @@ async fn handle_meetings_list(
                 "created_at": m.created_at,
                 "status": m.status,
                 "consensus": m.consensus,
+                "scope": m.scope,
             })
         })
         .collect();
