@@ -400,8 +400,8 @@ fn scope_matches_persona(
         segs.windows(2).any(|w| seg_match(w, prefix, value))
     };
     if let Some(id) = sc.strip_prefix("dept:") {
-        // 现代 ns：dept/<id>；旧 ns：project/<id>（部门段）
-        segments("dept", id) || segments("proj", id)
+        // 现代 persona ns：dept/<id>；旧 persona ns：project/<id>（部门段）
+        segments("dept", id) || segments("project", id)
     } else if let Some(id) = sc.strip_prefix("org:") {
         // 现代 ns：org/<company>；旧 ns：dept/<company>（公司段）。
         // 仅当该 persona 无现代 org/ 段时才回退 dept/，避免部门名=公司名时误匹配
@@ -421,14 +421,16 @@ fn scope_matches_persona(
 /// - scope="dept:<id>" → 调用者任一 ns 含 `dept/<id>` 段
 /// - scope="org:<company>" → 调用者任一 ns 含 `org/<company>` 段
 /// - 持有 `*`（admin）恒匹配
-fn scope_matches_caller(scope: &str, caller_ns: &[String]) -> bool {
+pub fn scope_matches_caller(scope: &str, caller_ns: &[String]) -> bool {
     if caller_ns.iter().any(|n| n == "*") {
         return true;
     }
     if let Some(id) = scope.strip_prefix("dept:") {
+        // caller 是现代 ns（org/{company}/dept/{dept}/proj/{project}），
+        // dept:<id> 只匹配 dept 段；proj 段是项目，匹配会误授权。
         caller_ns.iter().any(|n| {
             let segs: Vec<&str> = n.split('/').collect();
-            segs.windows(2).any(|w| seg_match(w, "dept", id)) || segs.windows(2).any(|w| seg_match(w, "proj", id))
+            segs.windows(2).any(|w| seg_match(w, "dept", id))
         })
     } else if let Some(id) = scope.strip_prefix("org:") {
         caller_ns.iter().any(|n| {

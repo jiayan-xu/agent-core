@@ -2120,10 +2120,11 @@ async fn handle_panel_discuss(
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    let admin = is_admin(&headers, &st).await;
     let v = match body {
         Some(Json(v)) => v,
         None => return (axum::http::StatusCode::BAD_REQUEST, "missing body").into_response(),
@@ -2157,6 +2158,18 @@ async fn handle_panel_discuss(
         .and_then(|x| x.as_str())
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty());
+
+    // 会议升级 Step1：发起者只能创建自己所属 scope 的会议（非 admin 时），
+    // 防止越权创建他人 scope 的部门/公司会议。
+    if let Some(ref sc) = scope {
+        if !admin && !agent_core::agent::scope_matches_caller(sc, &caller_ns) {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                format!("无权发起该 scope 的会议：{}", sc),
+            )
+                .into_response();
+        }
+    }
 
     // 计算实际参与者（用于会议记录），并预建会议记录（status=running）
     let g0 = st.agent.lock().await;
