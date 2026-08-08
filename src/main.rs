@@ -569,6 +569,19 @@ fn caller_has_proj(caller_ns: &[String], proj: &str) -> bool {
     caller_ns.iter().any(|n| n == "*") || ns_blob(caller_ns).contains(&needle)
 }
 
+/// 会议 scope 匹配调用者 ns（会议升级 Step1）：
+/// - scope="dept:<id>" → 调用者 ns 含 `dept/<id>`（caller_has_dept）
+/// - scope="org:<company>" → 调用者 ns 含 `org/<company>`（caller_in_org）
+fn meeting_scope_matches(scope: &str, caller_ns: &[String]) -> bool {
+    if scope.starts_with("dept:") {
+        caller_has_dept(caller_ns, &scope["dept:".len()..])
+    } else if scope.starts_with("org:") {
+        caller_in_org(caller_ns)
+    } else {
+        false
+    }
+}
+
 fn can_org_broadcast(caller_id: &str, caller_ns: &[String]) -> bool {
     // 注意：持有 `*`（Memoria admin）也不自动获得公司广播权，
     // 避免 jarvis 等服务身份误发国庆通知；须显式进白名单或 role。
@@ -2150,13 +2163,20 @@ async fn handle_panel_discuss(
         .and_then(|x| x.as_str())
         .map(|s| s == "public")
         .unwrap_or(false));
+    // 会议升级 Step1：层级范围（dept:<id> / org:<company>）。
+    // 提供时按 scope 过滤分身；缺省走全部（兼容旧客户端）。
+    let scope: Option<String> = v
+        .get("scope")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
 
     // 计算实际参与者（用于会议记录），并预建会议记录（status=running）
     let g0 = st.agent.lock().await;
     let has_agent = g0.is_some();
     let mut participants: Vec<String> = Vec::new();
     if let Some(ref agent) = *g0 {
-        let mut personas = agent.list_personas();
+        let mut personas = agent.list_personas_scoped(scope.as_deref());
         personas.sort_by(|a, b| a.persona_id.cmp(&b.persona_id));
         if let Some(ids) = &selected_ids {
             personas.retain(|p| ids.contains(&p.persona_id));
@@ -2170,7 +2190,7 @@ async fn handle_panel_discuss(
     let meeting_id = {
         let g = st.agent.lock().await;
         match &*g {
-            Some(ref agent) => agent.create_meeting(&topic, &caller, participants.clone(), is_private),
+            Some(ref agent) => agent.create_meeting(&topic, &caller, participants.clone(), is_private, scope.clone()),
             None => String::new(),
         }
     };
@@ -2185,6 +2205,7 @@ async fn handle_panel_discuss(
     let chair_c = chair.clone();
     let session_c = session_id.to_string();
     let sel_c = selected_ids;
+    let scope_c = scope;
     let meeting_id_c = meeting_id.clone();
     tokio::spawn(async move {
         let g = st_clone.agent.lock().await;
@@ -2193,7 +2214,7 @@ async fn handle_panel_discuss(
             return;
         };
         let ns = agent.caller_ns(&session_c);
-        let mut personas = agent.list_personas();
+        let mut personas = agent.list_personas_scoped(scope_c.as_deref());
         personas.sort_by(|a, b| a.persona_id.cmp(&b.persona_id));
         if let Some(ids) = &sel_c {
             personas.retain(|p| ids.contains(&p.persona_id));
@@ -2247,12 +2268,12 @@ async fn handle_panel_discuss(
     Sse::new(UnboundedReceiverStream::new(rx)).into_response()
 }
 
-/// Phase 6 增强：列出调用者可见的圆桌会议（私有仅拥有者 / admin 可见）
+/// Phase 6 增强：列出调用者可见的圆桌会议（私有仅拥有者 / admin 可见；scope 会议同级成员可见）
 async fn handle_meetings_list(
     headers: axum::http::HeaderMap,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -2262,8 +2283,19 @@ async fn handle_meetings_list(
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
     };
     let list = agent.list_meetings(&caller, admin);
+    // scope 会议为「public within scope」：同级成员按 ns prefix 匹配可见
     let items: Vec<serde_json::Value> = list
         .iter()
+        .filter(|m| {
+            if m.is_private && !admin && m.owner_user_id != caller {
+                // 私有：仅 owner/admin；若带 scope 且调用者属该 scope 则放行
+                if let Some(sc) = &m.scope {
+                    return meeting_scope_matches(sc, &caller_ns);
+                }
+                return false;
+            }
+            true
+        })
         .map(|m| {
             serde_json::json!({
                 "id": m.id,
@@ -2274,6 +2306,7 @@ async fn handle_meetings_list(
                 "created_at": m.created_at,
                 "status": m.status,
                 "consensus": m.consensus,
+                "scope": m.scope,
             })
         })
         .collect();

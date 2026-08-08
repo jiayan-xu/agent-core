@@ -373,6 +373,34 @@ pub struct Meeting {
     /// "running" | "done"
     pub status: String,
     pub consensus: Option<String>,
+    /// NEW(会议升级 Step1)：会议层级范围，如 "dept:engineering" / "org:cs-pufa-2nd-thermal"。
+    /// None = 旧版私有圆桌（仅拥有者 / admin 可见）。serde default 兼容旧 meetings.json。
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+/// 判断分身是否匹配会议 scope。
+/// - scope="dept:<id>" → Persona 的 ns_full_path 含 `dept/<id>` 段
+/// - scope="org:<company>" → Persona 的 ns_full_path 含 `org/<company>` 段
+/// - scope=None → 恒 true（不过滤，兼容旧客户端）
+fn scope_matches_persona(
+    scope: Option<&str>,
+    p: &crate::runtime::self_runtime::Persona,
+) -> bool {
+    let Some(sc) = scope else { return true };
+    let Some(ns) = p.ns_full_path.as_deref() else {
+        // 无 ns_full_path 的分身：仅 owner 本人可见（不匹配任何 scope 会议）
+        return false;
+    };
+    if let Some(id) = sc.strip_prefix("dept:") {
+        let needle = format!("dept/{}", id);
+        ns.split('/').collect::<Vec<_>>().windows(2).any(|w| w.join("/") == needle)
+    } else if let Some(id) = sc.strip_prefix("org:") {
+        let needle = format!("org/{}", id);
+        ns.starts_with(&needle)
+    } else {
+        false
+    }
 }
 
 /// P2-1: 单次任务执行的工作记忆状态机（AgentRunContext）
@@ -724,6 +752,18 @@ impl AgentCore {
         m.values().cloned().collect()
     }
 
+    /// 会议升级 Step1：按 scope 过滤分身。
+    /// - scope="dept:<id>" → 分身 ns_full_path 含 `dept/<id>` 段
+    /// - scope="org:<company>" → 分身 ns_full_path 含 `org/<company>` 段
+    /// - scope=None → 返回全部分身（兼容旧客户端）
+    pub fn list_personas_scoped(
+        &self,
+        scope: Option<&str>,
+    ) -> Vec<crate::runtime::self_runtime::Persona> {
+        let m = self.personas.lock().unwrap_or_else(|p| p.into_inner());
+        m.values().cloned().filter(|p| scope_matches_persona(scope, p)).collect()
+    }
+
     /// Phase 3：删除一个分身（default 不可删）
     pub fn remove_persona(&self, persona_id: &str) -> Result<(), String> {
         if persona_id == "default" {
@@ -853,6 +893,7 @@ impl AgentCore {
         owner: &str,
         participants: Vec<String>,
         is_private: bool,
+        scope: Option<String>,
     ) -> String {
         let id = format!("mtg_{}", chrono::Utc::now().timestamp_millis());
         let meeting = Meeting {
@@ -864,6 +905,7 @@ impl AgentCore {
             created_at: chrono::Utc::now().to_rfc3339(),
             status: "running".to_string(),
             consensus: None,
+            scope,
         };
         self.meetings
             .lock()
@@ -886,6 +928,8 @@ impl AgentCore {
     }
 
     /// 列出调用者可见的会议：公开 或 拥有者 或 admin
+    /// （scope 会议对本机始终可见：本仓库为单 agent 实例，scope 可见性由
+    ///  handler 层按调用者 ns 权威判定，此处保留基础过滤）
     pub fn list_meetings(&self, caller: &str, is_admin: bool) -> Vec<Meeting> {
         let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
         let mut out: Vec<Meeting> = v
