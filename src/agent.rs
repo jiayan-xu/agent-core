@@ -400,8 +400,10 @@ fn scope_matches_persona(
         segs.windows(2).any(|w| seg_match(w, prefix, value))
     };
     if let Some(id) = sc.strip_prefix("dept:") {
-        // 现代 persona ns：dept/<id>；旧 persona ns：project/<id>（部门段）
-        segments("dept", id) || segments("project", id)
+        // 与 scope_matches_caller 严格对称：dept 只匹配现代 ns 的 `dept/<id>` 段。
+        // 不匹配 project/proj 段——该段在现代 ns 是项目、旧 persona ns 是部门，
+        // 语义冲突且会造成「persona 被纳入但 caller 不可见」的授权不对称。
+        segments("dept", id)
     } else if let Some(id) = sc.strip_prefix("org:") {
         // 现代 ns：org/<company>；旧 ns：dept/<company>（公司段）。
         // 仅当该 persona 无现代 org/ 段时才回退 dept/，避免部门名=公司名时误匹配
