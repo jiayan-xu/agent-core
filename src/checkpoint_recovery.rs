@@ -127,8 +127,17 @@ pub async fn apply_checkpoint_recovery(
                     )
                     .await;
             }
+            // P0 根因修复（2026-08-08）：PendingApproval = 工具级审批等待，不是任务级「方向对吗」确认。
+            // 恢复成 AwaitingConfirmation 会：(1) 语义错位——审批等待被当成任务确认；
+            //   (2) 用户回「确认」走 is_confirm 分支 execute_chat(original=审批json)，但无 in_progress_plan，
+            //       pending 永不消费 → 产生「Approved 但 consumed_at=None」的孤儿审批单。
+            // 正确语义：审批等待恢复后落 Confirmed，让 execute_chat 入口调用的 execute_approved_request
+            // （agent.rs 中 execute_chat → execute_approved_request 调用处）全局扫描消费 Approved
+            // 未 consumed 的审批单，闭环孤儿单。
+            // 安全：list_approved_ready 只返回 Approved，Pending 审批单即使落 Confirmed 也不会被执行，无绕过。
+            // 与同文件 ExecutingPlan 分支（恢复后同样设 Confirmed）语义一致。
             session_manager
-                .set_state(session_id, SessionState::AwaitingConfirmation)
+                .set_state(session_id, SessionState::Confirmed)
                 .await;
         }
         CheckpointState::ExecutingPlan => {
@@ -356,6 +365,88 @@ mod tests {
             session_manager.get_state("s_ac").await,
             SessionState::AwaitingConfirmation
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P0 根因回归（2026-08-08）：PendingApproval = 工具级审批等待，恢复后必须落 Confirmed
+    /// （而非 AwaitingConfirmation），且 pending_action（含 approval_id）必须回填，
+    /// 否则 execute_chat 入口的 execute_approved_request 无法消费 Approved 未 consumed 的
+    /// 审批单 → 产生孤儿审批单。此测试锁定该语义，防再次被改回或回归。
+    #[tokio::test]
+    async fn test_e2e_restore_pending_approval_lands_confirmed() {
+        let path = std::env::temp_dir().join(format!("ckpt_e2e_pa_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let store = CheckpointStore::open(path.to_str().unwrap()).unwrap();
+            // 含 approval_id 的 PendingApproval checkpoint（模拟崩溃前审批等待现场）
+            let payload = serde_json::json!({
+                "approval_id": "apr_e2e_orphan_001",
+                "pending_action": {
+                    "tool_name": "manage_whitelist",
+                    "arguments": { "action": "add", "company": "测试固废" },
+                    "description": "白名单新增需审批"
+                }
+            });
+            store
+                .save("s_pa", "agent1", CheckpointState::PendingApproval, &payload)
+                .unwrap();
+        }
+
+        // 进程重启：重开同一文件
+        let store2 = Arc::new(Mutex::new(
+            CheckpointStore::open(path.to_str().unwrap()).unwrap(),
+        ));
+        let metrics = MetricsRegistry::new();
+        let session_manager = SessionManager::new();
+        let in_progress_plan = Arc::new(Mutex::new(None::<ExecutionPlan>));
+        let in_progress_step_results = Arc::new(Mutex::new(HashMap::<u32, String>::new()));
+
+        let st = apply_checkpoint_recovery(
+            "s_pa",
+            &store2,
+            &metrics,
+            &session_manager,
+            &in_progress_plan,
+            &in_progress_step_results,
+        )
+        .await
+        .expect("PendingApproval checkpoint must exist");
+        assert_eq!(st, CheckpointState::PendingApproval);
+
+        // 核心断言：恢复后 session 落 Confirmed（而非旧语义 AwaitingConfirmation）
+        // 注：本模块为零网络设计（不构造 AgentCore），仅验证【恢复语义】——session 落 Confirmed
+        // 使 execute_chat 入口的 execute_approved_request（agent.rs:execute_chat 调用处）能全局扫描
+        // 消费该已批准未消费的审批单，从而闭环孤儿单。此处不构造 AgentCore 故不内联复测该消费路径；
+        // 运行时闭环由 list_approved_ready 只返回 Approved + execute_approved_request 消费保证。
+        assert_eq!(
+            session_manager.get_state("s_pa").await,
+            SessionState::Confirmed,
+            "PendingApproval 恢复后必须落 Confirmed，孤儿审批单才能被 execute_approved_request 闭环消费"
+        );
+
+        // pending_action 必须回填，且 approval_id【原样保留】——这是 P0 核心不变式：execute_approved_request
+        // 全局扫描按 approval_id 匹配消费，若恢复时丢/空 approval_id（如删除 PendingApproval 分支的
+        // approval_id.clone()），孤儿单无法闭环，但仅查 has_pending_action 布尔存在会静默通过。
+        // → 用 take_pending_action 断言实际 approval_id 值 + tool_name 完好。
+        let pa = session_manager
+            .take_pending_action("s_pa")
+            .await
+            .expect("pending_action 必须回填");
+        assert_eq!(
+            pa.approval_id.as_deref(),
+            Some("apr_e2e_orphan_001"),
+            "approval_id 必须原样保留，供 execute_approved_request 按 id 消费闭环孤儿单"
+        );
+        assert_eq!(pa.tool_name, "manage_whitelist");
+
+        // 恢复计数：按 PendingApproval 分桶
+        let snap = metrics.snapshot(serde_json::json!({}), serde_json::json!({}));
+        let cr = &snap["checkpoint_recovery"];
+        assert_eq!(cr["attempts"].as_u64(), Some(1));
+        assert_eq!(cr["success"].as_u64(), Some(1));
+        assert_eq!(cr["by_state"]["PendingApproval"].as_u64(), Some(1));
 
         let _ = std::fs::remove_file(&path);
     }
