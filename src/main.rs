@@ -569,30 +569,6 @@ fn caller_has_proj(caller_ns: &[String], proj: &str) -> bool {
     caller_ns.iter().any(|n| n == "*") || ns_blob(caller_ns).contains(&needle)
 }
 
-/// 会议 scope 匹配调用者 ns（会议升级 Step1）：
-/// - scope="dept:<id>" → 调用者任一 ns 含 `dept/<id>` 段（caller_has_dept 语义）
-/// - scope="org:<company>" → 调用者任一 ns 含 `org/<company>` 段（按 scope 指定 company）
-/// 采用精确段匹配（非子串 contains），避免 `org/company-1` 误配 `org/company-1x` 导致越权。
-fn meeting_scope_matches(scope: &str, caller_ns: &[String]) -> bool {
-    if scope.starts_with("dept:") {
-        let dept = &scope["dept:".len()..];
-        caller_ns.iter().any(|n| n == "*")
-            || caller_ns.iter().any(|n| {
-                n.split('/').collect::<Vec<_>>().windows(2).any(|w| w == ["dept", dept])
-            })
-    } else if scope.starts_with("org:") {
-        let company = &scope["org:".len()..];
-        caller_ns.iter().any(|n| n == "*")
-            || caller_ns.iter().any(|n| {
-                // 精确段匹配：ns 可能为 `agent/xxx` 或 `org/company/dept/...`，
-                // 拆成路径段后检查是否存在 `["org", company]` 连续段
-                n.split('/').collect::<Vec<_>>().windows(2).any(|w| w == ["org", company])
-            })
-    } else {
-        false
-    }
-}
-
 fn can_org_broadcast(caller_id: &str, caller_ns: &[String]) -> bool {
     // 注意：持有 `*`（Memoria admin）也不自动获得公司广播权，
     // 避免 jarvis 等服务身份误发国庆通知；须显式进白名单或 role。
@@ -2293,20 +2269,10 @@ async fn handle_meetings_list(
     let Some(ref agent) = *g else {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
     };
-    let list = agent.list_meetings(&caller, admin);
-    // scope 会议为「public within scope」：同级成员按 ns prefix 匹配可见
+    let list = agent.list_meetings(&caller, admin, &caller_ns);
+    // scope 会议的可见性已在 AgentCore::list_meetings 内权威判定（public within scope）
     let items: Vec<serde_json::Value> = list
         .iter()
-        .filter(|m| {
-            if m.is_private && !admin && m.owner_user_id != caller {
-                // 私有：仅 owner/admin；若带 scope 且调用者属该 scope 则放行
-                if let Some(sc) = &m.scope {
-                    return meeting_scope_matches(sc, &caller_ns);
-                }
-                return false;
-            }
-            true
-        })
         .map(|m| {
             serde_json::json!({
                 "id": m.id,

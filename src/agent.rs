@@ -394,19 +394,55 @@ fn scope_matches_persona(
         // 无 ns_full_path 的分身：仅 owner 本人可见（不匹配任何 scope 会议）
         return false;
     };
-    // 段匹配助手：ns 连续两段 join 后等于 needle
-    let has_segment = |needle: &str| -> bool {
-        ns.split('/').collect::<Vec<_>>().windows(2).any(|w| w.join("/") == needle)
+    // 一次性拆段（性能：避免每次匹配重复 collect）
+    let segs: Vec<&str> = ns.split('/').collect();
+    let segments = |prefix: &str, value: &str| -> bool {
+        segs.windows(2).any(|w| seg_match(w, prefix, value))
     };
     if let Some(id) = sc.strip_prefix("dept:") {
         // 现代 ns：dept/<id>；旧 ns：project/<id>（部门段）
-        has_segment(&format!("dept/{}", id)) || has_segment(&format!("project/{}", id))
+        segments("dept", id) || segments("proj", id)
     } else if let Some(id) = sc.strip_prefix("org:") {
-        // 现代 ns：org/<company>；旧 ns：dept/<company>（公司段）
-        has_segment(&format!("org/{}", id)) || has_segment(&format!("dept/{}", id))
+        // 现代 ns：org/<company>；旧 ns：dept/<company>（公司段）。
+        // 仅当该 persona 无现代 org/ 段时才回退 dept/，避免部门名=公司名时误匹配
+        if segments("org", id) {
+            true
+        } else if !segs.iter().any(|s| *s == "org") {
+            segments("dept", id)
+        } else {
+            false
+        }
     } else {
         false
     }
+}
+
+/// 判断调用者是否匹配会议 scope（精确段匹配，非子串，避免越权）。
+/// - scope="dept:<id>" → 调用者任一 ns 含 `dept/<id>` 段
+/// - scope="org:<company>" → 调用者任一 ns 含 `org/<company>` 段
+/// - 持有 `*`（admin）恒匹配
+fn scope_matches_caller(scope: &str, caller_ns: &[String]) -> bool {
+    if caller_ns.iter().any(|n| n == "*") {
+        return true;
+    }
+    if let Some(id) = scope.strip_prefix("dept:") {
+        caller_ns.iter().any(|n| {
+            let segs: Vec<&str> = n.split('/').collect();
+            segs.windows(2).any(|w| seg_match(w, "dept", id)) || segs.windows(2).any(|w| seg_match(w, "proj", id))
+        })
+    } else if let Some(id) = scope.strip_prefix("org:") {
+        caller_ns.iter().any(|n| {
+            let segs: Vec<&str> = n.split('/').collect();
+            segs.windows(2).any(|w| seg_match(w, "org", id))
+        })
+    } else {
+        false
+    }
+}
+
+/// 判断 ns 连续两段 `w` 是否等于 `<prefix>/<value>`
+fn seg_match(w: &[&str], prefix: &str, value: &str) -> bool {
+    w.len() == 2 && w[0] == prefix && w[1] == value
 }
 
 /// P2-1: 单次任务执行的工作记忆状态机（AgentRunContext）
@@ -933,19 +969,22 @@ impl AgentCore {
         self.save_meetings();
     }
 
-    /// 列出调用者可见的会议：公开 或 拥有者 或 admin。
-    /// scope 会议视为「public within scope」：即使私有也返回，由 handler 层按
-    /// 调用者 ns 权威判定可见性（本仓库为单 agent 实例，避免在此处误剔除
-    /// scope 成员可见的私有会议）。
-    pub fn list_meetings(&self, caller: &str, is_admin: bool) -> Vec<Meeting> {
+    /// 列出调用者可见的会议：公开 或 拥有者 或 admin，或调用者属该 scope。
+    /// scope 会议视为「public within scope」：私有但带 scope 的会议，仅当调用者
+    /// 任一 ns 精确匹配 scope 时可见（权威判定在此处，避免公共 API 泄露敏感数据）。
+    pub fn list_meetings(&self, caller: &str, is_admin: bool, caller_ns: &[String]) -> Vec<Meeting> {
         let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
         let mut out: Vec<Meeting> = v
             .iter()
             .filter(|m| {
-                !m.is_private
-                    || is_admin
-                    || m.owner_user_id == caller
-                    || m.scope.is_some() // scope 会议交由 handler 判定，不在此处剔除
+                if m.is_private && !is_admin && m.owner_user_id != caller {
+                    // 私有且非 owner/admin：仅当带 scope 且调用者属该 scope 时可见
+                    if let Some(sc) = &m.scope {
+                        return scope_matches_caller(sc, caller_ns);
+                    }
+                    return false;
+                }
+                true
             })
             .cloned()
             .collect();
