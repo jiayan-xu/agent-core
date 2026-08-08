@@ -1237,9 +1237,12 @@ impl AgentCore {
                 return false;
             }
             // ocr-review bug·high(v13)：短消息(≤8字) fallback 收窄为【仅强确认词】。
+            // ocr-review bug·high(v17)：short 分支须排除复核前缀——strong_confirm = starts_with("确认")
+            // 对「确认一下/确认后/确认是否」也成立，核查前缀单独不算确认（「确认一下」是用户要核对，
+            // 不是批准）。→ (strong_confirm && !review_prefix) 才是真强确认；复核前缀仅当后续含明确
+            // 确认 token（explicit_approve_after_review）才算。
             if t.chars().count() <= 8 {
-                // 短消息：强确认词开头 或 复核前缀+明确确认token；核查前缀单独不算
-                return strong_confirm || explicit_approve_after_review;
+                return (strong_confirm && !review_prefix) || explicit_approve_after_review;
             }
             // ocr-review bug·high(v16)：长消息(>8字) fallback 不能靠 confirm_words.contains("确认")——
             // 该词被确认前缀本身满足（「确认，把皖A12345加到白名单」以确认开头即误判确认 → 0a 误执行
@@ -2049,6 +2052,44 @@ impl AgentCore {
     /// 判断是否为【明确成员查询句式】（供 confirm_but_query 用，宽松版，见上）。
     fn has_membership_query_syntax(message: &str) -> bool {
         Self::extract_membership_query_loose(message).is_some()
+    }
+
+    /// 判断消息是否含【命令式写动词】（真实写意图），供 try_preroute 的 confirm-prefix fallback
+    /// 二次拦截用（ocr-review bug·medium(v17)）。write_verbs 中「更新/修改/变更/改为/改成」常作
+    /// 时间背景（「更新后在不在白名单里」是查询），仅当带完成态后缀（后/过/了/之前/已/完）才算
+    /// 叙述性；其余动词（添加/加进/删掉/设为/收录 等）一律命令式——出现即真实写意图，不得被
+    /// 成员查询预路由静默吞掉。
+    fn has_command_write_verb(message: &str) -> bool {
+        let m = message.trim();
+        // 命令式动词（真实写意图）：直接匹配即拦截
+        let imperative = [
+            "添加", "新增", "登记", "录入", "删除", "移除",
+            "加入", "加进", "加一下", "加上", "收录", "补录",
+            "统一为", "统一成", "换为", "更新为", "变更为", "改名为", "设成", "调整为",
+            "设为", "换成",
+            "删掉", "去掉", "移出", "作废", "注销", "软删", "踢出", "清掉",
+        ];
+        if imperative.iter().any(|v| m.contains(*v)) {
+            return true;
+        }
+        // 叙述性动词（更新/修改/变更/改为/改成）：仅不带动词本身即拦截；带完成态后缀视为时间背景
+        // （「更新后在不在白名单里」「修改过公司名」是查询）。「公司名/固废种类」是宾语名词非动词，
+        // 由 extract_whitelist_update 等专用 extractor 判断写意图，此处不管。
+        let narrative = ["更新", "修改", "变更", "改为", "改成"];
+        for v in narrative.iter() {
+            if m.contains(*v) {
+                // 找到最后一次出现，检查其后是否紧邻完成态后缀
+                let need_check = m.match_indices(v).any(|(i, _)| {
+                    let after = &m[i + v.len()..];
+                    !(after.starts_with("后") || after.starts_with("过") || after.starts_with("了")
+                        || after.starts_with("之前") || after.starts_with("已") || after.starts_with("完"))
+                });
+                if need_check {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// 成员查询结果三态分类：Whitelisted / NotInList / Unknown。
@@ -3091,7 +3132,18 @@ impl AgentCore {
                 || message.trim_start().starts_with("批准")
                 || message.trim_start().starts_with("执行吧");
             if is_confirm_prefix {
-                Self::extract_membership_query_loose(message)
+                // ocr-review bug·medium(v17)：fallback 不能裸用 loose（无 write_verbs 拦截）——
+                // 「确认，把皖A12345加进白名单，在不在白名单里」含命令式写动词「加进」，loose 返回
+                // Some → 预路由只答成员查询，静默丢弃加白名单写请求。→ 二次拦截：命令式写动词
+                // （真实写意图）须返回 None，让后面的 add/update/remove 预路由处理写；仅叙述性写动词
+                // （更新后/修改过/变更了，时间背景非写指令）才放行 loose 走确定性查询。
+                // 命令式动词集 = write_verbs 中除叙述性动词（更新/修改/变更/改为/改成）外的全部；
+                // 叙述性动词须带完成态后缀（后/过/了/之前/已）才视为时间背景，否则仍是写意图。
+                if Self::has_command_write_verb(message) {
+                    None
+                } else {
+                    Self::extract_membership_query_loose(message)
+                }
             } else {
                 None
             }
@@ -10366,6 +10418,33 @@ mod whitelist_v11_tests {
         let r = AgentCore::extract_whitelist_membership_query("皖A12345在不在白名单里");
         assert!(r.is_some(), "纯成员查询应提取车牌: {r:?}");
         assert_eq!(r.unwrap(), "皖A12345");
+    }
+
+    // ocr-review bug·medium(v17)：confirm-prefix fallback 的命令式写动词二次拦截——
+    // 命令式动词（加进/删掉/设为）须判写意图；叙述性动词（更新后/修改过）判查询。
+    #[test]
+    fn test_has_command_write_verb() {
+        // 命令式 → true（真实写意图，不得被成员查询吞掉）
+        assert!(AgentCore::has_command_write_verb(
+            "确认，把皖A12345加进白名单，在不在白名单里"
+        ), "含「加进」命令式动词应判写意图");
+        assert!(AgentCore::has_command_write_verb(
+            "确认，把皖A12345从白名单里删掉，它在白名单吗"
+        ), "含「删掉」命令式动词应判写意图");
+        assert!(AgentCore::has_command_write_verb(
+            "把皖A12345收录进白名单，它在白名单吗"
+        ), "含「收录」命令式动词应判写意图");
+        // 叙述性动词（时间背景）→ false（是查询，非写指令）
+        assert!(!AgentCore::has_command_write_verb(
+            "确认，皖A12345更新后在不在白名单里"
+        ), "「更新后」是时间背景，不算命令式写");
+        assert!(!AgentCore::has_command_write_verb(
+            "皖A12345修改过公司名，它在白名单里吗"
+        ), "「修改过」是时间背景，不算命令式写");
+        // 无任何写动词 → false
+        assert!(!AgentCore::has_command_write_verb(
+            "皖A12345在不在白名单里"
+        ), "纯查询无写动词，不算命令式写");
     }
 
     // ocr-review test·low(v11)：测试名从 test_count_plates_ignores_code_like_text 改为

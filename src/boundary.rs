@@ -2276,135 +2276,44 @@ mod tests {
             r
         );
 
-        // ⑨ query 携带嵌套对象写参数（filters.company_name）→ 黄线
-        //    注意：v11 移除只读豁免后，HARD_DANGEROUS 工具在 check_tool 的 dangerous-floor
-        //    早退（tool_level=="dangerous"）先于任何参数检查返回黄线。下列 ⑨-⑰ 均在此 floor
-        //    短路，注释只描述「dangerous 工具一律审批」这一单一保证，不声称存在 arg 级校验。
-        let r = boundary.check_tool(
-            "manage_whitelist",
-            &serde_json::json!({"action": "query", "plate": "苏B12345", "filters": {"company_name": "佳士能"}}),
-            "test-agent",
-            "admin",
-            &PermissionLevel::Admin,
-            None,
-        );
-        assert_eq!(
-            r.level,
-            Some(BlockLevel::Yellow),
-            "query 携带嵌套写参数仍须审批（dangerous 一律审批）: {:?}",
-            r
-        );
-
-        // ⑩ query_oplog 携带 plate → 黄线（dangerous 一律审批）
-        let r = boundary.check_tool(
-            "sync_whitelist_plates",
-            &serde_json::json!({"action": "query_oplog", "plate": "苏B12345"}),
-            "test-agent",
-            "admin",
-            &PermissionLevel::Admin,
-            None,
-        );
-        assert_eq!(
-            r.level,
-            Some(BlockLevel::Yellow),
-            "query_oplog 携带 plate 参数仍须审批（dangerous 一律审批）: {:?}",
-            r
-        );
-
-        // ⑪ query 携带嵌套写意图于允许键值（plate 是对象）→ 黄线（dangerous 一律审批）
-        let r = boundary.check_tool(
-            "manage_whitelist",
-            &serde_json::json!({"action": "query", "plate": {"confirmed": true}}),
-            "test-agent",
-            "admin",
-            &PermissionLevel::Admin,
-            None,
-        );
-        assert_eq!(
-            r.level,
-            Some(BlockLevel::Yellow),
-            "plate 值为对象仍须审批（dangerous 一律审批）: {:?}",
-            r
-        );
-
-        // ⑫ query 携带 limit 为负/对象 → 黄线（dangerous 一律审批）
-        let r = boundary.check_tool(
-            "manage_whitelist",
-            &serde_json::json!({"action": "query", "plate": "苏B12345", "limit": -1}),
-            "test-agent",
-            "admin",
-            &PermissionLevel::Admin,
-            None,
-        );
-        assert_eq!(
-            r.level,
-            Some(BlockLevel::Yellow),
-            "limit 为负值仍须审批（dangerous 一律审批）: {:?}",
-            r
-        );
-
-        // ⑬ 缺必备参数（query 无 plate）→ 黄线（dangerous 一律审批）
-        let r = boundary.check_tool(
-            "manage_whitelist",
-            &serde_json::json!({"action": "query"}),
-            "test-agent",
-            "admin",
-            &PermissionLevel::Admin,
-            None,
-        );
-        assert_eq!(
-            r.level,
-            Some(BlockLevel::Yellow),
-            "query 缺 plate 仍须审批（dangerous 一律审批）: {:?}",
-            r
-        );
-
-        // ⑭ query_oplog 缺 limit → 黄线（dangerous 一律审批）
-        let r = boundary.check_tool(
-            "sync_whitelist_plates",
-            &serde_json::json!({"action": "query_oplog"}),
-            "test-agent",
-            "admin",
-            &PermissionLevel::Admin,
-            None,
-        );
-        assert_eq!(
-            r.level,
-            Some(BlockLevel::Yellow),
-            "query_oplog 缺 limit 仍须审批（dangerous 一律审批）: {:?}",
-            r
-        );
-
-        // ⑮ query 带空车牌 → 黄线（dangerous 一律审批）
-        let r = boundary.check_tool(
-            "manage_whitelist",
-            &serde_json::json!({"action": "query", "plate": "  "}),
-            "test-agent",
-            "admin",
-            &PermissionLevel::Admin,
-            None,
-        );
-        assert_eq!(
-            r.level,
-            Some(BlockLevel::Yellow),
-            "空车牌仍须审批（dangerous 一律审批）: {:?}",
-            r
-        );
-
-        // ⑯ limit 超上限（>1000）→ 黄线（dangerous 一律审批，批量拉全量防护）
-        let r = boundary.check_tool(
-            "manage_whitelist",
-            &serde_json::json!({"action": "query", "plate": "苏B12345", "limit": 1001}),
-            "test-agent",
-            "admin",
-            &PermissionLevel::Admin,
-            None,
-        );
-        assert_eq!(
-            r.level,
-            Some(BlockLevel::Yellow),
-            "limit 超上限仍须审批（dangerous 一律审批）: {:?}",
-            r
-        );
+        // ⑨-⑯ 各类参数形状 → 黄线。v11 移除只读豁免后，HARD_DANGEROUS 工具在 check_tool 的
+        // dangerous-floor 早退（tool_level=="dangerous"）先于任何参数检查返回黄线，因此 ⑨-⑯
+        // 全部断言同一保证：「dangerous 工具一律审批」，与参数内容无关。
+        // ocr-review test·medium+low(v17)：折叠为表驱动，消除 ⑨-⑯ 的重复样板——
+        // 单一保证用代表形状覆盖（纯 query / 嵌套对象 / 缺参 / 空值 / 越界），降低维护负担。
+        let dangerous_shapes: Vec<(&str, serde_json::Value, &str)> = vec![
+            // ⑨ query 携带嵌套对象写参数（filters.company_name）
+            ("manage_whitelist", serde_json::json!({"action": "query", "plate": "苏B12345", "filters": {"company_name": "佳士能"}}), "嵌套写参数"),
+            // ⑩ query_oplog 携带 plate
+            ("sync_whitelist_plates", serde_json::json!({"action": "query_oplog", "plate": "苏B12345"}), "query_oplog 携带 plate"),
+            // ⑪ query 携带嵌套写意图于允许键值（plate 是对象）
+            ("manage_whitelist", serde_json::json!({"action": "query", "plate": {"confirmed": true}}), "plate 为对象"),
+            // ⑫ query 携带 limit 为负
+            ("manage_whitelist", serde_json::json!({"action": "query", "plate": "苏B12345", "limit": -1}), "limit 为负"),
+            // ⑬ 缺必备参数（query 无 plate）
+            ("manage_whitelist", serde_json::json!({"action": "query"}), "缺 plate"),
+            // ⑭ query_oplog 缺 limit
+            ("sync_whitelist_plates", serde_json::json!({"action": "query_oplog"}), "缺 limit"),
+            // ⑮ query 带空车牌
+            ("manage_whitelist", serde_json::json!({"action": "query", "plate": "  "}), "空车牌"),
+            // ⑯ limit 超上限（>1000）
+            ("manage_whitelist", serde_json::json!({"action": "query", "plate": "苏B12345", "limit": 1001}), "limit 超上限"),
+        ];
+        for (tool, args, label) in dangerous_shapes {
+            let r = boundary.check_tool(
+                tool,
+                &args,
+                "test-agent",
+                "admin",
+                &PermissionLevel::Admin,
+                None,
+            );
+            assert_eq!(
+                r.level,
+                Some(BlockLevel::Yellow),
+                "{label} 仍须审批（dangerous 一律审批）: {:?}",
+                r
+            );
+        }
     }
 }
