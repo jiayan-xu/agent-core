@@ -1192,11 +1192,23 @@ impl AgentCore {
             // ocr-review bug·medium(v18)：移出「确认是否」前缀（它是疑问不是复核），且疑问词「是否」
             // 出现即不算确认——「确认是否同意」是问要不要同意，不是批准，0a 不得误执行 pending 写。
             let review_prefix = REVIEW_PREFIXES.iter().any(|p| t.starts_with(p));
+            // ocr-review bug·high(v30)：approval token 检测须排除前邻否定——refusal 词表只收精确
+            // 「不同意/不批准」，但「不太同意/未同意/没同意/非同意/别批准」含「同意/批准」且非否定前缀
+            // 开头，approval 用 contains("同意/批准") 命中 → 用户明确拒绝却被当批准执行 pending 写。
+            // → 抽 has_approval_semantic：含「同意/批准」且该 token 前邻字符非否定（不/未/没/非/别/无）。
+            let has_approval_semantic = |s: &str| -> bool {
+                ["同意", "批准"].iter().any(|tk| {
+                    s.match_indices(tk).any(|(j, _)| {
+                        let prev = s[..j].chars().next_back();
+                        !matches!(prev, Some('不') | Some('未') | Some('没') | Some('非') | Some('别') | Some('无'))
+                    })
+                })
+            };
             let explicit_approve_after_review = REVIEW_PREFIXES
                 .iter()
                 .any(|p| t.starts_with(p))
                 && !t.contains("是否")
-                && (t.contains("执行吧") || t.contains("同意") || t.contains("批准"));
+                && (t.contains("执行吧") || has_approval_semantic(t));
             // ocr-review bug·high(v15)：拒绝/疑问/复核后缀检查【统一生效】于长度分支之前——
             // 此前 refusal 只在 ≤8 字分支内，长消息(>8字)以强确认词开头时绕过拒绝词守卫
             // （「确认，但先别执行，等领导批准」14字 → 误判确认 → 0a 误执行 pending 写）。
@@ -1282,10 +1294,20 @@ impl AgentCore {
                 let combo = ["好的执行", "可以执行", "行没问题"]
                     .iter()
                     .any(|w| t_norm_short.contains(w));
+                // ocr-review bug·high(v30)：short 分支 explicit_short/combo 须 gate 查询意图——
+                // 「对的做法是什么」(7字)「好的执行结果如何」(8字) 以「对的/好的执行」开头命中
+                // explicit_short，但用户是【追问做法/结果】而非批准。refusal 词表不含「什么/如何/
+                // 为什么」等疑问词，confirm_but_query 只对 CONFIRM_PREFIXES 前缀生效这批不适用 →
+                // 0a 在 take_pending_action 后才查 is_query_intent，pending 写已被误执行。→ 归一化
+                // 文本含查询疑问词（什么/如何/为什么/咋/咋样）即不算批准。
+                let has_query_token = ["什么", "如何", "为什么", "咋", "怎样", "怎么样"]
+                    .iter()
+                    .any(|w| t_norm_short.contains(w));
                 return (strong_confirm && !review_prefix)
                     || explicit_approve_after_review
                     || (!refusal
                         && !has_review_suffix
+                        && !has_query_token
                         && (explicit_short
                             .iter()
                             .any(|w| t_norm_short.starts_with(w))
@@ -1307,8 +1329,7 @@ impl AgentCore {
                     .iter()
                     .find_map(|p| t.strip_prefix(p));
                 let tail = tail.unwrap_or(t);
-                let inner = tail.contains("同意")
-                    || tail.contains("批准")
+                let inner = has_approval_semantic(tail)
                     || tail.contains("好的")
                     || tail.contains("可以")
                     || tail.contains("确认执行")
@@ -2140,7 +2161,10 @@ impl AgentCore {
         let m = message.trim();
         m.match_indices(noun).any(|(i, _)| {
             let after = &m[i + noun.len()..];
-            let probe = after.chars().take(12).collect::<String>();
+            // ocr-review bug·medium(v29)：与 has_command_write_verb 同步——固定 12 字符探针窗口
+            // 在宾语过长时漏判（「公司名改成安徽省环保新能源科技有限公司后…」的「后」在窗口外）。
+            // → 探测名词后到句末的整段。
+            let probe = after.to_string();
             // ocr-review bug·medium(v25)：裸「前」过宽——「改为前卫环保」含「前」误判叙述性 →
             // 写意图被跳过。只接受「变/改/更/删/移+前」紧邻组合（改名前/变更前/删除前）。
             // ocr-review bug·medium(v29)：原 qian_adjacent 检查【「前」紧邻前一个字符】为 变/改/更/删/移，
@@ -2196,7 +2220,11 @@ impl AgentCore {
                 // 组合（改名前/变更前/删除前），裸「前」不再作为完成态后缀。
                 let need_check = m.match_indices(v).any(|(i, _)| {
                     let after = &m[i + v.len()..];
-                    let probe = after.chars().take(12).collect::<String>();
+                    // ocr-review bug·medium(v29)：固定 12 字符探针窗口在宾语过长时漏判——
+                    // 「公司名改成安徽省环保新能源科技有限公司后还在不在」中「后」落在 take(12)
+                    // 之外 → probe 不含完成态后缀 → 误判写意图 → 落入 update extractor 生成虚假
+                    // 审批流。→ 改为探测动词后【到句末】的整段（has_narrative_noun 同改）。
+                    let probe = after.to_string();
                     // ocr-review bug·medium(v29)：qian_adjacent 需识别「动词+前」紧邻组合
                     // （删除前/改名前/变更前…）为叙述性时间背景。分两种形态：
                     // ① 动词后【紧跟】「前」→「删除前」中 after 以「前」开头（probe 不含动词本身）；
@@ -10650,6 +10678,13 @@ mod whitelist_v11_tests {
         );
         assert!(r5.is_some(), "「删除前」是时间背景查询，应提取车牌: {r5:?}");
         assert_eq!(r5.unwrap(), "皖A12345");
+        // ocr-review bug·medium(v29)：长宾语（>12字）时完成态后缀「后」落在固定探针窗口外，
+        // 原实现误判写意图 → 落入 update extractor 生成虚假审批流。→ 探测到句末整段。
+        let r6 = AgentCore::extract_whitelist_membership_query(
+            "皖A12345公司名改成安徽省环保新能源科技有限公司后还在不在白名单里",
+        );
+        assert!(r6.is_some(), "长宾语 + 「后」是时间背景查询，应提取车牌: {r6:?}");
+        assert_eq!(r6.unwrap(), "皖A12345");
     }
 
     // ocr-review bug·medium(v17)：confirm-prefix fallback 的命令式写动词二次拦截——

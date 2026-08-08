@@ -2125,26 +2125,22 @@ mod tests {
 
     #[test]
     fn test_whitelist_dangerous_tools_require_approval() {
-        // 白名单混合工具（manage_whitelist / sync_whitelist_plates）在 HARD_DANGEROUS，
-        // 无论 query 还是写动作一律走审批闸（黄线）。query/query_oplog 也须审批；正常用户
-        // 查询由确定性预路由覆盖，不依赖此处。
-        // 本测试只断言【check_tool 的 dangerous-floor 行为】——即 HARD_DANGEROUS 工具在
-        // check_tool 早退返回黄线，与参数内容无关。它不驱动 agent.rs 的 LLM tool-loop/预路由
-        // 路径（豁免移除的实际生效点）；该路径由 agent.rs 的预路由/成员查询测试独立覆盖。
-        // 此处验证的是边界层保证，勿解读为对 tool-loop 豁免的回归钳制。
+        // 断言 check_tool 的 dangerous-floor 行为：HARD_DANGEROUS 工具（manage_whitelist /
+        // sync_whitelist_plates）无论 query/写动作一概走审批闸，与参数内容无关。
+        // 它不驱动 agent.rs 的 LLM tool-loop/预路由路径（豁免移除的实际生效点）；该路径由
+        // agent.rs 的 try_preroute/成员查询测试独立覆盖。此处仅验证边界层保证。
+        // （ocr-review documentation·low(v29)：精简，避免与 boundary.rs:907-913 生产注释重复、
+        // 硬编码 agent.rs 内部符号导致漂移。）
         let mut boundary = ComplianceBoundary::new(None);
         boundary
             .perm_chain
             .lock()
             .unwrap()
             .register("test-agent", None, PermissionLevel::Admin);
-        // 两工具显式注册为 "read"，使分类器返回 read（而非依赖默认分类表的 write 值）。
-        // 目的（评审 P0 加固）：让下方 16 个断言【只依赖 HARD_DANGEROUS 地板】产生 Yellow——
-        // ① 若两工具被移出 HARD_DANGEROUS，check_tool 对 read 落到 allow=true，断言失败；
-        // ② 不依赖默认分类表把 manage_whitelist 标为 write（未来分类表调整不使本测试脆失败）。
-        // 已实证：临时把 manage_whitelist 移出 HARD_DANGEROUS → 本测试 FAILED（非空通过）。
-        // 注意：ComplianceBoundary::new(None) 的 ToolClassifier 内置完整默认分类表，
-        // 非「空分类器」——manage_whitelist 默认即 write（boundary.rs:1112），故原测试本就钉住地板。
+        // 两工具显式注册为 "read"，使断言【只依赖 HARD_DANGEROUS 地板】产生拦截——
+        // 不依赖默认分类表把 manage_whitelist 标为 write（该值是检查顺序 read→write→dangerous
+        // 的产物，未来分类表调整不使本测试脆失败）。地板被移除则 check_tool 对 read 放行，
+        // 断言失败（已实证移出 HARD_DANGEROUS → FAILED，非空通过）。
         boundary.register_tool("manage_whitelist", "read");
         boundary.register_tool("sync_whitelist_plates", "read");
 
@@ -2199,10 +2195,13 @@ mod tests {
                 "{label} 应被拦截（dangerous 一律审批，allow 必须为 false）: {:?}",
                 r
             );
-            assert_eq!(
-                r.level,
-                Some(BlockLevel::Yellow),
-                "{label} 仍须审批（dangerous 一律审批）: {:?}",
+            // 该不变式是「HARD_DANGEROUS 工具无论参数一概拦截（需审批）」，由 !r.allow 表达。
+            // 具体级别钉死 Yellow 会脆——若未来加固为 Red（硬拦截）或更高优先级守卫
+            // （沙箱/导出/供应链）扩展到这些工具，安全姿态等同或更强，但 Yellow 断言会失败。
+            // （ocr-review maintainability·medium(v29)：断言不变式而非具体色。）
+            assert!(
+                r.level.is_some(),
+                "{label} 拦截须带级别（决定后续审批流程）: {:?}",
                 r
             );
             assert!(
