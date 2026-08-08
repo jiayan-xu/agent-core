@@ -25,6 +25,11 @@ pub const MEMBERSHIP_PHRASES: &[&str] = &[
     "在不在白名单", "白名单里有", "白名单有",
     "是不是白名单", "在白名单吗", "在白名单里吗", "在白名单中吗", "有没有白名单",
 ];
+/// 强确认前缀：明确批准语义的开头（ocr maintainability·low(v22) 抽为常量，is_confirm /
+/// confirm_but_query / is_confirm_prefix 三处复用，消除漂移）。
+pub const CONFIRM_PREFIXES: &[&str] = &["确认", "同意", "批准", "执行吧"];
+/// 复核/核查前缀：单独不算确认（用户要核对信息），仅当后续含明确确认 token 才算。
+pub const REVIEW_PREFIXES: &[&str] = &["确认一下", "确认下", "确认后"];
 use crate::checkpoint::{CheckpointState, CheckpointStore};
 use crate::degrade::{DegradeMode, DegradeMonitor, UNHEALTHY_THRESHOLD};
 use crate::harness::{self, ExecutionLog, HarnessStore};
@@ -1181,17 +1186,12 @@ impl AgentCore {
                 // 否定确认：即使后续含「同意/批准」也是拒绝（如「不同意批准」），明确拒绝语义优先
                 return false;
             }
-            let strong_confirm = t.starts_with("确认")
-                || t.starts_with("同意")
-                || t.starts_with("批准")
-                || t.starts_with("执行吧");
+            let strong_confirm = CONFIRM_PREFIXES.iter().any(|p| t.starts_with(p));
             // 复核/核查前缀（确认一下/确认下/确认后）：单独不算确认（用户要核对信息），
             // 但若后续含明确确认 token（执行吧/同意/批准）则算（「确认一下，执行吧」是批准）。
             // ocr-review bug·medium(v18)：移出「确认是否」前缀（它是疑问不是复核），且疑问词「是否」
             // 出现即不算确认——「确认是否同意」是问要不要同意，不是批准，0a 不得误执行 pending 写。
-            let review_prefix = t.starts_with("确认一下")
-                || t.starts_with("确认下")
-                || t.starts_with("确认后");
+            let review_prefix = REVIEW_PREFIXES.iter().any(|p| t.starts_with(p));
             let explicit_approve_after_review = (t.starts_with("确认一下")
                 || t.starts_with("确认下")
                 || t.starts_with("确认后"))
@@ -1234,12 +1234,21 @@ impl AgentCore {
             // ocr-review bug·high(v19)：explicit 词须 gate 在 !refusal——「可以确认吗」含「吗」refusal，
             // strong_confirm=false 走不到上方 refusal 守卫，会误判确认。→ 词集匹配须 !refusal。
             if t.chars().count() <= 8 {
+                // ocr-review bug·high(v22)：短消息 fallback 需覆盖日常批准变体——「好的，执行吧」
+                // 「对的」「可以，查吧」「行，没问题」是极常见审批回复，漏判会让 0b AwaitingConfirmation
+                // 分支的 rephrase_and_confirm 反复追问「方向对吗？」死循环，0a 分支用户批准被静默丢弃。
+                // 非前缀式批准词须 starts_with 锚定（「我确认」而非「确认」），避免 offset 匹配误伤；
+                // 统一 gate 在 !refusal（「可以确认吗」含「吗」是疑问不是批准）。
+                let explicit_short = [
+                    "我确认", "好的确认", "可以确认", "确认完毕", "确认无误",
+                    "好的，执行", "好的执行", "可以，查吧", "可以，执行", "行，没问题", "对的",
+                ];
                 return (strong_confirm && !review_prefix)
                     || explicit_approve_after_review
                     || (!refusal
-                        && ["我确认", "好的确认", "可以确认", "确认完毕", "确认无误"]
+                        && explicit_short
                             .iter()
-                            .any(|w| t.contains(*w)));
+                            .any(|w| t.starts_with(w)));
             }
             // ocr-review bug·high(v16)：长消息(>8字) fallback 不能靠 confirm_words.contains("确认")——
             // 该词被确认前缀本身满足（「确认，把皖A12345加到白名单」以确认开头即误判确认 → 0a 误执行
@@ -1248,21 +1257,27 @@ impl AgentCore {
             // 纯粹以确认开头 + 新请求正文（加/查/改）的不再算确认，走下方新请求预路由。
             if strong_confirm {
                 // 前缀是确认/同意/批准/执行吧，后续须再含一个【独立】确认词才算批准；
-                // ocr-review bug·high(v18)：`执行吧` 既是前缀又曾是内层确认词——「执行吧，帮我把
-                // 皖A12345加进白名单」以前缀「执行吧」开头 + 内层 contains("执行吧") 也成立 →
-                // 无条件确认 → 0a 误吞新写请求。前缀为「执行吧」时不得复用自身作二次确认。
-                let inner = t.contains("同意")
-                    || t.contains("批准")
-                    || t.contains("好的")
-                    || t.contains("可以")
-                    || t.contains("确认执行")
-                    || t.contains("就按")
-                    || t.contains("没问题")
-                    || t.contains("继续");
+                // ocr-review bug·high(v18/v22)：`执行吧`/`同意`/`批准` 既是前缀又曾是内层确认词——
+                // 「执行吧，帮我把皖A12345加进白名单」以前缀开头 + 内层 contains 同词也成立 → 无条件
+                // 确认 → 0a 误吞新写请求。前缀为这些词时不得复用自身作二次确认：inner 须在【去掉
+                // 前缀后的正文】中独立出现。前缀「确认」不含内层词（确认执行/确认完毕是复合词），
+                // 但其自身也须排除，统一用 strip_prefix 处理最稳。
+                let tail = CONFIRM_PREFIXES
+                    .iter()
+                    .find_map(|p| t.strip_prefix(p));
+                let tail = tail.unwrap_or(t);
+                let inner = tail.contains("同意")
+                    || tail.contains("批准")
+                    || tail.contains("好的")
+                    || tail.contains("可以")
+                    || tail.contains("确认执行")
+                    || tail.contains("就按")
+                    || tail.contains("没问题")
+                    || tail.contains("继续");
                 if t.starts_with("执行吧") {
                     return inner;
                 }
-                return t.contains("执行吧") || inner;
+                return tail.contains("执行吧") || inner;
             }
             explicit_approve_after_review
         };
@@ -1411,10 +1426,7 @@ impl AgentCore {
         // 不用 extract_whitelist_membership_query（其含 write_verbs 拦截）——否则「确认，皖A12345
         // 更新后在不在白名单里」含叙述性写动词「更新」会返回 None → confirm_but_query=false → 0a
         // 误执行 pending 写。叙述性写动词（更新后/修改过）是时间背景，用户明确在问成员关系，应查询优先。
-        let confirm_but_query = trimmed.starts_with("确认")
-            || trimmed.starts_with("同意")
-            || trimmed.starts_with("批准")
-            || trimmed.starts_with("执行吧");
+        let confirm_but_query = CONFIRM_PREFIXES.iter().any(|p| trimmed.starts_with(p));
         let confirm_but_query = confirm_but_query
             && (Self::has_membership_query_syntax(trimmed)
                 // ocr-review bug·high(v20)：is_confirm 长消息规则使「同意，帮我查一下皖A12345」
@@ -2038,8 +2050,15 @@ impl AgentCore {
     /// 叙述性写动词】（更新后/修改过/之前变更的，动词是时间背景非写指令）用户意图是查询，
     /// 用严格版会误推入 0a 审批执行。此处仅需成员句式 + 车牌即可判定查询意图。
     /// ocr-review bug·medium(v15)：write_verbs 过度拦截会把纯查询推入审批执行路径。
+    /// ocr-review bug·medium(v22)：补 has_attachment_block 守卫——loose 路径由 confirm_but_query /
+    /// try_preroute 调用，若附件正文块内引用了成员句式+车牌（如「确认，请看附件」+附件正文含
+    /// 「皖A12345在不在白名单」），无守卫会基于附件文本预路由成员答案，而「确认」token 被
+    /// confirm_but_query 消费永不生效。附件正文是数据非指令，须与 strict 版一致返回 None。
     fn extract_membership_query_loose(message: &str) -> Option<String> {
         let m = message.trim();
+        if Self::has_attachment_block(m) {
+            return None;
+        }
         let has_phrase = MEMBERSHIP_PHRASES.iter().any(|p| m.contains(*p));
         if !has_phrase {
             return None;
@@ -2082,12 +2101,17 @@ impl AgentCore {
         ];
         for v in narrative.iter() {
             if m.contains(*v) {
-                // 找到最后一次出现，检查其后是否紧邻完成态后缀
+                // 找到最后一次出现，检查其后（可隔宾语，如「皖A12345改成新能源后」）是否含完成态后缀。
+                // ocr-review bug·medium(v22)：此前只接受【紧邻】后缀，隔宾语（改成XX后）被判裸写意图
+                // → extract_whitelist_membership_query 返回 None → 确定性成员查询被跳过，落入 LLM 快道
+                // （原幻觉 bug）；「公司名改成XX后还在不在」还会误触发 extract_whitelist_update 生成
+                // 虚假写审批流。→ 放宽为动词后至多 12 字符内出现后缀即视为时间背景。
                 let need_check = m.match_indices(v).any(|(i, _)| {
                     let after = &m[i + v.len()..];
-                    !(after.starts_with("后") || after.starts_with("过") || after.starts_with("了")
-                        || after.starts_with("之前") || after.starts_with("已") || after.starts_with("完")
-                        || after.starts_with("前"))
+                    let probe = after.chars().take(12).collect::<String>();
+                    !(probe.contains("后") || probe.contains("过") || probe.contains("了")
+                        || probe.contains("之前") || probe.contains("已") || probe.contains("完")
+                        || probe.contains("前"))
                 });
                 if need_check {
                     return true;
@@ -3163,10 +3187,9 @@ impl AgentCore {
         // 违背确定性查询设计。→ 补 fallback：确认前缀 + 成员句式 + 车牌（has_membership_query_syntax）
         // 也走确定性查询（确认前缀消息的写动词是时间背景，非写指令）。
         let plate_opt = Self::extract_whitelist_membership_query(message).or_else(|| {
-            let is_confirm_prefix = message.trim_start().starts_with("确认")
-                || message.trim_start().starts_with("同意")
-                || message.trim_start().starts_with("批准")
-                || message.trim_start().starts_with("执行吧");
+            let is_confirm_prefix = CONFIRM_PREFIXES
+                .iter()
+                .any(|p| message.trim_start().starts_with(p));
             if is_confirm_prefix {
                 // ocr-review bug·medium(v17)：fallback 不能裸用 loose（无 write_verbs 拦截）——
                 // 「确认，把皖A12345加进白名单，在不在白名单里」含命令式写动词「加进」，loose 返回
@@ -10492,6 +10515,18 @@ mod whitelist_v11_tests {
         assert!(!AgentCore::has_command_write_verb(
             "皖A12345在不在白名单里"
         ), "纯查询无写动词，不算命令式写");
+        // ocr-review bug·medium(v22)：完成态后缀可隔宾语（「改成新能源后」）——此前只接受紧邻
+        // 后缀，隔宾语被判裸写意图 → extract_whitelist_membership_query 返回 None → 确定性成员
+        // 查询被跳过落入 LLM 快道；「公司名改成XX后还在不在」还会误触 update 写审批流。
+        assert!(!AgentCore::has_command_write_verb(
+            "皖A12345改成新能源后还在不在白名单里"
+        ), "「改成...后」隔宾语+完成态后缀是时间背景，不算命令式写");
+        assert!(!AgentCore::has_command_write_verb(
+            "皖A12345 更新 后 还在不在白名单"
+        ), "「更新...后」隔空格+完成态后缀是时间背景，不算命令式写");
+        assert!(!AgentCore::has_command_write_verb(
+            "皖A12345公司名改成新能源后还在不在白名单里"
+        ), "「公司名改成...后」是时间背景查询，不得误触发 update 写审批流");
     }
 
     // ocr-review test·low(v11)：测试名从 test_count_plates_ignores_code_like_text 改为

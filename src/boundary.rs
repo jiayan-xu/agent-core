@@ -2125,28 +2125,28 @@ mod tests {
 
     #[test]
     fn test_whitelist_dangerous_tools_require_approval() {
-        // 2026-08-07 v11：白名单混合工具（manage_whitelist / sync_whitelist_plates）在
-        // HARD_DANGEROUS，无论 query 还是写动作一律走审批闸（黄线）。v11 移除 LLM 工具循环
-        // 只读豁免后，query/query_oplog 也须审批；正常用户查询由确定性预路由覆盖，不依赖此处。
-        // ocr-review test·medium(v18)：本测试只断言【check_tool 的 dangerous-floor 行为】——
-        // 即 HARD_DANGEROUS 工具在 check_tool 早退返回黄线，与参数内容无关。它不驱动 agent.rs
-        // 的 LLM tool-loop/预路由路径（豁免移除的实际生效点）；该路径由 agent.rs 的预路由/成员
-        // 查询测试独立覆盖。此处验证的是边界层保证，勿解读为对 tool-loop 豁免的回归钳制。
+        // 白名单混合工具（manage_whitelist / sync_whitelist_plates）在 HARD_DANGEROUS，
+        // 无论 query 还是写动作一律走审批闸（黄线）。query/query_oplog 也须审批；正常用户
+        // 查询由确定性预路由覆盖，不依赖此处。
+        // 本测试只断言【check_tool 的 dangerous-floor 行为】——即 HARD_DANGEROUS 工具在
+        // check_tool 早退返回黄线，与参数内容无关。它不驱动 agent.rs 的 LLM tool-loop/预路由
+        // 路径（豁免移除的实际生效点）；该路径由 agent.rs 的预路由/成员查询测试独立覆盖。
+        // 此处验证的是边界层保证，勿解读为对 tool-loop 豁免的回归钳制。
         let mut boundary = ComplianceBoundary::new(None);
         boundary
             .perm_chain
             .lock()
             .unwrap()
             .register("test-agent", None, PermissionLevel::Admin);
-        // ocr-review test·low(v21)：manage_whitelist 注册为 "read"（仅走 is_dangerous_floor 分支），
-        // sync_whitelist_plates 注册为 "dangerous"（走 tool_level=="dangerous" 分类器分支）——
-        // 两条真实生产路径（floor ∪ classifier）都被覆盖，避免 16 行参数全落在同一条 floor 早退。
+        // manage_whitelist 注册为 "read"（仅走 is_dangerous_floor 分支），sync_whitelist_plates
+        // 注册为 "dangerous"（走 tool_level=="dangerous" 分类器分支）——两条真实生产路径
+        // （floor ∪ classifier）都被覆盖，避免参数全落在同一条 floor 早退。
         boundary.register_tool("manage_whitelist", "read");
         boundary.register_tool("sync_whitelist_plates", "dangerous");
 
-        // ocr-review test·medium(v18/v20/v21)：①-⑯ 十六个 near-identical check_tool+Yellow 块折叠为
-        // 统一表驱动（含纯查询/写动作/嵌套/缺参/空值/越界代表形状），单一保证「HARD_DANGEROUS
-        // 工具一律审批（与参数内容无关）」，消除重复样板。
+        // ①-⑯ 十六个 near-identical check_tool+Yellow 块折叠为统一表驱动（含纯查询/写动作/
+        // 嵌套/缺参/空值/越界代表形状），单一保证「HARD_DANGEROUS 工具一律审批（与参数内容
+        // 无关）」，消除重复样板。
         let dangerous_shapes: Vec<(&str, serde_json::Value, &str)> = vec![
             // ① manage_whitelist query（纯查询，无写参数）
             ("manage_whitelist", serde_json::json!({"action": "query", "plate": "苏B12345"}), "纯 query"),
