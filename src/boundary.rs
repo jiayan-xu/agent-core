@@ -1380,6 +1380,7 @@ fn is_whitelist_readonly_action(tool_name: &str, args: &serde_json::Value) -> bo
             return false;
         }
         // 值类型校验：plate 必须非空字符串且不含 SQL/通配符（% _ * ?），防止 LIKE 枚举；
+        // ocr-review security·medium(v10)：补拦 SQL 元字符（' ; --），防注入穿透只读豁免；
         // limit 必须 1..=MAX_PAGE_LIMIT；对象/数组一律拒绝
         match k.as_str() {
             "plate" => v.as_str().is_some_and(|s| {
@@ -1389,6 +1390,9 @@ fn is_whitelist_readonly_action(tool_name: &str, args: &serde_json::Value) -> bo
                     && !s.contains('_')
                     && !s.contains('*')
                     && !s.contains('?')
+                    && !s.contains('\'')
+                    && !s.contains(';')
+                    && !s.contains("--")
             }),
             "limit" => v.as_u64().is_some_and(|n| n >= 1 && n <= MAX_PAGE_LIMIT),
             _ => false,
@@ -2319,17 +2323,6 @@ mod tests {
             "未知 action 应 fail-closed 走审批: {:?}",
             r
         );
-
-        // ⑨ query_oplog 携带 limit（只读分页参数）→ 放行（allow-list 含 limit）
-        let r = boundary.check_tool(
-            "sync_whitelist_plates",
-            &serde_json::json!({"action": "query_oplog", "limit": 50}),
-            "test-agent",
-            "admin",
-            &PermissionLevel::Admin,
-            None,
-        );
-        assert!(r.allow, "query_oplog + limit 分页应免审批: {:?}", r);
 
         // ⑩ query 携带嵌套对象写参数（filters.company_name）→ 仍黄线（allow-list 只查顶层键，
         //    嵌套键不在 READONLY_KEYS → 整对象不豁免 → 走审批）

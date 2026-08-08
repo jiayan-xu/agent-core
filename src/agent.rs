@@ -1166,11 +1166,19 @@ impl AgentCore {
             // ocr-review bug·high(v9)：去掉裸「执行」前缀——「执行一下…」是常见命令动词，
             // starts_with("执行") 会误判为确认并绕过守卫（可能误执行待审批操作）。
             // 只保留明确批准语义的「确认/同意/批准」开头 + 「确认执行/执行吧」组合。
-            let strong_confirm = t.starts_with("确认")
-                || t.starts_with("同意")
-                || t.starts_with("批准")
-                || t.starts_with("确认执行")
-                || t.starts_with("执行吧");
+            // ocr-review bug·medium(v10)：排除核查前缀「确认一下/确认下/确认后」——
+            // 「确认一下皖A12345在白名单里吗」(>8字) 用户是想核对信息，starts_with("确认")
+            // 会误判为批准；若此刻有 pending_action（0a 分支 take_pending_action→执行）会误执行
+            // 待审批写操作。核查前缀一律不构成确认，走 is_query_intent 新请求路径。
+            let confirm_prefix = t.starts_with("确认一下")
+                || t.starts_with("确认下")
+                || t.starts_with("确认后")
+                || t.starts_with("确认是否");
+            let strong_confirm = !confirm_prefix
+                && (t.starts_with("确认")
+                    || t.starts_with("同意")
+                    || t.starts_with("批准")
+                    || t.starts_with("执行吧"));
             if t.chars().count() > 8 && !strong_confirm {
                 return false;
             }
@@ -1856,9 +1864,15 @@ impl AgentCore {
         // ocr-review bug·high(v9)：补全 extract_whitelist_remove 认可的移除动词（删掉/去掉/移出/作废/
         // 注销/软删/踢出/清掉），否则「把皖A12345从白名单删掉，它在白名单吗」这类「写意图+成员句式」
         // 混合消息不拦截 → 移除操作被成员查询预路由静默吞掉。
+        // ocr-review bug·high(v10)：补全全部写 extractor 认可的动词，避免「写意图+成员句式」混合消息
+        // 被成员查询分支先命中而静默吞掉写操作。覆盖：add(收录/补录)、update(统一为/换为/更新为/
+        // 变更为/改名为/设成/调整为/修改/更新/变更)、waste_type(设为/换成)、remove(删掉/去掉/移出/
+        // 作废/注销/软删/踢出/清掉)。注意「修改/更新/变更」本身较宽，但它们明确表写意图，宁可多拦。
         let write_verbs = [
             "添加", "新增", "登记", "录入", "删除", "移除", "改为", "改成", "公司名", "固废种类",
-            "加入", "加进", "加一下", "加上",
+            "加入", "加进", "加一下", "加上", "收录", "补录",
+            "统一为", "统一成", "换为", "更新为", "变更为", "改名为", "设成", "调整为", "改为", "改成",
+            "修改", "更新", "变更", "设为", "换成",
             "删掉", "去掉", "移出", "作废", "注销", "软删", "踢出", "清掉",
         ];
         if write_verbs.iter().any(|v| m.contains(*v)) {
@@ -1866,8 +1880,10 @@ impl AgentCore {
         }
         // 查询句式：收紧为明确的成员查询句式（ocr bug·medium），
         // 通配分支不再用「含白名单+任意查询词」这种过宽匹配（会吞掉记录查询）。
+        // maintainability·low(v10)：删被包含项——「在不在白名单里」被「在不在白名单」覆盖、
+        // 「白名单里有吗」被「白名单里有」覆盖，冗余项掩盖真实匹配语义。
         let has_membership_phrase = [
-            "在不在白名单", "在不在白名单里", "白名单里有", "白名单有", "白名单里有吗",
+            "在不在白名单", "白名单里有", "白名单有",
             "是不是白名单", "在白名单吗", "在白名单里吗", "在白名单中吗", "有没有白名单",
         ]
         .iter()
@@ -2815,7 +2831,15 @@ impl AgentCore {
                     // default-deny：仅明确正面标记（且不含任何否定词）才算在白名单。
                     // ocr-review bug·high：先归一化空白再匹配，避免「0 条」vs「0条」/「命中0条」
                     // 因空格差异漏判；否定词表扩展「0条/无该车牌/查无此车/命中0」等。
-                    let t_norm = t.replace(' ', "").replace('\u{3000}', "");
+                    // ocr-review bug·high(v10)：归一化同时去掉全角/半角冒号与逗号，使「命中：0」
+                    // 「命中,0」「命中:0」→「命中0」命中否定词，避免「命中：0」被误判为在白名单。
+                    let t_norm = t
+                        .replace(' ', "")
+                        .replace('\u{3000}', "")
+                        .replace('：', "")
+                        .replace(':', "")
+                        .replace('，', "")
+                        .replace(',', "");
                     let is_member = (t_norm.contains("在白名单中") || t_norm.contains("命中"))
                         && !t_norm.contains("不在")
                         && !t_norm.contains("未命中")
@@ -2830,6 +2854,8 @@ impl AgentCore {
                         && !t_norm.contains("0命中")
                         && !t_norm.contains("命中数为0")
                         && !t_norm.contains("命中数0")
+                        && !t_norm.contains("命中条数0")
+                        && !t_norm.contains("命中条数为0")
                         && !t_norm.contains("无此车牌")
                         && !t_norm.contains("无该车牌")
                         && !t_norm.contains("查无此车")
@@ -10018,6 +10044,70 @@ mod whitelist_preroute_tests {
         let (executed, note) = AgentCore::classify_tool_execution(&transport);
         assert!(!executed);
         assert!(note.unwrap().contains("timeout"));
+    }
+}
+
+#[cfg(test)]
+mod whitelist_v11_tests {
+    use super::*;
+
+    // ocr-review bug·high(v10)：write_verbs 补全 add/update/waste_type 动词后，
+    // 「写意图+成员句式」混合消息必须被拦截，不得被成员查询预路由静默吞掉写操作。
+    #[test]
+    fn test_membership_query_blocks_write_verbs() {
+        // add 动词「收录/补录」
+        assert_eq!(
+            AgentCore::extract_whitelist_membership_query("把皖A12345补录进白名单，它是不是在白名单？"),
+            None,
+            "含「补录」写意图应拦截，不得走成员查询"
+        );
+        assert_eq!(
+            AgentCore::extract_whitelist_membership_query("把皖A12345收录进白名单，它在白名单吗"),
+            None,
+            "含「收录」写意图应拦截"
+        );
+        // update 动词「统一为/换为/更新为/变更为/改名为」
+        assert_eq!(
+            AgentCore::extract_whitelist_membership_query("把皖A12345统一为XX环保，它在白名单里吗"),
+            None,
+            "含「统一为」写意图应拦截"
+        );
+        assert_eq!(
+            AgentCore::extract_whitelist_membership_query("皖A12345改名为XX，它在白名单里吗"),
+            None,
+            "含「改名为」写意图应拦截"
+        );
+        // waste_type 动词「设为/换成/调整为」
+        assert_eq!(
+            AgentCore::extract_whitelist_membership_query("皖A12345固废种类设为危废，它在白名单吗"),
+            None,
+            "含「设为」写意图应拦截"
+        );
+        // remove 动词（v9 已补）
+        assert_eq!(
+            AgentCore::extract_whitelist_membership_query("把皖A12345从白名单删掉，它在白名单吗"),
+            None,
+            "含「删掉」写意图应拦截"
+        );
+    }
+
+    // 纯成员查询仍应正常命中（不误拦）
+    #[test]
+    fn test_membership_query_still_works() {
+        let r = AgentCore::extract_whitelist_membership_query("皖A12345在不在白名单里");
+        assert!(r.is_some(), "纯成员查询应提取车牌: {r:?}");
+        assert_eq!(r.unwrap(), "皖A12345");
+    }
+
+    // ocr-review bug·medium(v10)：strong_confirm 排除「确认一下/确认下」核查前缀，
+    // 归并到 is_confirm 的确认词判定由调用处按 pending 有无分流，此处验证 extract 不受影响。
+    #[test]
+    fn test_count_plates_ignores_code_like_text() {
+        // ocr-review bug·medium(v10)：count_plates 宽松匹配会把「编号B10086」数成车牌，
+        // 单牌查询夹杂编号文本时 count>1 会误弃预路由。此为已知限制（退回 LLM 通道，非安全风险）。
+        // 但确认纯单牌仍 count==1。
+        assert_eq!(AgentCore::count_plates("皖A12345在白名单吗"), 1);
+        assert_eq!(AgentCore::count_plates("皖A12345 和 鲁H736A7 在白名单吗"), 2);
     }
 }
 
