@@ -40,11 +40,23 @@ fn test_agent() -> AgentCore {
         approver_id: None,
         meta_evolution: MetaEvolutionConfig::default(),
         safety: SafetyConfig::default(),
+        human_approval: false,
+        features: agent_core::agent::FeatureFlags::default(),
+        lats: agent_core::lats::LatsConfig::default(),
+        multiagent: agent_core::multiagent::MultiAgentConfig::default(),
+        ttc: agent_core::ttc::TtcConfig::default(),
+        intake_filter: agent_core::intake_filter::IntakeFilterConfig::default(),
     };
     let harness = HarnessStore::open_memory().unwrap();
     let cp = CheckpointStore::open_memory().unwrap();
     let local_resources = Arc::new(Mutex::new(LocalResourceSnapshot::default()));
-    AgentCore::new(config, harness, cp, local_resources)
+    AgentCore::new(
+        config,
+        harness,
+        cp,
+        local_resources,
+        Arc::new(agent_core::metrics::MetricsRegistry::default()),
+    )
 }
 
 #[test]
@@ -149,11 +161,23 @@ async fn eval_e07_mcp_down_degrade() {
         approver_id: None,
         meta_evolution: MetaEvolutionConfig::default(),
         safety: SafetyConfig::default(),
+        human_approval: false,
+        features: agent_core::agent::FeatureFlags::default(),
+        lats: agent_core::lats::LatsConfig::default(),
+        multiagent: agent_core::multiagent::MultiAgentConfig::default(),
+        ttc: agent_core::ttc::TtcConfig::default(),
+        intake_filter: agent_core::intake_filter::IntakeFilterConfig::default(),
     };
     let harness = HarnessStore::open_memory().unwrap();
     let cp = CheckpointStore::open_memory().unwrap();
     let local_resources = Arc::new(Mutex::new(LocalResourceSnapshot::default()));
-    let agent = AgentCore::new(config, harness, cp, local_resources);
+    let agent = AgentCore::new(
+        config,
+        harness,
+        cp,
+        local_resources,
+        Arc::new(agent_core::metrics::MetricsRegistry::default()),
+    );
 
     // 连续 3 次拉取工具（触发 UNHEALTHY_THRESHOLD）
     for _ in 0..3 {
