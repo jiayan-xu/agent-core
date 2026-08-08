@@ -2138,10 +2138,24 @@ mod tests {
             .lock()
             .unwrap()
             .register("test-agent", None, PermissionLevel::Admin);
-        // manage_whitelist 注册为 "read"（仅走 is_dangerous_floor 分支），sync_whitelist_plates
-        // 注册为 "dangerous"（走 tool_level=="dangerous" 分类器分支）——两条真实生产路径
-        // （floor ∪ classifier）都被覆盖，避免参数全落在同一条 floor 早退。
-        boundary.register_tool("manage_whitelist", "read");
+        // manage_whitelist 不注册，走默认分类 + HARD_DANGEROUS floor；
+        // sync_whitelist_plates 显式注册为 "dangerous"，确保 tool_level=="dangerous" 分类器分支
+        // 也被本表驱动覆盖（若仅靠默认，两工具都在 HARD_DANGEROUS floor，classifier 分支永不触发）。
+        // 同时断言生产默认分类符合预期，钉住真实强制配置（防未来从 HARD_DANGEROUS 移除后测试静默放宽）。
+        assert_eq!(
+            with_classifier(&boundary.classifier, "unknown".to_string(), |c| c
+                .classify("manage_whitelist")
+                .to_string()),
+            "write",
+            "生产分类器应把 manage_whitelist 判为 write（叠加 HARD_DANGEROUS 地板）"
+        );
+        assert_eq!(
+            with_classifier(&boundary.classifier, "unknown".to_string(), |c| c
+                .classify("sync_whitelist_plates")
+                .to_string()),
+            "dangerous",
+            "生产分类器应把 sync_whitelist_plates 判为 dangerous"
+        );
         boundary.register_tool("sync_whitelist_plates", "dangerous");
 
         // ①-⑯ 十六个 near-identical check_tool+Yellow 块折叠为统一表驱动（含纯查询/写动作/
