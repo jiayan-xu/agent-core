@@ -18,6 +18,18 @@ const HISTORY_WINDOW: usize = 20;
 /// P2-3: 历史窗口 token 预算（估算：CJK 约 1~1.5 字符/token，用 chars/2 保守上界）。
 /// 预算保留给 system prompt + 当前输入 + 工具定义，历史窗口默认 4000 tokens。
 const HISTORY_TOKEN_BUDGET: usize = 4000;
+/// 白名单成员查询句式表（储备 extract_whitelist_membership_query 与 extract_membership_query_loose
+/// 共用，避免两处重复漂移——ocr maintainability·low(v18)）。「在不在白名单里」被「在不在白名单」
+/// 覆盖、「白名单里有吗」被「白名单里有」覆盖，故只留最短非冗余项。
+pub const MEMBERSHIP_PHRASES: &[&str] = &[
+    "在不在白名单", "白名单里有", "白名单有",
+    "是不是白名单", "在白名单吗", "在白名单里吗", "在白名单中吗", "有没有白名单",
+];
+/// 强确认前缀：明确批准语义的开头（ocr maintainability·low(v22) 抽为常量，is_confirm /
+/// confirm_but_query / is_confirm_prefix 三处复用，消除漂移）。
+pub const CONFIRM_PREFIXES: &[&str] = &["确认", "同意", "批准", "执行吧"];
+/// 复核/核查前缀：单独不算确认（用户要核对信息），仅当后续含明确确认 token 才算。
+pub const REVIEW_PREFIXES: &[&str] = &["确认一下", "确认下", "确认后"];
 use crate::checkpoint::{CheckpointState, CheckpointStore};
 use crate::degrade::{DegradeMode, DegradeMonitor, UNHEALTHY_THRESHOLD};
 use crate::harness::{self, ExecutionLog, HarnessStore};
@@ -227,6 +239,14 @@ pub struct EpisodeArchive {
     pub memory_id: Option<String>,
     /// 归档时间戳（秒）
     pub archived_at: i64,
+}
+
+/// 成员查询结果三态（白名单预路由用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipVerdict {
+    Whitelisted,
+    NotInList,
+    Unknown,
 }
 
 /// Agent 核心
@@ -1130,30 +1150,9 @@ impl AgentCore {
         external_history: Option<Vec<(String, String)>>,
         stream_sender: Option<&tokio::sync::mpsc::UnboundedSender<crate::llm::SseEvent>>,
     ) -> String {
-        let confirm_words = [            "确认",
-            "确认添加",
-            "确认执行",
-            "添加",
-            "是",
-            "是的",
-            "对",
-            "执行",
-            "确定",
-            "可以",
-            "好",
-            "好的",
-            "行",
-            "没问题",
-            "去吧",
-            "查吧",
-            "需要",
-            "去查",
-            "查一下",
-            "执行吧",
-            "同意",
-            "继续",
-            "就按这个",
-        ];
+        // 确认词判定自 v16 起改为结构化（strong_confirm/review_prefix/explicit_approve_after_review
+        // 组合），不再用 confirm_words 宽匹配（其 contains 匹配「执行/确定/去查」等命令动词会误判
+        // → 0a 误执行 pending 写）。
         // 确认词用「包含匹配」而非精确相等：用户常回“对的”“好的，执行”“可以，查吧”
         // 等变体，精确匹配会漏掉导致确认状态机死循环（反复问“方向对吗？”）。
         // ⚠️ 修复 2026-08-04：宽泛词（对/好/是/行）对长消息误伤严重——「对比一下这两份文件」
@@ -1161,10 +1160,246 @@ impl AgentCore {
         // 长消息（>8 字，如附件对比/查询请求）绝不命中确认。
         let is_confirm = |m: &str| {
             let t = m.trim();
-            if t.chars().count() > 8 {
+            // ocr-review bug·low：强确认词开头必须优先于长度守卫判断，
+            // 否则「确认，麻烦帮我查一下…」(10+字) 的合法审批回复会被 >8 直接吞掉。
+            // ocr-review bug·high(v9)：去掉裸「执行」前缀——「执行一下…」是常见命令动词，
+            // starts_with("执行") 会误判为确认并绕过守卫（可能误执行待审批操作）。
+            // 只保留明确批准语义的「确认/同意/批准」开头 + 「确认执行/执行吧」组合。
+            // ocr-review bug·medium(v10)：排除核查前缀「确认一下/确认下/确认后」——
+            // 「确认一下皖A12345在白名单里吗」用户是想核对信息，starts_with("确认")
+            // 会误判为批准；若此刻有 pending_action（0a 分支 take_pending_action→执行）会误执行
+            // 待审批写操作。核查前缀一律不构成确认，走 is_query_intent 新请求路径。
+            // ocr-review bug·medium(v11)：确认前缀必须【无条件】early return false——
+            // 若只挡 strong_confirm，短消息(≤8字，如「确认一下」)不触发长度守卫，
+            // 会 falls through 到下方 confirm_words.contains("确认") 仍误判为确认。无条件截断最稳。
+            // ocr-review bug·medium(v12)：补否定确认词——「不确认/不同意/不批准/不执行/不确定」
+            // 是用户明确拒绝，若不排除会 falls through 到 confirm_words 误判为确认；在 0a 分支
+            // （is_confirm 先于 is_cancel 检查）会把用户拒绝的 pending 写操作误执行。否定词开头一律 false。
+            // ocr-review bug·medium(v16)：核查前缀（确认一下/确认下/确认后/确认是否）不再无条件拒绝——
+            // 「确认一下，执行吧」「确认后同意执行」含明确确认 token（执行吧/同意/批准）应算确认。
+            if t.starts_with("不确认")
+                || t.starts_with("不同意")
+                || t.starts_with("不批准")
+                || t.starts_with("不执行")
+                || t.starts_with("不确定")
+            {
+                // 否定确认：即使后续含「同意/批准」也是拒绝（如「不同意批准」），明确拒绝语义优先
                 return false;
             }
-            confirm_words.iter().any(|w| t.contains(*w))
+            let strong_confirm = CONFIRM_PREFIXES.iter().any(|p| t.starts_with(p));
+            // 复核/核查前缀（确认一下/确认下/确认后）：单独不算确认（用户要核对信息），
+            // 但若后续含明确确认 token（执行吧/同意/批准）则算（「确认一下，执行吧」是批准）。
+            // ocr-review bug·medium(v18)：移出「确认是否」前缀（它是疑问不是复核），且疑问词「是否」
+            // 出现即不算确认——「确认是否同意」是问要不要同意，不是批准，0a 不得误执行 pending 写。
+            let review_prefix = REVIEW_PREFIXES.iter().any(|p| t.starts_with(p));
+            // ocr-review bug·high(v30)：approval token 检测须排除前邻否定——refusal 词表只收精确
+            // 「不同意/不批准」，但「不太同意/未同意/没同意/非同意/别批准」含「同意/批准」且非否定前缀
+            // 开头，approval 用 contains("同意/批准") 命中 → 用户明确拒绝却被当批准执行 pending 写。
+            // → 抽 has_approval_semantic：含「同意/批准」且该 token 前邻字符非否定。
+            // ocr-review bug·high(v31)：前邻否定须查 2 字符窗口——「不太同意」是「不」+「太」+「同意」，
+            // token 前紧邻是「太」而非「不」，单字符检查漏判。→ 检查 prev（不/未/没/非/别/无）或
+            // prev2=「不」且 prev=「太」（不太X）。同时「不太」本身是否定（不太同意=拒绝）。
+            let has_approval_semantic = |s: &str| -> bool {
+                ["同意", "批准"].iter().any(|tk| {
+                    s.match_indices(tk).any(|(j, _)| {
+                        // ocr-review bug·low(v33)：前邻否定须跳过空白——「我 不 同意」的 token 前
+                        // 紧邻是空格，单字符检查漏判「不」→ approval=true → 用户拒绝却当批准执行
+                        // pending 写。→ 反向迭代先 filter 空白再取前邻。
+                        let mut it = s[..j].chars().rev().filter(|c| !c.is_whitespace());
+                        let prev = it.next();
+                        let prev2 = it.next();
+                        !matches!(prev, Some('不') | Some('未') | Some('没') | Some('非') | Some('别') | Some('无'))
+                            && !(prev2 == Some('不') && prev == Some('太'))
+                    })
+                })
+            };
+            let explicit_approve_after_review = REVIEW_PREFIXES
+                .iter()
+                .any(|p| t.starts_with(p))
+                && !t.contains("是否")
+                && (t.contains("执行吧") || has_approval_semantic(t));
+            // ocr-review bug·high(v15)：拒绝/疑问/复核后缀检查【统一生效】于长度分支之前——
+            // 此前 refusal 只在 ≤8 字分支内，长消息(>8字)以强确认词开头时绕过拒绝词守卫
+            // （「确认，但先别执行，等领导批准」14字 → 误判确认 → 0a 误执行 pending 写）。
+            // 结构化判定：凡【强确认词开头】的消息，若含拒绝/疑问/取消后缀即不构成确认。
+            let refusal = [
+                "不执行",
+                "先别",
+                "别执行",
+                "等一下",
+                "稍等",
+                "吗",
+                "？",
+                "?",
+                "是否", // ocr-review bug·high(v19)：疑问词「是否」出现即不算确认（「确认是否同意」是问要不要同意）
+                "确认一遍",
+                "确认没有",
+                "取消",
+                "算了",
+                // ocr-review bug·high(v25)：中间否定词——approval 检测用 contains("同意")/contains("批准")，
+                // 「确认，我不同意」「确认一下，不同意」的「不同意/不批准」子串仍会命中 approval token →
+                // 用户明确拒绝却被当批准执行 pending 写。refusal 补「不同意/不批准」及变体，统一在
+                // 长度分支前拦截（if strong_confirm && refusal → return false）。
+                "不同意",
+                "不批准",
+                "不同意执行",
+                "不批准执行",
+            ]
+            .iter()
+            .any(|w| t.contains(*w));
+            if strong_confirm && refusal {
+                return false;
+            }
+            // ocr-review bug·medium(v24)：尾缀否定——「确认不了/确认不做了/确认不」以「确认」开头
+            // 命中 strong_confirm，但含义是【拒绝】（无法确认/不确认了），refusal 词表不含裸「不/不了」。
+            // 若不拦，≤8 字短消息直接返回 true → 0a 分支 is_confirm 先于 is_cancel 判断，把用户明确
+            // 拒绝当批准执行 pending 写（反转 v12 修复场景）。→ 尾缀带「不/不了」即 early return false。
+            if t.ends_with("不了") || t.ends_with("不") {
+                return false;
+            }
+            if t.chars().count() > 8 && !strong_confirm && !explicit_approve_after_review {
+                return false;
+            }
+            // ocr-review bug·high(v13)：短消息(≤8字) fallback 收窄为【仅强确认词】。
+            // ocr-review bug·high(v17)：short 分支须排除复核前缀——strong_confirm = starts_with("确认")
+            // 对「确认一下/确认后/确认是否」也成立，核查前缀单独不算确认（「确认一下」是用户要核对，
+            // 不是批准）。→ (strong_confirm && !review_prefix) 才是真强确认；复核前缀仅当后续含明确
+            // 确认 token（explicit_approve_after_review）才算。
+            // ocr-review bug·medium(v18)：仅强前缀会漏掉【非前缀式】明确批准——「我确认」「好的确认」
+            // 「可以确认」是日常审批回复，须识别为确认，否则 pending 写悬空。→ 补明确批准词集。
+            // ocr-review bug·high(v19)：explicit 词须 gate 在 !refusal——「可以确认吗」含「吗」refusal，
+            // strong_confirm=false 走不到上方 refusal 守卫，会误判确认。→ 词集匹配须 !refusal。
+            if t.chars().count() <= 8 {
+                // ocr-review bug·high(v22)：短消息 fallback 需覆盖日常批准变体——「好的，执行吧」
+                // 「对的」「可以，查吧」「行，没问题」是极常见审批回复，漏判会让 0b AwaitingConfirmation
+                // 分支的 rephrase_and_confirm 反复追问「方向对吗？」死循环，0a 分支用户批准被静默丢弃。
+                // 非前缀式批准词须 starts_with 锚定（「我确认」而非「确认」），避免 offset 匹配误伤；
+                // 统一 gate 在 !refusal（「可以确认吗」含「吗」是疑问不是批准）。
+                // ocr-review bug·low(v23)：explicit_short 需容忍标点/空白变体——「好的,执行」
+                // 「可以执行」「行没问题」（半角逗号/空格/无标点）在 0b 分支会触发 rephrase 死循环。
+                // → 匹配前先归一化 t（去全/半角逗号与空白），explicit_short 用归一化后的 contains。
+                let t_norm_short = t
+                    .replace('，', "")
+                    .replace(',', "")
+                    .replace(' ', "")
+                    .replace('\u{3000}', "");
+                // ocr-review bug·high(v28)：explicit_short 的 starts_with 会误伤复核后缀——
+                // 「我确认一下」「好的确认下」「可以确认一下」以「我确认/好的确认/可以确认」开头，
+                // 但用户意图是【核对细节】而非批准。REVIEW_PREFIXES 只匹配【开头】，这些消息不以
+                // 「确认一下」等开头（是「我确认一下」），review_prefix=false → 误判确认 → 0a 误执行
+                // pending 写（正是 v10/v17 复核前缀防护想防的场景）。→ 归一化文本含复核后缀
+                // （确认一下/确认下/确认后）即 gate 掉 explicit_short/combo 的批准匹配。
+                let has_review_suffix = ["确认一下", "确认下", "确认后"]
+                    .iter()
+                    .any(|p| t_norm_short.contains(p));
+                let explicit_short = [
+                    "我确认", "好的确认", "可以确认", "确认完毕", "确认无误",
+                    "好的执行", "可以查吧", "可以执行", "行没问题", "对的",
+                ];
+                // ocr-review bug·medium(v24)：组合式批准（「好的可以执行」「可以，就这么办」）归一化后
+                // 不匹配任何单一前缀变体——「好的可以执行」不以「好的执行」或「可以执行」开头。旧
+                // confirm_words 的 contains 可命中。→ 补充组合词 contains 匹配（「好的」+「执行」、
+                // 「可以」+「执行」等），这类组合明确是批准。
+                let combo = ["好的执行", "可以执行", "行没问题"]
+                    .iter()
+                    .any(|w| t_norm_short.contains(w));
+                // ocr-review bug·high(v30)：short 分支 explicit_short/combo 须 gate 查询意图——
+                // 「对的做法是什么」(7字)「好的执行结果如何」(8字) 以「对的/好的执行」开头命中
+                // explicit_short，但用户是【追问做法/结果】而非批准。refusal 词表不含「什么/如何/
+                // 为什么」等疑问词，confirm_but_query 只对 CONFIRM_PREFIXES 前缀生效这批不适用 →
+                // 0a 在 take_pending_action 后才查 is_query_intent，pending 写已被误执行。→ 归一化
+                // 文本含查询疑问词即不算批准。
+                // ocr-review bug·high(v31)：has_query_token 须同时 gate `strong_confirm && !review_prefix`
+                // 项——「确认什么」「确认怎么执行」(6字)以「确认」开头（strong_confirm）但用户是问
+                // 要确认什么，不含 refusal 词，绕过 query gate → 误确认执行 pending 写。且 token 列表
+                // 补「怎么/哪/哪个」。→ 统一 gate 到三项（strong 前缀 / explicit_short / combo）。
+                // ocr-review bug·medium(v32)：has_query_token 过宽——「同意怎么执行都行」(8字)含
+                // 「怎么」被 gate 误拒，但它是【执行授权】（v13 场景），非追问。→ 收窄：疑问词后跟
+                // 「都/也」授权词（怎么执行都行/怎么都成）不算追问；仅纯粹的「确认/批准词+疑问词」
+                // 追问（确认什么/确认怎么执行/对的做法是什么）才 gate。
+                let has_query_token = ["什么", "怎么", "哪个", "哪", "如何", "为什么", "咋", "怎样", "怎么样"]
+                    .iter()
+                    .any(|w| {
+                        let idx = t_norm_short.find(w);
+                        match idx {
+                            Some(i) => {
+                                let tail = &t_norm_short[i + w.len()..];
+                                // 疑问词后段含「都/也/全」授权词 = 执行授权（怎么执行都行），非追问
+                                !tail.contains("都") && !tail.contains("也") && !tail.contains("全")
+                            }
+                            None => false,
+                        }
+                    });
+                return (strong_confirm && !review_prefix && !has_query_token)
+                    || explicit_approve_after_review
+                    || (!refusal
+                        && !has_review_suffix
+                        && !has_query_token
+                        && (explicit_short
+                            .iter()
+                            .any(|w| t_norm_short.starts_with(w))
+                            || combo));
+            }
+            // ocr-review bug·high(v16)：长消息(>8字) fallback 不能靠 confirm_words.contains("确认")——
+            // 该词被确认前缀本身满足（「确认，把皖A12345加到白名单」以确认开头即误判确认 → 0a 误执行
+            // 无关 pending 写 / 无 pending 时被罐头「当前没有待确认的操作」吞掉新请求）。
+            // → 长消息须【强确认词开头 + 后续含独立确认词】，或复核前缀+明确确认token；
+            // 纯粹以确认开头 + 新请求正文（加/查/改）的不再算确认，走下方新请求预路由。
+            if strong_confirm {
+                // 前缀是确认/同意/批准/执行吧，后续须再含一个【独立】确认词才算批准；
+                // ocr-review bug·high(v18/v22)：`执行吧`/`同意`/`批准` 既是前缀又曾是内层确认词——
+                // 「执行吧，帮我把皖A12345加进白名单」以前缀开头 + 内层 contains 同词也成立 → 无条件
+                // 确认 → 0a 误吞新写请求。前缀为这些词时不得复用自身作二次确认：inner 须在【去掉
+                // 前缀后的正文】中独立出现。前缀「确认」不含内层词（确认执行/确认完毕是复合词），
+                // 但其自身也须排除，统一用 strip_prefix 处理最稳。
+                let tail = CONFIRM_PREFIXES
+                    .iter()
+                    .find_map(|p| t.strip_prefix(p));
+                let tail = tail.unwrap_or(t);
+                // ocr-review bug·high(v33)：inner approval 集含裸「可以/继续」等，而 refusal 表
+                // 无推迟词——「确认，继续等待评审结果」「确认，可以稍后再执行」经「继续/可以」命中
+                // inner=true → is_confirm=true → 0a 执行 pending 写，但用户是【推迟/等待】而非批准，
+                // 属未授权变更。→ 推迟词（等待/稍后/待会儿/再等/先不/以后/晚点）出现即非确认。
+                let deferred = ["等待", "稍后", "待会", "待会儿", "再等", "先不", "以后", "晚点", "稍晚"]
+                    .iter()
+                    .any(|w| tail.contains(w));
+                if deferred {
+                    return false;
+                }
+                let inner = has_approval_semantic(tail)
+                    || tail.contains("好的")
+                    || tail.contains("可以")
+                    || tail.contains("确认执行")
+                    || tail.contains("就按")
+                    || tail.contains("没问题")
+                    || tail.contains("继续");
+                if t.starts_with("执行吧") {
+                    return inner;
+                }
+                return tail.contains("执行吧") || inner;
+            }
+            explicit_approve_after_review
+        };
+        // 查询/疑问意图判定（供调用处判断：无 pending 时含此词的消息当新请求，不做罐头回复）
+        // ocr-review maintainability·low(v11)：删裸「少」——「至少/减少/年少」非查询意图，
+        // 裸「少」过宽会把这些词误判为查询；「多少」已由「吗/什么/哪」覆盖大部分疑问句式。
+        // ocr-review bug·medium(v12)：补成员/疑问句式——「在不在/是不是/有没有/怎么/如何/为什么」
+        // 是极常见查询形式，缺了会漏判「确认，皖A12345在不在白名单」这类无 吗/查/看 的纯查询，
+        // 使其落入罐头回复而非成员查询预路由。
+        let is_query_intent = |m: &str| {
+            let t = m.trim();
+            t.contains('查')
+                || t.contains('问')
+                || t.contains('看')
+                || t.contains("什么")
+                || t.contains('哪')
+                || t.contains('吗')
+                || t.contains("在不在")
+                || t.contains("是不是")
+                || t.contains("有没有")
+                || t.contains("怎么")
+                || t.contains("如何")
+                || t.contains("为什么")
         };
         let is_cancel = |m: &str| {
             let kws = [
@@ -1272,7 +1507,41 @@ impl AgentCore {
         }
 
         // ── 0a. 工具级确认（现有）：pending_actions 中的操作等待确认 ──
-        if is_confirm(trimmed) {
+        // ocr-review bug·high(v12)：确认前缀 + 明确查询意图的消息（如「确认，帮我查一下皖A在不在
+        // 白名单」）用户真实意图是查询，不是批准写。若直接 take_pending_action 会把 pending 写操作误执行。
+        // → 凡「确认/同意/批准 开头 + is_query_intent」，一律视为查询请求，跳过 pending 执行，
+        // 落入下方 is_query_intent 分支走成员查询预路由/execute_chat。纯确认（「确认，执行吧」不含
+        // 查询句式）不受影响，仍正常执行 pending。
+        // ocr-review bug·low(v13)：is_query_intent 词表过宽（看/怎么/如何/有没有…），
+        // 「同意，怎么执行都行」「确认，看看有没有问题」等真·确认句会被误判为查询，导致 pending 写
+        // 既不执行也不取消（后续裸「确认」意外执行 → 审批丢失+延迟执行隐患）。
+        // → 收窄为【成员查询意图】：确认前缀 + 能提取到车牌的成员查询句（如「确认，皖A12345在不在
+        // 白名单」）。纯确认句无成员查询，confirm_but_query=false，正常执行 pending。
+        // ocr-review bug·medium(v15)：confirm_but_query 前缀集合须与 is_confirm 的 strong_confirm
+        // (确认/同意/批准/执行吧) 一致——「执行吧，皖A12345在不在白名单里」以「执行吧」开头是成员查询，
+        // 但若 confirm_but_query 不含「执行吧」，会 through is_confirm && confirm_but_query=false
+        // → 0a 误执行 pending 写。统一加「执行吧」。
+        // ocr-review bug·medium(v15)：查询判定用 has_membership_query_syntax（成员句式+车牌），
+        // 不用 extract_whitelist_membership_query（其含 write_verbs 拦截）——否则「确认，皖A12345
+        // 更新后在不在白名单里」含叙述性写动词「更新」会返回 None → confirm_but_query=false → 0a
+        // 误执行 pending 写。叙述性写动词（更新后/修改过）是时间背景，用户明确在问成员关系，应查询优先。
+        let confirm_but_query = CONFIRM_PREFIXES.iter().any(|p| trimmed.starts_with(p));
+        let confirm_but_query = confirm_but_query
+            && (Self::has_membership_query_syntax(trimmed)
+                // ocr-review bug·high(v20)：is_confirm 长消息规则使「同意，帮我查一下皖A12345」
+                // （无成员句式但有车牌+查询意图）自确认 → 0a 误执行无关 pending 写。→ 确认前缀+
+                // 车牌+查询意图词也算查询。保留 v13 保护：「同意，怎么执行都行」无车牌仍不算查询。
+                || (Self::extract_plate(trimmed).is_some() && is_query_intent(trimmed)));
+        // ocr-review bug·high(v32)：0a 分支执行 pending 前须检查消息是否【携带新写请求正文】——
+        // 「确认，可以把皖A12345加进白名单」以确认开头 + 内层「可以」使 is_confirm=true，但用户
+        // 意图是【发起新写请求】（加进白名单），不是确认旧 pending。confirm_but_query 仅当含成员
+        // 句式或（车牌+查询）才 true，这里不满足 → 直接 take_pending_action 执行与用户本意无关的
+        // pending 写，并把新写请求静默丢弃（旧逻辑只在无 pending 的 else-if 分支有 has_request_body
+        // 守卫，0a 路径没有）。→ 携带新写请求时跳过 0a，放行给下方 try_preroute 走正常写审批。
+        // ocr-review bug·medium(v33)：与 has_request_body 抽共享 carries_write_body，去粗粒度
+        // 「白名单/车牌」裸子串（「确认，白名单没问题」纯批准不得误判携带新写）。
+        let carries_new_write = Self::carries_write_body(trimmed);
+        if is_confirm(trimmed) && !confirm_but_query && !carries_new_write {
             if let Some(mut action) = self.session_manager.take_pending_action(session_id).await {
                 // 任务 652 前置修复：捕获 approval_id，供执行后消费审批项（防残留被全局扫描重执行）
                 let approval_id_opt = action.approval_id.clone();
@@ -1405,6 +1674,45 @@ impl AgentCore {
                 self.checkpoint_terminal(session_id, CheckpointState::Done)
                     .await;
                 return reply;
+            // ocr-review bug·high：AwaitingConfirmation 状态机在下方 0b 分支处理（取 original 后
+            // execute_chat），若此处无 pending_action 也直接返回罐头回复，会静默打断计划确认。
+            // → 仅当会话不在 AwaitingConfirmation 时才返回罐头；否则放行给 0b 状态机。
+            } else if self.session_manager.get_state(session_id).await != SessionState::AwaitingConfirmation {
+                // ocr-review bug·medium(v9)：无 pending 但含查询意图（查/问/看/吗 等）
+                // 不是「确认」，是全新查询 → 放行给预路由/execute_chat，不做罐头回复。
+                // ocr-review bug·medium(v23)：无 pending 且消息【除确认词外还含实际写请求正文】
+                // （如「确认，执行吧，把皖A12345加进白名单」）也不是纯确认——内嵌的写请求应转给
+                // execute_chat/预路由处理，否则被后面统一罐头回复静默丢弃（改动前该消息会穿落到
+                // 0b 状态机作为新请求处理）。→ 含写动词或业务请求词即放行，仅纯确认（确认/好的/可以）
+                // 才罐头。ocr-review bug·medium(v33)：与 0a 分支抽共享 carries_write_body。
+                let has_request_body = Self::carries_write_body(trimmed);
+                if is_query_intent(trimmed) || has_request_body {
+                    if let Some(pr) = self.try_preroute(trimmed, session_id).await {
+                        return pr;
+                    }
+                    return crate::reply_polish::polish_llm_reply(
+                        self.execute_chat(
+                            trimmed,
+                            user_id,
+                            session_id,
+                            allowed_ns,
+                            &trace_id,
+                            external_history.clone(),
+                            stream_sender,
+                        )
+                        .await,
+                    );
+                }
+                // 修复 2026-08-07：用户回「确认」但当前没有待确认的操作时，
+                // 直接明确告知，不再落入 execute_chat —— 否则 LLM 会基于脏历史
+                // 上下文回答不相干内容（实测：白名单查询后回「确认」答了「天越7月车次」）。
+                let reply = "当前没有待确认的操作。如果您是回应上一条查询结果，可以直接重新说明需要确认的内容；如需审批，请先在审批台批准后回复「确认」。".to_string();
+                let ns = self.caller_ns(session_id);
+                let db_path = self.harness.lock().await.db_path();
+                self.session_manager
+                    .save_to_history(session_id, &ns, &db_path, message, &reply)
+                    .await;
+                return reply;
             }
         }
 
@@ -1418,6 +1726,28 @@ impl AgentCore {
                 if is_cancel(trimmed) {
                     self.cancel_plan(session_id).await;
                     return "✅ 已取消该计划。如需重新开始，请告诉我新的需求。".to_string();
+                }
+                // ocr-review bug·medium(v13)：确认前缀 + 明确查询意图的消息（如「确认，查一下皖A
+                // 在不在白名单」），用户真实意图是查询，不是批准上一计划。若在此处被 is_confirm 拦截，
+                // 会把 original message 重执行（违背查询意图，且可能重复触发写操作）。
+                // → 在 is_confirm 之前放行为新查询请求（走 execute_chat(message) 而非 original）。
+                // ocr-review bug·medium(v14)：应答查询时【不得】把状态改为 Confirmed 并 checkpoint——
+                // 那会覆盖待确认计划，使后续裸「确认」落入「当前没有待确认的操作」而静默丢弃计划。
+                // → 保持 AwaitingConfirmation，仅应答成员查询（execute_chat 内部经 try_preroute
+                // 走确定性成员查询），计划仍可后续确认。
+                if confirm_but_query {
+                    return crate::reply_polish::polish_llm_reply(
+                        self.execute_chat(
+                            message,
+                            user_id,
+                            session_id,
+                            allowed_ns,
+                            &trace_id,
+                            external_history.clone(),
+                            stream_sender,
+                        )
+                        .await,
+                    );
                 }
                 if is_confirm(trimmed) {
                     let original = self
@@ -1782,6 +2112,427 @@ impl AgentCore {
         let rest = &chars[so + 1..];
         let sc = rest.iter().position(|&c| c == close)?;
         Some(rest[..sc].iter().collect())
+    }
+
+    /// 识别「某车牌是否在白名单」查询意图 → 车牌号。
+    /// 匹配：『XX 在不在白名单』『白名单有 XX 吗』『XX 是不是白名单』『查 XX 在白名单吗』。
+    /// 2026-08-08：确定性预路由，绕开 data_query 快速通道（LLM 无工具直答会编造数据）。
+    fn extract_whitelist_membership_query(message: &str) -> Option<String> {
+        let m = message.trim();
+        // 附件正文块内是数据，不是指令
+        if Self::has_attachment_block(m) {
+            return None;
+        }
+        // 含写动词（添加/删除/修改/公司名/加类）→ 不是纯查询，交给对应预路由。
+        // ocr-review bug·medium(v9)：删单字「加」——「加急/加班/参加/增加」会误伤成员查询；
+        // 多字变体（加入/加进/加一下/加上）已覆盖写意图。`记录`过宽（「查XX的记录」是查询）也删。
+        // ocr-review bug·high(v9)：补全 extract_whitelist_remove 认可的移除动词（删掉/去掉/移出/作废/
+        // 注销/软删/踢出/清掉），否则「把皖A12345从白名单删掉，它在白名单吗」这类「写意图+成员句式」
+        // 混合消息不拦截 → 移除操作被成员查询预路由静默吞掉。
+        // ocr-review bug·high(v10)：补全全部写 extractor 认可的动词，避免「写意图+成员句式」混合消息
+        // 被成员查询分支先命中而静默吞掉写操作。覆盖：add(收录/补录)、update(统一为/换为/更新为/
+        // 变更为/改名为/设成/调整为/修改/更新/变更)、waste_type(设为/换成)、remove(删掉/去掉/移出/
+        // 作废/注销/软删/踢出/清掉)。注意「修改/更新/变更」本身较宽，但它们明确表写意图，宁可多拦。
+        // maintainability·low(v11)：去重「改为/改成」（1878 首行已含），避免冗余掩盖匹配语义。
+        // 写意图拦截：用 has_command_write_verb（叙述性动词带完成态后缀视为查询，裸命令才拦），
+        // 使「皖A12345更新后还在不在白名单里」这类时间背景查询不被拦（ocr-review bug·medium(v19)）。
+        // 注意：strict extractor 语义仍是「遇写意图返回 None」——更新/修改/变更 裸词或移除/新增/
+        // 设为等命令都拦；「公司名/固废种类」是 extract_whitelist_update/waste_type 的宾语词，
+        // 出现即表写意图，单独补判（has_command_write_verb 不含宾语名词）。
+        // ocr-review bug·high(v23)：但「公司名/固废种类」作为【时间背景宾语】时（「皖A12345公司名
+        // 改成新能源后还在不在白名单里」，含成员句式、无确认前缀）不能无条件拦截——否则落入
+        // extract_whitelist_update 把「新能源后还在不在白名单里」当公司名提交 update_company 写审批，
+        // 用户确认后污染白名单。→ 宾语名词后跟完成态后缀（后/过/了/之前/已/完）视为叙述性（查询）
+        // 放行（has_narrative_noun=true 即放行），与 has_command_write_verb 的叙述性豁免一致。
+        // ocr-review bug·low(v32)：公司名/固废种类守卫过宽——「皖A12345公司名还在不在白名单里」
+        // 是纯成员查询（问公司名是否在白名单），含「公司名」但无变更动词，却被拦截 → 确定性查询
+        // 丢失落入 LLM 快道。extract_whitelist_update 需【变更动词】才产生虚假审批，故仅当消息确实
+        // 含变更动词（改为/改成/设为…）时才启用公司名词拦截，纯成员句式直接放行。
+        let company_noun_guard = (m.contains("公司名") || m.contains("固废种类"))
+            && ["改为", "改成", "设为", "换成", "更新为", "变更为", "改名为", "设成",
+                "调整为", "统一为", "统一成", "换为", "修改", "变更", "更新", "设为"]
+                .iter()
+                .any(|v| m.contains(v))
+            && !Self::has_narrative_noun(m, "公司名")
+            && !Self::has_narrative_noun(m, "固废种类");
+        if Self::has_command_write_verb(m) || company_noun_guard {
+            return None;
+        }
+        // 查询句式：收紧为明确的成员查询句式（ocr bug·medium），
+        // 通配分支不再用「含白名单+任意查询词」这种过宽匹配（会吞掉记录查询）。
+        // maintainability·low(v10)：删被包含项——「在不在白名单里」被「在不在白名单」覆盖、
+        // 「白名单里有吗」被「白名单里有」覆盖，冗余项掩盖真实匹配语义。
+        // maintainability·low(v18)：句式表抽为 MEMBERSHIP_PHRASES 常量，避免两处漂移。
+        let has_membership_phrase = MEMBERSHIP_PHRASES.iter().any(|p| m.contains(*p));
+        if !has_membership_phrase {
+            return None;
+        }
+        // 提取车牌（优先带空格的宽松匹配，如「皖 NB7691」）
+        Self::extract_plate(m).or_else(|| Self::extract_plate_spaced(m))
+    }
+
+    /// 宽松成员查询车牌提取（供 confirm_but_query / try_preroute fallback 用，不含 write_verbs 拦截）。
+    /// 与 extract_whitelist_membership_query 的区别：后者为防「写意图+成员句式」混合消息被吞，
+    /// 见写动词即返回 None；但「确认，皖A12345更新后在不在白名单里」这类【确认前缀 + 成员句式 +
+    /// 叙述性写动词】（更新后/修改过/之前变更的，动词是时间背景非写指令）用户意图是查询，
+    /// 用严格版会误推入 0a 审批执行。此处仅需成员句式 + 车牌即可判定查询意图。
+    /// ocr-review bug·medium(v15)：write_verbs 过度拦截会把纯查询推入审批执行路径。
+    /// ocr-review bug·medium(v22)：补 has_attachment_block 守卫——loose 路径由 confirm_but_query /
+    /// try_preroute 调用，若附件正文块内引用了成员句式+车牌（如「确认，请看附件」+附件正文含
+    /// 「皖A12345在不在白名单」），无守卫会基于附件文本预路由成员答案，而「确认」token 被
+    /// confirm_but_query 消费永不生效。附件正文是数据非指令，须与 strict 版一致返回 None。
+    fn extract_membership_query_loose(message: &str) -> Option<String> {
+        let m = message.trim();
+        if Self::has_attachment_block(m) {
+            return None;
+        }
+        let has_phrase = MEMBERSHIP_PHRASES.iter().any(|p| m.contains(*p));
+        if !has_phrase {
+            return None;
+        }
+        Self::extract_plate(m).or_else(|| Self::extract_plate_spaced(m))
+    }
+
+    /// 判断是否为【明确成员查询句式】（供 confirm_but_query 用，宽松版，见上）。
+    fn has_membership_query_syntax(message: &str) -> bool {
+        Self::extract_membership_query_loose(message).is_some()
+    }
+
+    /// 判断【宾语名词】是否为叙述性（时间背景）用法：名词后（可隔若干字）出现完成态后缀
+    /// （后/过/了/之前/已/完/前）即视为查询放行。用于「公司名/固废种类」这类写 extractor 的
+    /// 宾语词——「皖A12345公司名改成新能源后还在不在白名单」中「公司名」是时间背景宾语，
+    /// 不是 update 写意图，不得被成员查询拦截后落入 update 写审批污染白名单（ocr-review
+    /// bug·high(v23)，与 has_command_write_verb 的叙述性豁免一致）。
+    fn has_narrative_noun(message: &str, noun: &str) -> bool {
+        let m = message.trim();
+        m.match_indices(noun).any(|(i, _)| {
+            let after = &m[i + noun.len()..];
+            // ocr-review bug·medium(v29)：与 has_command_write_verb 同步——固定 12 字符探针窗口
+            // 在宾语过长时漏判（「公司名改成安徽省环保新能源科技有限公司后…」的「后」在窗口外）。
+            // → 探测名词后到句末的整段。
+            let probe = after.to_string();
+            // ocr-review bug·medium(v25)：裸「前」过宽——「改为前卫环保」含「前」误判叙述性 →
+            // 写意图被跳过。只接受「变/改/更/删/移+前」紧邻组合（改名前/变更前/删除前）。
+            // ocr-review bug·medium(v29)：原 qian_adjacent 检查【「前」紧邻前一个字符】为 变/改/更/删/移，
+            // 但「改名前」前一个是「名」、「删除前」前一个是「除」→ 实际只匹配「变更前」与字面
+            // 「改前/删前/移前」。改为匹配完整「动词+前」词组（改名前/删除前/变更前/修改前/移除前/移出前），
+            // 使「皖A12345公司改名前的状态」「删除前在不在白名单」正确识别为时间背景查询。
+            let qian_adjacent = ["改名前", "删除前", "变更前", "修改前", "移除前", "移出前"]
+                .iter()
+                .any(|w| probe.contains(w));
+            probe.contains("后") || probe.contains("过") || probe.contains("了")
+                || probe.contains("之前") || probe.contains("已") || probe.contains("完")
+                || qian_adjacent
+        })
+    }
+
+    /// 判断消息是否含【命令式写动词】（真实写意图），供 try_preroute 的 confirm-prefix fallback
+    /// 二次拦截用（ocr-review bug·medium(v17)）。「更新/修改/变更/改为/改成」及移除动词
+    /// （删除/删掉/移除/去掉/移出/作废/注销/软删/踢出/清掉）常作时间背景（「更新后在不在白名单里」
+    /// 「删除后还在不在」是查询），仅当带完成态后缀（后/过/了/之前/已/完）才算叙述性；无后缀的
+    /// 裸命令（删掉/加入/设为/收录 等）是真实写意图，不得被成员查询预路由静默吞掉。
+    /// ocr-review bug·medium(v19)：移除动词也纳入叙述性豁免——「确认，皖A12345删除后还在不在
+    /// 白名单里」是查询，此前被当写意图误送入 extract_whitelist_remove 提交删除审批。
+    fn has_command_write_verb(message: &str) -> bool {
+        let m = message.trim();
+        // 命令式动词（真实写意图）：直接匹配即拦截（无叙述性豁免）
+        let imperative = [
+            "添加", "新增", "登记", "录入",
+            "加入", "加进", "加一下", "加上", "收录", "补录",
+        ];
+        if imperative.iter().any(|v| m.contains(*v)) {
+            return true;
+        }
+        // 叙述性动词（更新/修改/变更/改为/改成 + 移除动词 + 为/成 变更动词）：带完成态后缀
+        // （后/过/了/之前/已/完/前）视为时间背景（「更新后在不在」「修改前在不在」「删除后还在不在」
+        // 是查询）；裸命令（更新为XX/设为/删掉）仍算写意图。ocr-review bug·medium(v19) 移除动词、
+        // (v20) 补「前」后缀 + 为/成 形式完成态豁免。
+        // 「公司名/固废种类」是宾语名词非动词，由 extract_whitelist_update 等专用 extractor 判断。
+        let narrative = [
+            "更新", "修改", "变更", "改为", "改成",
+            "统一为", "统一成", "换为", "更新为", "变更为", "改名为", "设成", "调整为",
+            "设为", "换成",
+            "删除", "删掉", "移除", "去掉", "移出", "作废", "注销", "软删", "踢出", "清掉",
+        ];
+        for v in narrative.iter() {
+            if m.contains(*v) {
+                // 找到最后一次出现，检查其后（可隔宾语，如「皖A12345改成新能源后」）是否含完成态后缀。
+                // ocr-review bug·medium(v22)：此前只接受【紧邻】后缀，隔宾语（改成XX后）被判裸写意图
+                // → extract_whitelist_membership_query 返回 None → 确定性成员查询被跳过，落入 LLM 快道
+                // （原幻觉 bug）；「公司名改成XX后还在不在」还会误触发 extract_whitelist_update 生成
+                // 虚假写审批流。→ 放宽为动词后至多 12 字符内出现后缀即视为时间背景。
+                // ocr-review bug·medium(v25)：裸「前」过宽——「改为前卫环保」的「前卫环保」含「前」
+                // 被误判叙述性 → update 写意图被跳过。→ 只保留「之前」与「变/改/更/删/移+前」紧邻
+                // 组合（改名前/变更前/删除前），裸「前」不再作为完成态后缀。
+                let need_check = m.match_indices(v).any(|(i, _)| {
+                    let after = &m[i + v.len()..];
+                    // ocr-review bug·medium(v29)：固定 12 字符探针窗口在宾语过长时漏判——
+                    // 「公司名改成安徽省环保新能源科技有限公司后还在不在」中「后」落在 take(12)
+                    // 之外 → probe 不含完成态后缀 → 误判写意图 → 落入 update extractor 生成虚假
+                    // 审批流。→ 改为探测动词后【到句末】的整段（has_narrative_noun 同改）。
+                    // ocr-review bug·high(v33)：扫到句末会让【后文叙述】污染【前文裸命令】——
+                    // 「删除皖A12345，它删除前在白名单吗」前一处「删除」的 probe 含后文「删除前」、
+                    // 后一处 after 以「前」开头，两处都判叙述 → has_command_write_verb=false →
+                    // 真实删除命令被成员查询预路由静默吞掉。→ 每个 occurrence 的 probe 界到
+                    // 【下一个同动词】出现处（截断 to 指针），使前文只探测到本动词后的片段。
+                    let probe_end = m[i + v.len()..]
+                        .find(v)
+                        .map(|rel| i + v.len() + rel);
+                    let probe = match probe_end {
+                        Some(end) => &m[i + v.len()..end],
+                        None => &m[i + v.len()..],
+                    }
+                    .to_string();
+                    // ocr-review bug·medium(v29)：qian_adjacent 需识别「动词+前」紧邻组合
+                    // （删除前/改名前/变更前…）为叙述性时间背景。分两种形态：
+                    // ① 动词后【紧跟】「前」→「删除前」中 after 以「前」开头（probe 不含动词本身）；
+                    // ② 隔宾语后的「变/改/更/删/移+前」→「皖A12345公司改名前的状态」probe 含「改名前」。
+                    // 原实现只查 probe 内「前」的紧邻前字符，漏掉①（after 以「前」开头时前字符在动词里）。
+                    // ocr-review bug·high(v31)：形态①须限制在【非赋值动词】——「改为前卫环保」的 after
+                    // 也以「前」开头（「前卫环保」是赋值后的公司名），若赋值动词也豁免会把「改为前卫环保」
+                    // 的写意图静默丢弃（v25 想防的场景）。→ 仅当前动词 v 为非赋值动词（移除/修改类）时
+                    // after 以「前」开头才算叙述性；赋值动词（改为/改成/设为/换成…）后跟名词补语不禁。
+                    let assign_verbs = ["改为", "改成", "设为", "换成", "统一为", "统一成",
+                        "换为", "更新为", "变更为", "改名为", "设成", "调整为"];
+                    let is_assign_verb = assign_verbs.iter().any(|a| v.contains(a));
+                    let qian_adjacent = (!is_assign_verb && after.trim_start().starts_with('前'))
+                        || ["改名前", "删除前", "变更前", "修改前", "移除前", "移出前"]
+                            .iter()
+                            .any(|w| probe.contains(w));
+                    !(probe.contains("后") || probe.contains("过") || probe.contains("了")
+                        || probe.contains("之前") || probe.contains("已") || probe.contains("完")
+                        || qian_adjacent)
+                });
+                if need_check {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// 判断消息是否【携带实际写请求正文】（确认词之外还有真实写意图）。
+    /// ocr-review bug·medium(v33)：0a 分支的 carries_new_write 与无 pending 分支的 has_request_body
+    /// 原是两处逐字复制且含粗粒度「白名单/车牌」子串——「确认，白名单没问题」是纯批准（is_confirm=true）
+    /// 却因含「白名单」被误判携带新写 → 0a 跳过，pending 既不执行也不取消，静默丢失。→ 抽共享 helper，
+    /// 删除/index 写动词已由 has_command_write_verb 覆盖，粗粒度「白名单/车牌」裸子串（被写动词隐含）
+    /// 一并去掉，两处复用保持口径一致。
+    fn carries_write_body(msg: &str) -> bool {
+        let m = msg.trim();
+        // 写意图已由 has_command_write_verb 完整覆盖：imperative（添加/新增/登记/录入/加入/加进…）
+        // 直接拦截；narrative 动词（删除/更新/改为/改成/移除…）带完成态后缀时豁免（「删除后在不在」
+        // 是查询）。此处不再重复裸 contains——粗粒度「白名单/车牌」子串已去掉（被写动词隐含），
+        // 避免「确认，白名单没问题」纯批准被误判携带新写。
+        Self::has_command_write_verb(m)
+    }
+
+    /// 成员查询结果三态分类：Whitelisted / NotInList / Unknown。
+    /// 输入为 manage_whitelist query 的原始返回串（未归一化）。
+    /// 抽成纯函数便于单测（ocr-review bug·medium，v12 子串碰撞修复）。
+    fn classify_membership(raw: &str) -> MembershipVerdict {
+        // 归一化：去空白(半/全角)、全/半角冒号、逗号，使「命中：0」→「命中0」可匹配
+        let t_norm = raw
+            .replace(' ', "")
+            .replace('\u{3000}', "")
+            .replace('：', "")
+            .replace(':', "")
+            .replace('，', "")
+            .replace(',', "");
+        // 正面：仅「在白名单中」明确，或「命中」后跟计数词（N条/数量/记录/数）才算命中计数。
+        // ocr-review bug·medium(v15)：裸「命中」子串过宽——「命中服务异常」「无法命中数据库」
+        // 是错误/非结果文本，会被误判 Whitelisted。→ 锚定：命中后须有计数词或 N。
+        // ocr-review bug·medium(v20)：positive 过宽——「命中404错误」「命中记录异常」此前被判
+        // Whitelisted（default-deny 下 Whitelisted 假阳性比 NotInList 假阴性更危险）。→ 要求
+        // 命中后是【数字+计数词】（命中5条/命中10条记录）或【明确计数词+数字】（命中数量0/命中
+        // 记录5条）；裸「命中404」（无计数词）或「命中记录异常」（记录后无数字）→ 不算 Whitelisted。
+        // ocr-review bug·medium(v23)：「在白名单中」无条件匹配——「未找到该车牌在白名单中」
+        // 「未能确认该车在白名单中」不在 strong_negative 枚举表内，含「在白名单中」即误判
+        // Whitelisted 假阳性（default-deny 下比假阴性更危险）。→ 前邻否定窗口：正面锚点前
+        // 2-3 字符被 没有/未/尚未/查无/未找到/未能 等否定语境紧邻时，不算正面。
+        let positive_zlm = {
+            let needle = "在白名单中";
+            let mut ok = false;
+            for (i, _) in t_norm.match_indices(needle) {
+                let before = &t_norm[..i];
+                // 前邻否定语境：取 needle 前【紧邻的尾部窗口】（至多 8 字符，原文顺序），检查
+                // 是否以否定语结尾/含否定语——「未找到该车牌在白名单中」「未能确认该车在白名单中」
+                // 的「未找到/未能」紧邻 needle。用 rev().take(8) 取尾部再 rev 还原，避免长前缀
+                // （如「您好根据您查询的皖A12345...」）把否定词挤出 take(8) 窗口（ocr-review
+                // bug·high(v24)）。default-deny 下宁可 Unknown 也不 Whitelisted 假阳性。
+                let prev: String = before
+                    .chars()
+                    .rev()
+                    .take(8)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                let negated = prev.contains("没有")
+                    || prev.contains("未曾")
+                    || prev.contains("并未")
+                    || prev.contains("并非")
+                    || prev.contains("尚未")
+                    || prev.contains("未找到")
+                    || prev.contains("未能")
+                    || prev.ends_with("未")
+                    || prev.ends_with("没");
+                if !negated {
+                    ok = true;
+                }
+            }
+            ok
+        };
+        let positive = positive_zlm
+            || {
+                match t_norm.find("命中") {
+                    None => false,
+                    Some(i) => {
+                        let rest = &t_norm[i + "命中".len()..];
+                        // 「命中N」后须跟计数词（条/数量/记录/个/数）才表计数
+                        let digit_count = rest
+                            .char_indices()
+                            .take_while(|(_, c)| c.is_ascii_digit())
+                            .last()
+                            .map_or(0, |(idx, _)| idx + 1);
+                        let after_digits = &rest[digit_count..];
+                        let digits_ok = digit_count > 0
+                            && (after_digits.starts_with("条")
+                                || after_digits.starts_with("数量")
+                                || after_digits.starts_with("记录")
+                                || after_digits.starts_with("个")
+                                || after_digits.starts_with("数"));
+                        // 「命中数量N」「命中记录N」「命中数N」：计数词在前、数字在后
+                        let count_word_first = ["数量", "记录", "数", "条"]
+                            .iter()
+                            .any(|w| {
+                                if !rest.starts_with(w) {
+                                    return false;
+                                }
+                                let after = &rest[w.len()..];
+                                let first = after.chars().next();
+                                // 数字为 0 时必须判负：数字为 0 时无论计数名词是数/条/数量/
+                                // 记录，均为「零命中」→ NotInList，不得经 count_word_first 算正面
+                                // 而 Whitelisted（ocr-review bug·low(v32)：与「命中数0」/「命中
+                                // 条数0」的 count_zero 口径对齐）。数字须 >0 才表非零命中。
+                                match first {
+                                    Some(c) if c.is_ascii_digit() && c != '0' => true,
+                                    Some('0') => false,
+                                    _ => false,
+                                }
+                            });
+                        digits_ok || count_word_first
+                    }
+                }
+            };
+        // 强否定：出现即明确不在（优先级最高，覆盖「不在白名单中」这类正负词共存）。
+        // ocr-review bug·medium(v16)：锚定白名单专属词——「不存在/未找到/尚未在/未命中」是通用
+        // 缺席词，「查询失败：数据库不存在」「未找到该模块」「服务尚未在集群中注册」等操作/基础设施
+        // 错误文本会误判 NotInList（对实际在白名单的车牌给出 ❌ 假阴性）。→ 只保留白名单语境词。
+        // ocr-review bug·high(v18)：positive 锚「在白名单中」会被否定变体也匹配——「皖A12345没有
+        // 在白名单中」「该车未曾在白名单中」含「在白名单中」但无紧邻的「没/未」→ 误判 Whitelisted。
+        // → 补齐所有否定变体（没有/未曾/并未/并非），default-deny 下凡否定变体即判 NotInList。
+        let strong_negative = t_norm.contains("不在白名单")
+            || t_norm.contains("未在白名单")
+            || t_norm.contains("没在白名单")
+            || t_norm.contains("没有在白名单")
+            || t_norm.contains("未曾在白名单")
+            || t_norm.contains("并未在白名单")
+            || t_norm.contains("并非在白名单")
+            || t_norm.contains("无此车牌")
+            || t_norm.contains("无该车牌")
+            || t_norm.contains("查无此车")
+            // ocr-review bug·medium(v33)：锚后否定——工具/LLM 回复的否定词可出现在「白名单中」
+            // 之后（「皖A12345在白名单中没有找到」「该车在白名单中未查到」），前窗口(positive_zlm
+            // 的 before)与 before-anchor 枚举表都抓不到 → 被误判 Whitelisted 假阳性（本代码注释
+            // 自认是最危险失败）。→ 补「白名单中」后跟否定词的变体。
+            || t_norm.contains("在白名单中没有")
+            || t_norm.contains("在白名单中未查")
+            || t_norm.contains("在白名单中未找到")
+            || t_norm.contains("在白名单中未搜索")
+            || t_norm.contains("在白名单中查无")
+            || t_norm.contains("在白名单中不存在")
+            || t_norm.contains("不在白名单中");
+        // 弱否定：零命中计数（锚定，避免「命中10条」被「0条」子串误伤）。
+        // ocr-review bug·medium(v13)：固定锚点表仍有遗漏——「命中记录0条」「命中数量0」因 0 与
+        // 「命中」间夹其他字不命中「命中0/共0条」。补「命中…0」形状。
+        // ocr-review bug·high(v14)：废弃「含0不含1」启发式——无「命中」时 fallback 全串会把
+        // 「共10条/错误码404/HTTP500」误判为零命中。改为：仅当「命中」存在时，解析其后首个
+        // 数字 token，若为 0 才算零命中；该 token 前可有任意量词名词（记录/数量/数/条数）。
+        let hit_zero = t_norm.contains("命中0条")
+            || t_norm.contains("命中为0")
+            || t_norm.contains("0命中")
+            || t_norm.contains("零命中")
+            || t_norm.contains("无命中");
+        // 命中…0形状：仅当「命中」存在，解析其后首个数字 token 的数值是否为 0。
+        // ocr-review bug·medium(v15)：① 排除回显车牌（「命中：皖A00000」中 A 后的数字是车牌非计数，
+        // 且无「条/数量/记录」等计数词后缀；② 「命中03条」数值=3≠0 应判正面，非全0启发式。
+        // ocr-review bug·low(v16)：区分维度从【数字后后缀】改为【数字前计数语境】——
+        // 此前 after_digits.is_empty() 允空后缀，把「命中皖A00000」车牌回显误判为零计数 → NotInList
+        // 假阴性；但只查后缀也无法排除「命中皖A00000记录」（车牌数字后正是「记录」）。根因是：
+        // 车牌回显的数字前是车牌字母（皖A），计数场景的数字前是计数名词（数量/记录/数/共）或紧跟
+        // 「命中」。→ 检查数字 token 前的字符是否为计数语境，而非其后的后缀。
+        let hit_gap_zero = {
+            match t_norm.find("命中") {
+                None => false,
+                Some(i) => {
+                    let rest = &t_norm[i + "命中".len()..];
+                    match rest.find(|c: char| c.is_ascii_digit()) {
+                        None => false,
+                        Some(d) => {
+                            let tail = &rest[d..];
+                            // 数字前的计数语境：数字紧跟「命中」（「命中0条」）之前为空，
+                            // 或前邻计数名词（数量/记录/数/共）。
+                            let before = &rest[..d];
+                            let has_count_ctx = before.is_empty()
+                                || before.ends_with("数量")
+                                || before.ends_with("记录")
+                                || before.ends_with("数")
+                                || before.ends_with("条")
+                                || before.ends_with("共");
+                            // 数值判断：首个数字 token 全部为 0（非 20/500/03 等）
+                            let digits: Vec<char> = tail
+                                .chars()
+                                .take_while(|c| c.is_ascii_digit())
+                                .collect();
+                            has_count_ctx
+                                && !digits.is_empty()
+                                && digits.iter().all(|&c| c == '0')
+                        }
+                    }
+                }
+            }
+        };
+        // 数值化零计数：匹配「共0/0条结果/命中数为0/命中数0/命中条数为0/命中条数0/无记录」等明确零值。
+        // 「0条」须为【独立零】——前一个字符非数字，避免「共10条/共20条」被「0条」子串误伤
+        // （「10条」含「0条」但 count=10）。用 match_indices 检查「0条」前字符。
+        let standalone_zero_tiao = t_norm.match_indices("0条").any(|(i, _)| {
+            // i 是「0」的字节偏移，前一个字节处不应是数字
+            i == 0 || !t_norm[..i].chars().last().map_or(false, |c| c.is_ascii_digit())
+        });
+        let count_zero = t_norm.contains("共0")
+            || t_norm.contains("0条结果")
+            || t_norm.contains("无记录")
+            || t_norm.contains("命中数为0")
+            || t_norm.contains("命中数0")
+            || t_norm.contains("命中条数为0")
+            || t_norm.contains("命中条数0")
+            || standalone_zero_tiao;
+        let zero_count_negative =
+            hit_zero || count_zero || hit_gap_zero;
+        // 判定：强否定 > 正面；弱否定（零计数）仅当无强否定时判负——即使正面词存在，
+        // 零计数命中也是明确「不在」（如「命中数量0」虽含「命中」但计数为0）。
+        // 区分：非零计数（命中1/命中10）→ member；零计数 → not_member（无需再依赖 !positive）。
+        let member = positive
+            && !strong_negative
+            && !zero_count_negative;
+        let not_member = strong_negative || zero_count_negative;
+        if member {
+            MembershipVerdict::Whitelisted
+        } else if not_member {
+            MembershipVerdict::NotInList
+        } else {
+            MembershipVerdict::Unknown
+        }
     }
 
     /// 识别「添加/登记白名单新车」意图，抽取 (车牌, 公司提示)。
@@ -2532,6 +3283,71 @@ impl AgentCore {
         None
     }
 
+    /// 统计消息中出现的车牌总数（宽松匹配，容忍空格）。用于多车牌提问判定：
+    /// 白名单成员查询预路由只处理单牌，多牌放弃预路由交常规流程（ocr-review bug·low）。
+    /// ocr-review bug·medium：与 extract_plate_spaced 对齐——CJK 后跳过空白再找大写字母，
+    /// 否则「皖 NB7691 和 鲁 H736A7」这种空格分隔车牌会数不到，多牌守卫失效。
+    fn count_plates(msg: &str) -> usize {
+        let chars: Vec<char> = msg.chars().collect();
+        // 车牌省份字集合（31 省级简称）。ocr-review bug·low(v19)+bug·medium(v20)：既排除「编号」
+        // 等非省份字（防编号 token 误计），又不误伤「查皖A」「问鲁B」等查询动词前的真实车牌
+        // （v19 用前邻 CJK 边界会因「查」非连接词而漏计「皖A」→ 多牌守卫失效）。
+        fn is_province_char(c: char) -> bool {
+            matches!(c, '京' | '津' | '沪' | '渝' | '冀' | '豫' | '云' | '辽' | '黑' | '湘'
+                | '皖' | '鲁' | '新' | '苏' | '浙' | '赣' | '鄂' | '桂' | '甘' | '晋'
+                | '蒙' | '陕' | '吉' | '闽' | '贵' | '粤' | '青' | '藏' | '川' | '宁' | '琼')
+        }
+        let mut count = 0usize;
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            // 省份字 + (可选空白) + 大写字母 + 字母数字体(≥3 位) = 一个车牌。
+            // ocr-review bug·low(v9)：与 extract_plate_spaced 阈值一致（body≥4 即字母+≥3 数字）。
+            if is_province_char(c) {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j].is_ascii_uppercase() {
+                    let mut digits = 0usize;
+                    let mut k = j + 1;
+                    while k < chars.len() && digits < 6 {
+                        let ch = chars[k];
+                        if ch.is_ascii_alphanumeric() {
+                            digits += 1;
+                        } else if !ch.is_whitespace() {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    // body = 首字母 + 后续数字，body≥4 即 digits≥3
+                    if digits >= 3 {
+                        // 排除组织/文号后缀：车牌 body 后紧跟「号」(京B12345号文)、
+                        // 「有限公司/科技」(北京B10086科技有限公司) 等组织/文号词 → 该
+                        // 「省份字+字母+数字」是公司名/文号而非车牌。ocr-review bug·low(v32)：
+                        // count_plates 只锚省份字+body≥4，此类被误计 → 单牌查询 count>1 被
+                        // 多牌守卫交 LLM 快道，确定性丢失。与 extract_plate 口径对齐。
+                        let tail: String = chars[k.min(chars.len())..]
+                            .iter()
+                            .take(8)
+                            .collect();
+                        let suffix_blocked = tail.starts_with("号")
+                            || tail.starts_with("文号")
+                            || tail.starts_with("有限公司")
+                            || tail.starts_with("科技");
+                        if !suffix_blocked {
+                            count += 1;
+                            i = k;
+                            continue;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        count
+    }
+
     /// 抽取添加新车的公司提示：优先引号，其次「公司是X/属于X」，再次「X的新车/X新车」。
     fn extract_company_for_add(msg: &str) -> Option<String> {
         for (o, cl) in [('「', '」'), ('“', '”'), ('‘', '’')] {
@@ -2643,6 +3459,91 @@ impl AgentCore {
     /// 确定性预路由表（重构阶段 2 抽取，行为与内联一致）：白名单 5 类受控写 +
     /// 异常/取样同步，命中即构造审批闸。返回 Some(已处理回复)。
     async fn try_preroute(&self, message: &str, session_id: &str) -> Option<String> {
+        // ── 白名单单牌查询 → manage_whitelist query（精确匹配）──
+        // 2026-08-08 修复：『XX 在不在白名单』会命中 data_query 快速通道，LLM 凭记忆
+        // 直答（无工具调用，曾编造"白名单 115 条"）。这里确定性识别并直接精确查询，
+        // 绕开快速通道与 LLM 幻觉。查不到 = 不在白名单（manage_whitelist query 按车牌唯一匹配）。
+        // ocr-review bug·medium(v16)：extract_whitelist_membership_query 含 write_verbs 拦截，
+        // 「确认，皖A12345更新后在不在白名单里」遇叙述性写动词「更新」返回 None → 落入 LLM 快道
+        // 违背确定性查询设计。→ 补 fallback：确认前缀 + 成员句式 + 车牌（has_membership_query_syntax）
+        // 也走确定性查询（确认前缀消息的写动词是时间背景，非写指令）。
+        let plate_opt = Self::extract_whitelist_membership_query(message).or_else(|| {
+            let is_confirm_prefix = CONFIRM_PREFIXES
+                .iter()
+                .any(|p| message.trim_start().starts_with(p));
+            if is_confirm_prefix {
+                // ocr-review bug·medium(v17)：fallback 不能裸用 loose（无 write_verbs 拦截）——
+                // 「确认，把皖A12345加进白名单，在不在白名单里」含命令式写动词「加进」，loose 返回
+                // Some → 预路由只答成员查询，静默丢弃加白名单写请求。→ 二次拦截：命令式写动词
+                // （真实写意图）须返回 None，让后面的 add/update/remove 预路由处理写；仅叙述性写动词
+                // （更新后/修改过/变更了，时间背景非写指令）才放行 loose 走确定性查询。
+                // 命令式动词集 = write_verbs 中除叙述性动词（更新/修改/变更/改为/改成）外的全部；
+                // 叙述性动词须带完成态后缀（后/过/了/之前/已）才视为时间背景，否则仍是写意图。
+                if Self::has_command_write_verb(message) {
+                    None
+                } else {
+                    Self::extract_membership_query_loose(message)
+                }
+            } else {
+                None
+            }
+        });
+        if let Some(plate) = plate_opt {
+            // ocr-review bug·low：多车牌提问只取第一个会给出不完整结论 → 放弃本预路由交常规流程
+            if Self::count_plates(message) > 1 {
+                return None;
+            }
+            // 确定性预路由直接走 call_tool_routed（不经 check_tool），天然免审批；
+            // 不依赖任何 args 信任标记（避免调用方伪造标记绕过审批，ocr security·medium）。
+            let args = serde_json::json!({
+                "action": "query",
+                "plate": plate,
+            });
+            let mut ns_vec = self.current_ns_paths().unwrap_or_default();
+            // ns 需含固废业务命名空间：current_ns_paths 只有 agent 自身 ns，
+            // 用 enrich_allowed_ns 扩展出部门工具包 ns（与 llm_loop 组合路由一致）
+            crate::dept_ops::enrich_allowed_ns(&mut ns_vec);
+            let result = self
+                .call_tool_routed(
+                    "manage_whitelist",
+                    &self.persona_for_session(session_id),
+                    &args,
+                    &ns_vec,
+                    "preroute-whitelist-query",
+                )
+                .await;
+            let exec_ok = result.is_ok();
+            let reply = match result {
+                Ok(t) => {
+                    // 三态分类（default-deny + 强否定优先 + 零计数锚定，抽成纯函数便于单测）
+                    match Self::classify_membership(&t) {
+                        MembershipVerdict::Whitelisted => {
+                            format!("✅ {} 在白名单中。\n\n{}", plate, t.chars().take(300).collect::<String>())
+                        }
+                        MembershipVerdict::NotInList => {
+                            format!("❌ {} 不在白名单中。\n\n{}", plate, t.chars().take(200).collect::<String>())
+                        }
+                        MembershipVerdict::Unknown => {
+                            format!("⚠️ 无法确认 {} 是否在白名单：查询返回了无法识别的格式。\n\n{}", plate, t.chars().take(200).collect::<String>())
+                        }
+                    }
+                }
+                Err(e) => format!("⚠️ 查询失败：{}", e),
+            };
+            self.save_to_history(session_id, message, &reply).await;
+            // ocr-review security·low：预路由绕过 check_tool 无审计，这里补一条工具调用审计，
+            // 保证只读查询也留痕（成功才标记 executed）。
+            self.audit_logger
+                .log_tool_call(
+                    &self.config.identity.agent_id,
+                    "manage_whitelist",
+                    &args,
+                    exec_ok,
+                )
+                .await;
+            return Some(reply);
+        }
+
         // ── 白名单公司名变更 → sync_whitelist_plates update_company ──
         // 绕过 LLM 规划器对 memory 工具的顽固误路由（详见 extract_whitelist_update）。
         if let Some((plate, company)) = Self::extract_whitelist_update(message) {
@@ -9804,6 +10705,298 @@ mod whitelist_preroute_tests {
         let (executed, note) = AgentCore::classify_tool_execution(&transport);
         assert!(!executed);
         assert!(note.unwrap().contains("timeout"));
+    }
+}
+
+#[cfg(test)]
+mod whitelist_v11_tests {
+    use super::*;
+
+    // ocr-review bug·high(v10)：write_verbs 补全 add/update/waste_type 动词后，
+    // 「写意图+成员句式」混合消息必须被拦截，不得被成员查询预路由静默吞掉写操作。
+    #[test]
+    fn test_membership_query_blocks_write_verbs() {
+        // add 动词「收录/补录」
+        assert_eq!(
+            AgentCore::extract_whitelist_membership_query("把皖A12345补录进白名单，它是不是在白名单？"),
+            None,
+            "含「补录」写意图应拦截，不得走成员查询"
+        );
+        assert_eq!(
+            AgentCore::extract_whitelist_membership_query("把皖A12345收录进白名单，它在白名单吗"),
+            None,
+            "含「收录」写意图应拦截"
+        );
+        // update 动词「统一为/换为/更新为/变更为/改名为」
+        assert_eq!(
+            AgentCore::extract_whitelist_membership_query("把皖A12345统一为XX环保，它在白名单里吗"),
+            None,
+            "含「统一为」写意图应拦截"
+        );
+        assert_eq!(
+            AgentCore::extract_whitelist_membership_query("皖A12345改名为XX，它在白名单里吗"),
+            None,
+            "含「改名为」写意图应拦截"
+        );
+        // waste_type 动词「设为/换成/调整为」
+        assert_eq!(
+            AgentCore::extract_whitelist_membership_query("皖A12345固废种类设为危废，它在白名单吗"),
+            None,
+            "含「设为」写意图应拦截"
+        );
+        // remove 动词（v9 已补）
+        assert_eq!(
+            AgentCore::extract_whitelist_membership_query("把皖A12345从白名单删掉，它在白名单吗"),
+            None,
+            "含「删掉」写意图应拦截"
+        );
+    }
+
+    // 纯成员查询仍应正常命中（不误拦）
+    #[test]
+    fn test_membership_query_still_works() {
+        let r = AgentCore::extract_whitelist_membership_query("皖A12345在不在白名单里");
+        assert!(r.is_some(), "纯成员查询应提取车牌: {r:?}");
+        assert_eq!(r.unwrap(), "皖A12345");
+    }
+
+    // ocr-review bug·high(v23)：「公司名/固废种类」作【时间背景宾语】时（后跟完成态后缀）
+    // 是成员查询，不是 update 写意图——此前 m.contains("公司名") 无条件拦截，使「皖A12345公司名
+    // 改成新能源后还在不在白名单里」落入 extract_whitelist_update 把「新能源后还在不在白名单里」
+    // 当公司名提交 update_company 写审批，用户确认后污染白名单。→ 端到端验证：此类消息应判定
+    // 为成员查询返回车牌。
+    #[test]
+    fn test_membership_query_company_narrative_noun() {
+        // 时间背景宾语（后跟完成态后缀）→ 查询，提取车牌
+        let r = AgentCore::extract_whitelist_membership_query(
+            "皖A12345公司名改成新能源后还在不在白名单里",
+        );
+        assert!(r.is_some(), "「公司名改成...后」是时间背景查询，应提取车牌: {r:?}");
+        assert_eq!(r.unwrap(), "皖A12345");
+        // 不带完成态后缀的「公司名」→ 仍是 update 写意图，拦截
+        let r2 = AgentCore::extract_whitelist_membership_query(
+            "皖A12345公司名改成新能源，它在白名单里吗",
+        );
+        assert_eq!(r2, None, "「公司名改成...」无完成态后缀是写意图，应拦截");
+        // ocr-review bug·medium(v25)：裸「前」不得作为完成态后缀——「改为前卫环保」的「前卫环保」
+        // 含「前」但那是公司名，应判 update 写意图而非叙述性查询（否则 update 写被静默跳过）。
+        let r3 = AgentCore::extract_whitelist_membership_query(
+            "皖A12345公司名改为前卫环保，它在白名单里吗",
+        );
+        assert_eq!(r3, None, "「改为前卫环保」含裸「前」但非时间背景，应判写意图拦截");
+        // 「改名前」紧邻组合（变/改/更/删/移+前）仍是叙述性 → 查询
+        let r4 = AgentCore::extract_whitelist_membership_query(
+            "皖A12345公司改名前的状态，它在白名单里吗",
+        );
+        assert!(r4.is_some(), "「改名前」是时间背景，应提取车牌: {r4:?}");
+        // ocr-review bug·medium(v29)：「删除前」也是时间背景——「皖A12345删除前在不在白名单」
+        // 是查询（问删除之前的状态），不是删除写意图。has_command_write_verb 须识别「删除前」
+        // 为叙述性，否则落入 remove 写 extractor 生成虚假删除审批流。
+        let r5 = AgentCore::extract_whitelist_membership_query(
+            "皖A12345删除前在不在白名单里",
+        );
+        assert!(r5.is_some(), "「删除前」是时间背景查询，应提取车牌: {r5:?}");
+        assert_eq!(r5.unwrap(), "皖A12345");
+        // ocr-review bug·medium(v29)：长宾语（>12字）时完成态后缀「后」落在固定探针窗口外，
+        // 原实现误判写意图 → 落入 update extractor 生成虚假审批流。→ 探测到句末整段。
+        let r6 = AgentCore::extract_whitelist_membership_query(
+            "皖A12345公司名改成安徽省环保新能源科技有限公司后还在不在白名单里",
+        );
+        assert!(r6.is_some(), "长宾语 + 「后」是时间背景查询，应提取车牌: {r6:?}");
+        assert_eq!(r6.unwrap(), "皖A12345");
+        // ocr-review bug·high(v31)：赋值动词「改为」后跟名词补语（前卫环保）且无「公司名」名词时，
+        // 不得因 after 以「前」开头误判叙述性——「皖A12345改为前卫环保」是 update 写意图（改公司名
+        // 为前卫环保），应拦截。此前 after.trim_start().starts_with('前') 对赋值动词也豁免 →
+        // 写意图被静默丢弃（v25 想防的场景）。→ 形态①仅限非赋值动词。
+        let r7 = AgentCore::extract_whitelist_membership_query(
+            "皖A12345改为前卫环保，它在白名单里吗",
+        );
+        assert_eq!(r7, None, "赋值动词「改为」+名词补语是写意图，应拦截: {r7:?}");
+    }
+
+    // ocr-review bug·medium(v17)：confirm-prefix fallback 的命令式写动词二次拦截——
+    // 命令式动词（加进/删掉/设为）须判写意图；叙述性动词（更新后/修改过）判查询。
+    #[test]
+    fn test_has_command_write_verb() {
+        // 命令式 → true（真实写意图，不得被成员查询吞掉）
+        assert!(AgentCore::has_command_write_verb(
+            "确认，把皖A12345加进白名单，在不在白名单里"
+        ), "含「加进」命令式动词应判写意图");
+        assert!(AgentCore::has_command_write_verb(
+            "确认，把皖A12345从白名单里删掉，它在白名单吗"
+        ), "含「删掉」命令式动词应判写意图");
+        assert!(AgentCore::has_command_write_verb(
+            "把皖A12345收录进白名单，它在白名单吗"
+        ), "含「收录」命令式动词应判写意图");
+        // 叙述性动词（时间背景）→ false（是查询，非写指令）
+        assert!(!AgentCore::has_command_write_verb(
+            "确认，皖A12345更新后在不在白名单里"
+        ), "「更新后」是时间背景，不算命令式写");
+        assert!(!AgentCore::has_command_write_verb(
+            "皖A12345修改过公司名，它在白名单里吗"
+        ), "「修改过」是时间背景，不算命令式写");
+        // ocr-review bug·medium(v19)：移除动词带完成态后缀 → 叙述性（「删除后还在不在」是查询）
+        assert!(!AgentCore::has_command_write_verb(
+            "确认，皖A12345删除后还在不在白名单里"
+        ), "「删除后」是时间背景，不算命令式写");
+        assert!(!AgentCore::has_command_write_verb(
+            "皖A12345被移出过白名单，它在白名单里吗"
+        ), "「移出过」是时间背景，不算命令式写");
+        // 裸移除命令 → 命令式（真实写意图）
+        assert!(AgentCore::has_command_write_verb(
+            "把皖A12345从白名单删掉"
+        ), "裸「删掉」是命令式写意图");
+        // 无任何写动词 → false
+        assert!(!AgentCore::has_command_write_verb(
+            "皖A12345在不在白名单里"
+        ), "纯查询无写动词，不算命令式写");
+        // ocr-review bug·medium(v22)：完成态后缀可隔宾语（「改成新能源后」）——此前只接受紧邻
+        // 后缀，隔宾语被判裸写意图 → extract_whitelist_membership_query 返回 None → 确定性成员
+        // 查询被跳过落入 LLM 快道；「公司名改成XX后还在不在」还会误触 update 写审批流。
+        assert!(!AgentCore::has_command_write_verb(
+            "皖A12345改成新能源后还在不在白名单里"
+        ), "「改成...后」隔宾语+完成态后缀是时间背景，不算命令式写");
+        assert!(!AgentCore::has_command_write_verb(
+            "皖A12345 更新 后 还在不在白名单"
+        ), "「更新...后」隔空格+完成态后缀是时间背景，不算命令式写");
+        assert!(!AgentCore::has_command_write_verb(
+            "皖A12345公司名改成新能源后还在不在白名单里"
+        ), "「公司名改成...后」是时间背景查询，不得误触发 update 写审批流");
+        // ocr-review bug·high(v33)：探针界到下一个同动词——「删除皖A12345，它删除前在白名单吗」
+        // 前一处「删除」是裸命令（写意图），后一处「删除前」是叙述（查询）。此前探针扫到句末，
+        // 前文 probe 含后文「删除前」→ 两处都判叙述 → 删除命令被成员查询静默吞掉。→ 前文须判
+        // 命令式（true）。
+        assert!(AgentCore::has_command_write_verb(
+            "删除皖A12345，它删除前在白名单吗"
+        ), "前一处[删除]是裸命令，不得被后文[删除前]叙述污染");
+        // 纯叙述两处都不构成命令式 → false
+        assert!(!AgentCore::has_command_write_verb(
+            "它删除前在白名单，删除后也在白名单"
+        ), "两处[删除前/删除后]均叙述，非命令式写");
+    }
+
+    // ocr-review test·low(v11)：测试名从 test_count_plates_ignores_code_like_text 改为
+    // test_count_plates_multi_plate——原名利误导（count_plates 实际会把「编号B10086」这类
+    // 代码文本数成车牌，并非 ignore），且断言只验证多牌计数。改名如实反映行为。
+    #[test]
+    fn test_count_plates_multi_plate() {
+        // ocr-review bug·medium(v10)：count_plates 宽松匹配会把「编号B10086」数成车牌，
+        // 单牌查询夹杂编号文本时 count>1 会误弃预路由。此为已知限制（退回 LLM 通道，非安全风险）。
+        // 但确认纯单牌仍 count==1。
+        // ocr-review bug·low(v19)+bug·medium(v20)：省份字集合锚定——既排除「编号B10086」（编/号
+        // 非省份字），又不误伤「查皖A」「问鲁B」等查询动词前的真实车牌，多牌守卫仍生效。
+        assert_eq!(AgentCore::count_plates("皖A12345在白名单吗"), 1);
+        assert_eq!(AgentCore::count_plates("皖A12345 和 鲁H736A7 在白名单吗"), 2);
+        assert_eq!(AgentCore::count_plates("编号B10086 在不在白名单"), 0, "編/号非省份字，非车牌");
+        assert_eq!(AgentCore::count_plates("皖A12345 编号B10086 在白名单吗"), 1, "仅皖A12345 计为车牌");
+        assert_eq!(AgentCore::count_plates("帮我查皖A12345和鲁H736A7在不在白名单"), 2, "查询动词后的省份牌仍计");
+        // ocr-review bug·low(v32)：count_plates 与 extract_plate 口径对齐——排除公司/文号后缀。
+        // 「北京B10086科技有限公司」「京B12345号文」中的省份字+字母+数字是公司名/文号，非车牌；
+        // 单牌查询不再被多牌守卫 count>1 误交 LLM。
+        assert_eq!(AgentCore::count_plates("北京B10086科技有限公司在不在白名单"), 0, "公司名非车牌");
+        assert_eq!(AgentCore::count_plates("京B12345号文已归档"), 0, "文号非车牌");
+        assert_eq!(AgentCore::count_plates("北京B10086科技有限公司 皖A12345 在白名单吗"), 1, "仅真实车牌计为1");
+    }
+
+    // ocr-review bug·medium(v12)：三态分类器抽成纯函数后的单测——
+    // 明确正面→Whitelisted；明确否定→NotInList；无法识别串→Unknown（宁缺毋滥，防假阴性）。
+    #[test]
+    fn test_classify_membership_tri_state() {
+        use MembershipVerdict::*;
+        // 明确正面
+        assert_eq!(AgentCore::classify_membership("皖A12345在白名单中，命中1条"), Whitelisted);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中10条记录"), Whitelisted);
+        // 明确否定（强否定优先，覆盖「不在白名单中」正负词共存）
+        assert_eq!(AgentCore::classify_membership("皖A12345不在白名单中"), NotInList);
+        assert_eq!(AgentCore::classify_membership("未命中，查无此车牌"), NotInList);
+        assert_eq!(AgentCore::classify_membership("查询成功，共0条结果"), NotInList);
+        // 零计数锚定：不用裸「0条」（是「10条」子串），避免「命中10条」被误判为不在
+        assert_eq!(AgentCore::classify_membership("查询成功，命中10条"), Whitelisted);
+        // ocr-review bug·medium(v13)：补「命中…0」形状——0 与命中间夹其他字（命中记录0/命中数量0）
+        // 不再靠固定锚点表，命中后跟零计数 token 即判不在
+        assert_eq!(AgentCore::classify_membership("查询成功，命中记录0条"), NotInList);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中数量0"), NotInList);
+        // 非零命中（命中1/命中10/命中20）不受「命中…0」影响，仍 Whitelisted
+        assert_eq!(AgentCore::classify_membership("查询成功，命中1条"), Whitelisted);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中20条"), Whitelisted);
+        // ocr-review bug·high(v14)：零计数须数值解析，非「含0不含1」启发式——
+        // 「共10条」是「0条」子串但 count=10，不得判 NotInList（无明确正面词 → Unknown，宁缺毋滥）；
+        // 错误码404/HTTP500 无正负标记应 Unknown
+        assert_eq!(AgentCore::classify_membership("查询成功，共10条"), Unknown);
+        assert_eq!(AgentCore::classify_membership("查询失败，错误码404"), Unknown);
+        assert_eq!(AgentCore::classify_membership("服务器错误 HTTP500"), Unknown);
+        // 无法识别串 → Unknown（不得判 ❌ 假阴性）
+        assert_eq!(AgentCore::classify_membership("查询超时，请稍后重试"), Unknown);
+        assert_eq!(AgentCore::classify_membership("参数错误：缺少plate字段"), Unknown);
+        // ocr-review bug·medium(v15)：positive 锚定——「命中服务异常」是错误文本非命中计数，
+        // 不得误判 Whitelisted；「命中：皖A00000」回显车牌无计数词后缀，不得误判 NotInList；
+        // 「命中03条」数值=3≠0，应正面
+        assert_eq!(AgentCore::classify_membership("命中服务异常，请重试"), Unknown);
+        assert_eq!(AgentCore::classify_membership("命中：皖A00000，请核对"), Unknown);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中03条"), Whitelisted);
+        // ocr-review bug·low(v16)：hit_gap_zero 改为【数字前计数语境】判定——「命中皖A00000」
+        // 车牌回显（数字前是车牌字母 A，非计数语境）不得判 NotInList；「命中数量0」数字前是
+        // 「数量」→ 判 NotInList。
+        assert_eq!(AgentCore::classify_membership("命中皖A00000"), Unknown);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中数量0"), NotInList);
+        // ocr-review bug·high(v18)：否定变体——「没有/未曾/并未/并非在白名单」含「在白名单中」
+        // 但须判 NotInList（default-deny，不得 Whitelisted 假阳性）
+        assert_eq!(AgentCore::classify_membership("皖A12345没有在白名单中"), NotInList);
+        assert_eq!(AgentCore::classify_membership("该车未曾在白名单中"), NotInList);
+        assert_eq!(AgentCore::classify_membership("该车并未在白名单中"), NotInList);
+        assert_eq!(AgentCore::classify_membership("此车并非在白名单中"), NotInList);
+        // ocr-review bug·medium(v18)：positive 锚定不得含宽泛「个/数」——「命中数据异常」含
+        // 「数据」但有「数」子串，不得 Whitelisted
+        assert_eq!(AgentCore::classify_membership("命中数据异常，请重试"), Unknown);
+        assert_eq!(AgentCore::classify_membership("命中这个操作无法执行"), Unknown);
+        // ocr-review bug·medium(v20)：positive 收紧——裸「命中404错误」「命中记录异常」无计数
+        // 数字不判 Whitelisted（default-deny 下 Whitelisted 假阳性比 NotInList 假阴性更危险）
+        assert_eq!(AgentCore::classify_membership("命中404错误（服务调用失败）"), Unknown);
+        assert_eq!(AgentCore::classify_membership("命中记录异常，请检查"), Unknown);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中5条记录"), Whitelisted);
+        // ocr-review bug·medium(v23)：正面锚点「在白名单中」前邻否定语境——「未找到该车牌在
+        // 白名单中」「未能确认该车在白名单中」不在 strong_negative 枚举表内，不能被无条件判
+        // Whitelisted（default-deny 下 Whitelisted 假阳性比 NotInList 假阴性更危险）→ Unknown/NotInList
+        assert_eq!(AgentCore::classify_membership("未找到该车牌在白名单中"), Unknown);
+        assert_eq!(AgentCore::classify_membership("未能确认该车在白名单中"), Unknown);
+        assert_eq!(AgentCore::classify_membership("皖A12345确实在白名单中"), Whitelisted);
+        // ocr-review bug·high(v24)：否定窗口须取【紧邻 needle 的尾部窗口】——长前缀（如
+        // 「您好根据您查询的皖A12345未找到该车牌在白名单中」未找到在 needle 前 18 字处）时，
+        // 取前 8 字符会把「未找到」挤出窗口 → 误判 Whitelisted。→ 尾部窗口必须命中。
+        assert_eq!(
+            AgentCore::classify_membership("您好根据您查询的皖A12345未找到该车牌在白名单中"),
+            Unknown,
+            "长前缀+未找到+在白名单中 应判 Unknown 而非 Whitelisted 假阳性"
+        );
+        // ocr-review bug·low(v32)：零计数口径统一——「命中条0」与「命中数0」「命中条数0」同属
+        // 零命中，数字为 0 无论计数名词是数/条/数量/记录 均判 NotInList，不得经 count_word_first
+        // 误判 Whitelisted。
+        assert_eq!(AgentCore::classify_membership("查询成功，命中条0"), NotInList);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中记录0"), NotInList);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中数量0"), NotInList);
+        // 非零计数不受影响
+        assert_eq!(AgentCore::classify_membership("查询成功，命中条5"), Whitelisted);
+        // ocr-review bug·medium(v33)：锚后否定——「皖A12345在白名单中没有找到」的否定词在
+        // 「白名单中」之后，前窗口(before)与 before-anchor 枚举表都抓不到 → 须判 NotInList，
+        // 不得 Whitelisted 假阳性（default-deny 下最危险）。
+        assert_eq!(AgentCore::classify_membership("皖A12345在白名单中没有找到"), NotInList);
+        assert_eq!(AgentCore::classify_membership("该车在白名单中未查到"), NotInList);
+        assert_eq!(AgentCore::classify_membership("该车在白名单中未找到"), NotInList);
+    }
+
+    // ocr-review bug·medium(v33)：carries_write_body 判定「确认词之外是否还携带真实写请求」。
+    // 纯批准提及「白名单」但无写动词 → false（不跳过 0a，pending 正常执行）；含写动词 → true。
+    #[test]
+    fn test_carries_write_body() {
+        // 纯批准提及白名单：is_confirm=true 但无写动词 → 非携带新写，pending 应正常执行
+        assert!(!AgentCore::carries_write_body("确认，白名单没问题"));
+        assert!(!AgentCore::carries_write_body("好的，同意"));
+        // 携带新写请求：写动词触发
+        assert!(AgentCore::carries_write_body("确认，可以把皖A12345加进白名单"));
+        assert!(AgentCore::carries_write_body("确认，帮我把皖A12345删除"));
+        assert!(AgentCore::carries_write_body("同意，把皖A12345改为佳士能"));
+        // 叙述性查询（完成态后缀豁免）→ 非写请求
+        assert!(!AgentCore::carries_write_body("皖A12345删除后还在不在白名单"));
     }
 }
 

@@ -904,6 +904,13 @@ impl ComplianceBoundary {
             let tool_level = with_classifier(&self.classifier, "read".to_string(), |c| {
                 c.classify(tool_name).to_string()
             });
+            // 本 check_tool 分支逻辑为 HARD_DANGEROUS 工具（manage_whitelist / sync_whitelist_plates）
+            // 的 dangerous-floor 早退——一律返回黄线，与参数内容无关。危险工具在 LLM 工具循环的
+            // 审批门禁由 agent.rs 对每次工具调用都走本 check_tool 保证；正常用户成员查询由
+            // agent.rs 确定性预路由（try_preroute 内 extract_whitelist_membership_query →
+            // call_tool_routed）天然免审批，不依赖本分支的豁免。此处不留 query 豁免，避免外部
+            // MCP handler 的 query 存在未察觉副作用或 query_oplog 泄漏全量操作日志时，构成对
+            // 危险地板的静默绕过。正常查询体验不受影响（预路由已覆盖）。
             if tool_level == "dangerous" || self.is_dangerous_floor(tool_name) {
                 return ToolCheck::yellow(&format!("{} 需要审批，请等待审批人确认", tool_name));
             }
@@ -2114,5 +2121,100 @@ mod tests {
             None,
         );
         assert!(r2.allow, "query_plate 应放行: {:?}", r2);
+    }
+
+    #[test]
+    fn test_whitelist_dangerous_tools_require_approval() {
+        // 断言 check_tool 的 dangerous-floor 行为：HARD_DANGEROUS 工具（manage_whitelist /
+        // sync_whitelist_plates）无论 query/写动作一概走审批闸，与参数内容无关。
+        // 它不驱动 agent.rs 的 LLM tool-loop/预路由路径（豁免移除的实际生效点）；该路径由
+        // agent.rs 的 try_preroute/成员查询测试独立覆盖。此处仅验证边界层保证。
+        // （精简：避免与生产注释重复、硬编码 agent.rs 内部符号导致漂移。）
+        let mut boundary = ComplianceBoundary::new(None);
+        boundary
+            .perm_chain
+            .lock()
+            .unwrap()
+            .register("test-agent", None, PermissionLevel::Admin);
+        // 两工具显式注册为 "read"，使断言【只依赖 HARD_DANGEROUS 地板】产生拦截——
+        // 不依赖默认分类表把 manage_whitelist 标为 write（该值是检查顺序 read→write→dangerous
+        // 的产物，未来分类表调整不使本测试脆失败）。地板被移除则 check_tool 对 read 放行，
+        // 断言失败（已实证移出 HARD_DANGEROUS → FAILED，非空通过）。
+        boundary.register_tool("manage_whitelist", "read");
+        boundary.register_tool("sync_whitelist_plates", "read");
+
+        // ①-⑯ 十六个 near-identical check_tool+Yellow 块折叠为统一表驱动（含纯查询/写动作/
+        // 嵌套/缺参/空值/越界代表形状），单一保证「HARD_DANGEROUS 工具一律审批（与参数内容
+        // 无关）」，消除重复样板。
+        let dangerous_shapes: Vec<(&str, serde_json::Value, &str)> = vec![
+            // ① manage_whitelist query（纯查询，无写参数）
+            ("manage_whitelist", serde_json::json!({"action": "query", "plate": "苏B12345"}), "纯 query"),
+            // ② query 携带写参数（confirmed）
+            ("manage_whitelist", serde_json::json!({"action": "query", "plate": "苏B12345", "confirmed": true}), "query 带 confirmed"),
+            // ③ add 写动作
+            ("manage_whitelist", serde_json::json!({"action": "add", "plate": "苏B12345", "waste_type": "装修垃圾"}), "add 写动作"),
+            // ④ query_oplog 纯查询（带 limit 分页）
+            ("sync_whitelist_plates", serde_json::json!({"action": "query_oplog", "limit": 50}), "query_oplog"),
+            // ⑤ update_company 写动作
+            ("sync_whitelist_plates", serde_json::json!({"action": "update_company", "plate": "苏B12345", "company_name": "佳士能"}), "update_company"),
+            // ⑥ query 携带写参数（effective_date）
+            ("manage_whitelist", serde_json::json!({"action": "query", "plate": "苏B12345", "effective_date": "2026-08-01"}), "query 带 effective_date"),
+            // ⑦ query_oplog 携带 plates 数组
+            ("sync_whitelist_plates", serde_json::json!({"action": "query_oplog", "plates": ["苏B12345", "皖NB7691"]}), "query_oplog 带 plates"),
+            // ⑧ 未知 action（fail-closed）
+            ("manage_whitelist", serde_json::json!({"action": "export", "plate": "苏B12345"}), "未知 action"),
+            // ⑨ query 携带嵌套对象写参数（filters.company_name）
+            ("manage_whitelist", serde_json::json!({"action": "query", "plate": "苏B12345", "filters": {"company_name": "佳士能"}}), "嵌套写参数"),
+            // ⑩ query_oplog 携带 plate
+            ("sync_whitelist_plates", serde_json::json!({"action": "query_oplog", "plate": "苏B12345"}), "query_oplog 携带 plate"),
+            // ⑪ query 携带嵌套写意图于允许键值（plate 是对象）
+            ("manage_whitelist", serde_json::json!({"action": "query", "plate": {"confirmed": true}}), "plate 为对象"),
+            // ⑫ query 携带 limit 为负
+            ("manage_whitelist", serde_json::json!({"action": "query", "plate": "苏B12345", "limit": -1}), "limit 为负"),
+            // ⑬ 缺必备参数（query 无 plate）
+            ("manage_whitelist", serde_json::json!({"action": "query"}), "缺 plate"),
+            // ⑭ query_oplog 缺 limit
+            ("sync_whitelist_plates", serde_json::json!({"action": "query_oplog"}), "缺 limit"),
+            // ⑮ query 带空车牌
+            ("manage_whitelist", serde_json::json!({"action": "query", "plate": "  "}), "空车牌"),
+            // ⑯ limit 超上限（>1000）
+            ("manage_whitelist", serde_json::json!({"action": "query", "plate": "苏B12345", "limit": 1001}), "limit 超上限"),
+        ];
+        for (tool, args, label) in dangerous_shapes {
+            let r = boundary.check_tool(
+                tool,
+                &args,
+                "test-agent",
+                "admin",
+                &PermissionLevel::Admin,
+                None,
+            );
+            assert!(
+                !r.allow,
+                "{label} 应被拦截（dangerous 一律审批，allow 必须为 false）: {:?}",
+                r
+            );
+            // 该不变式是「HARD_DANGEROUS 工具无论参数一概拦截（需审批）」，由 !r.allow 表达。
+            // 具体级别钉死 Yellow 会脆——若未来加固为 Red（硬拦截）或更高优先级守卫
+            // （沙箱/导出/供应链）扩展到这些工具，安全姿态等同或更强，但 Yellow 断言会失败。
+            // （断言不变式而非具体色。）
+            assert!(
+                r.level.is_some(),
+                "{label} 拦截须带级别（决定后续审批流程）: {:?}",
+                r
+            );
+            // 仅 !r.allow + level.is_some() 无法证明【审批门禁】触发——前置守卫（沙箱/供应链/导出/
+            // 安全模式）若未来拦截这些形状也会满足断言，测试会静默不再测到 HARD_DANGEROUS 审批闸
+            // 本体。→ 钉紧 reason 须含 approval gate 专属片段「需要审批」（boundary.rs:915 的 reason
+            // 恒含「需要审批，请等待审批人确认」）。注意不能用更宽的「审批」——数据外发守卫
+            // （「需要管理员审批」）、跨 ns 守卫（「跨 N namespace 聚合数据需要审批」）、否决同步
+            // 守卫（「须重新提交审批」）都含「审批」但非本闸，「审批」会让断言在这些守卫将来覆盖
+            // 到这些工具时误测主题漂移。用「需要审批」精确指纹（不含于「需要管理员审批」）。
+            assert!(
+                r.reason.contains("需要审批"),
+                "{label} 拦截原因须表明是【HARD_DANGEROUS 审批闸】而非其他守卫，实际: {:?}",
+                r
+            );
+        }
     }
 }
