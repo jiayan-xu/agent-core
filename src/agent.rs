@@ -1416,7 +1416,11 @@ impl AgentCore {
             || trimmed.starts_with("批准")
             || trimmed.starts_with("执行吧");
         let confirm_but_query = confirm_but_query
-            && Self::has_membership_query_syntax(trimmed);
+            && (Self::has_membership_query_syntax(trimmed)
+                // ocr-review bug·high(v20)：is_confirm 长消息规则使「同意，帮我查一下皖A12345」
+                // （无成员句式但有车牌+查询意图）自确认 → 0a 误执行无关 pending 写。→ 确认前缀+
+                // 车牌+查询意图词也算查询。保留 v13 保护：「同意，怎么执行都行」无车牌仍不算查询。
+                || (Self::extract_plate(trimmed).is_some() && is_query_intent(trimmed)));
         if is_confirm(trimmed) && !confirm_but_query {
             if let Some(mut action) = self.session_manager.take_pending_action(session_id).await {
                 // 任务 652 前置修复：捕获 approval_id，供执行后消费审批项（防残留被全局扫描重执行）
@@ -2061,17 +2065,19 @@ impl AgentCore {
         let imperative = [
             "添加", "新增", "登记", "录入",
             "加入", "加进", "加一下", "加上", "收录", "补录",
-            "统一为", "统一成", "换为", "更新为", "变更为", "改名为", "设成", "调整为",
-            "设为", "换成",
         ];
         if imperative.iter().any(|v| m.contains(*v)) {
             return true;
         }
-        // 叙述性动词（更新/修改/变更/改为/改成 + 移除动词）：带完成态后缀视为时间背景
-        // （「更新后在不在白名单里」「修改过公司名」「删除后还在不在」是查询）；裸命令仍算写意图。
+        // 叙述性动词（更新/修改/变更/改为/改成 + 移除动词 + 为/成 变更动词）：带完成态后缀
+        // （后/过/了/之前/已/完/前）视为时间背景（「更新后在不在」「修改前在不在」「删除后还在不在」
+        // 是查询）；裸命令（更新为XX/设为/删掉）仍算写意图。ocr-review bug·medium(v19) 移除动词、
+        // (v20) 补「前」后缀 + 为/成 形式完成态豁免。
         // 「公司名/固废种类」是宾语名词非动词，由 extract_whitelist_update 等专用 extractor 判断。
         let narrative = [
             "更新", "修改", "变更", "改为", "改成",
+            "统一为", "统一成", "换为", "更新为", "变更为", "改名为", "设成", "调整为",
+            "设为", "换成",
             "删除", "删掉", "移除", "去掉", "移出", "作废", "注销", "软删", "踢出", "清掉",
         ];
         for v in narrative.iter() {
@@ -2080,7 +2086,8 @@ impl AgentCore {
                 let need_check = m.match_indices(v).any(|(i, _)| {
                     let after = &m[i + v.len()..];
                     !(after.starts_with("后") || after.starts_with("过") || after.starts_with("了")
-                        || after.starts_with("之前") || after.starts_with("已") || after.starts_with("完"))
+                        || after.starts_with("之前") || after.starts_with("已") || after.starts_with("完")
+                        || after.starts_with("前"))
                 });
                 if need_check {
                     return true;
@@ -2105,17 +2112,36 @@ impl AgentCore {
         // 正面：仅「在白名单中」明确，或「命中」后跟计数词（N条/数量/记录/数）才算命中计数。
         // ocr-review bug·medium(v15)：裸「命中」子串过宽——「命中服务异常」「无法命中数据库」
         // 是错误/非结果文本，会被误判 Whitelisted。→ 锚定：命中后须有计数词或 N。
+        // ocr-review bug·medium(v20)：positive 过宽——「命中404错误」「命中记录异常」此前被判
+        // Whitelisted（default-deny 下 Whitelisted 假阳性比 NotInList 假阴性更危险）。→ 要求
+        // 命中后是【数字+计数词】（命中5条/命中10条记录）或【明确计数词+数字】（命中数量0/命中
+        // 记录5条）；裸「命中404」（无计数词）或「命中记录异常」（记录后无数字）→ 不算 Whitelisted。
         let positive = t_norm.contains("在白名单中")
             || {
-                // 「命中」后紧跟数字（命中5/命中10）或计数词（命中N条/命中数量/命中记录）
                 match t_norm.find("命中") {
                     None => false,
                     Some(i) => {
                         let rest = &t_norm[i + "命中".len()..];
-                        rest.starts_with(|c: char| c.is_ascii_digit())
-                            || rest.contains("条")
-                            || rest.contains("数量")
-                            || rest.contains("记录")
+                        // 「命中N」后须跟计数词（条/数量/记录/个/数）才表计数
+                        let digit_count = rest
+                            .char_indices()
+                            .take_while(|(_, c)| c.is_ascii_digit())
+                            .last()
+                            .map_or(0, |(idx, _)| idx + 1);
+                        let after_digits = &rest[digit_count..];
+                        let digits_ok = digit_count > 0
+                            && (after_digits.starts_with("条")
+                                || after_digits.starts_with("数量")
+                                || after_digits.starts_with("记录")
+                                || after_digits.starts_with("个")
+                                || after_digits.starts_with("数"));
+                        // 「命中数量N」「命中记录N」「命中数N」：计数词在前、数字在后
+                        let count_word_first = ["数量", "记录", "数", "条"]
+                            .iter()
+                            .any(|w| {
+                                rest.starts_with(w) && rest[w.len()..].chars().next().map_or(false, |c| c.is_ascii_digit())
+                            });
+                        digits_ok || count_word_first
                     }
                 }
             };
@@ -2973,22 +2999,21 @@ impl AgentCore {
     /// 否则「皖 NB7691 和 鲁 H736A7」这种空格分隔车牌会数不到，多牌守卫失效。
     fn count_plates(msg: &str) -> usize {
         let chars: Vec<char> = msg.chars().collect();
+        // 车牌省份字集合（31 省级简称）。ocr-review bug·low(v19)+bug·medium(v20)：既排除「编号」
+        // 等非省份字（防编号 token 误计），又不误伤「查皖A」「问鲁B」等查询动词前的真实车牌
+        // （v19 用前邻 CJK 边界会因「查」非连接词而漏计「皖A」→ 多牌守卫失效）。
+        fn is_province_char(c: char) -> bool {
+            matches!(c, '京' | '津' | '沪' | '渝' | '冀' | '豫' | '云' | '辽' | '黑' | '湘'
+                | '皖' | '鲁' | '新' | '苏' | '浙' | '赣' | '鄂' | '桂' | '甘' | '晋'
+                | '蒙' | '陕' | '吉' | '闽' | '贵' | '粤' | '青' | '藏' | '川' | '宁' | '琼')
+        }
         let mut count = 0usize;
         let mut i = 0;
         while i < chars.len() {
             let c = chars[i];
-            // 中文字符 + (可选空白) + 大写字母 + 字母数字体(≥3 位) = 一个车牌。
-            // ocr-review bug·low(v9)：与 extract_plate_spaced 阈值一致（body≥4 即字母+≥3 数字），
-            // 否则「皖A123 和 鲁B456」这种短牌 count_plates==0 导致多牌守卫失效。
-            // ocr-review bug·low(v19)：收紧词边界——CJK 前非 CJK 才算车牌起始（省份字在词边界），
-            // 「编号B10086」的「号」前邻「编」CJK → 不计为车牌；但保留连接词（和/与/及）后的
-            // 车牌（「皖A123 和 鲁B456」的「鲁」前是「和」），防误伤多牌检测。
-            fn is_connector(ch: char) -> bool {
-                matches!(ch, '和' | '与' | '及' | '或' | '、' | '，' | ',' | '(' | '（')
-            }
-            let prev = if i > 0 { Some(chars[i - 1]) } else { None };
-            let prev_is_cjk = prev.map_or(false, |p| ('\u{4e00}'..='\u{9fff}').contains(&p) && !is_connector(p));
-            if !prev_is_cjk && ('\u{4e00}'..='\u{9fff}').contains(&c) {
+            // 省份字 + (可选空白) + 大写字母 + 字母数字体(≥3 位) = 一个车牌。
+            // ocr-review bug·low(v9)：与 extract_plate_spaced 阈值一致（body≥4 即字母+≥3 数字）。
+            if is_province_char(c) {
                 let mut j = i + 1;
                 while j < chars.len() && chars[j].is_whitespace() {
                     j += 1;
@@ -10477,12 +10502,13 @@ mod whitelist_v11_tests {
         // ocr-review bug·medium(v10)：count_plates 宽松匹配会把「编号B10086」数成车牌，
         // 单牌查询夹杂编号文本时 count>1 会误弃预路由。此为已知限制（退回 LLM 通道，非安全风险）。
         // 但确认纯单牌仍 count==1。
-        // ocr-review bug·low(v19)：收紧词边界（CJK 前非 CJK/连接词）——「编号B10086」的「号」
-        // 前邻「编」CJK 不再计为车牌；「皖A12345 和 鲁H736A7」的「鲁」前是连接词「和」仍计为车牌。
+        // ocr-review bug·low(v19)+bug·medium(v20)：省份字集合锚定——既排除「编号B10086」（编/号
+        // 非省份字），又不误伤「查皖A」「问鲁B」等查询动词前的真实车牌，多牌守卫仍生效。
         assert_eq!(AgentCore::count_plates("皖A12345在白名单吗"), 1);
         assert_eq!(AgentCore::count_plates("皖A12345 和 鲁H736A7 在白名单吗"), 2);
-        assert_eq!(AgentCore::count_plates("编号B10086 在不在白名单"), 0, "「编号B10086」的号前邻编CJK，非车牌");
+        assert_eq!(AgentCore::count_plates("编号B10086 在不在白名单"), 0, "編/号非省份字，非车牌");
         assert_eq!(AgentCore::count_plates("皖A12345 编号B10086 在白名单吗"), 1, "仅皖A12345 计为车牌");
+        assert_eq!(AgentCore::count_plates("帮我查皖A12345和鲁H736A7在不在白名单"), 2, "查询动词后的省份牌仍计");
     }
 
     // ocr-review bug·medium(v12)：三态分类器抽成纯函数后的单测——
@@ -10536,6 +10562,11 @@ mod whitelist_v11_tests {
         // 「数据」但有「数」子串，不得 Whitelisted
         assert_eq!(AgentCore::classify_membership("命中数据异常，请重试"), Unknown);
         assert_eq!(AgentCore::classify_membership("命中这个操作无法执行"), Unknown);
+        // ocr-review bug·medium(v20)：positive 收紧——裸「命中404错误」「命中记录异常」无计数
+        // 数字不判 Whitelisted（default-deny 下 Whitelisted 假阳性比 NotInList 假阴性更危险）
+        assert_eq!(AgentCore::classify_membership("命中404错误（服务调用失败）"), Unknown);
+        assert_eq!(AgentCore::classify_membership("命中记录异常，请检查"), Unknown);
+        assert_eq!(AgentCore::classify_membership("查询成功，命中5条记录"), Whitelisted);
     }
 }
 
