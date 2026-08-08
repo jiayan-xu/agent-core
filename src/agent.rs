@@ -1195,12 +1195,18 @@ impl AgentCore {
             // ocr-review bug·high(v30)：approval token 检测须排除前邻否定——refusal 词表只收精确
             // 「不同意/不批准」，但「不太同意/未同意/没同意/非同意/别批准」含「同意/批准」且非否定前缀
             // 开头，approval 用 contains("同意/批准") 命中 → 用户明确拒绝却被当批准执行 pending 写。
-            // → 抽 has_approval_semantic：含「同意/批准」且该 token 前邻字符非否定（不/未/没/非/别/无）。
+            // → 抽 has_approval_semantic：含「同意/批准」且该 token 前邻字符非否定。
+            // ocr-review bug·high(v31)：前邻否定须查 2 字符窗口——「不太同意」是「不」+「太」+「同意」，
+            // token 前紧邻是「太」而非「不」，单字符检查漏判。→ 检查 prev（不/未/没/非/别/无）或
+            // prev2=「不」且 prev=「太」（不太X）。同时「不太」本身是否定（不太同意=拒绝）。
             let has_approval_semantic = |s: &str| -> bool {
                 ["同意", "批准"].iter().any(|tk| {
                     s.match_indices(tk).any(|(j, _)| {
-                        let prev = s[..j].chars().next_back();
+                        let mut it = s[..j].chars().rev();
+                        let prev = it.next();
+                        let prev2 = it.next();
                         !matches!(prev, Some('不') | Some('未') | Some('没') | Some('非') | Some('别') | Some('无'))
+                            && !(prev2 == Some('不') && prev == Some('太'))
                     })
                 })
             };
@@ -1299,11 +1305,15 @@ impl AgentCore {
                 // explicit_short，但用户是【追问做法/结果】而非批准。refusal 词表不含「什么/如何/
                 // 为什么」等疑问词，confirm_but_query 只对 CONFIRM_PREFIXES 前缀生效这批不适用 →
                 // 0a 在 take_pending_action 后才查 is_query_intent，pending 写已被误执行。→ 归一化
-                // 文本含查询疑问词（什么/如何/为什么/咋/咋样）即不算批准。
-                let has_query_token = ["什么", "如何", "为什么", "咋", "怎样", "怎么样"]
+                // 文本含查询疑问词即不算批准。
+                // ocr-review bug·high(v31)：has_query_token 须同时 gate `strong_confirm && !review_prefix`
+                // 项——「确认什么」「确认怎么执行」(6字)以「确认」开头（strong_confirm）但用户是问
+                // 要确认什么，不含 refusal 词，绕过 query gate → 误确认执行 pending 写。且 token 列表
+                // 补「怎么/哪/哪个」。→ 统一 gate 到三项（strong 前缀 / explicit_short / combo）。
+                let has_query_token = ["什么", "怎么", "哪个", "哪", "如何", "为什么", "咋", "怎样", "怎么样"]
                     .iter()
                     .any(|w| t_norm_short.contains(w));
-                return (strong_confirm && !review_prefix)
+                return (strong_confirm && !review_prefix && !has_query_token)
                     || explicit_approve_after_review
                     || (!refusal
                         && !has_review_suffix
@@ -2230,7 +2240,14 @@ impl AgentCore {
                     // ① 动词后【紧跟】「前」→「删除前」中 after 以「前」开头（probe 不含动词本身）；
                     // ② 隔宾语后的「变/改/更/删/移+前」→「皖A12345公司改名前的状态」probe 含「改名前」。
                     // 原实现只查 probe 内「前」的紧邻前字符，漏掉①（after 以「前」开头时前字符在动词里）。
-                    let qian_adjacent = after.trim_start().starts_with('前')
+                    // ocr-review bug·high(v31)：形态①须限制在【非赋值动词】——「改为前卫环保」的 after
+                    // 也以「前」开头（「前卫环保」是赋值后的公司名），若赋值动词也豁免会把「改为前卫环保」
+                    // 的写意图静默丢弃（v25 想防的场景）。→ 仅当前动词 v 为非赋值动词（移除/修改类）时
+                    // after 以「前」开头才算叙述性；赋值动词（改为/改成/设为/换成…）后跟名词补语不禁。
+                    let assign_verbs = ["改为", "改成", "设为", "换成", "统一为", "统一成",
+                        "换为", "更新为", "变更为", "改名为", "设成", "调整为"];
+                    let is_assign_verb = assign_verbs.iter().any(|a| v.contains(a));
+                    let qian_adjacent = (!is_assign_verb && after.trim_start().starts_with('前'))
                         || ["改名前", "删除前", "变更前", "修改前", "移除前", "移出前"]
                             .iter()
                             .any(|w| probe.contains(w));
@@ -10685,6 +10702,14 @@ mod whitelist_v11_tests {
         );
         assert!(r6.is_some(), "长宾语 + 「后」是时间背景查询，应提取车牌: {r6:?}");
         assert_eq!(r6.unwrap(), "皖A12345");
+        // ocr-review bug·high(v31)：赋值动词「改为」后跟名词补语（前卫环保）且无「公司名」名词时，
+        // 不得因 after 以「前」开头误判叙述性——「皖A12345改为前卫环保」是 update 写意图（改公司名
+        // 为前卫环保），应拦截。此前 after.trim_start().starts_with('前') 对赋值动词也豁免 →
+        // 写意图被静默丢弃（v25 想防的场景）。→ 形态①仅限非赋值动词。
+        let r7 = AgentCore::extract_whitelist_membership_query(
+            "皖A12345改为前卫环保，它在白名单里吗",
+        );
+        assert_eq!(r7, None, "赋值动词「改为」+名词补语是写意图，应拦截: {r7:?}");
     }
 
     // ocr-review bug·medium(v17)：confirm-prefix fallback 的命令式写动词二次拦截——
