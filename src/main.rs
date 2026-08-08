@@ -570,15 +570,24 @@ fn caller_has_proj(caller_ns: &[String], proj: &str) -> bool {
 }
 
 /// 会议 scope 匹配调用者 ns（会议升级 Step1）：
-/// - scope="dept:<id>" → 调用者 ns 含 `dept/<id>`（caller_has_dept）
-/// - scope="org:<company>" → 调用者 ns 含 `org/<company>`（按 scope 指定的 company，非当前 agent org）
+/// - scope="dept:<id>" → 调用者任一 ns 含 `dept/<id>` 段（caller_has_dept 语义）
+/// - scope="org:<company>" → 调用者任一 ns 含 `org/<company>` 段（按 scope 指定 company）
+/// 采用精确段匹配（非子串 contains），避免 `org/company-1` 误配 `org/company-1x` 导致越权。
 fn meeting_scope_matches(scope: &str, caller_ns: &[String]) -> bool {
     if scope.starts_with("dept:") {
-        caller_has_dept(caller_ns, &scope["dept:".len()..])
+        let dept = &scope["dept:".len()..];
+        caller_ns.iter().any(|n| n == "*")
+            || caller_ns.iter().any(|n| {
+                n.split('/').collect::<Vec<_>>().windows(2).any(|w| w == ["dept", dept])
+            })
     } else if scope.starts_with("org:") {
         let company = &scope["org:".len()..];
-        let needle = format!("org/{}", company);
-        caller_ns.iter().any(|n| n == "*") || ns_blob(caller_ns).contains(&needle)
+        caller_ns.iter().any(|n| n == "*")
+            || caller_ns.iter().any(|n| {
+                // 精确段匹配：ns 可能为 `agent/xxx` 或 `org/company/dept/...`，
+                // 拆成路径段后检查是否存在 `["org", company]` 连续段
+                n.split('/').collect::<Vec<_>>().windows(2).any(|w| w == ["org", company])
+            })
     } else {
         false
     }
