@@ -2203,18 +2203,13 @@ mod tests {
                 "{label} 拦截须带级别（决定后续审批流程）: {:?}",
                 r
             );
-            // ocr-review test·low(v33)：仅 !r.allow + level.is_some() 无法证明【审批门禁】触发——
-            // 前置守卫（沙箱/供应链/导出/安全模式）若未来拦截这些形状也会满足断言，测试会静默
-            // 不再测到 HARD_DANGEROUS 审批闸本体。→ 钉紧 reason 须含「审批」字样（approval gate
-            // 的 reason 恒含「需要审批」），任未来守卫加入也不致误测主题漂移。
+            // 仅 !r.allow + level.is_some() 无法证明【审批门禁】触发——前置守卫（沙箱/供应链/导出/
+            // 安全模式）若未来拦截这些形状也会满足断言，测试会静默不再测到 HARD_DANGEROUS 审批闸
+            // 本体。→ 钉紧 reason 须含「审批」字样（approval gate 的 reason 恒含「需要审批」），
+            // 任未来守卫加入也不致误测主题漂移。
             assert!(
                 r.reason.contains("审批"),
                 "{label} 拦截原因须表明是【审批】门禁（而非其他守卫），实际: {:?}",
-                r
-            );
-            assert!(
-                !r.reason.is_empty(),
-                "{label} 拦截原因不应为空: {:?}",
                 r
             );
         }
