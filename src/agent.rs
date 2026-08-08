@@ -1202,7 +1202,10 @@ impl AgentCore {
             let has_approval_semantic = |s: &str| -> bool {
                 ["同意", "批准"].iter().any(|tk| {
                     s.match_indices(tk).any(|(j, _)| {
-                        let mut it = s[..j].chars().rev();
+                        // ocr-review bug·low(v33)：前邻否定须跳过空白——「我 不 同意」的 token 前
+                        // 紧邻是空格，单字符检查漏判「不」→ approval=true → 用户拒绝却当批准执行
+                        // pending 写。→ 反向迭代先 filter 空白再取前邻。
+                        let mut it = s[..j].chars().rev().filter(|c| !c.is_whitespace());
                         let prev = it.next();
                         let prev2 = it.next();
                         !matches!(prev, Some('不') | Some('未') | Some('没') | Some('非') | Some('别') | Some('无'))
@@ -1353,6 +1356,16 @@ impl AgentCore {
                     .iter()
                     .find_map(|p| t.strip_prefix(p));
                 let tail = tail.unwrap_or(t);
+                // ocr-review bug·high(v33)：inner approval 集含裸「可以/继续」等，而 refusal 表
+                // 无推迟词——「确认，继续等待评审结果」「确认，可以稍后再执行」经「继续/可以」命中
+                // inner=true → is_confirm=true → 0a 执行 pending 写，但用户是【推迟/等待】而非批准，
+                // 属未授权变更。→ 推迟词（等待/稍后/待会儿/再等/先不/以后/晚点）出现即非确认。
+                let deferred = ["等待", "稍后", "待会", "待会儿", "再等", "先不", "以后", "晚点", "稍晚"]
+                    .iter()
+                    .any(|w| tail.contains(w));
+                if deferred {
+                    return false;
+                }
                 let inner = has_approval_semantic(tail)
                     || tail.contains("好的")
                     || tail.contains("可以")
@@ -1525,14 +1538,9 @@ impl AgentCore {
         // 句式或（车牌+查询）才 true，这里不满足 → 直接 take_pending_action 执行与用户本意无关的
         // pending 写，并把新写请求静默丢弃（旧逻辑只在无 pending 的 else-if 分支有 has_request_body
         // 守卫，0a 路径没有）。→ 携带新写请求时跳过 0a，放行给下方 try_preroute 走正常写审批。
-        let carries_new_write = Self::has_command_write_verb(trimmed)
-            || trimmed.contains("白名单")
-            || trimmed.contains("车牌")
-            || trimmed.contains("删除")
-            || trimmed.contains("添加")
-            || trimmed.contains("更新")
-            || trimmed.contains("改为")
-            || trimmed.contains("改成");
+        // ocr-review bug·medium(v33)：与 has_request_body 抽共享 carries_write_body，去粗粒度
+        // 「白名单/车牌」裸子串（「确认，白名单没问题」纯批准不得误判携带新写）。
+        let carries_new_write = Self::carries_write_body(trimmed);
         if is_confirm(trimmed) && !confirm_but_query && !carries_new_write {
             if let Some(mut action) = self.session_manager.take_pending_action(session_id).await {
                 // 任务 652 前置修复：捕获 approval_id，供执行后消费审批项（防残留被全局扫描重执行）
@@ -1676,15 +1684,8 @@ impl AgentCore {
                 // （如「确认，执行吧，把皖A12345加进白名单」）也不是纯确认——内嵌的写请求应转给
                 // execute_chat/预路由处理，否则被后面统一罐头回复静默丢弃（改动前该消息会穿落到
                 // 0b 状态机作为新请求处理）。→ 含写动词或业务请求词即放行，仅纯确认（确认/好的/可以）
-                // 才罐头。
-                let has_request_body = Self::has_command_write_verb(trimmed)
-                    || trimmed.contains("白名单")
-                    || trimmed.contains("车牌")
-                    || trimmed.contains("删除")
-                    || trimmed.contains("添加")
-                    || trimmed.contains("更新")
-                    || trimmed.contains("改为")
-                    || trimmed.contains("改成");
+                // 才罐头。ocr-review bug·medium(v33)：与 0a 分支抽共享 carries_write_body。
+                let has_request_body = Self::carries_write_body(trimmed);
                 if is_query_intent(trimmed) || has_request_body {
                     if let Some(pr) = self.try_preroute(trimmed, session_id).await {
                         return pr;
@@ -2269,7 +2270,19 @@ impl AgentCore {
                     // 「公司名改成安徽省环保新能源科技有限公司后还在不在」中「后」落在 take(12)
                     // 之外 → probe 不含完成态后缀 → 误判写意图 → 落入 update extractor 生成虚假
                     // 审批流。→ 改为探测动词后【到句末】的整段（has_narrative_noun 同改）。
-                    let probe = after.to_string();
+                    // ocr-review bug·high(v33)：扫到句末会让【后文叙述】污染【前文裸命令】——
+                    // 「删除皖A12345，它删除前在白名单吗」前一处「删除」的 probe 含后文「删除前」、
+                    // 后一处 after 以「前」开头，两处都判叙述 → has_command_write_verb=false →
+                    // 真实删除命令被成员查询预路由静默吞掉。→ 每个 occurrence 的 probe 界到
+                    // 【下一个同动词】出现处（截断 to 指针），使前文只探测到本动词后的片段。
+                    let probe_end = m[i + v.len()..]
+                        .find(v)
+                        .map(|rel| i + v.len() + rel);
+                    let probe = match probe_end {
+                        Some(end) => &m[i + v.len()..end],
+                        None => &m[i + v.len()..],
+                    }
+                    .to_string();
                     // ocr-review bug·medium(v29)：qian_adjacent 需识别「动词+前」紧邻组合
                     // （删除前/改名前/变更前…）为叙述性时间背景。分两种形态：
                     // ① 动词后【紧跟】「前」→「删除前」中 after 以「前」开头（probe 不含动词本身）；
@@ -2296,6 +2309,21 @@ impl AgentCore {
             }
         }
         false
+    }
+
+    /// 判断消息是否【携带实际写请求正文】（确认词之外还有真实写意图）。
+    /// ocr-review bug·medium(v33)：0a 分支的 carries_new_write 与无 pending 分支的 has_request_body
+    /// 原是两处逐字复制且含粗粒度「白名单/车牌」子串——「确认，白名单没问题」是纯批准（is_confirm=true）
+    /// 却因含「白名单」被误判携带新写 → 0a 跳过，pending 既不执行也不取消，静默丢失。→ 抽共享 helper，
+    /// 删除/index 写动词已由 has_command_write_verb 覆盖，粗粒度「白名单/车牌」裸子串（被写动词隐含）
+    /// 一并去掉，两处复用保持口径一致。
+    fn carries_write_body(msg: &str) -> bool {
+        let m = msg.trim();
+        // 写意图已由 has_command_write_verb 完整覆盖：imperative（添加/新增/登记/录入/加入/加进…）
+        // 直接拦截；narrative 动词（删除/更新/改为/改成/移除…）带完成态后缀时豁免（「删除后在不在」
+        // 是查询）。此处不再重复裸 contains——粗粒度「白名单/车牌」子串已去掉（被写动词隐含），
+        // 避免「确认，白名单没问题」纯批准被误判携带新写。
+        Self::has_command_write_verb(m)
     }
 
     /// 成员查询结果三态分类：Whitelisted / NotInList / Unknown。
@@ -2413,6 +2441,16 @@ impl AgentCore {
             || t_norm.contains("无此车牌")
             || t_norm.contains("无该车牌")
             || t_norm.contains("查无此车")
+            // ocr-review bug·medium(v33)：锚后否定——工具/LLM 回复的否定词可出现在「白名单中」
+            // 之后（「皖A12345在白名单中没有找到」「该车在白名单中未查到」），前窗口(positive_zlm
+            // 的 before)与 before-anchor 枚举表都抓不到 → 被误判 Whitelisted 假阳性（本代码注释
+            // 自认是最危险失败）。→ 补「白名单中」后跟否定词的变体。
+            || t_norm.contains("在白名单中没有")
+            || t_norm.contains("在白名单中未查")
+            || t_norm.contains("在白名单中未找到")
+            || t_norm.contains("在白名单中未搜索")
+            || t_norm.contains("在白名单中查无")
+            || t_norm.contains("在白名单中不存在")
             || t_norm.contains("不在白名单中");
         // 弱否定：零命中计数（锚定，避免「命中10条」被「0条」子串误伤）。
         // ocr-review bug·medium(v13)：固定锚点表仍有遗漏——「命中记录0条」「命中数量0」因 0 与
@@ -10824,6 +10862,17 @@ mod whitelist_v11_tests {
         assert!(!AgentCore::has_command_write_verb(
             "皖A12345公司名改成新能源后还在不在白名单里"
         ), "「公司名改成...后」是时间背景查询，不得误触发 update 写审批流");
+        // ocr-review bug·high(v33)：探针界到下一个同动词——「删除皖A12345，它删除前在白名单吗」
+        // 前一处「删除」是裸命令（写意图），后一处「删除前」是叙述（查询）。此前探针扫到句末，
+        // 前文 probe 含后文「删除前」→ 两处都判叙述 → 删除命令被成员查询静默吞掉。→ 前文须判
+        // 命令式（true）。
+        assert!(AgentCore::has_command_write_verb(
+            "删除皖A12345，它删除前在白名单吗"
+        ), "前一处[删除]是裸命令，不得被后文[删除前]叙述污染");
+        // 纯叙述两处都不构成命令式 → false
+        assert!(!AgentCore::has_command_write_verb(
+            "它删除前在白名单，删除后也在白名单"
+        ), "两处[删除前/删除后]均叙述，非命令式写");
     }
 
     // ocr-review test·low(v11)：测试名从 test_count_plates_ignores_code_like_text 改为
@@ -10927,6 +10976,27 @@ mod whitelist_v11_tests {
         assert_eq!(AgentCore::classify_membership("查询成功，命中数量0"), NotInList);
         // 非零计数不受影响
         assert_eq!(AgentCore::classify_membership("查询成功，命中条5"), Whitelisted);
+        // ocr-review bug·medium(v33)：锚后否定——「皖A12345在白名单中没有找到」的否定词在
+        // 「白名单中」之后，前窗口(before)与 before-anchor 枚举表都抓不到 → 须判 NotInList，
+        // 不得 Whitelisted 假阳性（default-deny 下最危险）。
+        assert_eq!(AgentCore::classify_membership("皖A12345在白名单中没有找到"), NotInList);
+        assert_eq!(AgentCore::classify_membership("该车在白名单中未查到"), NotInList);
+        assert_eq!(AgentCore::classify_membership("该车在白名单中未找到"), NotInList);
+    }
+
+    // ocr-review bug·medium(v33)：carries_write_body 判定「确认词之外是否还携带真实写请求」。
+    // 纯批准提及「白名单」但无写动词 → false（不跳过 0a，pending 正常执行）；含写动词 → true。
+    #[test]
+    fn test_carries_write_body() {
+        // 纯批准提及白名单：is_confirm=true 但无写动词 → 非携带新写，pending 应正常执行
+        assert!(!AgentCore::carries_write_body("确认，白名单没问题"));
+        assert!(!AgentCore::carries_write_body("好的，同意"));
+        // 携带新写请求：写动词触发
+        assert!(AgentCore::carries_write_body("确认，可以把皖A12345加进白名单"));
+        assert!(AgentCore::carries_write_body("确认，帮我把皖A12345删除"));
+        assert!(AgentCore::carries_write_body("同意，把皖A12345改为佳士能"));
+        // 叙述性查询（完成态后缀豁免）→ 非写请求
+        assert!(!AgentCore::carries_write_body("皖A12345删除后还在不在白名单"));
     }
 }
 

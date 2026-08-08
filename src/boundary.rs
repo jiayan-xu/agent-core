@@ -2129,8 +2129,7 @@ mod tests {
         // sync_whitelist_plates）无论 query/写动作一概走审批闸，与参数内容无关。
         // 它不驱动 agent.rs 的 LLM tool-loop/预路由路径（豁免移除的实际生效点）；该路径由
         // agent.rs 的 try_preroute/成员查询测试独立覆盖。此处仅验证边界层保证。
-        // （ocr-review documentation·low(v29)：精简，避免与 boundary.rs:907-913 生产注释重复、
-        // 硬编码 agent.rs 内部符号导致漂移。）
+        // （精简：避免与生产注释重复、硬编码 agent.rs 内部符号导致漂移。）
         let mut boundary = ComplianceBoundary::new(None);
         boundary
             .perm_chain
@@ -2198,10 +2197,19 @@ mod tests {
             // 该不变式是「HARD_DANGEROUS 工具无论参数一概拦截（需审批）」，由 !r.allow 表达。
             // 具体级别钉死 Yellow 会脆——若未来加固为 Red（硬拦截）或更高优先级守卫
             // （沙箱/导出/供应链）扩展到这些工具，安全姿态等同或更强，但 Yellow 断言会失败。
-            // （ocr-review maintainability·medium(v29)：断言不变式而非具体色。）
+            // （断言不变式而非具体色。）
             assert!(
                 r.level.is_some(),
                 "{label} 拦截须带级别（决定后续审批流程）: {:?}",
+                r
+            );
+            // ocr-review test·low(v33)：仅 !r.allow + level.is_some() 无法证明【审批门禁】触发——
+            // 前置守卫（沙箱/供应链/导出/安全模式）若未来拦截这些形状也会满足断言，测试会静默
+            // 不再测到 HARD_DANGEROUS 审批闸本体。→ 钉紧 reason 须含「审批」字样（approval gate
+            // 的 reason 恒含「需要审批」），任未来守卫加入也不致误测主题漂移。
+            assert!(
+                r.reason.contains("审批"),
+                "{label} 拦截原因须表明是【审批】门禁（而非其他守卫），实际: {:?}",
                 r
             );
             assert!(
