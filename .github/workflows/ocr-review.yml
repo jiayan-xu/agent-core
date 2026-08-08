@@ -38,9 +38,8 @@ jobs:
             exit 1
           fi
           ocr config set provider volcengine
-          # 模型 ID：改为火山方舟控制台开通的模型 ID（如 deepseek-v3.x / doubao-xxx）
-          # 注意：此值必须替换为真实模型 ID，否则 CI 会因模型不存在而失败
-          ocr config set model "ARK_MODEL_ID_PLACEHOLDER"
+          # 模型 ID：火山方舟 ark-code-latest
+          ocr config set model "ark-code-latest"
           ocr config set providers.volcengine.api_key "$ARK_API_KEY"
 
       - name: Run review (gate)
