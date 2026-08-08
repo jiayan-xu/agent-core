@@ -2138,17 +2138,12 @@ mod tests {
             .lock()
             .unwrap()
             .register("test-agent", None, PermissionLevel::Admin);
-        // manage_whitelist 不注册，走默认分类 + HARD_DANGEROUS floor；
-        // sync_whitelist_plates 显式注册为 "dangerous"，确保 tool_level=="dangerous" 分类器分支
-        // 也被本表驱动覆盖（若仅靠默认，两工具都在 HARD_DANGEROUS floor，classifier 分支永不触发）。
-        // 同时断言生产默认分类符合预期，钉住真实强制配置（防未来从 HARD_DANGEROUS 移除后测试静默放宽）。
-        assert_eq!(
-            with_classifier(&boundary.classifier, "unknown".to_string(), |c| c
-                .classify("manage_whitelist")
-                .to_string()),
-            "write",
-            "生产分类器应把 manage_whitelist 判为 write（叠加 HARD_DANGEROUS 地板）"
-        );
+        // 两工具均不显式注册，走生产默认分类器 + HARD_DANGEROUS floor：
+        // - manage_whitelist / sync_whitelist_plates 均在 HARD_DANGEROUS → 强制走 L2 黄线审批
+        // 断言 sync_whitelist_plates 生产分类为 dangerous（钉住 classifier 分支可达性）；不去断言
+        // manage_whitelist 的分类——它在 write_tools 与 dangerous_tools 均注册，classify 返回的
+        // "write" 是检查顺序的产物非稳定不变式（未来改为 dangerous 更准确时不应让本测试脆失败）。
+        // 真正的强制保证由下方表驱动的 level==Yellow 断言覆盖。
         assert_eq!(
             with_classifier(&boundary.classifier, "unknown".to_string(), |c| c
                 .classify("sync_whitelist_plates")
@@ -2156,7 +2151,6 @@ mod tests {
             "dangerous",
             "生产分类器应把 sync_whitelist_plates 判为 dangerous"
         );
-        boundary.register_tool("sync_whitelist_plates", "dangerous");
 
         // ①-⑯ 十六个 near-identical check_tool+Yellow 块折叠为统一表驱动（含纯查询/写动作/
         // 嵌套/缺参/空值/越界代表形状），单一保证「HARD_DANGEROUS 工具一律审批（与参数内容

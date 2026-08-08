@@ -1221,6 +1221,13 @@ impl AgentCore {
             if strong_confirm && refusal {
                 return false;
             }
+            // ocr-review bug·medium(v24)：尾缀否定——「确认不了/确认不做了/确认不」以「确认」开头
+            // 命中 strong_confirm，但含义是【拒绝】（无法确认/不确认了），refusal 词表不含裸「不/不了」。
+            // 若不拦，≤8 字短消息直接返回 true → 0a 分支 is_confirm 先于 is_cancel 判断，把用户明确
+            // 拒绝当批准执行 pending 写（反转 v12 修复场景）。→ 尾缀带「不/不了」即 early return false。
+            if t.ends_with("不了") || t.ends_with("不") {
+                return false;
+            }
             if t.chars().count() > 8 && !strong_confirm && !explicit_approve_after_review {
                 return false;
             }
@@ -1251,12 +1258,20 @@ impl AgentCore {
                     "我确认", "好的确认", "可以确认", "确认完毕", "确认无误",
                     "好的执行", "可以查吧", "可以执行", "行没问题", "对的",
                 ];
+                // ocr-review bug·medium(v24)：组合式批准（「好的可以执行」「可以，就这么办」）归一化后
+                // 不匹配任何单一前缀变体——「好的可以执行」不以「好的执行」或「可以执行」开头。旧
+                // confirm_words 的 contains 可命中。→ 补充组合词 contains 匹配（「好的」+「执行」、
+                // 「可以」+「执行」等），这类组合明确是批准。
+                let combo = ["好的执行", "可以执行", "行没问题"]
+                    .iter()
+                    .any(|w| t_norm_short.contains(w));
                 return (strong_confirm && !review_prefix)
                     || explicit_approve_after_review
                     || (!refusal
-                        && explicit_short
+                        && (explicit_short
                             .iter()
-                            .any(|w| t_norm_short.starts_with(w)));
+                            .any(|w| t_norm_short.starts_with(w))
+                            || combo));
             }
             // ocr-review bug·high(v16)：长消息(>8字) fallback 不能靠 confirm_words.contains("确认")——
             // 该词被确认前缀本身满足（「确认，把皖A12345加到白名单」以确认开头即误判确认 → 0a 误执行
@@ -2192,10 +2207,19 @@ impl AgentCore {
             let mut ok = false;
             for (i, _) in t_norm.match_indices(needle) {
                 let before = &t_norm[..i];
-                // 前邻否定语境：needle 前的紧邻字词以否定语结尾——「未找到该车牌在白名单中」
-                // 「未能确认该车在白名单中」的「未找到/未能」在 needle 前若干字处。取前 8 字符
-                // 窗口（原文顺序）检查是否以否定语结尾。default-deny 下宁可 Unknown 也不 Whitelisted 假阳性。
-                let prev = before.chars().take(8).collect::<String>();
+                // 前邻否定语境：取 needle 前【紧邻的尾部窗口】（至多 8 字符，原文顺序），检查
+                // 是否以否定语结尾/含否定语——「未找到该车牌在白名单中」「未能确认该车在白名单中」
+                // 的「未找到/未能」紧邻 needle。用 rev().take(8) 取尾部再 rev 还原，避免长前缀
+                // （如「您好根据您查询的皖A12345...」）把否定词挤出 take(8) 窗口（ocr-review
+                // bug·high(v24)）。default-deny 下宁可 Unknown 也不 Whitelisted 假阳性。
+                let prev: String = before
+                    .chars()
+                    .rev()
+                    .take(8)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
                 let negated = prev.contains("没有")
                     || prev.contains("未曾")
                     || prev.contains("并未")
@@ -10699,6 +10723,14 @@ mod whitelist_v11_tests {
         assert_eq!(AgentCore::classify_membership("未找到该车牌在白名单中"), Unknown);
         assert_eq!(AgentCore::classify_membership("未能确认该车在白名单中"), Unknown);
         assert_eq!(AgentCore::classify_membership("皖A12345确实在白名单中"), Whitelisted);
+        // ocr-review bug·high(v24)：否定窗口须取【紧邻 needle 的尾部窗口】——长前缀（如
+        // 「您好根据您查询的皖A12345未找到该车牌在白名单中」未找到在 needle 前 18 字处）时，
+        // 取前 8 字符会把「未找到」挤出窗口 → 误判 Whitelisted。→ 尾部窗口必须命中。
+        assert_eq!(
+            AgentCore::classify_membership("您好根据您查询的皖A12345未找到该车牌在白名单中"),
+            Unknown,
+            "长前缀+未找到+在白名单中 应判 Unknown 而非 Whitelisted 假阳性"
+        );
     }
 }
 
