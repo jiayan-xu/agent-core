@@ -100,29 +100,57 @@ ocr config set custom_providers.volcengine-ark-plan.model "ark-code-latest"
 
 ---
 
-## 5. ⚠️ 本仓库合并 PR 的已知坑（BLOCKED 但检查全绿）
+## 5. ✅ 本仓库合并 PR 的 BLOCKED 坑（已根治，2026-08-08 PR #9）
 
-**症状**：PR 的 `ocr-review` / `gitleaks` check-run 全部 `success`，但
+**曾经的症状**：PR 的 `ocr-review` / `gitleaks` check-run 全部 `success`，但
 `gh pr merge` 报 `not mergeable: the base branch policy prohibits the merge`，
 `mergeStateStatus = BLOCKED`。
 
-**根因**：master 分支保护 `required_status_checks` 要求 context `ocr-review` / `gitleaks`，
-但这些 context 由 GitHub Actions **check-run** 产生（`github-actions` app 触发），
-**从不生成 legacy commit status** —— 查 `GET /commits/{sha}/status` 恒为
-`state=pending` + `statuses=[]` 空数组。GitHub 因此认为"要求的 status context 缺失"，
-永远 BLOCKED。
+**曾经的根因**：master 分支保护 `required_status_checks` 要求 legacy commit status
+context `ocr-review` / `gitleaks`，但这些 context 由 GitHub Actions **check-run** 产生
+（`github-actions` app 触发），**从不自动生成 legacy commit status** —— 查
+`GET /commits/{sha}/status` 恒为 `state=pending` + `statuses=[]` 空数组。GitHub 因此
+认为"要求的 status context 缺失"，永远 BLOCKED。
 
-**解决**：用 admin 权限合并（保护规则 `enforce_admins=false`，可绕过）：
+**✅ 根治方案（PR #9 已合并，master 220264d）**：
+在两个 workflow 末尾各加一步，用 `GITHUB_TOKEN`（`permissions: statuses: write`）
+显式 `POST /statuses/{sha}` 把 check-run 结果同步成 legacy commit status：
 
-```bash
-gh pr merge <n> --repo jiayan-xu/agent-core --merge --admin --delete-branch
+```yaml
+permissions:
+  contents: read
+  statuses: write   # 关键：写入 legacy status 需要此权限
+
+# 每个 job 末尾（if: always()）
+- name: Sync check result to commit status
+  if: always()
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  run: |
+    if [ "${{ job.status }}" = "success" ]; then
+      STATE="success"; DESC="ocr-review passed"   # 或 gitleaks passed
+    else
+      STATE="failure"; DESC="ocr-review failed"
+    fi
+    SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+    curl -sS -X POST \
+      -H "Authorization: Bearer $GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/${{ github.repository }}/statuses/$SHA" \
+      -d "{\"state\":\"$STATE\",\"context\":\"ocr-review\",\"description\":\"$DESC\"}"
 ```
 
-**注意**：这是**本仓库的现象**，PR #5 / #6 / #7 都这样，不是配置错误。
-判断依据：check-run 全绿 = 实际审查已通过，admin 合并是安全的。
+**关键点**：
+- context 名必须与分支保护完全一致：`ocr-review` / `gitleaks`
+  （⚠️ gitleaks 的 context 是 `gitleaks`，**不是 job 名** `gitleaks secret scan`）
+- 两个 workflow 都要加（否则另一个 context 仍缺失，仍 BLOCKED）
+- `if: always()`：无论前步成败都同步（失败时写 failure，门禁照样拦）
 
-**根治方案（未做，可选）**：在 workflow 末尾加一步用 GitHub API 显式写 commit status，
-让 legacy status 与 check-run 对齐。需要时再补。
+**效果验证**：PR #9 的 head commit 的 `GET /commits/{sha}/status` 返回
+`state=success` + `statuses=[ocr-review:success, gitleaks:success]`，
+`mergeStateStatus = CLEAN` → **普通 `gh pr merge` 即可合并，无需 --admin**。
+
+**历史背景**：PR #5 / #6 / #7 是在根治前合并的，当时用 `--admin` 绕过。
 
 ---
 
@@ -135,8 +163,8 @@ gh pr merge <n> --repo jiayan-xu/agent-core --merge --admin --delete-branch
 [ ] model 用双引号字符串（如 "ark-code-latest"）
 [ ] api_key 读自 $ARK_API_KEY（Secret），无硬编码
 [ ] GitHub Secret 里 ARK_API_KEY 已配置
-[ ] 推送后 ocr-review + gitleaks 双绿
-[ ] 合并走 --admin（本仓库 BLOCKED 坑）
+[ ] 推送后 ocr-review + gitleaks 双绿（含 legacy commit status 同步）
+[ ] 合并：普通 gh pr merge（已根治，无需 --admin）
 ```
 
 ---
