@@ -2138,11 +2138,15 @@ mod tests {
             .lock()
             .unwrap()
             .register("test-agent", None, PermissionLevel::Admin);
-        // 两工具均不显式注册，走生产默认分类器 + HARD_DANGEROUS floor：
-        // - manage_whitelist / sync_whitelist_plates 均在 HARD_DANGEROUS → 强制走 L2 黄线审批
-        // 不针对任一工具断言 classify 具体值——两工具的分类值都是检查顺序（read→write→dangerous）
-        // 的产物，未来调整分类表时不应让本测试脆失败。真正的强制保证（HARD_DANGEROUS 一律黄线）
-        // 由下方表驱动的 16 个 level==Yellow 断言独立钉住，与分类器解耦。
+        // 两工具显式注册为 "read"，使分类器返回 read（而非依赖默认分类表的 write 值）。
+        // 目的（评审 P0 加固）：让下方 16 个断言【只依赖 HARD_DANGEROUS 地板】产生 Yellow——
+        // ① 若两工具被移出 HARD_DANGEROUS，check_tool 对 read 落到 allow=true，断言失败；
+        // ② 不依赖默认分类表把 manage_whitelist 标为 write（未来分类表调整不使本测试脆失败）。
+        // 已实证：临时把 manage_whitelist 移出 HARD_DANGEROUS → 本测试 FAILED（非空通过）。
+        // 注意：ComplianceBoundary::new(None) 的 ToolClassifier 内置完整默认分类表，
+        // 非「空分类器」——manage_whitelist 默认即 write（boundary.rs:1112），故原测试本就钉住地板。
+        boundary.register_tool("manage_whitelist", "read");
+        boundary.register_tool("sync_whitelist_plates", "read");
 
         // ①-⑯ 十六个 near-identical check_tool+Yellow 块折叠为统一表驱动（含纯查询/写动作/
         // 嵌套/缺参/空值/越界代表形状），单一保证「HARD_DANGEROUS 工具一律审批（与参数内容
