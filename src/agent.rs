@@ -398,9 +398,37 @@ pub struct Meeting {
     pub messages: Vec<MeetingMessage>,
     /// NEW(会议升级 Step3)：实时状态机阶段。
     /// "ai_speaking" | "awaiting_humans" | "discussing" | "done"。
-    /// None = 旧数据 / 兼容。serde default 兼容旧 meetings.json。
-    #[serde(default)]
+    /// None = 旧数据（无该字段）。读侧 serde default 兼容旧 meetings.json；
+    /// 写侧 skip_serializing_if 保证 None 时**不写出该键**，旧数据回盘后
+    /// 仍是原样（不会凭空多出 `"phase": null`），老前端 / 老 fixture 不受影响。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<MeetingPhase>,
+}
+
+impl Meeting {
+    /// Step3：圆桌收敛完成后的状态机跃迁（纯逻辑，便于单测）。
+    ///
+    /// 返回 `false` 表示**拒绝本次回填**——会议已处于终态（status=done 或 phase=Done）。
+    /// 该保护针对的竞态是：圆桌后台任务在 LLM 收敛（可能耗时数十秒）后回调本方法，
+    /// 而拥有者可能已通过 `/api/meetings/{id}/end` 结束会议。若无保护，
+    /// 延迟到达的回调会把 done 改回 running，并用 AI 共识覆盖用户共识，
+    /// 订阅端还会观察到 done → running 的状态倒退。
+    pub fn apply_convergence(&mut self, consensus: &str) -> bool {
+        if self.status == "done" || self.phase == Some(MeetingPhase::Done) {
+            return false;
+        }
+        if self.participant_agents.is_empty() {
+            // 纯 AI 圆桌：收敛即终局
+            self.status = "done".to_string();
+            self.phase = Some(MeetingPhase::Done);
+        } else {
+            // 有真人参会：保持 running，等待真人接手讨论
+            self.status = "running".to_string();
+            self.phase = Some(MeetingPhase::AwaitingHumans);
+        }
+        self.consensus = Some(consensus.to_string());
+        true
+    }
 }
 
 /// 会议中的一条发言（AI 分身 / 真人 A2A）。
@@ -416,13 +444,36 @@ pub struct MeetingMessage {
     pub at: String,
 }
 
+/// 会议实时事件类型（Step3）。serde snake_case 序列化与 SSE 事件名一致，消除魔法字符串。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    Snapshot,
+    Message,
+    State,
+    Presence,
+    Ended,
+}
+impl EventKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EventKind::Snapshot => "snapshot",
+            EventKind::Message => "message",
+            EventKind::State => "state",
+            EventKind::Presence => "presence",
+            EventKind::Ended => "ended",
+        }
+    }
+}
+
 /// Step3：会议实时事件，经 AppState 的 broadcast 通道推送给所有订阅该会议的 SSE 客户端。
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct MeetingEvent {
     pub meeting_id: String,
-    /// "snapshot" | "message" | "state" | "presence" | "ended"
-    pub kind: String,
-    /// 事件载荷：message/state/ended 为完整 Meeting JSON；presence 为在线列表
+    /// 事件类型（snapshot/message/state/presence/ended），类型安全
+    pub kind: EventKind,
+    /// 事件载荷：snapshot/ended 为完整 Meeting JSON；message 为增量（单条新发言 + phase/status）；
+    /// presence 为在线列表；state 为状态变更
     pub payload: serde_json::Value,
     /// RFC3339 时间
     pub at: String,
@@ -1079,30 +1130,65 @@ impl AgentCore {
             .unwrap_or_default()
     }
 
-    /// Step3：按 id 取单条会议（供 SSE 快照 / 广播载荷）。返回克隆，调用方无需持有锁。
+    /// Step3：按 id 取单条会议（供 SSE **初始快照 / Lagged 重同步**）。返回克隆，调用方无需持有锁。
+    ///
+    /// 注意：克隆包含完整 messages 历史，代价 O(n)。**热路径（每条发言广播）请勿调用**，
+    /// 改用 `meeting_state()` 取轻量状态、只广播增量，避免 O(n²) 累积。
     pub fn get_meeting(&self, id: &str) -> Option<Meeting> {
         let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
         v.iter().find(|m| m.id == id).cloned()
     }
 
+    /// Step3：只取会议的轻量状态 `(status, phase)`，不克隆 messages 历史。
+    /// 供增量广播（message/ended）使用，把每次广播从 O(n) 降为 O(1)。
+    pub fn meeting_state(&self, id: &str) -> Option<(String, Option<MeetingPhase>)> {
+        let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+        v.iter().find(|m| m.id == id).map(|m| (m.status.clone(), m.phase))
+    }
+
+    /// Step3：会议可见性判定（owner / admin / scope 成员 / 公开会议）。
+    /// 返回 `None` 表示会议不存在（调用方应按「无权」处理，避免探测会议 ID 是否存在）。
+    ///
+    /// 权威单一实现：SSE 订阅（stream）与心跳（heartbeat）共用本方法，
+    /// 避免鉴权规则在两个 handler 里各写一份而悄悄漂移。同样不克隆会议数据。
+    pub fn meeting_visible(
+        &self,
+        id: &str,
+        caller: &str,
+        caller_ns: &[String],
+        is_admin: bool,
+    ) -> Option<bool> {
+        let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+        v.iter().find(|m| m.id == id).map(|m| {
+            m.owner_user_id == caller
+                || is_admin
+                || (m.scope.is_none() && !m.is_private)
+                || m.scope
+                    .as_ref()
+                    .is_some_and(|s| scope_matches_caller(s, caller_ns))
+        })
+    }
+
     /// 圆桌收敛完成后回填共识。
     /// Step3 状态机：有真人参与者时会议保持 running（phase=awaiting_humans）等待真人讨论；
     /// 纯 AI 圆桌则直接 done。
+    ///
+    /// 幂等 / 终态保护：本方法由圆桌后台任务（tokio::spawn）在 LLM 收敛后调用，
+    /// 与拥有者主动 `/api/meetings/{id}/end` 存在竞态。若会议已终止（status=done 或
+    /// phase=Done），**直接返回**，不得把 done 回退成 running、也不得覆盖用户已写入的共识
+    /// （否则 SSE 订阅端会看到 done → running 的状态倒退）。
     pub fn finish_meeting(&self, id: &str, consensus: &str) {
-        {
+        let changed = {
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(m) = v.iter_mut().find(|m| m.id == id) {
-                if m.participant_agents.is_empty() {
-                    m.status = "done".to_string();
-                    m.phase = Some(MeetingPhase::Done);
-                } else {
-                    m.status = "running".to_string();
-                    m.phase = Some(MeetingPhase::AwaitingHumans);
-                }
-                m.consensus = Some(consensus.to_string());
+            match v.iter_mut().find(|m| m.id == id) {
+                Some(m) => m.apply_convergence(consensus),
+                None => false,
             }
+        };
+        // 未发生变更（会议不存在 / 已终态）时不落盘，避免无谓 IO 与状态倒退
+        if changed {
+            self.save_meetings();
         }
-        self.save_meetings();
     }
 
     /// 列出调用者可见的会议：公开 或 拥有者 或 admin，或调用者属该 scope。
@@ -10978,6 +11064,87 @@ mod whitelist_preroute_tests {
         assert_eq!(back.messages.len(), 2);
         assert_eq!(back.messages[1].kind, "human");
         assert_eq!(back.messages[1].content, "意见");
+    }
+
+    fn mk_meeting(status: &str, phase: Option<MeetingPhase>, agents: Vec<String>) -> Meeting {
+        Meeting {
+            id: "mtg_x".into(),
+            topic: "t".into(),
+            owner_user_id: "u".into(),
+            participant_personas: vec!["ai1".into()],
+            is_private: true,
+            created_at: "2026-08-01T00:00:00Z".into(),
+            status: status.into(),
+            consensus: None,
+            scope: None,
+            participant_agents: agents,
+            phase,
+            messages: vec![],
+        }
+    }
+
+    /// 会议升级 Step3（ocr-review bug·high）：已终止的会议不得被延迟到达的收敛回调复活。
+    /// 这是「用户已 end → 后台 LLM 收敛才返回」竞态的回归锚点。
+    #[test]
+    fn finish_meeting_never_reopens_terminated_meeting() {
+        // 用户已结束（status=done + 自定共识）
+        let mut m = mk_meeting("done", Some(MeetingPhase::Done), vec!["agent/admin".into()]);
+        m.consensus = Some("用户共识".into());
+        assert!(!m.apply_convergence("AI 共识"), "终态会议必须拒绝回填");
+        assert_eq!(m.status, "done", "不得回退为 running");
+        assert_eq!(m.phase, Some(MeetingPhase::Done), "phase 不得回退");
+        assert_eq!(m.consensus.as_deref(), Some("用户共识"), "用户共识不得被覆盖");
+
+        // 仅 phase=Done（status 尚未同步）也视为终态
+        let mut m2 = mk_meeting("running", Some(MeetingPhase::Done), vec![]);
+        assert!(!m2.apply_convergence("AI 共识"));
+        assert!(m2.consensus.is_none());
+    }
+
+    /// Step3 状态机正向路径：纯 AI 圆桌收敛即 done；有真人参会则保持 running 等待真人。
+    #[test]
+    fn finish_meeting_phase_transitions() {
+        let mut ai_only = mk_meeting("running", Some(MeetingPhase::AiSpeaking), vec![]);
+        assert!(ai_only.apply_convergence("结论A"));
+        assert_eq!(ai_only.status, "done");
+        assert_eq!(ai_only.phase, Some(MeetingPhase::Done));
+        assert_eq!(ai_only.consensus.as_deref(), Some("结论A"));
+
+        let mut with_human =
+            mk_meeting("running", Some(MeetingPhase::AiSpeaking), vec!["agent/admin".into()]);
+        assert!(with_human.apply_convergence("结论B"));
+        assert_eq!(with_human.status, "running", "有真人参会须保持 running");
+        assert_eq!(with_human.phase, Some(MeetingPhase::AwaitingHumans));
+    }
+
+    /// Step3（ocr-review other·low）：phase=None 的旧会议回盘时**不得**凭空多出 `"phase":null`，
+    /// 否则老前端 / 老 fixture 会看到一个从未存在过的新值。
+    #[test]
+    fn meeting_phase_none_is_omitted_on_serialize() {
+        let m = mk_meeting("running", None, vec![]);
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(!s.contains("\"phase\""), "phase=None 必须整键省略，实际: {s}");
+
+        // 有值时正常写出 snake_case 字符串
+        let m2 = mk_meeting("running", Some(MeetingPhase::AwaitingHumans), vec![]);
+        let s2 = serde_json::to_string(&m2).unwrap();
+        assert!(s2.contains("\"phase\":\"awaiting_humans\""), "实际: {s2}");
+    }
+
+    /// Step3（ocr-review maintainability·medium）：EventKind 的 serde 名与 SSE 事件名必须一致，
+    /// 否则前端 addEventListener 收不到。as_str() 是 SSE 侧唯一取名入口，需与 serde 对齐。
+    #[test]
+    fn event_kind_serde_matches_sse_name() {
+        for k in [
+            EventKind::Snapshot,
+            EventKind::Message,
+            EventKind::State,
+            EventKind::Presence,
+            EventKind::Ended,
+        ] {
+            let json = serde_json::to_string(&k).unwrap();
+            assert_eq!(json, format!("\"{}\"", k.as_str()), "serde 名与 as_str() 必须一致");
+        }
     }
 }
 
