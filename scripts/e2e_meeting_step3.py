@@ -57,14 +57,15 @@ def agent_key() -> str:
 
     解析规则与 `start_agent_core.py`（服务端启动器）逐条对齐，否则同一份 .env 会被
     两边解释成不同的值，导致 E2E 拿到与服务实际加载的不一致的 key 而 403：
-      - 进程环境变量优先（启动器同样是 `if _k not in env` 的 env-first 语义）；
+      - 环境变量**存在即权威**：启动器仅在 `AGENT_API_KEY` 不在 env 时才读 .env；
+        故 env 中已设置（含空串）直接返回，不回退 .env，避免两边解释不一致而 403；
       - 按 `=` 首次出现切分，key / value 两侧 strip（支持 `AGENT_API_KEY = xxx`）；
       - value 剥去成对包裹的引号（支持 `AGENT_API_KEY="xxx"` / `'xxx'`）；
       - 跳过空行、`#` 注释行、不含 `=` 的行；utf-8-sig 自动剔除 BOM。
     """
-    env_key = os.environ.get("AGENT_API_KEY", "").strip()
-    if env_key:
-        return env_key
+    # env 中存在即权威（与启动器一致），含空值也直接返回，不回退 .env
+    if "AGENT_API_KEY" in os.environ:
+        return os.environ["AGENT_API_KEY"]
 
     path = os.path.join(ROOT, ".env")
     try:

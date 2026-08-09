@@ -2432,7 +2432,10 @@ async fn handle_meeting_message(
         Some(Json(v)) => v,
         None => return (axum::http::StatusCode::BAD_REQUEST, "missing body").into_response(),
     };
-    let from = v.get("from").and_then(|x| x.as_str()).unwrap_or(&caller).to_string();
+    // 安全：发言身份强制绑定到已认证的 caller，忽略请求体中的 `from` 伪造。
+    // 否则任意认证用户可伪装成受邀参与者 (participant_agents)，强制把状态机推进到
+    // discussing，干扰圆桌收敛（见 round-9 F3）。
+    let from = caller.clone();
     let content = match v.get("content").and_then(|x| x.as_str()) {
         Some(c) if !c.trim().is_empty() => c.to_string(),
         _ => return (axum::http::StatusCode::BAD_REQUEST,
@@ -2511,8 +2514,8 @@ async fn handle_meeting_end(
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
     };
     match agent.end_meeting(&id, &consensus, &requested_by, admin) {
-        Ok(()) => {
-            // 清理该会议的在线态，防止 meeting_presence 无界增长
+        Ok(true) => {
+            // 实际发生终态跃迁：清理在线态并广播 ended 事件
             st.meeting_presence.lock().await.remove(&id);
             // Step3 实时同步：广播结束事件（增量，不含完整消息历史）
             broadcast_meeting_event(
@@ -2526,6 +2529,12 @@ async fn handle_meeting_end(
                 }),
             );
             Json(serde_json::json!({"ok": true, "ended": id})).into_response()
+        }
+        Ok(false) => {
+            // 已终态（幂等）：不重复广播 ended，避免订阅端收到两次 ended 事件 / 共识分歧。
+            // 仍清理在线态（幂等安全），但不下发 ended。
+            st.meeting_presence.lock().await.remove(&id);
+            Json(serde_json::json!({"ok": true, "ended": id, "already_terminal": true})).into_response()
         }
         Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
     }
@@ -2798,6 +2807,12 @@ async fn handle_meeting_stream(
                                     // 记录已转发发言指纹，保证去重集与实际下发一致；
                                     // (from,at) 因 RFC3339 含亚秒精度实际唯一，碰撞在实践中不可能。
                                     snap_msg_keys.insert(key);
+                                    // 内存护栏：去重集只增不删会在长连接 × 订阅数下线性膨胀。
+                                    // 超阈值即清空（正常发言经 broadcast 单次发布不会重复下发，
+                                    // Lagged 路径会基于快照重建集合，见 round-9 F6）。
+                                    if snap_msg_keys.len() > 4096 {
+                                        snap_msg_keys.clear();
+                                    }
                                 }
                             }
                             // 关键实时事件：区分 Closed(断开→结束) 与 Full(慢客户端→背压 2s，避免重连风暴)
@@ -2929,45 +2944,45 @@ async fn handle_meeting_heartbeat(
     // 锁顺序 agent → presence，与 handle_meeting_delete / handle_meeting_end 保持一致，无死锁风险。
     //
     // 会议不存在时同样按「无权」处理，避免任意认证用户借错误码探测会议 ID 是否存在。
-    {
+    // 在 agent 锁内只做 O(1) 可见性 + 终态判定（不触碰磁盘、不碰 presence），随即释放
+    // agent 锁；presence 写入仅在 presence 锁下进行，避免把全局 agent 锁拉长成跨会议争用点
+    // （圆桌 LLM 收敛期间持锁尤甚，见 round-9 F5）。
+    let (visible, terminal) = {
         let g = st.agent.lock().await;
-        let visible = match &*g {
-            Some(agent) => agent
-                .meeting_visible(&id, &caller, &caller_ns, admin)
-                .unwrap_or(false),
-            None => false,
-        };
-        if !visible {
-            return (axum::http::StatusCode::FORBIDDEN, "无权访问该会议").into_response();
-        }
-        // 终态会议（status=done / phase=Done）不再接受心跳：end/delete 后迟到的心跳会通过
-        // or_default() 重建孤儿 presence 条目，而 SSE 任务在 ended 后已终止、5s tick 不再裁剪，
-        // 导致该键无界泄漏。直接清理并返回空在线表。
-        let terminal = g.as_ref().map_or(true, |agent| {
-            agent
-                .meeting_state(&id)
-                .map_or(true, |(s, p, _)| is_terminal_state(&s, p))
-        });
-        if terminal {
-            st.meeting_presence.lock().await.remove(&id);
-            return Json(serde_json::json!({ "ok": true, "online": [] })).into_response();
-        }
-        // 写入前先裁剪过期条目（elapsed >= 15s），防止 meeting_presence 无界增长
+        let agent_opt = g.as_ref();
+        let visible = agent_opt
+            .map(|a| a.meeting_visible(&id, &caller, &caller_ns, admin).unwrap_or(false))
+            .unwrap_or(false);
+        let terminal = agent_opt
+            .map_or(true, |a| a.meeting_state(&id).map_or(true, |(s, p, _)| is_terminal_state(&s, p)));
+        (visible, terminal)
+    };
+    if !visible {
+        return (axum::http::StatusCode::FORBIDDEN, "无权访问该会议").into_response();
+    }
+    // 终态会议（status=done / phase=Done）不再接受心跳：直接清在线态并返回空在线表，
+    // 避免 or_default() 重建孤儿 presence 条目导致该键无界泄漏。
+    if terminal {
+        st.meeting_presence.lock().await.remove(&id);
+        return Json(serde_json::json!({ "ok": true, "online": [] })).into_response();
+    }
+    // 仅持 presence 锁完成「写在线态 + 读在线列表」（agent 锁已释放，无跨会议争用）。
+    // 写与读合并在**同一次** presence 锁内，避免重复加锁造成的自死锁（tokio Mutex 不可重入）。
+    // 并发 delete/end 在两次心跳之间发生会瞬时写入孤儿 presence，但 delete/end 自身已
+    // remove(&id) 清理，且 entry 按 15s 裁剪，不会无界泄漏。
+    let online: Vec<String> = {
         let mut map = st.meeting_presence.lock().await;
         let entry = map.entry(id.clone()).or_default();
         entry.retain(|_, t| t.elapsed().as_secs() < 15);
         entry.insert(caller.clone(), std::time::Instant::now());
-    }
-    let online: Vec<String> = {
-        let map = st.meeting_presence.lock().await;
-        match map.get(&id) {
-            Some(p) => p
-                .iter()
-                .filter(|(_, t)| t.elapsed().as_secs() < 15)
-                .map(|(k, _)| k.clone())
-                .collect(),
-            None => Vec::new(),
-        }
+        map.get(&id)
+            .map(|p| {
+                p.iter()
+                    .filter(|(_, t)| t.elapsed().as_secs() < 15)
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     };
     Json(serde_json::json!({ "ok": true, "online": online })).into_response()
 }

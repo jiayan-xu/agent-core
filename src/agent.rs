@@ -1173,25 +1173,28 @@ impl AgentCore {
         consensus: &str,
         requested_by: &str,
         is_admin: bool,
-    ) -> Result<(), String> {
-        {
+    ) -> Result<bool, String> {
+        // 返回是否实际发生终态跃迁：Ok(true) 由 handler 广播 ended；Ok(false) 表示已终态
+        // （幂等），handler 据此跳过第二次 ended 广播，避免订阅端收到两条 ended / 共识分歧。
+        let transitioned = {
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
             let m = v.iter_mut().find(|m| m.id == id).ok_or("会议不存在")?;
             if m.owner_user_id != requested_by && !is_admin {
                 return Err("仅拥有者或管理员可结束会议".to_string());
             }
-            // 幂等：已终态（status=done 或 phase=Done）直接返回，不覆盖既有共识、
-            // 不重复落盘 / 触发二次 ended 广播。防止重复 `/end`（空 consensus）把用户共识抹掉、
-            // 让订阅端收到两次 ended 事件。
+            // 幂等：已终态（status=done 或 phase=Done）不覆盖既有共识、不重复落盘 /
+            // 不触发二次 ended 广播，返回 Ok(false) 让 handler 跳过广播（防止重复 `/end`
+            // 把用户已确认的共识抹掉、订阅端收到两次 ended 事件）。
             if m.is_terminal() {
-                return Ok(());
+                return Ok(false);
             }
             m.status = STATUS_DONE.to_string();
             m.phase = Some(MeetingPhase::Done);
             m.consensus = Some(consensus.to_string());
-        }
+            true
+        };
         self.save_meetings();
-        Ok(())
+        Ok(transitioned)
     }
 
     /// Step2：读取某会议的全部 participant_agents（A2A 通知目标）。
@@ -1287,18 +1290,10 @@ impl AgentCore {
         // 用 spawn_blocking 在阻塞线程执行，避免阻塞收敛回调所在的 tokio 任务
         // （save_meetings 含 std::fs 同步写，久则拖垮同 executor 上的其他异步任务）。
         if out.is_some() {
-            if let Some(payload) = self.serialize_meetings() {
-                tokio::task::spawn_blocking(move || {
-                    let path = match std::env::current_dir() {
-                        Ok(d) => d.join("meetings.json"),
-                        Err(_) => return,
-                    };
-                    let tmp = path.with_extension("tmp");
-                    if std::fs::write(&tmp, &payload).is_ok() {
-                        let _ = std::fs::rename(&tmp, &path);
-                    }
-                });
-            }
+            // 同步落盘：save_meetings 已受 AgentCore 锁串行化，无需 spawn_blocking。
+            // fire-and-forget 异步写会与其它同步持久化路径竞争同一 tmp 文件（lost update），
+            // 且在 tokio runtime 外 panic、JoinHandle 被丢弃导致写失败静默（见 round-9 F1）。
+            self.save_meetings();
         }
         out
     }
@@ -1347,8 +1342,8 @@ impl AgentCore {
 
     /// 会议持久化：落盘 cwd/meetings.json（原子写）
     /// 把内存会议序列化为 JSON 字符串（仅持锁做序列化，不触碰磁盘）。
-    /// 返回的 `String` 是 `Send + 'static`，可移入 `spawn_blocking` 做磁盘写入，
-    /// 从而把慢 IO 从 async worker 剥离（见 `finish_meeting`）。
+    /// 供 `save_meetings` 在 AgentCore 锁串行化下调用；调用方负责在合适位置落盘
+    /// （见 `save_meetings` 与 `finish_meeting`）。
     fn serialize_meetings(&self) -> Option<String> {
         let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
         let payload = serde_json::json!({ "meetings": v.iter().collect::<Vec<_>>() });
@@ -1358,13 +1353,23 @@ impl AgentCore {
     pub fn save_meetings(&self) {
         let cwd = match std::env::current_dir() {
             Ok(d) => d,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "save_meetings: 无法获取当前目录，跳过落盘");
+                return;
+            }
         };
         let path = cwd.join("meetings.json");
-        let Some(s) = self.serialize_meetings() else { return; };
+        let Some(s) = self.serialize_meetings() else {
+            tracing::warn!("save_meetings: 序列化会议失败，跳过落盘");
+            return;
+        };
         let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &s).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+        if let Err(e) = std::fs::write(&tmp, &s) {
+            tracing::warn!(error = %e, path = %tmp.display(), "save_meetings: 临时文件写入失败");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            tracing::warn!(error = %e, path = %path.display(), "save_meetings: 重命名落盘失败");
         }
     }
 
