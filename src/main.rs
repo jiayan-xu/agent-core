@@ -2370,7 +2370,11 @@ async fn handle_meeting_delete(
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
     };
     match agent.remove_meeting(&id, &caller, admin) {
-        Ok(()) => Json(serde_json::json!({"ok": true, "removed": id})).into_response(),
+        Ok(()) => {
+            // 清理该会议的在线态，防止 meeting_presence 无界增长
+            st.meeting_presence.lock().await.remove(&id);
+            Json(serde_json::json!({"ok": true, "removed": id})).into_response()
+        }
         Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
     }
 }
@@ -2459,6 +2463,8 @@ async fn handle_meeting_end(
     };
     match agent.end_meeting(&id, &consensus, &requested_by, admin) {
         Ok(()) => {
+            // 清理该会议的在线态，防止 meeting_presence 无界增长
+            st.meeting_presence.lock().await.remove(&id);
             // Step3 实时同步：广播会议结束事件
             if let Some(m) = agent.get_meeting(&id) {
                 broadcast_meeting(&st, &id, "ended", &m);
@@ -2541,22 +2547,37 @@ async fn handle_meeting_stream(
                                 .iter()
                                 .filter(|(_, t)| t.elapsed().as_secs() < 15)
                                 .map(|(k, _)| k.clone())
-                                .collect::<Vec<_>>(),
+                                .collect::<Vec::<_>>(),
                             None => Vec::new(),
                         }
                     };
-                    let _ = tx.send(Ok(SseEvent::default().event("presence").data(
+                    // 客户端断开时 tx.send 返回 Err，立即退出避免任务泄漏
+                    if tx.send(Ok(SseEvent::default().event("presence").data(
                         serde_json::json!({ "online": online }).to_string(),
-                    )));
-                    let _ = tx.send(Ok(SseEvent::default().data(": ping\n\n")));
+                    ))).is_err() { break; }
+                    // SSE 注释行心跳：axum 以 ':' 前缀发出，客户端忽略，不产生伪 message 事件
+                    if tx.send(Ok(SseEvent::default().comment("ping"))).is_err() { break; }
                 }
                 msg = rx.recv() => {
                     match msg {
                         Ok(ev) if ev.meeting_id == id2 => {
-                            let _ = tx.send(Ok(SseEvent::default().event(&ev.kind).data(ev.payload.to_string())));
+                            if tx.send(Ok(SseEvent::default().event(&ev.kind).data(ev.payload.to_string()))).is_err() { break; }
                         }
                         Ok(_) => {}
-                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        // 客户端落后超过缓冲：重新发送完整快照以重同步，避免静默丢事件
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let snap = {
+                                let g = st2.agent.lock().await;
+                                if let Some(agent) = &*g {
+                                    agent.get_meeting(&id2).map(|m| serde_json::to_string(&m).unwrap_or_default())
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(s) = snap {
+                                if tx.send(Ok(SseEvent::default().event("snapshot").data(s))).is_err() { break; }
+                            }
+                        }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
@@ -2582,15 +2603,39 @@ async fn handle_meeting_heartbeat(
     axum::extract::Path(id): axum::extract::Path<String>,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    let admin = is_admin(&headers, &st).await;
+    // 可见性校验（与 handle_meeting_stream 一致）：owner / admin / scope 成员 / 公开会议。
+    // 拒绝未知会议 ID，避免任意认证用户探私会议在线列表或伪造 presence 广播。
+    let visible = {
+        let g = st.agent.lock().await;
+        match &*g {
+            Some(agent) => match agent.get_meeting(&id) {
+                Some(m) => {
+                    m.owner_user_id == caller
+                        || admin
+                        || (m.scope.is_none() && !m.is_private)
+                        || m.scope
+                            .as_ref()
+                            .map_or(false, |s| agent_core::agent::scope_matches_caller(s, &caller_ns))
+                }
+                None => false,
+            },
+            None => false,
+        }
+    };
+    if !visible {
+        return (axum::http::StatusCode::FORBIDDEN, "无权访问该会议").into_response();
+    }
+    // 写入前先裁剪过期条目（elapsed >= 15s），防止 meeting_presence 无界增长
     {
         let mut map = st.meeting_presence.lock().await;
-        map.entry(id.clone())
-            .or_default()
-            .insert(caller.clone(), std::time::Instant::now());
+        let entry = map.entry(id.clone()).or_default();
+        entry.retain(|_, t| t.elapsed().as_secs() < 15);
+        entry.insert(caller.clone(), std::time::Instant::now());
     }
     let online: Vec<String> = {
         let map = st.meeting_presence.lock().await;

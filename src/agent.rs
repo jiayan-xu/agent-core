@@ -360,6 +360,17 @@ pub struct RoundtableResult {
     pub consensus: String,
 }
 
+/// 会议实时状态机阶段（会议升级 Step3）。
+/// serde snake_case 序列化与前端 / 旧 meetings.json 字符串完全一致（ai_speaking / awaiting_humans / discussing / done），向后兼容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingPhase {
+    AiSpeaking,
+    AwaitingHumans,
+    Discussing,
+    Done,
+}
+
 /// 圆桌会议记录（Phase 6 增强）：默认私有，仅拥有者 / admin 可见；持久化到 cwd/meetings.json
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Meeting {
@@ -389,7 +400,7 @@ pub struct Meeting {
     /// "ai_speaking" | "awaiting_humans" | "discussing" | "done"。
     /// None = 旧数据 / 兼容。serde default 兼容旧 meetings.json。
     #[serde(default)]
-    pub phase: Option<String>,
+    pub phase: Option<MeetingPhase>,
 }
 
 /// 会议中的一条发言（AI 分身 / 真人 A2A）。
@@ -996,7 +1007,7 @@ impl AgentCore {
             scope,
             participant_agents,
             messages: Vec::new(),
-            phase: Some("ai_speaking".to_string()),
+            phase: Some(MeetingPhase::AiSpeaking),
         };
         self.meetings
             .lock()
@@ -1028,8 +1039,10 @@ impl AgentCore {
                 return Err("会议已结束，无法发言".to_string());
             }
             m.messages.push(msg.clone());
-            // Step3 状态机推进：有真人发言 → discussing
-            m.phase = Some("discussing".to_string());
+            // Step3 状态机推进：仅真人发言 → discussing（AI 发言不推进，保持 awaiting_humans / ai_speaking）
+            if kind == "human" {
+                m.phase = Some(MeetingPhase::Discussing);
+            }
         }
         self.save_meetings();
         Ok(msg)
@@ -1050,7 +1063,7 @@ impl AgentCore {
                 return Err("仅拥有者或管理员可结束会议".to_string());
             }
             m.status = "done".to_string();
-            m.phase = Some("done".to_string());
+            m.phase = Some(MeetingPhase::Done);
             m.consensus = Some(consensus.to_string());
         }
         self.save_meetings();
@@ -1081,10 +1094,10 @@ impl AgentCore {
             if let Some(m) = v.iter_mut().find(|m| m.id == id) {
                 if m.participant_agents.is_empty() {
                     m.status = "done".to_string();
-                    m.phase = Some("done".to_string());
+                    m.phase = Some(MeetingPhase::Done);
                 } else {
                     m.status = "running".to_string();
-                    m.phase = Some("awaiting_humans".to_string());
+                    m.phase = Some(MeetingPhase::AwaitingHumans);
                 }
                 m.consensus = Some(consensus.to_string());
             }
@@ -10953,7 +10966,7 @@ mod whitelist_preroute_tests {
             consensus: None,
             scope: None,
             participant_agents: vec!["agent/admin".into()],
-            phase: Some("discussing".into()),
+            phase: Some(MeetingPhase::Discussing),
             messages: vec![
                 MeetingMessage { from: "ai1".into(), kind: "ai".into(), content: "立场".into(), at: "2026-08-01T00:00:01Z".into() },
                 MeetingMessage { from: "agent/admin".into(), kind: "human".into(), content: "意见".into(), at: "2026-08-01T00:00:02Z".into() },
