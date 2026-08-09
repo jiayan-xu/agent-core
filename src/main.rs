@@ -2249,11 +2249,22 @@ async fn handle_panel_discuss(
     let meeting_id_c = meeting_id.clone();
     let owner_c = caller.clone();
     tokio::spawn(async move {
-        let g = st_clone.agent.lock().await;
-        let Some(ref agent) = *g else {
-            let _ = tx.send(Ok(SseEvent::default().event("done").data("")));
-            return;
+        // 仅取 Arc<AgentCore> 克隆后立即释放全局 agent 锁：
+        // 收敛过程含 LLM 调用 / A2A 投递，绝不能在整个 SSE 任务期间持全局锁
+        // （reviewer round-11 F2：原 `let Some(ref agent) = *g` 让 guard 活到任务结束，
+        // 嵌套 agent→meeting_tx 广播且阻塞所有并发 agent 操作）。
+        // 克隆出的 Arc 全程持有，所有 agent 方法经 &AgentCore 调用，不再依赖全局锁。
+        let agent_arc: std::sync::Arc<AgentCore> = {
+            let g = st_clone.agent.lock().await;
+            match g.as_ref() {
+                Some(a) => a.clone(),
+                None => {
+                    let _ = tx.send(Ok(SseEvent::default().event("done").data("")));
+                    return;
+                }
+            }
         };
+        let agent = agent_arc.as_ref();
         let ns = agent.caller_ns(&session_c);
         // 会议升级 Step2：开场即 A2A 通知真人参与者（agent/<id> 收件箱）
         if !meeting_id_c.is_empty() && !participant_agents_c.is_empty() {
@@ -2524,7 +2535,9 @@ async fn handle_meeting_end(
         Some(Json(v)) => v,
         None => serde_json::json!({}),
     };
-    let requested_by = v.get("requested_by").and_then(|x| x.as_str()).unwrap_or(&caller).to_string();
+    // 安全：结束会议的「请求者」强制绑定到已认证的 caller，忽略请求体中的 `requested_by` 伪造。
+    // 否则任意认证用户可把 requested_by 设成 owner 以绕过 `end_meeting` 的 ownership 校验（越权结束会议）。
+    let requested_by = caller.clone();
     let consensus = v.get("consensus").and_then(|x| x.as_str()).unwrap_or("").to_string();
     // 在 agent 锁短作用域完成终态跃迁判定，随即释放全局锁，避免 presence 清理 / 实时广播
     // 在持全局锁期间 await 而拉长全局锁持有时长、并引入脆弱的锁顺序（reviewer round-10 F1）。
@@ -2634,13 +2647,15 @@ fn spawn_meeting_channel_sweeper(st: Arc<AppState>) {
     });
 }
 
-/// Step3：会议在线表兜底清理 —— 周期性移除「会议已不存在」的孤儿 presence 条目。
+/// Step3：会议在线表兜底清理 —— 周期性移除「会议已不存在」或「已终态但仍存在」的孤儿 presence 条目。
 ///
 /// 心跳 handler（handle_meeting_heartbeat）为降低全局 agent 锁持有时长，分两步执行：
 /// 先在 agent 锁内做「可见性 + 终态」判定并释放，再在 presence 锁内写入在线态。若并发的
 /// delete/end 在两步之间 remove 掉该会议，心跳会用 `or_default()` 为已删除会议重建孤儿 presence
 /// 条目；此后心跳对该会议恒返回 403（不可见）、SSE 任务也已退出，无人再裁剪该键，造成无界泄漏。
-/// 本后台任务每 60s 扫描一次，对「会议已不存在」的 id 直接 remove，作为确定性兜底。
+/// 此外，纯 AI 圆桌经 `handle_panel_discuss` 收敛为终态（status=done）后会议仍保留在 `meetings` 中，
+/// 原 `is_none()` 谓词匹配不到，其 presence 条目同样会泄漏。
+/// 本后台任务每 60s 扫描一次，对「会议不存在」或「已终态」的 id 直接 remove，作为确定性兜底。
 ///
 /// 锁顺序：agent → presence（先取 agent 锁判定会议是否存在，再取 presence 锁删除），
 /// 与 delete/end、心跳 handler 的锁顺序一致，无死锁风险（无任何路径反向 presence→agent 取锁）。
@@ -2661,11 +2676,20 @@ fn spawn_meeting_presence_sweeper(st: Arc<AppState>) {
             };
             let mut missing = Vec::new();
             for id in &ids {
-                let exists = {
+                // 既清「会议已不存在」的孤儿，也清「已终态但仍存在」的会议 presence：
+                // 终态会议仍保留在 meetings 中，原 is_none() 谓词匹配不到，导致 presence 无界泄漏
+                // （reviewer round-11 F1）。终态会议的心跳会返回 online:[] 并移除 presence，
+                // 但存在竞态窗口，此处作为确定性兜底一并清理。
+                let should_clear = {
                     let g = st.agent.lock().await;
-                    g.as_ref().map(|a| a.meeting_state(id).is_some()).unwrap_or(false)
+                    g.as_ref()
+                        .map(|a| {
+                            a.meeting_state(id)
+                                .map_or(true, |(s, p, _)| is_terminal_state(&s, p))
+                        })
+                        .unwrap_or(true)
                 };
-                if !exists {
+                if should_clear {
                     missing.push(id.clone());
                 }
             }

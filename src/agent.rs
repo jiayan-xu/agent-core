@@ -490,10 +490,17 @@ impl Meeting {
         if advances {
             self.phase = Some(MeetingPhase::Discussing);
         }
+        let idx = self.messages.len();
         self.messages.push(msg);
         // 返回被追加的消息（已无多余克隆），供上层 A2A 投递 / 增量广播复用。
         // 取刚 push 进向量的那条，避免对入参再 clone 一次（消除热路径多余分配）。
-        Ok(self.messages.last().cloned().unwrap())
+        // 用索引取回并避免 unwrap（reviewer round-11 F2）：极端情况下取回失败以 Err 上抛而非 panic。
+        let m = self
+            .messages
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| "内部错误：发言入队后无法取回".to_string())?;
+        Ok(m)
     }
 }
 
@@ -1261,19 +1268,21 @@ impl AgentCore {
     /// 返回值供调用方（圆桌后台任务）向订阅端广播 `state` / `ended` 实时事件——
     /// 否则订阅者会持有陈旧的 phase/status，直到真人发言或会议被结束/删除（见 `handle_meeting_stream`）。
     pub fn finish_meeting(&self, id: &str, consensus: &str) -> Option<(String, Option<MeetingPhase>)> {
-        // 状态跃迁与结果读取必须在**同一次加锁**内完成。
-        //
+        // 状态跃迁、结果读取与「序列化」必须在**同一次加锁**内完成（消除 TOCTOU 窗口，见下）。
+        // 序列化的字节串随返回值一并带出锁外落盘：串行化保证来自 self.meetings 内部锁
+        // （而非任何外部 AgentCore 锁），确保落盘内容严格对应本次内存变更、无撕裂读 / lost update。
         // 反例（TOCTOU）：先在锁 A 内 apply_convergence、释放锁、save_meetings()（全量序列化，慢），
         // 再在锁 B 内重读 (status, phase)。两锁之间其他线程可能：
         //   - 真人发言把 phase 推进到 Discussing → 广播出去的不是本次收敛的结果；
         //   - end_meeting 置 done → 广播 state 而非 ended，订阅端永远等不到终态；
         //   - 删除会议 → 重读得 None，调用方以为「未变更」而完全不广播。
-        // 因此在锁内直接克隆出返回值，锁外只做磁盘 IO。
-        let out = {
+        // 因此在锁内直接克隆出返回值与序列化结果，锁外只做磁盘 IO。
+        let (out, serialized) = {
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
-            match v.iter_mut().find(|m| m.id == id) {
+            // 先确定是否变更并取出结果（变更后随即释放对 m 的可变借用），
+            // 再在锁内以只读方式序列化，避免 m 可变借用与 v.iter() 只读借用冲突。
+            let out_opt = match v.iter_mut().find(|m| m.id == id) {
                 Some(m) => {
-                    // 同一把锁内先尝试收敛；成功即克隆结果返回，避免 TOCTOU 窗口
                     if m.apply_convergence(consensus) {
                         Some((m.status.clone(), m.phase))
                     } else {
@@ -1282,18 +1291,23 @@ impl AgentCore {
                 }
                 // 会议不存在 / 已终态 / 已幂等回填
                 None => None,
-            }
+            };
+            // 同一把内部锁内完成「序列化」：带出的 serialized 严格对应本次内存状态。
+            let serialized = if out_opt.is_some() {
+                serde_json::to_string_pretty(
+                    &serde_json::json!({ "meetings": v.iter().collect::<Vec<_>>() }),
+                )
+                .ok()
+            } else {
+                None
+            };
+            (out_opt, serialized)
         };
-        // 未发生变更时不落盘，避免无谓 IO 与状态倒退。
-        // 发生变更时，把磁盘 IO（全量序列化 + 写文件）移出当前 async worker：
-        // 仅转移「数据」(序列化后的字节串，Send + 'static)，不捕获 &self，
-        // 用 spawn_blocking 在阻塞线程执行，避免阻塞收敛回调所在的 tokio 任务
-        // （save_meetings 含 std::fs 同步写，久则拖垮同 executor 上的其他异步任务）。
-        if out.is_some() {
-            // 同步落盘：save_meetings 已受 AgentCore 锁串行化，无需 spawn_blocking。
-            // fire-and-forget 异步写会与其它同步持久化路径竞争同一 tmp 文件（lost update），
-            // 且在 tokio runtime 外 panic、JoinHandle 被丢弃导致写失败静默（见 round-9 F1）。
-            self.save_meetings();
+        // 发生变更时落盘：序列化已在 self.meetings 内部锁内完成，此处仅做磁盘 IO（tmp + 原子 rename），
+        // 不持任何锁。不另起 spawn_blocking：fire-and-forget 异步写会与其他持久化路径竞争同一 tmp 文件
+        // （lost update），且在 tokio runtime 外 panic、JoinHandle 被丢弃导致写失败静默（见 round-9 F1）。
+        if let Some(s) = serialized {
+            self.write_meetings_file(&s);
         }
         out
     }
@@ -1340,36 +1354,46 @@ impl AgentCore {
         }
     }
 
-    /// 会议持久化：落盘 cwd/meetings.json（原子写）
-    /// 把内存会议序列化为 JSON 字符串（仅持锁做序列化，不触碰磁盘）。
-    /// 供 `save_meetings` 在 AgentCore 锁串行化下调用；调用方负责在合适位置落盘
-    /// （见 `save_meetings` 与 `finish_meeting`）。
+    /// 会议持久化：把内存会议序列化为 JSON 字符串（仅持锁做序列化，不触碰磁盘）。
+    /// 串行化由 self.meetings 内部锁保证：调用方须在锁临界区内调用以得到与内存严格一致的快照
+    /// （如 `finish_meeting` 在锁内序列化后带出锁外落盘）。`save_meetings` 自身内部亦会加该锁。
     fn serialize_meetings(&self) -> Option<String> {
         let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
         let payload = serde_json::json!({ "meetings": v.iter().collect::<Vec<_>>() });
         serde_json::to_string_pretty(&payload).ok()
     }
 
+    /// 会议持久化：落盘 cwd/meetings.json（原子写 tmp + rename）。
+    /// 串行化在 self.meetings 内部锁内完成（见 `serialize_meetings` / `finish_meeting`），
+    /// 自身也以该锁串行化，故并发调用 `save_meetings` 不会相互撕裂；调用方（remove_meeting /
+    /// end_meeting）须在释放内部锁后调用，避免 `serialize_meetings` 重入死锁（std Mutex 不可重入）。
     pub fn save_meetings(&self) {
-        let cwd = match std::env::current_dir() {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(error = %e, "save_meetings: 无法获取当前目录，跳过落盘");
-                return;
-            }
-        };
-        let path = cwd.join("meetings.json");
         let Some(s) = self.serialize_meetings() else {
             tracing::warn!("save_meetings: 序列化会议失败，跳过落盘");
             return;
         };
+        self.write_meetings_file(&s);
+    }
+
+    /// 把已序列化的会议 JSON 原子写入 cwd/meetings.json（tmp + rename）。
+    /// 不含任何锁：调用方负责在 self.meetings 内部锁临界区内完成序列化（如 `finish_meeting`），
+    /// 本函数只做磁盘 IO，可安全在锁外调用，避免把慢速 fs 写挡在全局内存锁上。
+    fn write_meetings_file(&self, s: &str) {
+        let cwd = match std::env::current_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, "write_meetings_file: 无法获取当前目录，跳过落盘");
+                return;
+            }
+        };
+        let path = cwd.join("meetings.json");
         let tmp = path.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp, &s) {
-            tracing::warn!(error = %e, path = %tmp.display(), "save_meetings: 临时文件写入失败");
+        if let Err(e) = std::fs::write(&tmp, s) {
+            tracing::warn!(error = %e, path = %tmp.display(), "write_meetings_file: 临时文件写入失败");
             return;
         }
         if let Err(e) = std::fs::rename(&tmp, &path) {
-            tracing::warn!(error = %e, path = %path.display(), "save_meetings: 重命名落盘失败");
+            tracing::warn!(error = %e, path = %path.display(), "write_meetings_file: 重命名落盘失败");
         }
     }
 

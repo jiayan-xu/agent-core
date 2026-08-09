@@ -217,7 +217,13 @@ def main() -> int:
     ok &= wait_for(lambda: "ended" in _kinds(), 8, "ended 事件")
     end_ev = next((d for k, d in _snapshot_events() if k == "ended"), "")
     print(f"   ended payload = {end_ev}")
-    ok &= '"deleted":true' in end_ev.replace(" ", "")
+    # 解析 JSON 断言（避免字符串拼接误判；reviewer round-11 F3）
+    end_obj: dict = {}
+    try:
+        end_obj = json.loads(end_ev)
+    except Exception:
+        pass
+    ok &= bool(end_obj.get("deleted") is True)
 
     print("6) 心跳注释行保活存在")
     has_ping = any(line.startswith(": ping") or line == ":ping" for line in _snapshot_raw())
