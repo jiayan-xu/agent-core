@@ -2292,9 +2292,29 @@ async fn handle_panel_discuss(
         let _ = tx.send(Ok(SseEvent::default().event("consensus").data(
             serde_json::json!({ "consensus": consensus }).to_string(),
         )));
-        // 回填会议记录（共识 + done）
+        // 回填会议记录（共识 + 状态机跃迁），并把收敛结果实时广播给订阅端：
+        // - 终态（status=done / phase=Done）→ ended，关闭订阅流；
+        // - 非终态（真人待接手）→ state，订阅端更新 phase（ai_speaking → awaiting_humans）。
+        // 否则订阅者永远看不到本次跃迁，停留在陈旧状态。
         if !meeting_id_c.is_empty() {
-            agent.finish_meeting(&meeting_id_c, &consensus);
+            if let Some((status, phase)) = agent.finish_meeting(&meeting_id_c, &consensus) {
+                let terminal = status == "done" || phase == Some(MeetingPhase::Done);
+                if terminal {
+                    broadcast_meeting_event(
+                        &st,
+                        &meeting_id_c,
+                        EventKind::Ended,
+                        serde_json::json!({ "status": status, "phase": phase, "terminal": true }),
+                    );
+                } else {
+                    broadcast_meeting_event(
+                        &st,
+                        &meeting_id_c,
+                        EventKind::State,
+                        serde_json::json!({ "status": status, "phase": phase }),
+                    );
+                }
+            }
         }
         // 最佳努力写入 Memoria（调用者自身 ns）
         let stances_text = stances
@@ -2453,15 +2473,16 @@ async fn handle_meeting_message(
     // Step3 实时同步：广播**增量**（仅新发言 + 状态字段）。
     // 不再序列化完整 Meeting：否则每条发言都是 O(n)，broadcast 通道又保留最近 256 条，
     // 长会议会累积 O(n²) 的数据量。完整快照只保留给初始订阅 / Lagged 重同步路径。
-    let (status, phase, _) = agent
-        .meeting_state(&id)
-        .unwrap_or_else(|| ("running".to_string(), None, 0));
-    broadcast_meeting_event(
-        &st,
-        &id,
-        EventKind::Message,
-        serde_json::json!({ "message": msg, "status": status, "phase": phase }),
-    );
+    // 仅在会议仍存在时广播增量事件：add_meeting_message 成功后到此处读状态之间若被并发删除，
+    // meeting_state 返回 None，不应伪造 status:"running" 广播针对已不存在会议的消息。
+    if let Some((status, phase, _)) = agent.meeting_state(&id) {
+        broadcast_meeting_event(
+            &st,
+            &id,
+            EventKind::Message,
+            serde_json::json!({ "message": msg, "status": status, "phase": phase }),
+        );
+    }
     Json(serde_json::json!({"ok": true, "delivered": delivered, "targets": targets.len()})).into_response()
 }
 
@@ -2651,7 +2672,7 @@ async fn handle_meeting_stream(
     // 终态快照：status != running 或 phase == Done 都表示会议已结束。
     let terminal = state
         .as_ref()
-        .map_or(true, |(s, p, _)| s != "running" || *p == Some(MeetingPhase::Done));
+        .map_or(true, |(s, p, _)| s == "done" || *p == Some(MeetingPhase::Done));
     match state {
         Some((status, phase, count)) => {
             let changed = match &snap {
@@ -2671,8 +2692,10 @@ async fn handle_meeting_stream(
             snap = None;
         }
     }
-    // 服务端去重指纹：快照中已有发言的 (from,at)。订阅窗口（克隆→订阅）内落地的发言会同时
-    // 出现在快照与 rx 缓冲，非终态时跳过转发，避免客户端重复应用（此前依赖前端去重）。
+    // 服务端去重指纹：快照中已有发言的 (from,at)。每个订阅连接构建一次（O(消息数)），
+    // 订阅窗口（克隆→订阅）内落地的发言会同时出现在快照与 rx 缓冲，非终态时跳过转发，
+    // 避免客户端重复应用（此前依赖前端去重）。本领域（固废监管圆桌）会议发言数有界且较小，
+    // 每连接线性内存开销可接受；集合随订阅任务结束而释放，不会跨会议累积。
     let mut snap_msg_keys: HashSet<(String, String)> = snap
         .as_ref()
         .map(|m| m.messages.iter().map(|msg| (msg.from.clone(), msg.at.clone())).collect())
@@ -2795,6 +2818,15 @@ async fn handle_meeting_stream(
                                         .map(|msg| (msg.from.clone(), msg.at.clone()))
                                         .collect();
                                     if tx.try_send(Ok(SseEvent::default().event("snapshot").data(s))).is_err() { break; }
+                                    // Lagged 重同步后判定终态：Ended 可能被本次 Lagged 吞掉，
+                                    // 若会议已结束/删除则补发 ended 并终止，避免 zombie 流。
+                                    if m.is_terminal() {
+                                        let _ = tx.try_send(Ok(SseEvent::default().event("ended").data(
+                                            serde_json::json!({ "terminal": true }).to_string(),
+                                        )));
+                                        cleanup_meeting_channel(&st2, &id2);
+                                        break;
+                                    }
                                 }
                                 None => {
                                     // 会议已被删除：不再重同步，转发终止避免永久阻塞 rx.recv()
@@ -2859,7 +2891,7 @@ async fn handle_meeting_heartbeat(
         let terminal = g.as_ref().map_or(true, |agent| {
             agent
                 .meeting_state(&id)
-                .map_or(true, |(s, p, _)| s != "running" || p == Some(MeetingPhase::Done))
+                .map_or(true, |(s, p, _)| s == "done" || p == Some(MeetingPhase::Done))
         });
         if terminal {
             st.meeting_presence.lock().await.remove(&id);

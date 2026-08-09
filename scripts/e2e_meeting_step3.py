@@ -2,6 +2,12 @@
 
 严格时序：先建立 SSE 订阅并确认收到 snapshot，再依次触发事件，最后断言事件均已抵达。
 用法：python scripts/e2e_meeting_step3.py [base_url]
+
+注意（幂等与重跑）：本脚本依赖 meetings.json 中预置的旧格式种子会议 `mtg_e2e_step3`
+（phase 键省略，验证 skip_serializing_if 旧数据兼容）。Step5 的 DELETE 会通过
+`remove_meeting` + `save_meetings` 把删除持久化到 meetings.json，因此**单次运行会销毁该
+种子会议**；重跑前需由外部（harness / CI）重新写入种子（ phase 省略）并重启服务。
+脚本本身不负责重置种子，避免与运行实例的内存状态不一致。
 """
 
 from __future__ import annotations
@@ -14,7 +20,7 @@ import time
 import urllib.error
 import urllib.request
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:9753"
+BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:9753").rstrip("/")
 MID = "mtg_e2e_step3"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

@@ -463,6 +463,10 @@ pub struct MeetingMessage {
     pub at: String,
 }
 
+/// 发言来源类型常量，替代魔法字符串。仅 `MSG_KIND_HUMAN` 推进状态机到 Discussing。
+pub const MSG_KIND_HUMAN: &str = "human";
+pub const MSG_KIND_AI: &str = "ai";
+
 /// 会议实时事件类型（Step3）。serde snake_case 序列化与 SSE 事件名一致，消除魔法字符串。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1114,7 +1118,7 @@ impl AgentCore {
             }
             m.messages.push(msg.clone());
             // Step3 状态机推进：仅真人发言 → discussing（AI 发言不推进，保持 awaiting_humans / ai_speaking）
-            if kind == "human" {
+            if kind == MSG_KIND_HUMAN {
                 m.phase = Some(MeetingPhase::Discussing);
             }
         }
@@ -1202,7 +1206,12 @@ impl AgentCore {
     /// 与拥有者主动 `/api/meetings/{id}/end` 存在竞态。若会议已终止（status=done 或
     /// phase=Done），**直接返回**，不得把 done 回退成 running、也不得覆盖用户已写入的共识
     /// （否则 SSE 订阅端会看到 done → running 的状态倒退）。
-    pub fn finish_meeting(&self, id: &str, consensus: &str) {
+    /// Step3：回填共识并推进状态机（调用 `apply_convergence`）。
+    /// 返回收敛后的 `(status, phase)`；未发生变更（会议不存在 / 已终态 / 已幂等回填）返回 None。
+    ///
+    /// 返回值供调用方（圆桌后台任务）向订阅端广播 `state` / `ended` 实时事件——
+    /// 否则订阅者会持有陈旧的 phase/status，直到真人发言或会议被结束/删除（见 `handle_meeting_stream`）。
+    pub fn finish_meeting(&self, id: &str, consensus: &str) -> Option<(String, Option<MeetingPhase>)> {
         let changed = {
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
             match v.iter_mut().find(|m| m.id == id) {
@@ -1213,6 +1222,13 @@ impl AgentCore {
         // 未发生变更（会议不存在 / 已终态）时不落盘，避免无谓 IO 与状态倒退
         if changed {
             self.save_meetings();
+            // 重新读取收敛后的状态用于实时广播
+            let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+            v.iter()
+                .find(|m| m.id == id)
+                .map(|m| (m.status.clone(), m.phase.clone()))
+        } else {
+            None
         }
     }
 
