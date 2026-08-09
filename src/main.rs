@@ -2394,26 +2394,34 @@ async fn handle_meeting_delete(
         Err(resp) => return resp,
     };
     let admin = is_admin(&headers, &st).await;
-    let g = st.agent.lock().await;
-    let Some(ref agent) = *g else {
-        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
-    };
-    match agent.remove_meeting(&id, &caller, admin) {
-        Ok(()) => {
-            // 清理该会议的在线态，防止 meeting_presence 无界增长
-            st.meeting_presence.lock().await.remove(&id);
-            // Step3 实时同步：广播终止事件。会议已被删除，get_meeting 之后恒为 None，
-            // 若不广播，订阅端拿不到任何终止信号 → 本地状态永久陈旧、SSE 任务空转到客户端断开为止。
-            broadcast_meeting_event(
-                &st,
-                &id,
-                EventKind::Ended,
-                serde_json::json!({ "deleted": true, "status": "done" }),
-            ).await;
-            Json(serde_json::json!({"ok": true, "removed": id})).into_response()
+    // 在 agent 锁短作用域完成删除判定，随即释放全局锁，避免 presence 清理 / 实时广播
+    // 在持全局锁期间 await 而拉长全局锁持有时长、并引入脆弱的锁顺序（reviewer round-10 F1）。
+    // presence / 广播均在 agent 锁释放后进行，无 agent→presence 嵌套。
+    {
+        let g = st.agent.lock().await;
+        let Some(ref agent) = *g else {
+            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+        };
+        match agent.remove_meeting(&id, &caller, admin) {
+            Ok(()) => {}
+            Err(e) => {
+                return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))
+                    .into_response()
+            }
         }
-        Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
     }
+    // 全局 st.agent 锁已释放：presence 清理与实时广播均在锁外进行。
+    st.meeting_presence.lock().await.remove(&id);
+    // Step3 实时同步：广播终止事件。会议已被删除，get_meeting 之后恒为 None，
+    // 若不广播，订阅端拿不到任何终止信号 → 本地状态永久陈旧、SSE 任务空转到客户端断开为止。
+    broadcast_meeting_event(
+        &st,
+        &id,
+        EventKind::Ended,
+        serde_json::json!({ "deleted": true, "status": "done" }),
+    )
+    .await;
+    Json(serde_json::json!({"ok": true, "removed": id})).into_response()
 }
 
 /// Phase 6 增强 (Step2)：真人 A2A 参会——向会议发言。
@@ -2442,24 +2450,32 @@ async fn handle_meeting_message(
         _ => return (axum::http::StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "content required"}))).into_response(),
     };
-    let g = st.agent.lock().await;
-    let Some(ref agent) = *g else {
-        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+    // 在 agent 锁短作用域内完成「记录发言 + 收集投递目标 + 读取状态」，随即释放全局锁，
+    // 避免后续 A2A 网络投递（collab_send_raw）与实时广播（broadcast 通道锁）在持全局锁期间
+    // await 而拉长全局 agent 锁持有时长、并引入脆弱的 agent→presence/agent→meeting_tx 锁顺序
+    // （reviewer round-10 F1）。collab_send_raw 需 agent 引用，故克隆 Arc 在锁外调用。
+    let (msg, targets, state, agent_arc) = {
+        let g = st.agent.lock().await;
+        let Some(ref agent) = *g else {
+            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+        };
+        let agent_arc = agent.clone();
+        let msg = match agent.add_meeting_message(&id, &from, "human", &content) {
+            Ok(m) => m,
+            Err(e) => {
+                return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))
+                    .into_response()
+            }
+        };
+        let targets: Vec<String> = agent
+            .meeting_agent_participants(&id)
+            .into_iter()
+            .filter(|a| *a != from)
+            .collect();
+        let state = agent.meeting_state(&id);
+        (msg, targets, state, agent_arc)
     };
-    // 记录发言（kind=human，A2A 真人消息）
-    let msg = match agent.add_meeting_message(&id, &from, "human", &content) {
-        Ok(m) => m,
-        Err(e) => {
-            return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))
-                .into_response()
-        }
-    };
-    // A2A 投递到其余真人参与者收件箱
-    let targets: Vec<String> = agent
-        .meeting_agent_participants(&id)
-        .into_iter()
-        .filter(|a| *a != from)
-        .collect();
+    // 全局 st.agent 锁已释放；以下 A2A 网络投递与实时广播均在锁外进行。
     let mut delivered = 0usize;
     for t in &targets {
         let envelope = serde_json::json!({
@@ -2470,7 +2486,7 @@ async fn handle_meeting_message(
             "content": content,
             "kind": "human-message",
         });
-        if agent.collab_send_raw(t, &envelope).await.is_ok() {
+        if agent_arc.collab_send_raw(t, &envelope).await.is_ok() {
             delivered += 1;
         }
     }
@@ -2479,7 +2495,7 @@ async fn handle_meeting_message(
     // 长会议会累积 O(n²) 的数据量。完整快照只保留给初始订阅 / Lagged 重同步路径。
     // 仅在会议仍存在时广播增量事件：add_meeting_message 成功后到此处读状态之间若被并发删除，
     // meeting_state 返回 None，不应伪造 status:"running" 广播针对已不存在会议的消息。
-    if let Some((status, phase, _)) = agent.meeting_state(&id) {
+    if let Some((status, phase, _)) = state {
         broadcast_meeting_event(
             &st,
             &id,
@@ -2510,12 +2526,25 @@ async fn handle_meeting_end(
     };
     let requested_by = v.get("requested_by").and_then(|x| x.as_str()).unwrap_or(&caller).to_string();
     let consensus = v.get("consensus").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let g = st.agent.lock().await;
-    let Some(ref agent) = *g else {
-        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+    // 在 agent 锁短作用域完成终态跃迁判定，随即释放全局锁，避免 presence 清理 / 实时广播
+    // 在持全局锁期间 await 而拉长全局锁持有时长、并引入脆弱的锁顺序（reviewer round-10 F1）。
+    // presence / 广播均在 agent 锁释放后进行，无 agent→presence 嵌套。
+    let transitioned = {
+        let g = st.agent.lock().await;
+        let Some(ref agent) = *g else {
+            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+        };
+        match agent.end_meeting(&id, &consensus, &requested_by, admin) {
+            Ok(b) => b,
+            Err(e) => {
+                return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))
+                    .into_response()
+            }
+        }
     };
-    match agent.end_meeting(&id, &consensus, &requested_by, admin) {
-        Ok(true) => {
+    // 全局 st.agent 锁已释放；presence 清理与广播均在锁外进行。
+    match transitioned {
+        true => {
             // 实际发生终态跃迁：清理在线态并广播 ended 事件
             st.meeting_presence.lock().await.remove(&id);
             // Step3 实时同步：广播结束事件（增量，不含完整消息历史）
@@ -2531,13 +2560,12 @@ async fn handle_meeting_end(
             ).await;
             Json(serde_json::json!({"ok": true, "ended": id})).into_response()
         }
-        Ok(false) => {
+        false => {
             // 已终态（幂等）：不重复广播 ended，避免订阅端收到两次 ended 事件 / 共识分歧。
             // 仍清理在线态（幂等安全），但不下发 ended。
             st.meeting_presence.lock().await.remove(&id);
             Json(serde_json::json!({"ok": true, "ended": id, "already_terminal": true})).into_response()
         }
-        Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
     }
 }
 
@@ -2621,20 +2649,26 @@ fn spawn_meeting_presence_sweeper(st: Arc<AppState>) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             tick.tick().await;
-            // agent 锁内收集「会议已不存在」的 id（agent → presence 顺序，避免反向加锁死锁）
-            let missing: Vec<String> = {
-                let g = st.agent.lock().await;
-                let agent_opt = g.as_ref();
+            // 锁序（修复 reviewer round-10 F2）：
+            // ① 仅持 presence 锁收集全部 id（不碰 agent），随即释放；
+            // ② 逐个持 agent 锁做 O(1) 的会议存在性判定（agent 锁短持、且不在 presence 锁内）；
+            // ③ 仅对确认缺失的 id 持 presence 锁删除（短临界区）。
+            // 全程不「持 agent 锁内取 presence」，与心跳 / end / delete 的「agent 释放后取 presence」
+            // 方向一致，无死锁；且不再周期性同时持全局 agent + presence 锁全表扫描，消除全局停顿。
+            let ids: Vec<String> = {
                 let p = st.meeting_presence.lock().await;
-                p.keys()
-                    .filter(|id| {
-                        agent_opt
-                            .map(|a| a.meeting_state(id).is_none())
-                            .unwrap_or(true)
-                    })
-                    .cloned()
-                    .collect()
+                p.keys().cloned().collect()
             };
+            let mut missing = Vec::new();
+            for id in &ids {
+                let exists = {
+                    let g = st.agent.lock().await;
+                    g.as_ref().map(|a| a.meeting_state(id).is_some()).unwrap_or(false)
+                };
+                if !exists {
+                    missing.push(id.clone());
+                }
+            }
             if !missing.is_empty() {
                 let mut p = st.meeting_presence.lock().await;
                 for id in &missing {
