@@ -2498,7 +2498,11 @@ async fn handle_meeting_message(
     // add_meeting_message 已不再内部落盘（round-14 #4），此处须在释放全局锁后、于锁外调用
     // save_meetings，避免把同步全量写盘拖进持 st.agent 全局锁的临界区（否则慢磁盘阻塞所有
     // agent 操作）。save_meetings 内部仍持轻量 persist_lock 串行化，保进程崩溃不丢已确认发言。
-    agent_arc.save_meetings();
+    // 【round-15 #3】落盘失败以 **error 级**日志记录「已确认但未持久化」的发言（含会议 id），
+    // 使审计域可发现；但不因此拒绝已成功的发言请求（客户端已确认，内存状态已生效，仅持久化失败）。
+    if let Err(e) = agent_arc.save_meetings() {
+        tracing::error!(error = %e, meeting = %id, "handle_meeting_message: 发言已确认但落盘失败（可能进程崩溃丢失，请排查磁盘）");
+    }
     // 以下 A2A 网络投递与实时广播均在锁外进行。
     let mut delivered = 0usize;
     for t in &targets {
@@ -2547,11 +2551,17 @@ async fn handle_meeting_end(
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
     let admin = is_admin(&headers, &st).await;
+    // 【round-15 #1 反枚举】结束会议前先做可见性门禁（与 message/SSE/心跳同一 meeting_visible
+    // 判定）：会议不存在与无权统一返回 403「无权访问该会议」，避免通过 /end 的错误串差异探测
+    // 私有会议 ID 是否存在（end_meeting 内部的错误串也已统一）。
+    if !meeting_visible(&st, &id, &caller, &caller_ns, admin).await {
+        return (axum::http::StatusCode::FORBIDDEN, "无权访问该会议").into_response();
+    }
     let v = match body {
         Some(Json(v)) => v,
         None => serde_json::json!({}),
@@ -2563,20 +2573,31 @@ async fn handle_meeting_end(
     // 在 agent 锁短作用域完成终态跃迁判定，随即释放全局锁，避免 presence 清理 / 实时广播
     // 在持全局锁期间 await 而拉长全局锁持有时长、并引入脆弱的锁顺序（reviewer round-10 F1）。
     // presence / 广播均在 agent 锁释放后进行，无 agent→presence 嵌套。
-    let transitioned = {
+    let (transitioned, agent_arc) = {
         let g = st.agent.lock().await;
         let Some(ref agent) = *g else {
             return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
         };
+        let agent_arc = agent.clone();
         match agent.end_meeting(&id, &consensus, &requested_by, admin) {
-            Ok(b) => b,
+            Ok(b) => (b, agent_arc),
             Err(e) => {
                 return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))
                     .into_response()
             }
         }
     };
-    // 全局 st.agent 锁已释放；presence 清理与广播均在锁外进行。
+    // 全局 st.agent 锁已释放。落盘移到锁外（round-15 #2）：end_meeting 已不再内部落盘，
+    // 此处须在释放全局锁后于锁外调用 save_meetings，避免把同步 fsync 写盘拖进持 st.agent
+    // 全局锁的临界区（否则慢磁盘阻塞所有 agent 操作）。仅当实际发生终态跃迁才落盘
+    // （已终态幂等返回时状态未变，无需写盘）。
+    if transitioned {
+        // 【round-15 #3】落盘失败以 error 级日志记录（含会议 id），使审计域可发现
+        if let Err(e) = agent_arc.save_meetings() {
+            tracing::error!(error = %e, meeting = %id, "handle_meeting_end: 会议已结束但共识落盘失败（可能进程崩溃丢失，请排查磁盘）");
+        }
+    }
+    // 以下 presence 清理与广播均在锁外进行。
     match transitioned {
         true => {
             // 实际发生终态跃迁：清理在线态并广播 ended 事件
@@ -2967,7 +2988,10 @@ async fn handle_meeting_stream(
                                         let _ = tx.try_send(Ok(SseEvent::default().event("ended").data(
                                             serde_json::json!({ "terminal": true }).to_string(),
                                         )));
-                                        cleanup_meeting_channel(&st2, &id2).await;
+                                        // 【round-15 #4】此处不再重复调 cleanup_meeting_channel：
+                                        // break 后的 post-loop 会统一清理同一通道（receiver_count()
+                                        // 在本任务 drop 其 rx 前恒 >0，分支内清理无效果且与 post-loop
+                                        // 重复取锁）。仅在 break 后由 post-loop 做一次清理即可。
                                         break;
                                     }
                                 }

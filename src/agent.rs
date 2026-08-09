@@ -1184,7 +1184,8 @@ impl AgentCore {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(meeting);
-        self.save_meetings();
+        // 低频创建路径：落盘失败已在 save_meetings 内 warn，此处忽略 Result（返回 id 不因 IO 失败而变）
+        let _ = self.save_meetings();
         id
     }
 
@@ -1250,11 +1251,21 @@ impl AgentCore {
     ) -> Result<bool, String> {
         // 返回是否实际发生终态跃迁：Ok(true) 由 handler 广播 ended；Ok(false) 表示已终态
         // （幂等），handler 据此跳过第二次 ended 广播，避免订阅端收到两条 ended / 共识分歧。
+        // 【round-15 #1 反枚举】会议不存在与「无权结束」统一返回同一错误串「无权访问该会议」，
+        // 与 add_meeting_message / meeting_visible / heartbeat 的反枚举策略一致：任何已认证用户
+        // 都无法通过 /api/meetings/{id}/end 的错误串差异探测私有会议 ID 是否存在。
+        // 【round-15 #2 性能】不再在此处同步落盘：end_meeting 由 handle_meeting_end 在持
+        // st.agent 全局锁内调用，若在此同步 fsync 写盘，慢磁盘会阻塞所有 agent 操作（与
+        // add_meeting_message 重构同一原则）。落盘职责上移给调用方，在释放全局锁后于锁外调
+        // save_meetings()。
         let transitioned = {
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
-            let m = v.iter_mut().find(|m| m.id == id).ok_or("会议不存在")?;
+            let m = v.iter_mut().find(|m| m.id == id);
+            let Some(m) = m else {
+                return Err("无权访问该会议".to_string());
+            };
             if m.owner_user_id != requested_by && !is_admin {
-                return Err("仅拥有者或管理员可结束会议".to_string());
+                return Err("无权访问该会议".to_string());
             }
             // 幂等：已终态（status=done 或 phase=Done）不覆盖既有共识、不重复落盘 /
             // 不触发二次 ended 广播，返回 Ok(false) 让 handler 跳过广播（防止重复 `/end`
@@ -1267,7 +1278,6 @@ impl AgentCore {
             m.consensus = Some(consensus.to_string());
             true
         };
-        self.save_meetings();
         Ok(transitioned)
     }
 
@@ -1414,7 +1424,8 @@ impl AgentCore {
         // 会议并发量显著上升，可在调用方（tokio 上下文）用 spawn_blocking 只迁移写盘、保留本函数
         // 的序列化在 self.meetings 锁内以维持 TOCTOU 保证。
         if let Some(s) = serialized {
-            self.write_meetings_file(&s);
+            // 低频收敛落盘：写失败已在 write_meetings_file 内 warn，此处忽略 Result
+            let _ = self.write_meetings_file(&s);
         }
         out
     }
@@ -1454,7 +1465,8 @@ impl AgentCore {
                 }
                 v.remove(i);
                 drop(v);
-                self.save_meetings();
+                // 低频删除路径：落盘失败已在 save_meetings 内 warn，此处忽略 Result
+                let _ = self.save_meetings();
                 Ok(())
             }
             None => Err("会议不存在".to_string()),
@@ -1467,22 +1479,24 @@ impl AgentCore {
     /// 杜绝较旧序列化结果后 rename 覆盖较新文件）。self.meetings 仅在序列化期间持有，写盘前释放。
     /// 调用方（remove_meeting / end_meeting / add_meeting_message）须在释放 self.meetings 锁后
     /// 调用本方法，避免 persist_lock / self.meetings 嵌套顺序不一致（锁顺序恒为 persist_lock → self.meetings）。
-    pub fn save_meetings(&self) {
+    /// 返回 `Result`（reviewer round-15 #3）：调用方（如 handle_meeting_message / end）在落盘
+    /// 失败时可用 error 级日志记录「已确认但未持久化的状态」，使审计域可发现。内部低频调用点
+    /// （create_meeting / remove_meeting）可忽略返回值（写失败已在此处 warn 日志）。
+    pub fn save_meetings(&self) -> Result<(), String> {
         // persist_lock 跨「序列化 + 写盘」整个关键区（见 finish_meeting 注释）。
         let _pg = self.persist_lock.lock().unwrap_or_else(|p| p.into_inner());
         let serialized = {
             let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
-            serde_json::to_string_pretty(&serde_json::json!({ "meetings": v.iter().collect::<Vec<_>>() }))
-                .map_err(|e| {
+            match serde_json::to_string_pretty(&serde_json::json!({ "meetings": v.iter().collect::<Vec<_>>() }))
+            {
+                Ok(s) => s,
+                Err(e) => {
                     tracing::warn!(error = %e, "save_meetings: 序列化会议失败，跳过落盘");
-                    e
-                })
-                .ok()
+                    return Err(format!("序列化会议失败: {e}"));
+                }
+            }
         };
-        let Some(s) = serialized else {
-            return;
-        };
-        self.write_meetings_file(&s);
+        self.write_meetings_file(&serialized)
     }
 
     /// 把已序列化的会议 JSON 原子写入 cwd/meetings.json（tmp + 原子 rename + fsync）。
@@ -1492,12 +1506,12 @@ impl AgentCore {
     /// rename 后新文件完整）；写 tmp 后 `sync_all`（fsync）使数据落盘，再 rename，以覆盖
     /// OS 崩溃 / 断电场景（否则 rename 的文件可能为空或陈旧）。rename 后目录未 fsync，故
     /// 「断电后文件名永久丢失」仍无法 100% 保证——文档如实声明，不夸大。
-    fn write_meetings_file(&self, s: &str) {
+    fn write_meetings_file(&self, s: &str) -> Result<(), String> {
         let cwd = match std::env::current_dir() {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(error = %e, "write_meetings_file: 无法获取当前目录，跳过落盘");
-                return;
+                return Err(format!("无法获取当前目录: {e}"));
             }
         };
         let path = cwd.join("meetings.json");
@@ -1512,11 +1526,13 @@ impl AgentCore {
         })();
         if let Err(e) = write_res {
             tracing::warn!(error = %e, path = %tmp.display(), "write_meetings_file: 临时文件写入/fsync 失败");
-            return;
+            return Err(format!("临时文件写入失败: {e}"));
         }
         if let Err(e) = std::fs::rename(&tmp, &path) {
             tracing::warn!(error = %e, path = %path.display(), "write_meetings_file: 重命名落盘失败");
+            return Err(format!("重命名落盘失败: {e}"));
         }
+        Ok(())
     }
 
     /// 启动时从 meetings.json 恢复会议记录

@@ -119,17 +119,32 @@ def subscribe():
     try:
         r = urllib.request.Request(f"{BASE}/api/meetings/{MID}/stream", headers=HDR)
         with urllib.request.urlopen(r, timeout=30) as resp:
+            # SSE 规范解析（reviewer round-15 #5，bug·high）：
+            # axum 0.8 的 Sse 序列化器每个事件块写 wire 格式 `data:{...}\nevent:{name}\n\n`，
+            # 即 `data:` **先于** `event:`。若在收到 `data:` 行时就用「上一块的 event 名」立即
+            # 派发，会把每个事件的载荷错记到上一个事件名下（snapshot→message、presence→snapshot…）。
+            # 正确做法：缓冲当前块的 event/data 字段，在**空行终止符**（`\n\n`）处结算并派发。
             name = None
+            data = None
             for bline in resp:
                 if stop.is_set():
                     break
                 line = bline.decode("utf-8", "replace").rstrip("\r\n")
                 _append_raw(line)
-                if line.startswith("event:"):
+                if line == "":
+                    # 空行 = 事件块结束：结算当前缓冲的 event/data
+                    if data is not None:
+                        _append_event(name or "message", data)
+                    name, data = None, None
+                elif line.startswith("event:"):
                     name = line[6:].strip()
                 elif line.startswith("data:"):
-                    _append_event(name or "message", line[5:].strip())
-                    name = None
+                    piece = line[5:].strip()
+                    # 多行 data 按 SSE 规范用换行拼接
+                    data = f"{data}\n{piece}" if data is not None else piece
+            # 流结束（服务端关闭）时若仍有未结算缓冲，一并结算，避免丢最后一个事件
+            if data is not None:
+                _append_event(name or "message", data)
     except urllib.error.HTTPError as e:
         # 403 等：清晰记录失败并立即打印，由 main 的超时断言判 FAIL，不抛原始 traceback
         _append_raw(f": error {e.code}")
