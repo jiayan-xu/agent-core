@@ -50,8 +50,11 @@ def agent_key() -> str:
     """从 .env 读取 AGENT_API_KEY，绝不硬编码密钥。"""
     path = os.path.join(ROOT, ".env")
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
+        with open(path, "r", encoding="utf-8-sig") as f:  # utf-8-sig 自动剔除 BOM
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
                 if line.startswith("AGENT_API_KEY="):
                     return line.split("=", 1)[1].strip()
     except FileNotFoundError:
@@ -99,12 +102,15 @@ def subscribe():
                     _append_event(name or "message", line[5:].strip())
                     name = None
     except urllib.error.HTTPError as e:
-        # 403 等：清晰记录失败，由 main 的超时断言判 FAIL，不抛原始 traceback
+        # 403 等：清晰记录失败并立即打印，由 main 的超时断言判 FAIL，不抛原始 traceback
         _append_raw(f": error {e.code}")
+        print(f"  [subscribe] HTTPError {e.code}（期望 200/403，见 main 断言）")
     except urllib.error.URLError as e:
         _append_raw(f": error connection {e.reason}")
+        print(f"  [subscribe] 连接错误: {e.reason}")
     except Exception as e:  # noqa: BLE001
         _append_raw(f": error {e}")
+        print(f"  [subscribe] 异常: {e}")
 
 
 def wait_for(pred, timeout=10.0, label=""):
@@ -134,9 +140,18 @@ def main() -> int:
         ok = False
     else:
         snap = next((d for k, d in _snapshot_events() if k == "snapshot"), "")
-        assert_no_phase = '"phase"' not in snap
-        print(f"   snapshot 收到；旧数据 phase 键省略 = {assert_no_phase}")
-        ok &= assert_no_phase
+        try:
+            snap_obj = json.loads(snap)
+            phase = snap_obj.get("phase")
+            # 种子会议为旧格式（meetings.json 省略 phase 键）→ 反序列化为 None，
+            # 验证 skip_serializing_if 旧数据兼容：快照不含 phase 或值为 null。
+            # 断言实际 phase 值而非仅"键缺失"，避免会议改为运行时创建(总带 phase)时误报 PASS。
+            assert_no_phase = phase is None
+            print(f"   snapshot 收到；phase={phase!r}（旧格式种子应为 None）= {assert_no_phase}")
+            ok &= assert_no_phase
+        except Exception as e:  # noqa: BLE001
+            print(f"   !! snapshot 解析失败: {e}")
+            ok = False
 
     print("2) 心跳鉴权")
     s1, _ = req("POST", f"/api/meetings/{MID}/heartbeat")

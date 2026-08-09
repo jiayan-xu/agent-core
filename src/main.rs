@@ -26,7 +26,7 @@ use axum::{
 use chrono::{Local, Timelike};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -45,7 +45,9 @@ use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 use wry::WebViewBuilder;
 
-use agent_core::agent::{AgentConfig, AgentCore, AgentIdentity, EventKind, MeetingEvent};
+use agent_core::agent::{
+    AgentConfig, AgentCore, AgentIdentity, EventKind, MeetingEvent, MeetingPhase,
+};
 use agent_core::audit::AuditLogger;
 use agent_core::meta_evolve::{MetaEvolutionConfig, SafetyConfig};
 use agent_core::code_evolve::{apply_patch, eval_crate, find_up, git_commit, git_diff, git_revert, propose_fn, EvalResult};
@@ -2544,7 +2546,9 @@ fn cleanup_meeting_channel(st: &Arc<AppState>, id: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if let Some(tx) = map.get(id) {
-        if tx.receiver_count() == 0 {
+        // 调用点：本函数总在 spawned 任务内、rx 仍存活时执行，receiver_count() 至少为 1。
+        // 用 `<= 1` 判定（即仅剩本任务这一接收者）才能正确回收，否则 Sender 永不释放 → 泄漏。
+        if tx.receiver_count() <= 1 {
             map.remove(id);
         }
     }
@@ -2609,35 +2613,68 @@ async fn handle_meeting_stream(
     };
     {
         let g = st.agent.lock().await;
-        if let Some(cur) = g.as_ref().and_then(|a| a.get_meeting(&id2)) {
-            // 克隆快照后、订阅前若有并发事件落地，重新克隆以纳入该事件；
-            // 缓冲区中的同一事件由前端按 (from,at) 去重，不会重复应用。
-            let changed = match &snap {
-                Some(s) => {
-                    cur.messages.len() != s.messages.len()
-                        || cur.status != s.status
-                        || cur.phase != s.phase
+        match g.as_ref().and_then(|a| a.get_meeting(&id2)) {
+            Some(cur) => {
+                // 克隆快照后、订阅前若有并发事件落地，重新克隆以纳入该事件。
+                let changed = match &snap {
+                    Some(s) => {
+                        cur.messages.len() != s.messages.len()
+                            || cur.status != s.status
+                            || cur.phase != s.phase
+                    }
+                    None => true,
+                };
+                if changed {
+                    snap = Some(cur.clone());
                 }
-                None => true,
-            };
-            if changed {
-                snap = Some(cur.clone());
+            }
+            None => {
+                // 复核窗口内会议已被删除（cur 为 None）：标记 snap 为 None，
+                // 稍后在 spawned 任务中发 ended(deleted) 并终止，避免 zombie 流。
+                snap = None;
             }
         }
     }
+    // 终态快照：status != running 或 phase == Done 都表示会议已结束。
+    // 若初始快照即终态，spawned 任务直接发 ended 并 return，不留永不关闭的 zombie 连接。
+    let terminal = snap
+        .as_ref()
+        .map_or(true, |m| m.status != "running" || m.phase == Some(MeetingPhase::Done));
+    // 服务端去重指纹：快照中已有发言的 (from,at)。订阅窗口（克隆→订阅）内落地的发言会同时
+    // 出现在快照与 rx 缓冲，非终态时跳过转发，避免客户端重复应用（此前依赖前端去重）。
+    let mut snap_msg_keys: HashSet<(String, String)> = snap
+        .as_ref()
+        .map(|m| m.messages.iter().map(|msg| (msg.from.clone(), msg.at.clone())).collect())
+        .unwrap_or_default();
     let (tx, rx_out) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(64);
     let st2 = st.clone();
     tokio::spawn(async move {
         // 初始快照：克隆已在上方锁内完成，此处仅序列化并发送。
         if let Some(m) = snap {
             let data = serde_json::to_string(&m).unwrap_or_default();
-                if tx
-                    .try_send(Ok(SseEvent::default().event("snapshot").data(data)))
-                    .is_err()
-                {
-                    cleanup_meeting_channel(&st2, &id2);
-                    return;
-                }
+            if tx
+                .try_send(Ok(SseEvent::default().event("snapshot").data(data)))
+                .is_err()
+            {
+                cleanup_meeting_channel(&st2, &id2);
+                return;
+            }
+            if terminal {
+                // 快照已是终态（status != running 或 phase == Done）：无后续事件，
+                // 立即发 ended 并终止流，避免客户端持有永不关闭的 zombie 连接。
+                let _ = tx.try_send(Ok(SseEvent::default().event("ended").data(
+                    serde_json::json!({ "terminal": true }).to_string(),
+                )));
+                cleanup_meeting_channel(&st2, &id2);
+                return;
+            }
+        } else {
+            // 复核窗口内会议已被删除：立即发 ended(deleted) 终止，不留 zombie 流。
+            let _ = tx.try_send(Ok(SseEvent::default().event("ended").data(
+                serde_json::json!({ "deleted": true }).to_string(),
+            )));
+            cleanup_meeting_channel(&st2, &id2);
+            return;
         }
         // 心跳保活 + 在线表推送（每 5s）
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -2672,6 +2709,19 @@ async fn handle_meeting_stream(
                             // 会议终止（ended / 删除）事件转发后立即结束推送任务并关闭 SSE 流，
                             // 避免任务、mpsc 通道、broadcast 接收端随服务器生命周期无限常驻（资源泄漏）。
                             let ended = ev.kind == EventKind::Ended;
+                            // 服务端去重：订阅窗口内落地、已随快照下发的发言，跳过转发，
+                            // 避免客户端收到两次（此前仅依赖前端 (from,at) 去重）。
+                            if ev.kind == EventKind::Message {
+                                if let Some(inner) = ev.payload.get("message") {
+                                    let key = (
+                                        inner.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                        inner.get("at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                    );
+                                    if snap_msg_keys.contains(&key) {
+                                        continue;
+                                    }
+                                }
+                            }
                             if tx
                                 .try_send(Ok(SseEvent::default().event(ev.kind.as_str()).data(ev.payload.to_string())))
                                 .is_err()
@@ -2686,9 +2736,25 @@ async fn handle_meeting_stream(
                                 let g = st2.agent.lock().await;
                                 g.as_ref().and_then(|a| a.get_meeting(&id2))
                             };
-                            if let Some(m) = m {
-                                let s = serde_json::to_string(&m).unwrap_or_default();
-                                if tx.try_send(Ok(SseEvent::default().event("snapshot").data(s))).is_err() { break; }
+                            match m {
+                                Some(m) => {
+                                    let s = serde_json::to_string(&m).unwrap_or_default();
+                                    // 重同步快照可能包含订阅窗口之后的发言，刷新去重指纹，
+                                    // 避免这些发言被后续 rx 再次下发导致客户端重复应用。
+                                    snap_msg_keys = m
+                                        .messages
+                                        .iter()
+                                        .map(|msg| (msg.from.clone(), msg.at.clone()))
+                                        .collect();
+                                    if tx.try_send(Ok(SseEvent::default().event("snapshot").data(s))).is_err() { break; }
+                                }
+                                None => {
+                                    // 会议已被删除：不再重同步，转发终止避免永久阻塞 rx.recv()
+                                    let _ = tx.try_send(Ok(SseEvent::default().event("ended").data(
+                                        serde_json::json!({ "deleted": true }).to_string(),
+                                    )));
+                                    break;
+                                }
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => break,

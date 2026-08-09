@@ -422,9 +422,14 @@ impl Meeting {
             self.status = "done".to_string();
             self.phase = Some(MeetingPhase::Done);
         } else {
-            // 有真人参会：保持 running，等待真人接手讨论
+            // 有真人参会：保持 running，等待真人接手讨论。
+            // 终态守卫：若延迟到达的收敛回调到来时真人已切入 Discussing，
+            // 不再回退成 awaiting_humans（否则状态倒退 + 订阅端观察到抖动）。
+            // 共识文本仍照常回填。
             self.status = "running".to_string();
-            self.phase = Some(MeetingPhase::AwaitingHumans);
+            if self.phase != Some(MeetingPhase::Discussing) {
+                self.phase = Some(MeetingPhase::AwaitingHumans);
+            }
         }
         self.consensus = Some(consensus.to_string());
         true
