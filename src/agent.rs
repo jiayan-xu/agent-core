@@ -373,6 +373,80 @@ pub struct Meeting {
     /// "running" | "done"
     pub status: String,
     pub consensus: Option<String>,
+    /// NEW(会议升级 Step1)：会议层级范围，如 "dept:engineering" / "org:cs-pufa-2nd-thermal"。
+    /// None = 旧版私有圆桌（仅拥有者 / admin 可见）。serde default 兼容旧 meetings.json。
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+/// 判断分身是否匹配会议 scope。
+/// - scope="dept:<id>" → Persona 的 ns_full_path 含 `dept/<id>` 段（现代 ns）
+///                       或 `project/<id>` 段（旧 ns：部门存于 project 段）
+/// - scope="org:<company>" → Persona 的 ns_full_path 含 `org/<company>` 段（现代 ns）
+///                       或 `dept/<company>` 段（旧 ns：公司存于 dept 段）
+/// - scope=None → 恒 true（不过滤，兼容旧客户端）
+fn scope_matches_persona(
+    scope: Option<&str>,
+    p: &crate::runtime::self_runtime::Persona,
+) -> bool {
+    let Some(sc) = scope else { return true };
+    let Some(ns) = p.ns_full_path.as_deref() else {
+        // 无 ns_full_path 的分身：仅 owner 本人可见（不匹配任何 scope 会议）
+        return false;
+    };
+    // 一次性拆段（性能：避免每次匹配重复 collect）
+    let segs: Vec<&str> = ns.split('/').collect();
+    let segments = |prefix: &str, value: &str| -> bool {
+        segs.windows(2).any(|w| seg_match(w, prefix, value))
+    };
+    if let Some(id) = sc.strip_prefix("dept:") {
+        // 与 scope_matches_caller 严格对称：dept 只匹配现代 ns 的 `dept/<id>` 段。
+        // 不匹配 project/proj 段——该段在现代 ns 是项目、旧 persona ns 是部门，
+        // 语义冲突且会造成「persona 被纳入但 caller 不可见」的授权不对称。
+        segments("dept", id)
+    } else if let Some(id) = sc.strip_prefix("org:") {
+        // 现代 ns：org/<company>；旧 ns：dept/<company>（公司段）。
+        // 仅当该 persona 无现代 org/ 段时才回退 dept/，避免部门名=公司名时误匹配
+        if segments("org", id) {
+            true
+        } else if !segs.iter().any(|s| *s == "org") {
+            segments("dept", id)
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
+/// 判断调用者是否匹配会议 scope（精确段匹配，非子串，避免越权）。
+/// - scope="dept:<id>" → 调用者任一 ns 含 `dept/<id>` 段
+/// - scope="org:<company>" → 调用者任一 ns 含 `org/<company>` 段
+/// - 持有 `*`（admin）恒匹配
+pub fn scope_matches_caller(scope: &str, caller_ns: &[String]) -> bool {
+    if caller_ns.iter().any(|n| n == "*") {
+        return true;
+    }
+    if let Some(id) = scope.strip_prefix("dept:") {
+        // caller 是现代 ns（org/{company}/dept/{dept}/proj/{project}），
+        // dept:<id> 只匹配 dept 段；proj 段是项目，匹配会误授权。
+        caller_ns.iter().any(|n| {
+            let segs: Vec<&str> = n.split('/').collect();
+            segs.windows(2).any(|w| seg_match(w, "dept", id))
+        })
+    } else if let Some(id) = scope.strip_prefix("org:") {
+        caller_ns.iter().any(|n| {
+            let segs: Vec<&str> = n.split('/').collect();
+            segs.windows(2).any(|w| seg_match(w, "org", id))
+        })
+    } else {
+        false
+    }
+}
+
+/// 判断 ns 连续两段 `w` 是否等于 `<prefix>/<value>`
+fn seg_match(w: &[&str], prefix: &str, value: &str) -> bool {
+    w.len() == 2 && w[0] == prefix && w[1] == value
 }
 
 /// P2-1: 单次任务执行的工作记忆状态机（AgentRunContext）
@@ -724,6 +798,18 @@ impl AgentCore {
         m.values().cloned().collect()
     }
 
+    /// 会议升级 Step1：按 scope 过滤分身。
+    /// - scope="dept:<id>" → 分身 ns_full_path 含 `dept/<id>` 段
+    /// - scope="org:<company>" → 分身 ns_full_path 含 `org/<company>` 段
+    /// - scope=None → 返回全部分身（兼容旧客户端）
+    pub fn list_personas_scoped(
+        &self,
+        scope: Option<&str>,
+    ) -> Vec<crate::runtime::self_runtime::Persona> {
+        let m = self.personas.lock().unwrap_or_else(|p| p.into_inner());
+        m.values().cloned().filter(|p| scope_matches_persona(scope, p)).collect()
+    }
+
     /// Phase 3：删除一个分身（default 不可删）
     pub fn remove_persona(&self, persona_id: &str) -> Result<(), String> {
         if persona_id == "default" {
@@ -853,6 +939,7 @@ impl AgentCore {
         owner: &str,
         participants: Vec<String>,
         is_private: bool,
+        scope: Option<String>,
     ) -> String {
         let id = format!("mtg_{}", chrono::Utc::now().timestamp_millis());
         let meeting = Meeting {
@@ -864,6 +951,7 @@ impl AgentCore {
             created_at: chrono::Utc::now().to_rfc3339(),
             status: "running".to_string(),
             consensus: None,
+            scope,
         };
         self.meetings
             .lock()
@@ -885,12 +973,23 @@ impl AgentCore {
         self.save_meetings();
     }
 
-    /// 列出调用者可见的会议：公开 或 拥有者 或 admin
-    pub fn list_meetings(&self, caller: &str, is_admin: bool) -> Vec<Meeting> {
+    /// 列出调用者可见的会议：公开 或 拥有者 或 admin，或调用者属该 scope。
+    /// scope 会议视为「public within scope」：私有但带 scope 的会议，仅当调用者
+    /// 任一 ns 精确匹配 scope 时可见（权威判定在此处，避免公共 API 泄露敏感数据）。
+    pub fn list_meetings(&self, caller: &str, is_admin: bool, caller_ns: &[String]) -> Vec<Meeting> {
         let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
         let mut out: Vec<Meeting> = v
             .iter()
-            .filter(|m| !m.is_private || is_admin || m.owner_user_id == caller)
+            .filter(|m| {
+                if m.is_private && !is_admin && m.owner_user_id != caller {
+                    // 私有且非 owner/admin：仅当带 scope 且调用者属该 scope 时可见
+                    if let Some(sc) = &m.scope {
+                        return scope_matches_caller(sc, caller_ns);
+                    }
+                    return false;
+                }
+                true
+            })
             .cloned()
             .collect();
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
