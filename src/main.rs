@@ -1674,6 +1674,8 @@ fn main() {
                 .route("/api/roundtable", post(handle_panel_discuss))
                 .route("/api/meetings", get(handle_meetings_list))
                 .route("/api/meetings/{id}", delete(handle_meeting_delete))
+                .route("/api/meetings/{id}/message", post(handle_meeting_message))
+                .route("/api/meetings/{id}/end", post(handle_meeting_end))
                 .route("/api/evolve", post(handle_code_evolve))
                 .route("/api/meta-evolution/run", post(handle_meta_evolution_run))
                 .route("/api/meta-evolution/status", get(handle_meta_evolution_status))
@@ -2171,6 +2173,19 @@ async fn handle_panel_discuss(
         }
     }
 
+    // 会议升级 Step2：真人 A2A 参会者（agent_id 列表）。
+    // 前端「真人参会」多选产生；每人以 `agent/<id>` 收件箱接收会议开播通知。
+    let participant_agents: Vec<String> = v
+        .get("participants")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let participant_agents_c = participant_agents.clone();
+
     // 计算实际参与者（用于会议记录），并预建会议记录（status=running）
     let g0 = st.agent.lock().await;
     let has_agent = g0.is_some();
@@ -2190,7 +2205,14 @@ async fn handle_panel_discuss(
     let meeting_id = {
         let g = st.agent.lock().await;
         match &*g {
-            Some(ref agent) => agent.create_meeting(&topic, &caller, participants.clone(), is_private, scope.clone()),
+            Some(ref agent) => agent.create_meeting(
+                &topic,
+                &caller,
+                participants.clone(),
+                participant_agents,
+                is_private,
+                scope.clone(),
+            ),
             None => String::new(),
         }
     };
@@ -2207,6 +2229,7 @@ async fn handle_panel_discuss(
     let sel_c = selected_ids;
     let scope_c = scope;
     let meeting_id_c = meeting_id.clone();
+    let owner_c = caller.clone();
     tokio::spawn(async move {
         let g = st_clone.agent.lock().await;
         let Some(ref agent) = *g else {
@@ -2214,6 +2237,22 @@ async fn handle_panel_discuss(
             return;
         };
         let ns = agent.caller_ns(&session_c);
+        // 会议升级 Step2：开场即 A2A 通知真人参与者（agent/<id> 收件箱）
+        if !meeting_id_c.is_empty() && !participant_agents_c.is_empty() {
+            let notice = serde_json::json!({
+                "type": "meeting",
+                "subject": format!("会议「{}」已开始，等待你的参会意见", topic_c),
+                "meeting": meeting_id_c,
+                "from": owner_c,
+                "content": format!("会议「{}」已由 {} 发起并开始，会议 ID={}。请通过 /api/meetings/{}/message 提交你的意见。", topic_c, owner_c, meeting_id_c, meeting_id_c),
+                "kind": "meeting-notice",
+            });
+            for t in &participant_agents_c {
+                if let Err(e) = agent.collab_send_raw(t, &notice).await {
+                    tracing::warn!(target = %t, "会议开播通知 A2A 投递失败: {}", e);
+                }
+            }
+        }
         let mut personas = agent.list_personas_scoped(scope_c.as_deref());
         personas.sort_by(|a, b| a.persona_id.cmp(&b.persona_id));
         if let Some(ids) = &sel_c {
@@ -2297,6 +2336,8 @@ async fn handle_meetings_list(
                 "status": m.status,
                 "consensus": m.consensus,
                 "scope": m.scope,
+                "participant_agents": m.participant_agents,
+                "messages": m.messages,
             })
         })
         .collect();
@@ -2320,6 +2361,90 @@ async fn handle_meeting_delete(
     };
     match agent.remove_meeting(&id, &caller, admin) {
         Ok(()) => Json(serde_json::json!({"ok": true, "removed": id})).into_response(),
+        Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+/// Phase 6 增强 (Step2)：真人 A2A 参会——向会议发言。
+/// body: { "from": agent_id, "content": "..." }
+/// 记录发言后，将该消息 A2A 投递到会议其余 participant_agents 的收件箱。
+async fn handle_meeting_message(
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> axum::response::Response {
+    let (caller, _) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let v = match body {
+        Some(Json(v)) => v,
+        None => return (axum::http::StatusCode::BAD_REQUEST, "missing body").into_response(),
+    };
+    let from = v.get("from").and_then(|x| x.as_str()).unwrap_or(&caller).to_string();
+    let content = match v.get("content").and_then(|x| x.as_str()) {
+        Some(c) if !c.trim().is_empty() => c.to_string(),
+        _ => return (axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "content required"}))).into_response(),
+    };
+    let g = st.agent.lock().await;
+    let Some(ref agent) = *g else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+    };
+    // 记录发言（kind=human，A2A 真人消息）
+    if let Err(e) = agent.add_meeting_message(&id, &from, "human", &content) {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response();
+    }
+    // A2A 投递到其余真人参与者收件箱
+    let targets: Vec<String> = agent
+        .meeting_agent_participants(&id)
+        .into_iter()
+        .filter(|a| *a != from)
+        .collect();
+    let mut delivered = 0usize;
+    for t in &targets {
+        let envelope = serde_json::json!({
+            "type": "meeting",
+            "subject": format!("会议 {}：{} 发言", id, from),
+            "meeting": id,
+            "from": from,
+            "content": content,
+            "kind": "human-message",
+        });
+        if agent.collab_send_raw(t, &envelope).await.is_ok() {
+            delivered += 1;
+        }
+    }
+    Json(serde_json::json!({"ok": true, "delivered": delivered, "targets": targets.len()})).into_response()
+}
+
+/// Phase 6 增强 (Step2)：结束会议并回填共识。
+/// body: { "requested_by": "<owner>", "consensus": "..." }
+/// consensus 可选，缺省用 caller 的 ""。
+async fn handle_meeting_end(
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> axum::response::Response {
+    let (caller, _) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let admin = is_admin(&headers, &st).await;
+    let v = match body {
+        Some(Json(v)) => v,
+        None => serde_json::json!({}),
+    };
+    let requested_by = v.get("requested_by").and_then(|x| x.as_str()).unwrap_or(&caller).to_string();
+    let consensus = v.get("consensus").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let g = st.agent.lock().await;
+    let Some(ref agent) = *g else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+    };
+    match agent.end_meeting(&id, &consensus, &requested_by, admin) {
+        Ok(()) => Json(serde_json::json!({"ok": true, "ended": id})).into_response(),
         Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
     }
 }
