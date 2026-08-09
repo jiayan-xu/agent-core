@@ -413,8 +413,22 @@ impl Meeting {
     /// 而拥有者可能已通过 `/api/meetings/{id}/end` 结束会议。若无保护，
     /// 延迟到达的回调会把 done 改回 running，并用 AI 共识覆盖用户共识，
     /// 订阅端还会观察到 done → running 的状态倒退。
+    /// 终态判定：status=done 或 phase=Done 都表示会议已结束。
+    /// `add_meeting_message` 与 `apply_convergence` 共享此单一来源，避免两处谓词漂移
+    /// （否则新增状态如 paused/cancelled 会在两处表现不一致）。
+    pub fn is_terminal(&self) -> bool {
+        self.status == "done" || self.phase == Some(MeetingPhase::Done)
+    }
+
     pub fn apply_convergence(&mut self, consensus: &str) -> bool {
-        if self.status == "done" || self.phase == Some(MeetingPhase::Done) {
+        // 终态守卫：会议已结束（status=done 或 phase=Done）则拒绝本次回填，
+        // 防止延迟到达的收敛回调把 done 改回 running、用 AI 共识覆盖用户共识。
+        if self.is_terminal() {
+            return false;
+        }
+        // 幂等：共识已回填（来自收敛或 end_meeting 置 done 被上方守卫拦截）则跳过，
+        // 避免重复/迟到回调重写相同的 AI 共识并触发多余的 save_meetings() 磁盘写。
+        if self.consensus.is_some() {
             return false;
         }
         if self.participant_agents.is_empty() {
@@ -1091,11 +1105,11 @@ impl AgentCore {
         {
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
             let m = v.iter_mut().find(|m| m.id == id).ok_or("会议不存在")?;
-            // 终态守卫：status 已非 running **或** phase 已收敛为 Done 均视为会议终止，
-            // 拒绝新发言。与 `apply_convergence` 共享同一终态判定，避免「status 仍是 running
-            // 但 phase=Done」这条 belt-and-suspenders 场景下真人发言把 phase 回退成 Discussing、
-            // 复活刚被保护的终止态。
-            if m.status != "running" || m.phase == Some(MeetingPhase::Done) {
+            // 终态守卫：会议已结束（status=done 或 phase=Done）则拒绝新发言。
+            // 与 `apply_convergence` 共享 `Meeting::is_terminal()` 同一终态判定，
+            // 避免「status 仍是 running 但 phase=Done」场景下真人发言把 phase 回退成
+            // Discussing、复活刚被保护的终止态。
+            if m.is_terminal() {
                 return Err("会议已结束，无法发言".to_string());
             }
             m.messages.push(msg.clone());
@@ -1148,11 +1162,13 @@ impl AgentCore {
         v.iter().find(|m| m.id == id).cloned()
     }
 
-    /// Step3：只取会议的轻量状态 `(status, phase)`，不克隆 messages 历史。
-    /// 供增量广播（message/ended）使用，把每次广播从 O(n) 降为 O(1)。
-    pub fn meeting_state(&self, id: &str) -> Option<(String, Option<MeetingPhase>)> {
+    /// Step3：只取会议的轻量状态 `(status, phase, 发言数)`，不克隆 messages 历史。
+    /// 供增量广播（message/ended）与 SSE 订阅复核使用，把每次调用从 O(n) 降为 O(1)。
+    pub fn meeting_state(&self, id: &str) -> Option<(String, Option<MeetingPhase>, usize)> {
         let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
-        v.iter().find(|m| m.id == id).map(|m| (m.status.clone(), m.phase))
+        v.iter()
+            .find(|m| m.id == id)
+            .map(|m| (m.status.clone(), m.phase, m.messages.len()))
     }
 
     /// Step3：会议可见性判定（owner / admin / scope 成员 / 公开会议）。

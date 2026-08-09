@@ -1700,7 +1700,10 @@ fn main() {
                 .merge(protected)
                 .layer(cors)
                 .layer(axum::middleware::from_fn(trace_middleware))
-                .with_state(state);
+                .with_state(state.clone());
+
+            // 后台周期回收无接收者的会议 broadcast 通道（兜底清理并发退出竞态导致的 Sender 泄漏）
+            spawn_meeting_channel_sweeper(state.clone());
 
             if let Err(e) = axum::serve(listener, app).await {
                 tracing::error!("HTTP 服务异常终止: {}", e);
@@ -2450,9 +2453,9 @@ async fn handle_meeting_message(
     // Step3 实时同步：广播**增量**（仅新发言 + 状态字段）。
     // 不再序列化完整 Meeting：否则每条发言都是 O(n)，broadcast 通道又保留最近 256 条，
     // 长会议会累积 O(n²) 的数据量。完整快照只保留给初始订阅 / Lagged 重同步路径。
-    let (status, phase) = agent
+    let (status, phase, _) = agent
         .meeting_state(&id)
-        .unwrap_or_else(|| ("running".to_string(), None));
+        .unwrap_or_else(|| ("running".to_string(), None, 0));
     broadcast_meeting_event(
         &st,
         &id,
@@ -2554,6 +2557,33 @@ fn cleanup_meeting_channel(st: &Arc<AppState>, id: &str) {
     }
 }
 
+/// Step3：周期回收无接收者的会议 broadcast 通道（兜底清理）。
+///
+/// `cleanup_meeting_channel` 在 SSE 任务结束时调用，但当多个订阅者**同时**退出时存在竞态窗口：
+/// 每个任务调用 cleanup 时自身 `rx` 仍存活、`receiver_count()` 可能都 `> 1`，于是谁都不删，
+/// 留下一个 0 接收者的 `Sender` 永久泄漏。本后台任务每 60s 扫描一次，移除 `receiver_count()==0`
+/// 的通道，作为确定性的兜底，杜绝无界泄漏。
+fn spawn_meeting_channel_sweeper(st: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            let mut map = st
+                .meeting_tx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let stale: Vec<String> = map
+                .iter()
+                .filter(|(_, tx)| tx.receiver_count() == 0)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in stale {
+                map.remove(&id);
+            }
+        }
+    });
+}
+
 /// Step3：会议可见性判定的**取锁便捷包装**（供 SSE 订阅使用）。
 ///
 /// 判定规则的唯一实现在 `AgentCore::meeting_visible`（owner / admin / scope 成员 / 公开会议），
@@ -2611,35 +2641,36 @@ async fn handle_meeting_stream(
             .or_insert_with(|| broadcast::channel(256).0)
             .subscribe()
     };
-    {
+    // 复核窗口：用 meeting_state()（仅取 status/phase/发言数，O(1) 不克隆整会）判断快照是否过期，
+    // 仅在确实变化时再克隆完整会议用于序列化，避免每次订阅都做全量 clone 占用全局 agent 锁、
+    // 拖慢大会议的所有 agent 操作（发言 / A2A / 生命周期 handler）。
+    let state = {
         let g = st.agent.lock().await;
-        match g.as_ref().and_then(|a| a.get_meeting(&id2)) {
-            Some(cur) => {
-                // 克隆快照后、订阅前若有并发事件落地，重新克隆以纳入该事件。
-                let changed = match &snap {
-                    Some(s) => {
-                        cur.messages.len() != s.messages.len()
-                            || cur.status != s.status
-                            || cur.phase != s.phase
-                    }
-                    None => true,
-                };
-                if changed {
+        g.as_ref().and_then(|a| a.meeting_state(&id2))
+    };
+    // 终态快照：status != running 或 phase == Done 都表示会议已结束。
+    let terminal = state
+        .as_ref()
+        .map_or(true, |(s, p, _)| s != "running" || *p == Some(MeetingPhase::Done));
+    match state {
+        Some((status, phase, count)) => {
+            let changed = match &snap {
+                Some(s) => s.messages.len() != count || s.status != status || s.phase != phase,
+                None => true,
+            };
+            if changed {
+                // 仅在确实变化时克隆完整会议（用于快照序列化），避免每次订阅全量 clone
+                let g = st.agent.lock().await;
+                if let Some(cur) = g.as_ref().and_then(|a| a.get_meeting(&id2)) {
                     snap = Some(cur.clone());
                 }
             }
-            None => {
-                // 复核窗口内会议已被删除（cur 为 None）：标记 snap 为 None，
-                // 稍后在 spawned 任务中发 ended(deleted) 并终止，避免 zombie 流。
-                snap = None;
-            }
+        }
+        None => {
+            // 复核窗口内会议已被删除：标记 snap 为 None，稍后发 ended(deleted) 并终止。
+            snap = None;
         }
     }
-    // 终态快照：status != running 或 phase == Done 都表示会议已结束。
-    // 若初始快照即终态，spawned 任务直接发 ended 并 return，不留永不关闭的 zombie 连接。
-    let terminal = snap
-        .as_ref()
-        .map_or(true, |m| m.status != "running" || m.phase == Some(MeetingPhase::Done));
     // 服务端去重指纹：快照中已有发言的 (from,at)。订阅窗口（克隆→订阅）内落地的发言会同时
     // 出现在快照与 rx 缓冲，非终态时跳过转发，避免客户端重复应用（此前依赖前端去重）。
     let mut snap_msg_keys: HashSet<(String, String)> = snap
@@ -2651,7 +2682,15 @@ async fn handle_meeting_stream(
     tokio::spawn(async move {
         // 初始快照：克隆已在上方锁内完成，此处仅序列化并发送。
         if let Some(m) = snap {
-            let data = serde_json::to_string(&m).unwrap_or_default();
+            // 序列化失败不应静默下发空快照（会污染客户端会议状态）；记录诊断并终止流。
+            let data = match serde_json::to_string(&m) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(meeting = %id2, "snapshot 序列化失败: {e}");
+                    cleanup_meeting_channel(&st2, &id2);
+                    return;
+                }
+            };
             if tx
                 .try_send(Ok(SseEvent::default().event("snapshot").data(data)))
                 .is_err()
@@ -2720,6 +2759,9 @@ async fn handle_meeting_stream(
                                     if snap_msg_keys.contains(&key) {
                                         continue;
                                     }
+                                    // 记录已转发发言指纹，保证去重集与实际下发一致；
+                                    // (from,at) 因 RFC3339 含亚秒精度实际唯一，碰撞在实践中不可能。
+                                    snap_msg_keys.insert(key);
                                 }
                             }
                             if tx
@@ -2738,7 +2780,13 @@ async fn handle_meeting_stream(
                             };
                             match m {
                                 Some(m) => {
-                                    let s = serde_json::to_string(&m).unwrap_or_default();
+                                    let s = match serde_json::to_string(&m) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            tracing::warn!(meeting = %id2, "Lagged 重同步快照序列化失败: {e}");
+                                            break;
+                                        }
+                                    };
                                     // 重同步快照可能包含订阅窗口之后的发言，刷新去重指纹，
                                     // 避免这些发言被后续 rx 再次下发导致客户端重复应用。
                                     snap_msg_keys = m
@@ -2804,6 +2852,18 @@ async fn handle_meeting_heartbeat(
         };
         if !visible {
             return (axum::http::StatusCode::FORBIDDEN, "无权访问该会议").into_response();
+        }
+        // 终态会议（status=done / phase=Done）不再接受心跳：end/delete 后迟到的心跳会通过
+        // or_default() 重建孤儿 presence 条目，而 SSE 任务在 ended 后已终止、5s tick 不再裁剪，
+        // 导致该键无界泄漏。直接清理并返回空在线表。
+        let terminal = g.as_ref().map_or(true, |agent| {
+            agent
+                .meeting_state(&id)
+                .map_or(true, |(s, p, _)| s != "running" || p == Some(MeetingPhase::Done))
+        });
+        if terminal {
+            st.meeting_presence.lock().await.remove(&id);
+            return Json(serde_json::json!({ "ok": true, "online": [] })).into_response();
         }
         // 写入前先裁剪过期条目（elapsed >= 15s），防止 meeting_presence 无界增长
         let mut map = st.meeting_presence.lock().await;

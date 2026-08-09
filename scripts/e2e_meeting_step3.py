@@ -56,7 +56,12 @@ def agent_key() -> str:
                 if not line or line.startswith("#"):
                     continue
                 if line.startswith("AGENT_API_KEY="):
-                    return line.split("=", 1)[1].strip()
+                    key = line.split("=", 1)[1].strip()
+                    if key:
+                        return key
+                    # 空值等同于缺失：配置错误应尽早清晰失败，而非带着空 key 跑到 403 才暴露
+                    print("  !! AGENT_API_KEY 在 .env 中为空值")
+                    raise SystemExit(1)
     except FileNotFoundError:
         print(f"  !! 缺少 .env 文件（期望于 {path}），无法读取 AGENT_API_KEY")
         raise SystemExit(1)
