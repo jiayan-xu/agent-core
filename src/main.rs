@@ -2448,6 +2448,8 @@ async fn handle_meeting_message(
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    // 发言资格判定需 admin 身份；在获取全局 agent 锁之前算好，避免持锁期间 await。
+    let admin = is_admin(&headers, &st).await;
     let v = match body {
         Some(Json(v)) => v,
         None => return (axum::http::StatusCode::BAD_REQUEST, "missing body").into_response(),
@@ -2471,7 +2473,7 @@ async fn handle_meeting_message(
             return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
         };
         let agent_arc = agent.clone();
-        let msg = match agent.add_meeting_message(&id, &from, "human", &content) {
+        let msg = match agent.add_meeting_message(&id, &from, "human", &content, admin) {
             Ok(m) => m,
             Err(e) => {
                 return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))

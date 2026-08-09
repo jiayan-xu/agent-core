@@ -83,8 +83,11 @@ def agent_key() -> str:
                 # 空值等同于缺失：配置错误应尽早清晰失败，而非带着空 key 跑到 403 才暴露
                 print("  !! AGENT_API_KEY 在 .env 中为空值")
                 raise SystemExit(1)
-    except FileNotFoundError:
-        print(f"  !! 缺少 .env 文件（期望于 {path}），无法读取 AGENT_API_KEY")
+    except OSError as e:
+        print(f"  !! 无法读取 .env 文件（{path}）：{e}")
+        raise SystemExit(1)
+    except UnicodeDecodeError as e:
+        print(f"  !! .env 文件编码异常（{path}）：{e}")
         raise SystemExit(1)
     print("  !! AGENT_API_KEY 未在环境变量与 .env 中找到")
     raise SystemExit(1)

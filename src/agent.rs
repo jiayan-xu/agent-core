@@ -297,6 +297,11 @@ pub struct AgentCore {
     pub personas: std::sync::Mutex<std::collections::HashMap<String, crate::runtime::self_runtime::Persona>>,
     /// 圆桌会议记录（Phase 6 增强）：默认私有，仅拥有者 / admin 可见；持久化到 cwd/meetings.json
     pub meetings: std::sync::Mutex<Vec<Meeting>>,
+    /// 持久化串行锁：跨「序列化（持 self.meetings）+ 写盘（tmp + rename）」整个关键区，
+    /// 保证任意两次持久化严格按获取 persist_lock 的顺序串行，杜绝「较旧序列化结果后 rename
+    /// 覆盖较新文件」的 lost update / 撕裂写（reviewer round-12 #1）。
+    /// 锁顺序恒为 persist_lock → self.meetings；不反向加锁，无死锁风险。
+    persist_lock: std::sync::Mutex<()>,
     /// Phase 2：会话 → 分身 绑定（分身级工具白名单接线）
     pub session_personas: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// Phase 2：分身 tick 调度器注册表（真实 tick 由 AgentCore 驱动，避免循环依赖）
@@ -371,6 +376,38 @@ pub enum MeetingPhase {
     Done,
 }
 
+/// 宽容反序列化 `Option<MeetingPhase>`（reviewer round-12 #4）：未知 phase 字符串
+/// （如未来版本写入的 "paused"）回退为 None 并告警，而非让整条会议反序列化失败被
+/// `load_meetings_from_disk` 静默跳过、随后被 `save_meetings` 覆盖永久丢失。
+/// 序列化仍走 `MeetingPhase` 的标准 snake_case，向后兼容旧 meetings.json。
+fn deserialize_phase_tolerant<'de, D>(d: D) -> Result<Option<MeetingPhase>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum MeetingPhaseRaw {
+        AiSpeaking,
+        AwaitingHumans,
+        Discussing,
+        Done,
+        #[serde(other)]
+        Unknown,
+    }
+    let raw = Option::<MeetingPhaseRaw>::deserialize(d)?;
+    Ok(match raw {
+        Some(MeetingPhaseRaw::Unknown) => {
+            tracing::warn!("反序列化会议 phase 遇到未知值，回退为 None（宽容兼容跨版本）");
+            None
+        }
+        Some(MeetingPhaseRaw::AiSpeaking) => Some(MeetingPhase::AiSpeaking),
+        Some(MeetingPhaseRaw::AwaitingHumans) => Some(MeetingPhase::AwaitingHumans),
+        Some(MeetingPhaseRaw::Discussing) => Some(MeetingPhase::Discussing),
+        Some(MeetingPhaseRaw::Done) => Some(MeetingPhase::Done),
+        None => None,
+    })
+}
+
 /// 圆桌会议记录（Phase 6 增强）：默认私有，仅拥有者 / admin 可见；持久化到 cwd/meetings.json
 /// 会议 `status` 字段的取值常量，替代散落的魔法字符串。
 ///
@@ -419,7 +456,7 @@ pub struct Meeting {
     /// None = 旧数据（无该字段）。读侧 serde default 兼容旧 meetings.json；
     /// 写侧 skip_serializing_if 保证 None 时**不写出该键**，旧数据回盘后
     /// 仍是原样（不会凭空多出 `"phase": null`），老前端 / 老 fixture 不受影响。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "deserialize_phase_tolerant", skip_serializing_if = "Option::is_none")]
     pub phase: Option<MeetingPhase>,
 }
 
@@ -829,6 +866,7 @@ impl AgentCore {
                 m
             }),
             meetings: std::sync::Mutex::new(Vec::new()),
+            persist_lock: std::sync::Mutex::new(()),
             session_personas: std::sync::Mutex::new(std::collections::HashMap::new()),
             tick_scheduler: crate::scheduler::tick_scheduler::TickScheduler::default(),
             approval_gate,
@@ -1146,27 +1184,39 @@ impl AgentCore {
     }
 
     /// Step2：追加一条会议发言。仅当会议存在且为 running 时才允许。
-    /// 返回被追加的 MeetingMessage 供上层 A2A 投递；会议不存在或已结束返回 Err。
+    /// 返回被追加的 MeetingMessage 供上层 A2A 投递；会议不存在 / 已结束 / 无发言资格返回 Err。
     pub fn add_meeting_message(
         &self,
         id: &str,
         from: &str,
         kind: &str,
         content: &str,
+        is_admin: bool,
     ) -> Result<MeetingMessage, String> {
-        let msg = MeetingMessage {
-            from: from.to_string(),
-            kind: kind.to_string(),
-            content: content.to_string(),
-            at: chrono::Utc::now().to_rfc3339(),
-        };
-        // 终态守卫与状态机推进委托给 `Meeting::apply_message`（纯逻辑单一来源），
-        // 与 `apply_convergence` 共享 `is_terminal()` 判定。apply_message 消费 msg 并返回
-        // 被追加的消息，消除热路径上的多余 clone（原实现 `msg.clone()` 后原 msg 又作为
-        // 返回值，等价两份拷贝）。返回 Err 时提前退出，不落盘。
+        // 入库前强制校验发送者身份（reviewer round-12 #2）：私有会议仅 owner / admin / 受邀
+        // participant_agents 成员可发言；公开会议（可见即可评）允许任何已认证用户发言。
+        // 此前任何已认证用户只要猜到会议 ID，就能向任意（含私有）会议注入发言、污染圆桌记录，
+        // 且 `add_meeting_message` 不查 owner / scope / is_private。可见性由 handler 层
+        // `meeting_visible` 兜底；此处保证「能入库发言者必是受邀方或公开会议参与者」。
         let pushed = {
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
             let m = v.iter_mut().find(|m| m.id == id).ok_or("会议不存在")?;
+            let authorized = is_admin
+                || !m.is_private
+                || m.owner_user_id == from
+                || m.participant_agents.iter().any(|a| a == from);
+            if !authorized {
+                return Err("发言者非会议拥有者或受邀参与者".to_string());
+            }
+            let msg = MeetingMessage {
+                from: from.to_string(),
+                kind: kind.to_string(),
+                content: content.to_string(),
+                at: chrono::Utc::now().to_rfc3339(),
+            };
+            // 终态守卫与状态机推进委托给 `Meeting::apply_message`（纯逻辑单一来源），
+            // 与 `apply_convergence` 共享 `is_terminal()` 判定。apply_message 消费 msg 并返回
+            // 被追加的消息，消除热路径上的多余 clone。返回 Err 时提前退出，不落盘。
             m.apply_message(msg)?
         };
         self.save_meetings();
@@ -1277,6 +1327,12 @@ impl AgentCore {
         //   - end_meeting 置 done → 广播 state 而非 ended，订阅端永远等不到终态；
         //   - 删除会议 → 重读得 None，调用方以为「未变更」而完全不广播。
         // 因此在锁内直接克隆出返回值与序列化结果，锁外只做磁盘 IO。
+        // persist_lock 跨「序列化（持 self.meetings）+ 写盘（tmp + rename）」整个关键区，
+        // 保证任意两次持久化严格按获取 persist_lock 的顺序串行：较旧序列化结果不可能在
+        // 较新文件之后 rename 覆盖（reviewer round-12 #1，lost update / 撕裂写）。
+        // self.meetings 仅在序列化期间持有，写盘前释放，避免把磁盘 IO 拖进全局会议锁
+        // （见 round-9 F1 / round-11）。锁顺序：persist_lock → self.meetings，全代码唯一顺序。
+        let _pg = self.persist_lock.lock().unwrap_or_else(|p| p.into_inner());
         let (out, serialized) = {
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
             // 先确定是否变更并取出结果（变更后随即释放对 m 的可变借用），
@@ -1297,14 +1353,18 @@ impl AgentCore {
                 serde_json::to_string_pretty(
                     &serde_json::json!({ "meetings": v.iter().collect::<Vec<_>>() }),
                 )
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "finish_meeting: 序列化会议失败，跳过落盘");
+                    e
+                })
                 .ok()
             } else {
                 None
             };
             (out_opt, serialized)
         };
-        // 发生变更时落盘：序列化已在 self.meetings 内部锁内完成，此处仅做磁盘 IO（tmp + 原子 rename），
-        // 不持任何锁。不另起 spawn_blocking：fire-and-forget 异步写会与其他持久化路径竞争同一 tmp 文件
+        // 发生变更时落盘：在 persist_lock 临界区内、self.meetings 释放后做磁盘 IO（tmp + 原子 rename），
+        // 不另起 spawn_blocking：fire-and-forget 异步写会与其他持久化路径竞争同一 tmp 文件
         // （lost update），且在 tokio runtime 外 panic、JoinHandle 被丢弃导致写失败静默（见 round-9 F1）。
         if let Some(s) = serialized {
             self.write_meetings_file(&s);
@@ -1354,22 +1414,25 @@ impl AgentCore {
         }
     }
 
-    /// 会议持久化：把内存会议序列化为 JSON 字符串（仅持锁做序列化，不触碰磁盘）。
-    /// 串行化由 self.meetings 内部锁保证：调用方须在锁临界区内调用以得到与内存严格一致的快照
-    /// （如 `finish_meeting` 在锁内序列化后带出锁外落盘）。`save_meetings` 自身内部亦会加该锁。
-    fn serialize_meetings(&self) -> Option<String> {
-        let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
-        let payload = serde_json::json!({ "meetings": v.iter().collect::<Vec<_>>() });
-        serde_json::to_string_pretty(&payload).ok()
-    }
-
-    /// 会议持久化：落盘 cwd/meetings.json（原子写 tmp + rename）。
-    /// 串行化在 self.meetings 内部锁内完成（见 `serialize_meetings` / `finish_meeting`），
-    /// 自身也以该锁串行化，故并发调用 `save_meetings` 不会相互撕裂；调用方（remove_meeting /
-    /// end_meeting）须在释放内部锁后调用，避免 `serialize_meetings` 重入死锁（std Mutex 不可重入）。
+    /// 会议持久化：落盘 cwd/meetings.json（tmp + 原子 rename）。
+    /// 在 persist_lock 临界区内完成「序列化（持 self.meetings）+ 写盘」，与 `finish_meeting`
+    /// 共用同一把 persist_lock，保证任意两次持久化严格按获取顺序串行（reviewer round-12 #1，
+    /// 杜绝较旧序列化结果后 rename 覆盖较新文件）。self.meetings 仅在序列化期间持有，写盘前释放。
+    /// 调用方（remove_meeting / end_meeting / add_meeting_message）须在释放 self.meetings 锁后
+    /// 调用本方法，避免 persist_lock / self.meetings 嵌套顺序不一致（锁顺序恒为 persist_lock → self.meetings）。
     pub fn save_meetings(&self) {
-        let Some(s) = self.serialize_meetings() else {
-            tracing::warn!("save_meetings: 序列化会议失败，跳过落盘");
+        // persist_lock 跨「序列化 + 写盘」整个关键区（见 finish_meeting 注释）。
+        let _pg = self.persist_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let serialized = {
+            let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+            serde_json::to_string_pretty(&serde_json::json!({ "meetings": v.iter().collect::<Vec<_>>() }))
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "save_meetings: 序列化会议失败，跳过落盘");
+                    e
+                })
+                .ok()
+        };
+        let Some(s) = serialized else {
             return;
         };
         self.write_meetings_file(&s);
