@@ -37,6 +37,7 @@ use tao::{
     window::WindowBuilder,
 };
 use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 use tokio::time::interval;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -44,7 +45,7 @@ use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 use wry::WebViewBuilder;
 
-use agent_core::agent::{AgentConfig, AgentCore, AgentIdentity};
+use agent_core::agent::{AgentConfig, AgentCore, AgentIdentity, Meeting, MeetingEvent};
 use agent_core::audit::AuditLogger;
 use agent_core::meta_evolve::{MetaEvolutionConfig, SafetyConfig};
 use agent_core::code_evolve::{apply_patch, eval_crate, find_up, git_commit, git_diff, git_revert, propose_fn, EvalResult};
@@ -686,6 +687,10 @@ struct AppState {
     evolve_running: AtomicBool,
     /// 战略罗盘「可观测」：运行指标注册表（与 AgentCore 共享同一 Arc，供 /api/metrics 暴露）
     metrics: Arc<MetricsRegistry>,
+    /// Step3：会议实时事件广播中枢（所有 SSE 订阅者从此订阅，按 meeting_id 过滤）
+    meeting_tx: broadcast::Sender<MeetingEvent>,
+    /// Step3：会议在线表 meeting_id → (agent_id → 最近心跳 Instant)
+    meeting_presence: tokio::sync::Mutex<HashMap<String, HashMap<String, std::time::Instant>>>,
 }
 
 /// 白龙马 Phase B：多端唤醒 —— 后台活动事件（心跳自主产生的活动，供 PFAiX 拉取"唤醒"）
@@ -1421,6 +1426,8 @@ fn main() {
                 next_event_id: AtomicU64::new(1),
                 evolve_running: AtomicBool::new(false),
                 metrics: metrics.clone(),
+                meeting_tx: broadcast::channel(256).0,
+                meeting_presence: tokio::sync::Mutex::new(HashMap::new()),
             });
 
             // 先绑定端口，确保服务立即可用（即使 Memoria 慢/未就绪也不阻塞启动）
@@ -1674,6 +1681,8 @@ fn main() {
                 .route("/api/roundtable", post(handle_panel_discuss))
                 .route("/api/meetings", get(handle_meetings_list))
                 .route("/api/meetings/{id}", delete(handle_meeting_delete))
+                .route("/api/meetings/{id}/stream", get(handle_meeting_stream))
+                .route("/api/meetings/{id}/heartbeat", post(handle_meeting_heartbeat))
                 .route("/api/meetings/{id}/message", post(handle_meeting_message))
                 .route("/api/meetings/{id}/end", post(handle_meeting_end))
                 .route("/api/evolve", post(handle_code_evolve))
@@ -2338,6 +2347,7 @@ async fn handle_meetings_list(
                 "scope": m.scope,
                 "participant_agents": m.participant_agents,
                 "messages": m.messages,
+                "phase": m.phase,
             })
         })
         .collect();
@@ -2416,6 +2426,10 @@ async fn handle_meeting_message(
             delivered += 1;
         }
     }
+    // Step3 实时同步：广播最新会议状态（含新发言）给所有订阅者
+    if let Some(m) = agent.get_meeting(&id) {
+        broadcast_meeting(&st, &id, "message", &m);
+    }
     Json(serde_json::json!({"ok": true, "delivered": delivered, "targets": targets.len()})).into_response()
 }
 
@@ -2444,9 +2458,152 @@ async fn handle_meeting_end(
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
     };
     match agent.end_meeting(&id, &consensus, &requested_by, admin) {
-        Ok(()) => Json(serde_json::json!({"ok": true, "ended": id})).into_response(),
+        Ok(()) => {
+            // Step3 实时同步：广播会议结束事件
+            if let Some(m) = agent.get_meeting(&id) {
+                broadcast_meeting(&st, &id, "ended", &m);
+            }
+            Json(serde_json::json!({"ok": true, "ended": id})).into_response()
+        }
         Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
     }
+}
+
+/// Step3：向会议实时广播通道推送一条事件（payload 为完整 Meeting JSON）
+fn broadcast_meeting(st: &Arc<AppState>, id: &str, kind: &str, m: &Meeting) {
+    let _ = st.meeting_tx.send(MeetingEvent {
+        meeting_id: id.to_string(),
+        kind: kind.to_string(),
+        payload: serde_json::to_value(m).unwrap_or(serde_json::Value::Null),
+        at: chrono::Utc::now().to_rfc3339(),
+    });
+}
+
+/// Step3：实时同步 —— SSE 订阅某会议的实时事件流。
+/// 事件类型：snapshot（初始快照）/ message / state / ended（会议状态变更）/ presence（在线列表）。
+async fn handle_meeting_stream(
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(st): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let (caller, caller_ns) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let admin = is_admin(&headers, &st).await;
+    // 可见性校验：owner / admin / scope 成员 / 公开会议 可订阅
+    let visible = {
+        let g = st.agent.lock().await;
+        match &*g {
+            Some(agent) => match agent.get_meeting(&id) {
+                Some(m) => {
+                    m.owner_user_id == caller
+                        || admin
+                        || (m.scope.is_none() && !m.is_private)
+                        || m.scope
+                            .as_ref()
+                            .map_or(false, |s| agent_core::agent::scope_matches_caller(s, &caller_ns))
+                }
+                None => false,
+            },
+            None => false,
+        }
+    };
+    if !visible {
+        return (axum::http::StatusCode::FORBIDDEN, "无权订阅该会议").into_response();
+    }
+
+    let mut rx = st.meeting_tx.subscribe();
+    let (tx, rx_out) = tokio::sync::mpsc::unbounded_channel::<Result<SseEvent, Infallible>>();
+    let st2 = st.clone();
+    let id2 = id.clone();
+    tokio::spawn(async move {
+        // 初始快照
+        {
+            let g = st2.agent.lock().await;
+            if let Some(agent) = &*g {
+                if let Some(m) = agent.get_meeting(&id2) {
+                    let _ = tx.send(Ok(SseEvent::default().event("snapshot").data(
+                        serde_json::to_string(&m).unwrap_or_default(),
+                    )));
+                }
+            }
+        }
+        // 心跳保活 + 在线表推送（每 5s）
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let online = {
+                        let map = st2.meeting_presence.lock().await;
+                        match map.get(&id2) {
+                            Some(p) => p
+                                .iter()
+                                .filter(|(_, t)| t.elapsed().as_secs() < 15)
+                                .map(|(k, _)| k.clone())
+                                .collect::<Vec<_>>(),
+                            None => Vec::new(),
+                        }
+                    };
+                    let _ = tx.send(Ok(SseEvent::default().event("presence").data(
+                        serde_json::json!({ "online": online }).to_string(),
+                    )));
+                    let _ = tx.send(Ok(SseEvent::default().data(": ping\n\n")));
+                }
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(ev) if ev.meeting_id == id2 => {
+                            let _ = tx.send(Ok(SseEvent::default().event(&ev.kind).data(ev.payload.to_string())));
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+        let _ = tx.send(Ok(SseEvent::default().event("done").data("")));
+    });
+    let mut resp = Sse::new(UnboundedReceiverStream::new(rx_out)).into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    resp.headers_mut().insert(
+        "x-accel-buffering",
+        axum::http::HeaderValue::from_static("no"),
+    );
+    resp
+}
+
+/// Step3：实时同步 —— 心跳保活。记录调用者在该会议的在线状态，返回当前在线列表。
+async fn handle_meeting_heartbeat(
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(st): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let (caller, _) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    {
+        let mut map = st.meeting_presence.lock().await;
+        map.entry(id.clone())
+            .or_default()
+            .insert(caller.clone(), std::time::Instant::now());
+    }
+    let online: Vec<String> = {
+        let map = st.meeting_presence.lock().await;
+        match map.get(&id) {
+            Some(p) => p
+                .iter()
+                .filter(|(_, t)| t.elapsed().as_secs() < 15)
+                .map(|(k, _)| k.clone())
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    Json(serde_json::json!({ "ok": true, "online": online })).into_response()
 }
 
 /// Phase 7：进化任务并发守卫（Drop 时复位，确保任何退出路径都释放锁）

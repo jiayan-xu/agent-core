@@ -385,6 +385,11 @@ pub struct Meeting {
     /// serde default 兼容旧 meetings.json。
     #[serde(default)]
     pub messages: Vec<MeetingMessage>,
+    /// NEW(会议升级 Step3)：实时状态机阶段。
+    /// "ai_speaking" | "awaiting_humans" | "discussing" | "done"。
+    /// None = 旧数据 / 兼容。serde default 兼容旧 meetings.json。
+    #[serde(default)]
+    pub phase: Option<String>,
 }
 
 /// 会议中的一条发言（AI 分身 / 真人 A2A）。
@@ -396,6 +401,18 @@ pub struct MeetingMessage {
     pub kind: String,
     /// 发言内容
     pub content: String,
+    /// RFC3339 时间
+    pub at: String,
+}
+
+/// Step3：会议实时事件，经 AppState 的 broadcast 通道推送给所有订阅该会议的 SSE 客户端。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct MeetingEvent {
+    pub meeting_id: String,
+    /// "snapshot" | "message" | "state" | "presence" | "ended"
+    pub kind: String,
+    /// 事件载荷：message/state/ended 为完整 Meeting JSON；presence 为在线列表
+    pub payload: serde_json::Value,
     /// RFC3339 时间
     pub at: String,
 }
@@ -979,6 +996,7 @@ impl AgentCore {
             scope,
             participant_agents,
             messages: Vec::new(),
+            phase: Some("ai_speaking".to_string()),
         };
         self.meetings
             .lock()
@@ -989,14 +1007,14 @@ impl AgentCore {
     }
 
     /// Step2：追加一条会议发言。仅当会议存在且为 running 时才允许。
-    /// 返回 (meeting_id, from, content) 供上层 A2A 投递；会议不存在或已结束返回 Err。
+    /// 返回被追加的 MeetingMessage 供上层 A2A 投递；会议不存在或已结束返回 Err。
     pub fn add_meeting_message(
         &self,
         id: &str,
         from: &str,
         kind: &str,
         content: &str,
-    ) -> Result<(), String> {
+    ) -> Result<MeetingMessage, String> {
         let msg = MeetingMessage {
             from: from.to_string(),
             kind: kind.to_string(),
@@ -1009,10 +1027,12 @@ impl AgentCore {
             if m.status != "running" {
                 return Err("会议已结束，无法发言".to_string());
             }
-            m.messages.push(msg);
+            m.messages.push(msg.clone());
+            // Step3 状态机推进：有真人发言 → discussing
+            m.phase = Some("discussing".to_string());
         }
         self.save_meetings();
-        Ok(())
+        Ok(msg)
     }
 
     /// Step2：结束会议并回填共识。requested_by 需为 owner / admin，否则拒绝。
@@ -1030,6 +1050,7 @@ impl AgentCore {
                 return Err("仅拥有者或管理员可结束会议".to_string());
             }
             m.status = "done".to_string();
+            m.phase = Some("done".to_string());
             m.consensus = Some(consensus.to_string());
         }
         self.save_meetings();
@@ -1045,12 +1066,26 @@ impl AgentCore {
             .unwrap_or_default()
     }
 
-    /// 圆桌收敛完成后回填共识并标记 done
+    /// Step3：按 id 取单条会议（供 SSE 快照 / 广播载荷）。返回克隆，调用方无需持有锁。
+    pub fn get_meeting(&self, id: &str) -> Option<Meeting> {
+        let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+        v.iter().find(|m| m.id == id).cloned()
+    }
+
+    /// 圆桌收敛完成后回填共识。
+    /// Step3 状态机：有真人参与者时会议保持 running（phase=awaiting_humans）等待真人讨论；
+    /// 纯 AI 圆桌则直接 done。
     pub fn finish_meeting(&self, id: &str, consensus: &str) {
         {
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(m) = v.iter_mut().find(|m| m.id == id) {
-                m.status = "done".to_string();
+                if m.participant_agents.is_empty() {
+                    m.status = "done".to_string();
+                    m.phase = Some("done".to_string());
+                } else {
+                    m.status = "running".to_string();
+                    m.phase = Some("awaiting_humans".to_string());
+                }
                 m.consensus = Some(consensus.to_string());
             }
         }
@@ -10918,6 +10953,7 @@ mod whitelist_preroute_tests {
             consensus: None,
             scope: None,
             participant_agents: vec!["agent/admin".into()],
+            phase: Some("discussing".into()),
             messages: vec![
                 MeetingMessage { from: "ai1".into(), kind: "ai".into(), content: "立场".into(), at: "2026-08-01T00:00:01Z".into() },
                 MeetingMessage { from: "agent/admin".into(), kind: "human".into(), content: "意见".into(), at: "2026-08-01T00:00:02Z".into() },
