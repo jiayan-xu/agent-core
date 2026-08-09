@@ -1086,7 +1086,11 @@ impl AgentCore {
         {
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
             let m = v.iter_mut().find(|m| m.id == id).ok_or("会议不存在")?;
-            if m.status != "running" {
+            // 终态守卫：status 已非 running **或** phase 已收敛为 Done 均视为会议终止，
+            // 拒绝新发言。与 `apply_convergence` 共享同一终态判定，避免「status 仍是 running
+            // 但 phase=Done」这条 belt-and-suspenders 场景下真人发言把 phase 回退成 Discussing、
+            // 复活刚被保护的终止态。
+            if m.status != "running" || m.phase == Some(MeetingPhase::Done) {
                 return Err("会议已结束，无法发言".to_string());
             }
             m.messages.push(msg.clone());
@@ -1162,7 +1166,7 @@ impl AgentCore {
         v.iter().find(|m| m.id == id).map(|m| {
             m.owner_user_id == caller
                 || is_admin
-                || (m.scope.is_none() && !m.is_private)
+                || !m.is_private
                 || m.scope
                     .as_ref()
                     .is_some_and(|s| scope_matches_caller(s, caller_ns))

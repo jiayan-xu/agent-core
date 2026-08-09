@@ -688,7 +688,10 @@ struct AppState {
     /// 战略罗盘「可观测」：运行指标注册表（与 AgentCore 共享同一 Arc，供 /api/metrics 暴露）
     metrics: Arc<MetricsRegistry>,
     /// Step3：会议实时事件广播中枢（所有 SSE 订阅者从此订阅，按 meeting_id 过滤）
-    meeting_tx: broadcast::Sender<MeetingEvent>,
+    // 每会议独立 broadcast 通道：避免单通道下单个繁忙会议的事件洪流唤醒所有会议的所有订阅者
+    // （全局单通道会让无关订阅者被反复唤醒、落后 256 缓冲触发 Lagged、进而整会克隆 + 序列化，
+    // 造成跨会议吞吐/延迟耦合与 agent 锁竞争）。通道仅在订阅时按需创建、SSE 任务结束时回收。
+    meeting_tx: std::sync::Mutex<HashMap<String, broadcast::Sender<MeetingEvent>>>,
     /// Step3：会议在线表 meeting_id → (agent_id → 最近心跳 Instant)
     meeting_presence: tokio::sync::Mutex<HashMap<String, HashMap<String, std::time::Instant>>>,
 }
@@ -1426,7 +1429,7 @@ fn main() {
                 next_event_id: AtomicU64::new(1),
                 evolve_running: AtomicBool::new(false),
                 metrics: metrics.clone(),
-                meeting_tx: broadcast::channel(256).0,
+                meeting_tx: std::sync::Mutex::new(HashMap::new()),
                 meeting_presence: tokio::sync::Mutex::new(HashMap::new()),
             });
 
@@ -2508,19 +2511,43 @@ async fn handle_meeting_end(
 /// - `Message` / `Ended`：**增量**（新发言 + status/phase，或终止状态），O(1)；
 /// - `Snapshot`：完整 Meeting JSON，仅用于初始订阅与 Lagged 重同步。
 ///
-/// 无订阅者时 `send` 返回 Err，属正常情况，忽略。
+/// 仅向**已存在**的会议通道广播：通道在订阅时按需创建，无订阅者时不创建孤儿通道
+/// （否则无接收者的通道会永久留在 map 中），避免内存无限增长。迟到的订阅者会收到包含
+/// 最新状态（含 ended）的初始快照，无需重放历史事件。
 fn broadcast_meeting_event(
     st: &Arc<AppState>,
     id: &str,
     kind: EventKind,
     payload: serde_json::Value,
 ) {
-    let _ = st.meeting_tx.send(MeetingEvent {
-        meeting_id: id.to_string(),
-        kind,
-        payload,
-        at: chrono::Utc::now().to_rfc3339(),
-    });
+    let sender = {
+        let map = st
+            .meeting_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.get(id).cloned()
+    };
+    if let Some(sender) = sender {
+        let _ = sender.send(MeetingEvent {
+            meeting_id: id.to_string(),
+            kind,
+            payload,
+            at: chrono::Utc::now().to_rfc3339(),
+        });
+    }
+}
+
+/// Step3：SSE 任务结束时清理该会议的 broadcast 通道（若无存活接收者），避免每会议通道无限积累。
+fn cleanup_meeting_channel(st: &Arc<AppState>, id: &str) {
+    let mut map = st
+        .meeting_tx
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(tx) = map.get(id) {
+        if tx.receiver_count() == 0 {
+            map.remove(id);
+        }
+    }
 }
 
 /// Step3：会议可见性判定的**取锁便捷包装**（供 SSE 订阅使用）。
@@ -2563,28 +2590,54 @@ async fn handle_meeting_stream(
         return (axum::http::StatusCode::FORBIDDEN, "无权订阅该会议").into_response();
     }
 
-    let mut rx = st.meeting_tx.subscribe();
-    // 有界通道 + try_send：SSE 是长连接，若客户端保持 TCP 打开却停止读取（网络卡死 / 标签页挂起），
-    // hyper 不再轮询流，无界通道会把每 5s 的 presence/ping 与所有广播无限堆积到内存里。
-    // 这里缓冲满即判定该连接已失活，直接结束推送任务并关闭流。
+    // Step3 顺序关键：先克隆快照（锁内），再订阅**该会议**专属通道，订阅后立刻复核会议是否
+    // 在「克隆→订阅」窗口内发生变化（如并发发言）；若变化则重新克隆，使快照包含该事件，
+    // 避免该事件既在快照中又被 rx 重放导致前端重复应用（subscribe/snapshot 竞态修复）。
+    let id2 = id.clone();
+    let mut snap = {
+        let g = st.agent.lock().await;
+        g.as_ref().and_then(|a| a.get_meeting(&id2))
+    };
+    let mut rx = {
+        let mut map = st
+            .meeting_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(id2.clone())
+            .or_insert_with(|| broadcast::channel(256).0)
+            .subscribe()
+    };
+    {
+        let g = st.agent.lock().await;
+        if let Some(cur) = g.as_ref().and_then(|a| a.get_meeting(&id2)) {
+            // 克隆快照后、订阅前若有并发事件落地，重新克隆以纳入该事件；
+            // 缓冲区中的同一事件由前端按 (from,at) 去重，不会重复应用。
+            let changed = match &snap {
+                Some(s) => {
+                    cur.messages.len() != s.messages.len()
+                        || cur.status != s.status
+                        || cur.phase != s.phase
+                }
+                None => true,
+            };
+            if changed {
+                snap = Some(cur.clone());
+            }
+        }
+    }
     let (tx, rx_out) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(64);
     let st2 = st.clone();
-    let id2 = id.clone();
     tokio::spawn(async move {
-        // 初始快照：先在最小临界区内取出会议克隆，**出锁后**再做 JSON 序列化，
-        // 避免长会议序列化期间阻塞所有共享 st.agent 的 handler（message/end/list/delete）。
-        let snap = {
-            let g = st2.agent.lock().await;
-            g.as_ref().and_then(|a| a.get_meeting(&id2))
-        };
+        // 初始快照：克隆已在上方锁内完成，此处仅序列化并发送。
         if let Some(m) = snap {
             let data = serde_json::to_string(&m).unwrap_or_default();
-            if tx
-                .try_send(Ok(SseEvent::default().event("snapshot").data(data)))
-                .is_err()
-            {
-                return;
-            }
+                if tx
+                    .try_send(Ok(SseEvent::default().event("snapshot").data(data)))
+                    .is_err()
+                {
+                    cleanup_meeting_channel(&st2, &id2);
+                    return;
+                }
         }
         // 心跳保活 + 在线表推送（每 5s）
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -2602,6 +2655,10 @@ async fn handle_meeting_stream(
                             None => Vec::new(),
                         }
                     };
+                    // 在线表无存活条目时移除该会议键，防止 meeting_presence 随会议数无界增长
+                    if online.is_empty() {
+                        st2.meeting_presence.lock().await.remove(&id2);
+                    }
                     // 客户端断开（Closed）或已失活致缓冲写满（Full）时立即退出，避免任务与内存泄漏
                     if tx.try_send(Ok(SseEvent::default().event("presence").data(
                         serde_json::json!({ "online": online }).to_string(),
@@ -2612,7 +2669,14 @@ async fn handle_meeting_stream(
                 msg = rx.recv() => {
                     match msg {
                         Ok(ev) if ev.meeting_id == id2 => {
-                            if tx.try_send(Ok(SseEvent::default().event(ev.kind.as_str()).data(ev.payload.to_string()))).is_err() { break; }
+                            // 会议终止（ended / 删除）事件转发后立即结束推送任务并关闭 SSE 流，
+                            // 避免任务、mpsc 通道、broadcast 接收端随服务器生命周期无限常驻（资源泄漏）。
+                            let ended = ev.kind == EventKind::Ended;
+                            if tx
+                                .try_send(Ok(SseEvent::default().event(ev.kind.as_str()).data(ev.payload.to_string())))
+                                .is_err()
+                            { break; }
+                            if ended { break; }
                         }
                         Ok(_) => {}
                         // 客户端落后超过缓冲：重新发送完整快照以重同步，避免静默丢事件
@@ -2633,6 +2697,7 @@ async fn handle_meeting_stream(
             }
         }
         let _ = tx.try_send(Ok(SseEvent::default().event("done").data("")));
+        cleanup_meeting_channel(&st2, &id2);
     });
     let mut resp = Sse::new(ReceiverStream::new(rx_out)).into_response();
     resp.headers_mut().insert(

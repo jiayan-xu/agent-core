@@ -4,6 +4,8 @@
 用法：python scripts/e2e_meeting_step3.py [base_url]
 """
 
+from __future__ import annotations
+
 import json
 import os
 import sys
@@ -16,15 +18,47 @@ BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:9753"
 MID = "mtg_e2e_step3"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# 跨线程共享状态的同步原语：subscribe 守护线程只追加、main 读数，统一在锁保护下操作，
+# 杜绝自由线程 / 无 GIL 解释器下的数据竞争（finding: 跨线程共享可变状态无同步）。
+_lock = threading.Lock()
+events: list[tuple[str, str]] = []  # [(event_name, data_str)]
+raw_lines: list[str] = []
+stop = threading.Event()
+
+
+def _append_event(name: str, data: str) -> None:
+    with _lock:
+        events.append((name, data))
+
+
+def _append_raw(line: str) -> None:
+    with _lock:
+        raw_lines.append(line)
+
+
+def _snapshot_events() -> list[tuple[str, str]]:
+    with _lock:
+        return list(events)
+
+
+def _snapshot_raw() -> list[str]:
+    with _lock:
+        return list(raw_lines)
+
 
 def agent_key() -> str:
     """从 .env 读取 AGENT_API_KEY，绝不硬编码密钥。"""
     path = os.path.join(ROOT, ".env")
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.startswith("AGENT_API_KEY="):
-                return line.split("=", 1)[1].strip()
-    raise SystemExit("AGENT_API_KEY 未在 .env 中找到")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("AGENT_API_KEY="):
+                    return line.split("=", 1)[1].strip()
+    except FileNotFoundError:
+        print(f"  !! 缺少 .env 文件（期望于 {path}），无法读取 AGENT_API_KEY")
+        raise SystemExit(1)
+    print("  !! AGENT_API_KEY 未在 .env 中找到")
+    raise SystemExit(1)
 
 
 KEY = agent_key()
@@ -42,27 +76,35 @@ def req(method: str, path: str, body=None):
             return resp.status, resp.read().decode()
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode()
-
-
-events = []          # [(event_name, data_str)]
-raw_lines = []
-stop = threading.Event()
+    except urllib.error.URLError as e:
+        # 连接被拒 / DNS 失败 / 超时：返回 (0, 错误描述) 由调用方判定 FAIL，而非抛出原始 traceback
+        return 0, f"connection_error: {e.reason}"
+    except Exception as e:  # noqa: BLE001
+        return 0, f"request_error: {e}"
 
 
 def subscribe():
-    r = urllib.request.Request(f"{BASE}/api/meetings/{MID}/stream", headers=HDR)
-    with urllib.request.urlopen(r, timeout=30) as resp:
-        name = None
-        for bline in resp:
-            if stop.is_set():
-                break
-            line = bline.decode("utf-8", "replace").rstrip("\r\n")
-            raw_lines.append(line)
-            if line.startswith("event:"):
-                name = line[6:].strip()
-            elif line.startswith("data:"):
-                events.append((name or "message", line[5:].strip()))
-                name = None
+    try:
+        r = urllib.request.Request(f"{BASE}/api/meetings/{MID}/stream", headers=HDR)
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            name = None
+            for bline in resp:
+                if stop.is_set():
+                    break
+                line = bline.decode("utf-8", "replace").rstrip("\r\n")
+                _append_raw(line)
+                if line.startswith("event:"):
+                    name = line[6:].strip()
+                elif line.startswith("data:"):
+                    _append_event(name or "message", line[5:].strip())
+                    name = None
+    except urllib.error.HTTPError as e:
+        # 403 等：清晰记录失败，由 main 的超时断言判 FAIL，不抛原始 traceback
+        _append_raw(f": error {e.code}")
+    except urllib.error.URLError as e:
+        _append_raw(f": error connection {e.reason}")
+    except Exception as e:  # noqa: BLE001
+        _append_raw(f": error {e}")
 
 
 def wait_for(pred, timeout=10.0, label=""):
@@ -75,8 +117,8 @@ def wait_for(pred, timeout=10.0, label=""):
     return False
 
 
-def kinds():
-    return [k for k, _ in events]
+def _kinds() -> list[str]:
+    return [k for k, _ in _snapshot_events()]
 
 
 def main() -> int:
@@ -85,11 +127,16 @@ def main() -> int:
     ok = True
 
     print("1) SSE 初始快照")
-    ok &= wait_for(lambda: "snapshot" in kinds(), 8, "snapshot")
-    snap = next((d for k, d in events if k == "snapshot"), "{}")
-    assert_no_phase = '"phase"' not in snap
-    print(f"   snapshot 收到；旧数据 phase 键省略 = {assert_no_phase}")
-    ok &= assert_no_phase
+    got_snap = wait_for(lambda: "snapshot" in _kinds(), 8, "snapshot")
+    if not got_snap:
+        # 未收到快照时**不**回退到伪造的空快照，而是明确判失败，避免误报成功
+        print("   !! 未收到 snapshot，跳过 phase 断言（不回退到伪造空快照）")
+        ok = False
+    else:
+        snap = next((d for k, d in _snapshot_events() if k == "snapshot"), "")
+        assert_no_phase = '"phase"' not in snap
+        print(f"   snapshot 收到；旧数据 phase 键省略 = {assert_no_phase}")
+        ok &= assert_no_phase
 
     print("2) 心跳鉴权")
     s1, _ = req("POST", f"/api/meetings/{MID}/heartbeat")
@@ -99,16 +146,21 @@ def main() -> int:
 
     print("3) presence 应包含 agent/admin")
     got_presence = wait_for(
-        lambda: any(k == "presence" and "agent/admin" in d for k, d in events), 8, "presence"
+        lambda: any(k == "presence" and "agent/admin" in d for k, d in _snapshot_events()),
+        8,
+        "presence",
     )
     ok &= got_presence
 
     print("4) 发言 → message 增量事件")
-    s3, b3 = req("POST", f"/api/meetings/{MID}/message",
-                 {"from": "agent/admin", "content": "第一条真人发言"})
+    s3, b3 = req(
+        "POST",
+        f"/api/meetings/{MID}/message",
+        {"from": "agent/admin", "content": "第一条真人发言"},
+    )
     print(f"   POST message -> {s3} {b3}")
-    ok &= wait_for(lambda: "message" in kinds(), 8, "message 事件")
-    msg_ev = next((d for k, d in events if k == "message"), "")
+    ok &= wait_for(lambda: "message" in _kinds(), 8, "message 事件")
+    msg_ev = next((d for k, d in _snapshot_events() if k == "message"), "")
     try:
         p = json.loads(msg_ev)
         is_delta = "message" in p and "messages" not in p
@@ -121,18 +173,18 @@ def main() -> int:
     print("5) 删除 → ended 终止广播")
     s4, b4 = req("DELETE", f"/api/meetings/{MID}")
     print(f"   DELETE -> {s4} {b4}")
-    ok &= wait_for(lambda: "ended" in kinds(), 8, "ended 事件")
-    end_ev = next((d for k, d in events if k == "ended"), "")
+    ok &= wait_for(lambda: "ended" in _kinds(), 8, "ended 事件")
+    end_ev = next((d for k, d in _snapshot_events() if k == "ended"), "")
     print(f"   ended payload = {end_ev}")
     ok &= '"deleted":true' in end_ev.replace(" ", "")
 
     print("6) 心跳注释行保活存在")
-    has_ping = any(line.startswith(": ping") or line == ":ping" for line in raw_lines)
+    has_ping = any(line.startswith(": ping") or line == ":ping" for line in _snapshot_raw())
     print(f"   注释行 ': ping' 存在 = {has_ping}")
     ok &= has_ping
 
     stop.set()
-    print("\n事件序列:", kinds())
+    print("\n事件序列:", _kinds())
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
