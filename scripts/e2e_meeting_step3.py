@@ -53,25 +53,39 @@ def _snapshot_raw() -> list[str]:
 
 
 def agent_key() -> str:
-    """从 .env 读取 AGENT_API_KEY，绝不硬编码密钥。"""
+    """取 AGENT_API_KEY，绝不硬编码密钥。
+
+    解析规则与 `start_agent_core.py`（服务端启动器）逐条对齐，否则同一份 .env 会被
+    两边解释成不同的值，导致 E2E 拿到与服务实际加载的不一致的 key 而 403：
+      - 进程环境变量优先（启动器同样是 `if _k not in env` 的 env-first 语义）；
+      - 按 `=` 首次出现切分，key / value 两侧 strip（支持 `AGENT_API_KEY = xxx`）；
+      - value 剥去成对包裹的引号（支持 `AGENT_API_KEY="xxx"` / `'xxx'`）；
+      - 跳过空行、`#` 注释行、不含 `=` 的行；utf-8-sig 自动剔除 BOM。
+    """
+    env_key = os.environ.get("AGENT_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
     path = os.path.join(ROOT, ".env")
     try:
         with open(path, "r", encoding="utf-8-sig") as f:  # utf-8-sig 自动剔除 BOM
             for raw in f:
                 line = raw.strip()
-                if not line or line.startswith("#"):
+                if not line or line.startswith("#") or "=" not in line:
                     continue
-                if line.startswith("AGENT_API_KEY="):
-                    key = line.split("=", 1)[1].strip()
-                    if key:
-                        return key
-                    # 空值等同于缺失：配置错误应尽早清晰失败，而非带着空 key 跑到 403 才暴露
-                    print("  !! AGENT_API_KEY 在 .env 中为空值")
-                    raise SystemExit(1)
+                k, v = line.split("=", 1)
+                if k.strip() != "AGENT_API_KEY":
+                    continue
+                key = v.strip().strip('"').strip("'")
+                if key:
+                    return key
+                # 空值等同于缺失：配置错误应尽早清晰失败，而非带着空 key 跑到 403 才暴露
+                print("  !! AGENT_API_KEY 在 .env 中为空值")
+                raise SystemExit(1)
     except FileNotFoundError:
         print(f"  !! 缺少 .env 文件（期望于 {path}），无法读取 AGENT_API_KEY")
         raise SystemExit(1)
-    print("  !! AGENT_API_KEY 未在 .env 中找到")
+    print("  !! AGENT_API_KEY 未在环境变量与 .env 中找到")
     raise SystemExit(1)
 
 

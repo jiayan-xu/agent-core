@@ -372,6 +372,24 @@ pub enum MeetingPhase {
 }
 
 /// 圆桌会议记录（Phase 6 增强）：默认私有，仅拥有者 / admin 可见；持久化到 cwd/meetings.json
+/// 会议 `status` 字段的取值常量，替代散落的魔法字符串。
+///
+/// 与 [`MeetingPhase`] 不同，`status` 是持久化在 meetings.json 里的字符串（历史格式，
+/// 不便改成枚举而不破坏兼容）。集中成常量后，`is_terminal` / `end_meeting` /
+/// `apply_convergence` / HTTP 层共享同一字面量来源，避免某处拼写漂移导致终态判定失效。
+pub const STATUS_RUNNING: &str = "running";
+pub const STATUS_DONE: &str = "done";
+
+/// 终态判定的**唯一实现**：`status=done` 或 `phase=Done` 都表示会议已结束。
+///
+/// HTTP 层拿到的是 `meeting_state()` 返回的轻量元组（没有 `Meeting` 实体），
+/// 若各 handler 各写一份 `s == "done" || p == Some(Done)`，新增终态（如 cancelled）
+/// 时必然漏改其中一处，造成「SSE 认为已结束、心跳认为还活着」这类分歧。
+/// [`Meeting::is_terminal`] 亦委托至此。
+pub fn is_terminal_state(status: &str, phase: Option<MeetingPhase>) -> bool {
+    status == STATUS_DONE || phase == Some(MeetingPhase::Done)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Meeting {
     pub id: String,
@@ -417,7 +435,7 @@ impl Meeting {
     /// `add_meeting_message` 与 `apply_convergence` 共享此单一来源，避免两处谓词漂移
     /// （否则新增状态如 paused/cancelled 会在两处表现不一致）。
     pub fn is_terminal(&self) -> bool {
-        self.status == "done" || self.phase == Some(MeetingPhase::Done)
+        is_terminal_state(&self.status, self.phase)
     }
 
     pub fn apply_convergence(&mut self, consensus: &str) -> bool {
@@ -433,20 +451,41 @@ impl Meeting {
         }
         if self.participant_agents.is_empty() {
             // 纯 AI 圆桌：收敛即终局
-            self.status = "done".to_string();
+            self.status = STATUS_DONE.to_string();
             self.phase = Some(MeetingPhase::Done);
         } else {
             // 有真人参会：保持 running，等待真人接手讨论。
             // 终态守卫：若延迟到达的收敛回调到来时真人已切入 Discussing，
             // 不再回退成 awaiting_humans（否则状态倒退 + 订阅端观察到抖动）。
             // 共识文本仍照常回填。
-            self.status = "running".to_string();
+            self.status = STATUS_RUNNING.to_string();
             if self.phase != Some(MeetingPhase::Discussing) {
                 self.phase = Some(MeetingPhase::AwaitingHumans);
             }
         }
         self.consensus = Some(consensus.to_string());
         true
+    }
+
+    /// Step3：追加一条发言并推进状态机（纯逻辑，便于单测；与 `apply_convergence` 同构）。
+    ///
+    /// 终态（status=done 或 phase=Done）拒绝发言，返回 `Err`。
+    /// 仅**受邀真人**发言推进到 `Discussing`：
+    /// AI 发言不推进（保持 ai_speaking / awaiting_humans）；
+    /// 纯 AI 圆桌（`participant_agents` 为空）即使收到旁路真人发言也不推进——
+    /// 该类会议「收敛即终局」，其生命周期里不存在 Discussing 阶段，
+    /// 无条件推进会让订阅端看到 ai_speaking → discussing → done 的伪跃迁。
+    /// 发言本身照常入库，只是不改 phase。
+    pub fn apply_message(&mut self, msg: MeetingMessage) -> Result<(), String> {
+        if self.is_terminal() {
+            return Err("会议已结束，无法发言".to_string());
+        }
+        let advances = msg.kind == MSG_KIND_HUMAN && !self.participant_agents.is_empty();
+        self.messages.push(msg);
+        if advances {
+            self.phase = Some(MeetingPhase::Discussing);
+        }
+        Ok(())
     }
 }
 
@@ -1107,20 +1146,12 @@ impl AgentCore {
             at: chrono::Utc::now().to_rfc3339(),
         };
         {
+            // 终态守卫与状态机推进均委托给 `Meeting::apply_message`（纯逻辑单一来源），
+            // 与 `apply_convergence` 共享 `is_terminal()` 判定，避免两处谓词漂移。
+            // 返回 Err 时提前退出，不落盘。
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
             let m = v.iter_mut().find(|m| m.id == id).ok_or("会议不存在")?;
-            // 终态守卫：会议已结束（status=done 或 phase=Done）则拒绝新发言。
-            // 与 `apply_convergence` 共享 `Meeting::is_terminal()` 同一终态判定，
-            // 避免「status 仍是 running 但 phase=Done」场景下真人发言把 phase 回退成
-            // Discussing、复活刚被保护的终止态。
-            if m.is_terminal() {
-                return Err("会议已结束，无法发言".to_string());
-            }
-            m.messages.push(msg.clone());
-            // Step3 状态机推进：仅真人发言 → discussing（AI 发言不推进，保持 awaiting_humans / ai_speaking）
-            if kind == MSG_KIND_HUMAN {
-                m.phase = Some(MeetingPhase::Discussing);
-            }
+            m.apply_message(msg.clone())?;
         }
         self.save_meetings();
         Ok(msg)
@@ -1140,7 +1171,7 @@ impl AgentCore {
             if m.owner_user_id != requested_by && !is_admin {
                 return Err("仅拥有者或管理员可结束会议".to_string());
             }
-            m.status = "done".to_string();
+            m.status = STATUS_DONE.to_string();
             m.phase = Some(MeetingPhase::Done);
             m.consensus = Some(consensus.to_string());
         }
@@ -1212,24 +1243,34 @@ impl AgentCore {
     /// 返回值供调用方（圆桌后台任务）向订阅端广播 `state` / `ended` 实时事件——
     /// 否则订阅者会持有陈旧的 phase/status，直到真人发言或会议被结束/删除（见 `handle_meeting_stream`）。
     pub fn finish_meeting(&self, id: &str, consensus: &str) -> Option<(String, Option<MeetingPhase>)> {
-        let changed = {
+        // 状态跃迁与结果读取必须在**同一次加锁**内完成。
+        //
+        // 反例（TOCTOU）：先在锁 A 内 apply_convergence、释放锁、save_meetings()（全量序列化，慢），
+        // 再在锁 B 内重读 (status, phase)。两锁之间其他线程可能：
+        //   - 真人发言把 phase 推进到 Discussing → 广播出去的不是本次收敛的结果；
+        //   - end_meeting 置 done → 广播 state 而非 ended，订阅端永远等不到终态；
+        //   - 删除会议 → 重读得 None，调用方以为「未变更」而完全不广播。
+        // 因此在锁内直接克隆出返回值，锁外只做磁盘 IO。
+        let out = {
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
             match v.iter_mut().find(|m| m.id == id) {
-                Some(m) => m.apply_convergence(consensus),
-                None => false,
+                Some(m) => {
+                    // 同一把锁内先尝试收敛；成功即克隆结果返回，避免 TOCTOU 窗口
+                    if m.apply_convergence(consensus) {
+                        Some((m.status.clone(), m.phase))
+                    } else {
+                        None
+                    }
+                }
+                // 会议不存在 / 已终态 / 已幂等回填
+                None => None,
             }
         };
-        // 未发生变更（会议不存在 / 已终态）时不落盘，避免无谓 IO 与状态倒退
-        if changed {
+        // 未发生变更时不落盘，避免无谓 IO 与状态倒退
+        if out.is_some() {
             self.save_meetings();
-            // 重新读取收敛后的状态用于实时广播
-            let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
-            v.iter()
-                .find(|m| m.id == id)
-                .map(|m| (m.status.clone(), m.phase.clone()))
-        } else {
-            None
         }
+        out
     }
 
     /// 列出调用者可见的会议：公开 或 拥有者 或 admin，或调用者属该 scope。
@@ -11156,6 +11197,49 @@ mod whitelist_preroute_tests {
         assert!(with_human.apply_convergence("结论B"));
         assert_eq!(with_human.status, "running", "有真人参会须保持 running");
         assert_eq!(with_human.phase, Some(MeetingPhase::AwaitingHumans));
+    }
+
+    /// Step3（ocr-review test·low）：`add_meeting_message` 的状态机分支必须有回归锚点。
+    /// 覆盖四条路径：受邀真人 → Discussing；AI 发言不推进；纯 AI 会议真人发言不推进；
+    /// 终态会议拒绝任何发言。
+    #[test]
+    fn add_meeting_message_phase_transitions() {
+        let mk_msg = |kind: &str| MeetingMessage {
+            from: "agent/admin".into(),
+            kind: kind.into(),
+            content: "内容".into(),
+            at: "2026-08-01T00:00:00Z".into(),
+        };
+
+        // 1) 有真人参会 + 真人发言 → Discussing
+        let mut m = mk_meeting(STATUS_RUNNING, Some(MeetingPhase::AiSpeaking), vec!["agent/admin".into()]);
+        assert!(m.apply_message(mk_msg(MSG_KIND_HUMAN)).is_ok());
+        assert_eq!(m.phase, Some(MeetingPhase::Discussing), "受邀真人发言必须推进到 discussing");
+        assert_eq!(m.messages.len(), 1);
+
+        // 2) AI 发言不推进状态机
+        let mut m = mk_meeting(
+            STATUS_RUNNING,
+            Some(MeetingPhase::AwaitingHumans),
+            vec!["agent/admin".into()],
+        );
+        assert!(m.apply_message(mk_msg(MSG_KIND_AI)).is_ok());
+        assert_eq!(m.phase, Some(MeetingPhase::AwaitingHumans), "AI 发言不得推进 phase");
+
+        // 3) 纯 AI 会议（无 participant_agents）即使收到旁路真人发言也不得出现 Discussing
+        let mut m = mk_meeting(STATUS_RUNNING, Some(MeetingPhase::AiSpeaking), vec![]);
+        assert!(m.apply_message(mk_msg(MSG_KIND_HUMAN)).is_ok());
+        assert_eq!(m.phase, Some(MeetingPhase::AiSpeaking), "纯 AI 会议不存在 discussing 阶段");
+        assert_eq!(m.messages.len(), 1, "发言本身仍须入库");
+
+        // 4) 终态会议拒绝发言（status=done 与 phase=Done 任一命中都算终态）
+        let mut m = mk_meeting(STATUS_DONE, Some(MeetingPhase::Done), vec!["agent/admin".into()]);
+        assert!(m.apply_message(mk_msg(MSG_KIND_HUMAN)).is_err());
+        assert_eq!(m.messages.len(), 0, "被拒发言不得入库");
+
+        let mut m = mk_meeting(STATUS_RUNNING, Some(MeetingPhase::Done), vec!["agent/admin".into()]);
+        assert!(m.apply_message(mk_msg(MSG_KIND_HUMAN)).is_err(), "phase=Done 也是终态");
+        assert_eq!(m.messages.len(), 0);
     }
 
     /// Step3（ocr-review other·low）：phase=None 的旧会议回盘时**不得**凭空多出 `"phase":null`，
