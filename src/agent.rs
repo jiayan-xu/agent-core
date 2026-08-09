@@ -376,35 +376,39 @@ pub enum MeetingPhase {
     Done,
 }
 
-/// 宽容反序列化 `Option<MeetingPhase>`（reviewer round-12 #4）：未知 phase 字符串
-/// （如未来版本写入的 "paused"）回退为 None 并告警，而非让整条会议反序列化失败被
-/// `load_meetings_from_disk` 静默跳过、随后被 `save_meetings` 覆盖永久丢失。
+/// 宽容反序列化 `Option<MeetingPhase>`（reviewer round-12 #4 / round-13 #4）：
+/// 未知 phase 字符串（如未来版本写入的 "paused"）或**非字符串**值（数字/对象/数组）
+/// 一律回退为 None 并告警，而非让整条会议反序列化失败被 `load_meetings_from_disk`
+/// 静默跳过、随后被 `save_meetings` 覆盖永久丢失。
 /// 序列化仍走 `MeetingPhase` 的标准 snake_case，向后兼容旧 meetings.json。
 fn deserialize_phase_tolerant<'de, D>(d: D) -> Result<Option<MeetingPhase>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    enum MeetingPhaseRaw {
-        AiSpeaking,
-        AwaitingHumans,
-        Discussing,
-        Done,
-        #[serde(other)]
-        Unknown,
-    }
-    let raw = Option::<MeetingPhaseRaw>::deserialize(d)?;
+    // 先解成 serde_json::Value 而非带 #[serde(other)] 的字符串枚举：
+    // 后者对「非字符串」值（数字/对象）仍会报类型错误，无法达到宽容兼容目的。
+    let raw = Option::<serde_json::Value>::deserialize(d)?;
     Ok(match raw {
-        Some(MeetingPhaseRaw::Unknown) => {
-            tracing::warn!("反序列化会议 phase 遇到未知值，回退为 None（宽容兼容跨版本）");
-            None
-        }
-        Some(MeetingPhaseRaw::AiSpeaking) => Some(MeetingPhase::AiSpeaking),
-        Some(MeetingPhaseRaw::AwaitingHumans) => Some(MeetingPhase::AwaitingHumans),
-        Some(MeetingPhaseRaw::Discussing) => Some(MeetingPhase::Discussing),
-        Some(MeetingPhaseRaw::Done) => Some(MeetingPhase::Done),
         None => None,
+        Some(v) => {
+            let s = match v.as_str() {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(?v, "反序列化会议 phase 遇到非字符串值，回退为 None（宽容兼容跨版本）");
+                    return Ok(None);
+                }
+            };
+            match s {
+                "ai_speaking" => Some(MeetingPhase::AiSpeaking),
+                "awaiting_humans" => Some(MeetingPhase::AwaitingHumans),
+                "discussing" => Some(MeetingPhase::Discussing),
+                "done" => Some(MeetingPhase::Done),
+                _ => {
+                    tracing::warn!(phase = %s, "反序列化会议 phase 遇到未知值，回退为 None（宽容兼容跨版本）");
+                    None
+                }
+            }
+        }
     })
 }
 
@@ -523,7 +527,8 @@ impl Meeting {
         // 「收敛即终局」，生命周期里不存在 Discussing 阶段。
         let advances = msg.kind == MSG_KIND_HUMAN
             && !self.participant_agents.is_empty()
-            && self.participant_agents.iter().any(|a| a == &msg.from);
+            && (self.owner_user_id == msg.from
+                || self.participant_agents.iter().any(|a| a == &msg.from));
         if advances {
             self.phase = Some(MeetingPhase::Discussing);
         }
@@ -1298,6 +1303,7 @@ impl AgentCore {
             m.owner_user_id == caller
                 || is_admin
                 || !m.is_private
+                || m.participant_agents.iter().any(|a| a == caller)
                 || m.scope
                     .as_ref()
                     .is_some_and(|s| scope_matches_caller(s, caller_ns))
@@ -1363,9 +1369,17 @@ impl AgentCore {
             };
             (out_opt, serialized)
         };
-        // 发生变更时落盘：在 persist_lock 临界区内、self.meetings 释放后做磁盘 IO（tmp + 原子 rename），
+        // 发生变更时落盘：在 persist_lock 临界区内、self.meetings 释放后做磁盘 IO（tmp + 原子 rename）。
         // 不另起 spawn_blocking：fire-and-forget 异步写会与其他持久化路径竞争同一 tmp 文件
         // （lost update），且在 tokio runtime 外 panic、JoinHandle 被丢弃导致写失败静默（见 round-9 F1）。
+        //
+        // 【accepted ceiling · reviewer round-13 #3】这里的同步磁盘 IO 在 tokio worker 线程上执行，
+        // 且持 persist_lock。这是**有意取舍**：(a) 写盘前已释放 self.meetings 全局会议锁，只持
+        // 轻量 persist_lock，不阻塞会议内存读写；(b) 持久化调用点低频（会议创建 / 结束 / 删除 /
+        // 收敛落盘，非高频热路径），单次 IO 为小文件 tmp+rename 原子写，量级毫秒；(c) 同步写保证
+        // 进程崩溃不丢已确认的状态，且经 persist_lock 串行化杜绝 lost update / 撕裂写。若未来
+        // 会议并发量显著上升，可在调用方（tokio 上下文）用 spawn_blocking 只迁移写盘、保留本函数
+        // 的序列化在 self.meetings 锁内以维持 TOCTOU 保证。
         if let Some(s) = serialized {
             self.write_meetings_file(&s);
         }
@@ -11394,6 +11408,40 @@ mod whitelist_preroute_tests {
             let json = serde_json::to_string(&k).unwrap();
             assert_eq!(json, format!("\"{}\"", k.as_str()), "serde 名与 as_str() 必须一致");
         }
+    }
+
+    /// Step3（ocr-review round-13 #4）：宽容反序列化必须同时兜住「未知字符串」与「非字符串」
+    /// 两种 phase 值，均回退为 None 而非让整条 Meeting 反序列化失败（否则被 load 静默跳过、
+    /// 随后被 save_meetings 覆盖丢失）。回归测试覆盖完整 Meeting 反序列化路径，而非仅单测函数。
+    #[test]
+    fn phase_tolerant_deserialization_unknown_and_non_string() {
+        // 已知 4 种合法值应正常解析（不回归）
+        for (raw, expect) in [
+            ("ai_speaking", MeetingPhase::AiSpeaking),
+            ("awaiting_humans", MeetingPhase::AwaitingHumans),
+            ("discussing", MeetingPhase::Discussing),
+            ("done", MeetingPhase::Done),
+        ] {
+            let json = format!(r#"{{"id":"m","topic":"t","owner_user_id":"u","participant_personas":[],"is_private":true,"created_at":"2026-08-01T00:00:00Z","status":"running","consensus":null,"scope":null,"participant_agents":[],"messages":[],"phase":"{raw}"}}"#);
+            let m: Meeting = serde_json::from_str(&json).unwrap();
+            assert_eq!(m.phase, Some(expect), "合法 phase {raw} 应解析成功");
+        }
+        // 未知字符串 → None（宽容，不回退成整条失败）
+        let unknown = r#"{"id":"m","topic":"t","owner_user_id":"u","participant_personas":[],"is_private":true,"created_at":"2026-08-01T00:00:00Z","status":"running","consensus":null,"scope":null,"participant_agents":[],"messages":[],"phase":"paused"}"#;
+        let m: Meeting = serde_json::from_str(unknown).unwrap();
+        assert_eq!(m.phase, None, "未知字符串 phase 应宽容回退为 None");
+        // 非字符串值（数字 / 对象 / 数组 / bool）也 → None，而非整条反序列化失败
+        for raw in ["42", "{\"x\":1}", "[1,2]", "true"] {
+            let json = format!(r#"{{"id":"m","topic":"t","owner_user_id":"u","participant_personas":[],"is_private":true,"created_at":"2026-08-01T00:00:00Z","status":"running","consensus":null,"scope":null,"participant_agents":[],"messages":[],"phase":{raw}}}"#);
+            let m: Meeting = serde_json::from_str(&json).unwrap_or_else(|e| {
+                panic!("非字符串 phase {raw} 应宽容解析而非失败: {e}");
+            });
+            assert_eq!(m.phase, None, "非字符串 phase {raw} 应宽容回退为 None");
+        }
+        // phase 键缺失（旧格式）→ None
+        let missing = r#"{"id":"m","topic":"t","owner_user_id":"u","participant_personas":[],"is_private":true,"created_at":"2026-08-01T00:00:00Z","status":"running","consensus":null,"scope":null,"participant_agents":[],"messages":[]}"#;
+        let m: Meeting = serde_json::from_str(missing).unwrap();
+        assert_eq!(m.phase, None, "缺 phase 键（旧格式）应解析为 None");
     }
 }
 

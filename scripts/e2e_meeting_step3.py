@@ -208,8 +208,15 @@ def main() -> int:
     try:
         p = json.loads(msg_ev)
         is_delta = "message" in p and "messages" not in p
-        print(f"   payload 为增量(不含完整历史) = {is_delta}; phase={p.get('phase')}")
-        ok &= is_delta and p.get("phase") == "discussing"
+        phase = p.get("phase")
+        print(f"   payload 为增量(不含完整历史) = {is_delta}; phase={phase}")
+        # phase 推进到 discussing 依赖种子前置：`mtg_e2e_step3` 的 participant_agents 必须含
+        # `agent/admin` 且非空（apply_message 仅当受邀真人发言才推进），且 msg.from 被强制绑定到
+        # 已认证 caller=agent/admin。若断言失败，先核对种子是否满足该前置，勿误判为服务状态机回归。
+        ok &= is_delta and phase == "discussing"
+        if phase != "discussing" and not is_delta is None:
+            print("   !! phase 未推进到 discussing：请核对种子 mtg_e2e_step3 的 participant_agents"
+                  " 是否含 agent/admin（前置条件，见 apply_message）")
     except Exception as e:  # noqa: BLE001
         print(f"   !! message payload 解析失败: {e}")
         ok = False

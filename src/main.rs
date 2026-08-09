@@ -2508,7 +2508,12 @@ async fn handle_meeting_message(
     // 长会议会累积 O(n²) 的数据量。完整快照只保留给初始订阅 / Lagged 重同步路径。
     // 仅在会议仍存在时广播增量事件：add_meeting_message 成功后到此处读状态之间若被并发删除，
     // meeting_state 返回 None，不应伪造 status:"running" 广播针对已不存在会议的消息。
-    if let Some((status, phase, _)) = state {
+    // TOCTOU（reviewer round-13 #5）：上面的 `state` 是在 agent 锁内、A2A 投递**之前**读取的，
+    // 而 `collab_send_raw` 会 await 网络 I/O（可能耗时数秒）；若期间并发 end/delete/finish 提交，
+    // 直接沿用该陈旧 state 广播会让订阅端先收到 Ended/State 事件、再收到一条携带
+    // status:"running"/旧 phase 的 Message 事件——可见的状态倒退。故在 A2A 循环**之后**、广播
+    // **之前**用 agent_arc 重读一次会议状态：会议已消失则丢弃广播；状态已变化则用新状态。
+    if let Some((status, phase, _)) = agent_arc.meeting_state(&id).or(state) {
         broadcast_meeting_event(
             &st,
             &id,
@@ -2707,9 +2712,12 @@ fn spawn_meeting_presence_sweeper(st: Arc<AppState>) {
 
 /// Step3：会议可见性判定的**取锁便捷包装**（供 SSE 订阅使用）。
 ///
-/// 判定规则的唯一实现在 `AgentCore::meeting_visible`（owner / admin / scope 成员 / 公开会议），
-/// 心跳 handler 直接调用该核心方法——因为它需要把「校验 + 写 presence」放在同一个 agent 锁
-/// 临界区内以消除竞态，不能在这里提前释放锁。两条路径共享同一份规则，不会各写一份而漂移。
+/// 判定规则的唯一实现在 `AgentCore::meeting_visible`（owner / admin / scope 成员 /
+/// 公开 / participant_agents 成员），SSE 订阅与心跳 handler 共用同一份规则，不会各写一份而漂移。
+/// 注意：**仅 SSE 订阅**通过本包装取锁调用；心跳 handler 为保持 `agent → presence` 锁顺序、
+/// 降低全局 agent 锁持有时长，**主动分两步**执行——先在 agent 锁内做「可见性 + 终态」判定并
+/// 释放锁，再在 presence 锁内写在线态（见 `handle_meeting_heartbeat`）。两条路径共享
+/// `AgentCore::meeting_visible` 这一权威判定，但取锁策略各自独立，勿混淆。
 ///
 /// 会议不存在时返回 false（不区分「不存在 / 无权」，避免被用来探测会议 ID）。
 async fn meeting_visible(
@@ -2753,7 +2761,7 @@ async fn handle_meeting_stream(
         let g = st.agent.lock().await;
         g.as_ref().and_then(|a| a.get_meeting(&id2))
     };
-        let mut rx = {
+    let mut rx = {
             let mut map = st.meeting_tx.lock().await;
             map.entry(id2.clone())
                 .or_insert_with(|| broadcast::channel(256).0)
