@@ -693,7 +693,7 @@ struct AppState {
     // 每会议独立 broadcast 通道：避免单通道下单个繁忙会议的事件洪流唤醒所有会议的所有订阅者
     // （全局单通道会让无关订阅者被反复唤醒、落后 256 缓冲触发 Lagged、进而整会克隆 + 序列化，
     // 造成跨会议吞吐/延迟耦合与 agent 锁竞争）。通道仅在订阅时按需创建、SSE 任务结束时回收。
-    meeting_tx: std::sync::Mutex<HashMap<String, broadcast::Sender<MeetingEvent>>>,
+    meeting_tx: tokio::sync::Mutex<HashMap<String, broadcast::Sender<MeetingEvent>>>,
     /// Step3：会议在线表 meeting_id → (agent_id → 最近心跳 Instant)
     meeting_presence: tokio::sync::Mutex<HashMap<String, HashMap<String, std::time::Instant>>>,
 }
@@ -1431,7 +1431,7 @@ fn main() {
                 next_event_id: AtomicU64::new(1),
                 evolve_running: AtomicBool::new(false),
                 metrics: metrics.clone(),
-                meeting_tx: std::sync::Mutex::new(HashMap::new()),
+                meeting_tx: tokio::sync::Mutex::new(HashMap::new()),
                 meeting_presence: tokio::sync::Mutex::new(HashMap::new()),
             });
 
@@ -1704,6 +1704,7 @@ fn main() {
 
             // 后台周期回收无接收者的会议 broadcast 通道（兜底清理并发退出竞态导致的 Sender 泄漏）
             spawn_meeting_channel_sweeper(state.clone());
+            spawn_meeting_presence_sweeper(state.clone());
 
             if let Err(e) = axum::serve(listener, app).await {
                 tracing::error!("HTTP 服务异常终止: {}", e);
@@ -2305,14 +2306,14 @@ async fn handle_panel_discuss(
                         &meeting_id_c,
                         EventKind::Ended,
                         serde_json::json!({ "status": status, "phase": phase, "terminal": true }),
-                    );
+                    ).await;
                 } else {
                     broadcast_meeting_event(
                         &st,
                         &meeting_id_c,
                         EventKind::State,
                         serde_json::json!({ "status": status, "phase": phase }),
-                    );
+                    ).await;
                 }
             }
         }
@@ -2408,7 +2409,7 @@ async fn handle_meeting_delete(
                 &id,
                 EventKind::Ended,
                 serde_json::json!({ "deleted": true, "status": "done" }),
-            );
+            ).await;
             Json(serde_json::json!({"ok": true, "removed": id})).into_response()
         }
         Err(e) => (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response(),
@@ -2484,7 +2485,7 @@ async fn handle_meeting_message(
             &id,
             EventKind::Message,
             serde_json::json!({ "message": msg, "status": status, "phase": phase }),
-        );
+        ).await;
     }
     Json(serde_json::json!({"ok": true, "delivered": delivered, "targets": targets.len()})).into_response()
 }
@@ -2527,7 +2528,7 @@ async fn handle_meeting_end(
                     "phase": "done",
                     "consensus": consensus,
                 }),
-            );
+            ).await;
             Json(serde_json::json!({"ok": true, "ended": id})).into_response()
         }
         Ok(false) => {
@@ -2549,17 +2550,14 @@ async fn handle_meeting_end(
 /// 仅向**已存在**的会议通道广播：通道在订阅时按需创建，无订阅者时不创建孤儿通道
 /// （否则无接收者的通道会永久留在 map 中），避免内存无限增长。迟到的订阅者会收到包含
 /// 最新状态（含 ended）的初始快照，无需重放历史事件。
-fn broadcast_meeting_event(
+async fn broadcast_meeting_event(
     st: &Arc<AppState>,
     id: &str,
     kind: EventKind,
     payload: serde_json::Value,
 ) {
     let sender = {
-        let map = st
-            .meeting_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let map = st.meeting_tx.lock().await;
         map.get(id).cloned()
     };
     if let Some(sender) = sender {
@@ -2573,11 +2571,8 @@ fn broadcast_meeting_event(
 }
 
 /// Step3：SSE 任务结束时清理该会议的 broadcast 通道（若无存活接收者），避免每会议通道无限积累。
-fn cleanup_meeting_channel(st: &Arc<AppState>, id: &str) {
-    let mut map = st
-        .meeting_tx
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+async fn cleanup_meeting_channel(st: &Arc<AppState>, id: &str) {
+    let mut map = st.meeting_tx.lock().await;
     if let Some(tx) = map.get(id) {
         // 调用点：本函数总在 spawned 任务内、rx 仍存活时执行，receiver_count() 至少为 1。
         // 用 `<= 1` 判定（即仅剩本任务这一接收者）才能正确回收，否则 Sender 永不释放 → 泄漏。
@@ -2598,10 +2593,7 @@ fn spawn_meeting_channel_sweeper(st: Arc<AppState>) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             tick.tick().await;
-            let mut map = st
-                .meeting_tx
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut map = st.meeting_tx.lock().await;
             let stale: Vec<String> = map
                 .iter()
                 .filter(|(_, tx)| tx.receiver_count() == 0)
@@ -2609,6 +2601,45 @@ fn spawn_meeting_channel_sweeper(st: Arc<AppState>) {
                 .collect();
             for id in stale {
                 map.remove(&id);
+            }
+        }
+    });
+}
+
+/// Step3：会议在线表兜底清理 —— 周期性移除「会议已不存在」的孤儿 presence 条目。
+///
+/// 心跳 handler（handle_meeting_heartbeat）为降低全局 agent 锁持有时长，分两步执行：
+/// 先在 agent 锁内做「可见性 + 终态」判定并释放，再在 presence 锁内写入在线态。若并发的
+/// delete/end 在两步之间 remove 掉该会议，心跳会用 `or_default()` 为已删除会议重建孤儿 presence
+/// 条目；此后心跳对该会议恒返回 403（不可见）、SSE 任务也已退出，无人再裁剪该键，造成无界泄漏。
+/// 本后台任务每 60s 扫描一次，对「会议已不存在」的 id 直接 remove，作为确定性兜底。
+///
+/// 锁顺序：agent → presence（先取 agent 锁判定会议是否存在，再取 presence 锁删除），
+/// 与 delete/end、心跳 handler 的锁顺序一致，无死锁风险（无任何路径反向 presence→agent 取锁）。
+fn spawn_meeting_presence_sweeper(st: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            // agent 锁内收集「会议已不存在」的 id（agent → presence 顺序，避免反向加锁死锁）
+            let missing: Vec<String> = {
+                let g = st.agent.lock().await;
+                let agent_opt = g.as_ref();
+                let p = st.meeting_presence.lock().await;
+                p.keys()
+                    .filter(|id| {
+                        agent_opt
+                            .map(|a| a.meeting_state(id).is_none())
+                            .unwrap_or(true)
+                    })
+                    .cloned()
+                    .collect()
+            };
+            if !missing.is_empty() {
+                let mut p = st.meeting_presence.lock().await;
+                for id in &missing {
+                    p.remove(id);
+                }
             }
         }
     });
@@ -2662,15 +2693,12 @@ async fn handle_meeting_stream(
         let g = st.agent.lock().await;
         g.as_ref().and_then(|a| a.get_meeting(&id2))
     };
-    let mut rx = {
-        let mut map = st
-            .meeting_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        map.entry(id2.clone())
-            .or_insert_with(|| broadcast::channel(256).0)
-            .subscribe()
-    };
+        let mut rx = {
+            let mut map = st.meeting_tx.lock().await;
+            map.entry(id2.clone())
+                .or_insert_with(|| broadcast::channel(256).0)
+                .subscribe()
+        };
     // 复核窗口：用 meeting_state()（仅取 status/phase/发言数，O(1) 不克隆整会）判断快照是否过期，
     // 仅在确实变化时再克隆完整会议用于序列化，避免每次订阅都做全量 clone 占用全局 agent 锁、
     // 拖慢大会议的所有 agent 操作（发言 / A2A / 生命周期 handler）。
@@ -2722,7 +2750,7 @@ async fn handle_meeting_stream(
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(meeting = %id2, "snapshot 序列化失败: {e}");
-                    cleanup_meeting_channel(&st2, &id2);
+                    cleanup_meeting_channel(&st2, &id2).await;
                     return;
                 }
             };
@@ -2730,7 +2758,7 @@ async fn handle_meeting_stream(
                 .try_send(Ok(SseEvent::default().event("snapshot").data(data)))
                 .is_err()
             {
-                cleanup_meeting_channel(&st2, &id2);
+                cleanup_meeting_channel(&st2, &id2).await;
                 return;
             }
             if terminal {
@@ -2739,7 +2767,7 @@ async fn handle_meeting_stream(
                 let _ = tx.try_send(Ok(SseEvent::default().event("ended").data(
                     serde_json::json!({ "terminal": true }).to_string(),
                 )));
-                cleanup_meeting_channel(&st2, &id2);
+                cleanup_meeting_channel(&st2, &id2).await;
                 return;
             }
         } else {
@@ -2747,7 +2775,7 @@ async fn handle_meeting_stream(
             let _ = tx.try_send(Ok(SseEvent::default().event("ended").data(
                 serde_json::json!({ "deleted": true }).to_string(),
             )));
-            cleanup_meeting_channel(&st2, &id2);
+            cleanup_meeting_channel(&st2, &id2).await;
             return;
         }
         // 心跳保活 + 在线表推送（每 5s）
@@ -2858,7 +2886,7 @@ async fn handle_meeting_stream(
                                         let _ = tx.try_send(Ok(SseEvent::default().event("ended").data(
                                             serde_json::json!({ "terminal": true }).to_string(),
                                         )));
-                                        cleanup_meeting_channel(&st2, &id2);
+                                        cleanup_meeting_channel(&st2, &id2).await;
                                         break;
                                     }
                                 }
@@ -2878,7 +2906,7 @@ async fn handle_meeting_stream(
         }
         // 不再下发无契约的裸 `done` 事件：流的结束由连接关闭 / 终态 `ended` 事件表达，
         // 一个空 payload 的 `done` 无 SSE 契约、客户端不应依赖（见 ocr-review finding #8）。
-        cleanup_meeting_channel(&st2, &id2);
+        cleanup_meeting_channel(&st2, &id2).await;
     });
     let mut resp = Sse::new(ReceiverStream::new(rx_out)).into_response();
     resp.headers_mut().insert(
@@ -2917,12 +2945,21 @@ async fn send_meeting_event(
                 Ok(e) => e,
                 Err(_) => return false,
             };
-            tokio::time::timeout(
+            // 区分内层结果：外层 Ok 仅代表「send 调用已返回」，不代表客户端仍在线。
+            // - Ok(Ok(()))：真正下发成功；
+            // - Ok(Err(_))：接收端已 drop（客户端断开），应立即结束任务、避免僵尸流；
+            // - Err(_)：2s 超时（慢客户端背压），关键事件在窗口内仍未下发，按失败处理，
+            //   与「Closed→立即结束避免僵尸流」契约一致，避免拖长数秒（见 ocr-review finding #9）。
+            match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 tx.send(Ok::<_, Infallible>(ev)),
             )
             .await
-            .is_ok()
+            {
+                Ok(Ok(())) => true,
+                Ok(Err(_)) => false,
+                Err(_) => false,
+            }
         }
     }
 }
@@ -2938,15 +2975,13 @@ async fn handle_meeting_heartbeat(
         Err(resp) => return resp,
     };
     let admin = is_admin(&headers, &st).await;
-    // 可见性校验 + 在线态写入，**在同一个 agent 锁临界区内完成**，消除 check-then-act 竞态：
-    // 若只做「先校验、后插入」，并发的 delete/end 可能在两步之间删掉会议，
-    // 使 or_default() 为一个已不存在的会议重建孤儿 presence 条目（复活刚被清理的状态）。
-    // 锁顺序 agent → presence，与 handle_meeting_delete / handle_meeting_end 保持一致，无死锁风险。
-    //
-    // 会议不存在时同样按「无权」处理，避免任意认证用户借错误码探测会议 ID 是否存在。
-    // 在 agent 锁内只做 O(1) 可见性 + 终态判定（不触碰磁盘、不碰 presence），随即释放
-    // agent 锁；presence 写入仅在 presence 锁下进行，避免把全局 agent 锁拉长成跨会议争用点
-    // （圆桌 LLM 收敛期间持锁尤甚，见 round-9 F5）。
+    // 降低全局 agent 锁持有时长：可见性校验 + 终态判定在 agent 锁内完成（O(1)，仅判可见+终态，
+    // 不触碰磁盘、不碰 presence），随即释放 agent 锁；在线态写入单独在 presence 锁内完成。
+    // 两步拆分存在 check-then-act 竞态：并发 delete/end 可能在两步之间 remove 掉该会议，使后续
+    // 心跳用 or_default() 为已删除会议重建孤儿 presence 条目。该竞态由 spawn_meeting_presence_sweeper
+    // （每 60s 兜底清理「会议已不存在」的孤儿条目）兜底，杜绝无界泄漏，故此处无需在 presence 锁内
+    // 反向回查 agent（会破坏 agent→presence 锁顺序、引发死锁）。锁顺序始终保持 agent → presence。
+    // 会议不存在时同样按「无权」返回，避免任意认证用户借错误码探测会议 ID 是否存在。
     let (visible, terminal) = {
         let g = st.agent.lock().await;
         let agent_opt = g.as_ref();
