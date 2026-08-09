@@ -377,6 +377,27 @@ pub struct Meeting {
     /// None = 旧版私有圆桌（仅拥有者 / admin 可见）。serde default 兼容旧 meetings.json。
     #[serde(default)]
     pub scope: Option<String>,
+    /// NEW(会议升级 Step2)：真人实例 agent_id 列表（A2A 参会）。
+    /// 通过 A2A 投递消息到这些实例的收件箱。serde default 兼容旧 meetings.json。
+    #[serde(default)]
+    pub participant_agents: Vec<String>,
+    /// NEW(会议升级 Step2)：会议发言记录（AI 分身 + 真人）。
+    /// serde default 兼容旧 meetings.json。
+    #[serde(default)]
+    pub messages: Vec<MeetingMessage>,
+}
+
+/// 会议中的一条发言（AI 分身 / 真人 A2A）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MeetingMessage {
+    /// 发送者：AI 分身为 persona_id，真人为 agent_id
+    pub from: String,
+    /// "ai" | "human"
+    pub kind: String,
+    /// 发言内容
+    pub content: String,
+    /// RFC3339 时间
+    pub at: String,
 }
 
 /// 判断分身是否匹配会议 scope。
@@ -933,11 +954,15 @@ impl AgentCore {
     }
 
     /// 创建一条会议记录（默认私有），返回会议 id
+    /// - `participant_personas`：AI 分身列表
+    /// - `participant_agents`：真人实例 agent_id 列表（Step2 新增，A2A 参会）
+    #[allow(clippy::too_many_arguments)]
     pub fn create_meeting(
         &self,
         topic: &str,
         owner: &str,
         participants: Vec<String>,
+        participant_agents: Vec<String>,
         is_private: bool,
         scope: Option<String>,
     ) -> String {
@@ -952,6 +977,8 @@ impl AgentCore {
             status: "running".to_string(),
             consensus: None,
             scope,
+            participant_agents,
+            messages: Vec::new(),
         };
         self.meetings
             .lock()
@@ -959,6 +986,63 @@ impl AgentCore {
             .push(meeting);
         self.save_meetings();
         id
+    }
+
+    /// Step2：追加一条会议发言。仅当会议存在且为 running 时才允许。
+    /// 返回 (meeting_id, from, content) 供上层 A2A 投递；会议不存在或已结束返回 Err。
+    pub fn add_meeting_message(
+        &self,
+        id: &str,
+        from: &str,
+        kind: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        let msg = MeetingMessage {
+            from: from.to_string(),
+            kind: kind.to_string(),
+            content: content.to_string(),
+            at: chrono::Utc::now().to_rfc3339(),
+        };
+        {
+            let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+            let m = v.iter_mut().find(|m| m.id == id).ok_or("会议不存在")?;
+            if m.status != "running" {
+                return Err("会议已结束，无法发言".to_string());
+            }
+            m.messages.push(msg);
+        }
+        self.save_meetings();
+        Ok(())
+    }
+
+    /// Step2：结束会议并回填共识。requested_by 需为 owner / admin，否则拒绝。
+    pub fn end_meeting(
+        &self,
+        id: &str,
+        consensus: &str,
+        requested_by: &str,
+        is_admin: bool,
+    ) -> Result<(), String> {
+        {
+            let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+            let m = v.iter_mut().find(|m| m.id == id).ok_or("会议不存在")?;
+            if m.owner_user_id != requested_by && !is_admin {
+                return Err("仅拥有者或管理员可结束会议".to_string());
+            }
+            m.status = "done".to_string();
+            m.consensus = Some(consensus.to_string());
+        }
+        self.save_meetings();
+        Ok(())
+    }
+
+    /// Step2：读取某会议的全部 participant_agents（A2A 通知目标）。
+    pub fn meeting_agent_participants(&self, id: &str) -> Vec<String> {
+        let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+        v.iter()
+            .find(|m| m.id == id)
+            .map(|m| m.participant_agents.clone())
+            .unwrap_or_default()
     }
 
     /// 圆桌收敛完成后回填共识并标记 done
@@ -10804,6 +10888,47 @@ mod whitelist_preroute_tests {
         let (executed, note) = AgentCore::classify_tool_execution(&transport);
         assert!(!executed);
         assert!(note.unwrap().contains("timeout"));
+    }
+
+    /// 会议升级 Step2：旧 meetings.json（无 participant_agents/messages 字段）必须能反序列化，
+    /// 且新字段序列化后 roundtrip 一致。这是 A2A 参会功能的兼容性锚点。
+    #[test]
+    fn meeting_step2_serde_backward_compat() {
+        // 旧格式（Step1 时代，只有 scope，无 Step2 字段）
+        let old_json = r#"{
+            "id":"mtg_1","topic":"盘点","owner_user_id":"u1",
+            "participant_personas":["p1"],"is_private":true,
+            "created_at":"2026-08-01T00:00:00Z","status":"running",
+            "consensus":null,"scope":"dept:eng"
+        }"#;
+        let m: Meeting = serde_json::from_str(old_json).expect("旧格式必须可反序列化");
+        assert_eq!(m.participant_agents.len(), 0, "旧数据 participant_agents 应默认空");
+        assert_eq!(m.messages.len(), 0, "旧数据 messages 应默认空");
+        assert_eq!(m.scope.as_deref(), Some("dept:eng"));
+
+        // 新格式 roundtrip：messages 含 ai + human 两种
+        let m2 = Meeting {
+            id: "mtg_2".into(),
+            topic: "t".into(),
+            owner_user_id: "u".into(),
+            participant_personas: vec!["ai1".into()],
+            is_private: true,
+            created_at: "2026-08-01T00:00:00Z".into(),
+            status: "running".into(),
+            consensus: None,
+            scope: None,
+            participant_agents: vec!["agent/admin".into()],
+            messages: vec![
+                MeetingMessage { from: "ai1".into(), kind: "ai".into(), content: "立场".into(), at: "2026-08-01T00:00:01Z".into() },
+                MeetingMessage { from: "agent/admin".into(), kind: "human".into(), content: "意见".into(), at: "2026-08-01T00:00:02Z".into() },
+            ],
+        };
+        let s = serde_json::to_string(&m2).unwrap();
+        let back: Meeting = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.participant_agents, vec!["agent/admin"]);
+        assert_eq!(back.messages.len(), 2);
+        assert_eq!(back.messages[1].kind, "human");
+        assert_eq!(back.messages[1].content, "意见");
     }
 }
 
