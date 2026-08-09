@@ -476,16 +476,24 @@ impl Meeting {
     /// 该类会议「收敛即终局」，其生命周期里不存在 Discussing 阶段，
     /// 无条件推进会让订阅端看到 ai_speaking → discussing → done 的伪跃迁。
     /// 发言本身照常入库，只是不改 phase。
-    pub fn apply_message(&mut self, msg: MeetingMessage) -> Result<(), String> {
+    pub fn apply_message(&mut self, msg: MeetingMessage) -> Result<MeetingMessage, String> {
         if self.is_terminal() {
             return Err("会议已结束，无法发言".to_string());
         }
-        let advances = msg.kind == MSG_KIND_HUMAN && !self.participant_agents.is_empty();
-        self.messages.push(msg);
+        // 仅受邀真人（msg.from 须为会议 `participant_agents` 之一）发言才推进到 Discussing。
+        // 否则伪造 `from`（请求体可控、会议 ID 可猜）即可强行把 phase 推进到 discussing，
+        // 干扰状态机。`participant_agents` 为空（纯 AI 圆桌）时本分支恒不成立——该类会议
+        // 「收敛即终局」，生命周期里不存在 Discussing 阶段。
+        let advances = msg.kind == MSG_KIND_HUMAN
+            && !self.participant_agents.is_empty()
+            && self.participant_agents.iter().any(|a| a == &msg.from);
         if advances {
             self.phase = Some(MeetingPhase::Discussing);
         }
-        Ok(())
+        self.messages.push(msg);
+        // 返回被追加的消息（已无多余克隆），供上层 A2A 投递 / 增量广播复用。
+        // 取刚 push 进向量的那条，避免对入参再 clone 一次（消除热路径多余分配）。
+        Ok(self.messages.last().cloned().unwrap())
     }
 }
 
@@ -1145,16 +1153,17 @@ impl AgentCore {
             content: content.to_string(),
             at: chrono::Utc::now().to_rfc3339(),
         };
-        {
-            // 终态守卫与状态机推进均委托给 `Meeting::apply_message`（纯逻辑单一来源），
-            // 与 `apply_convergence` 共享 `is_terminal()` 判定，避免两处谓词漂移。
-            // 返回 Err 时提前退出，不落盘。
+        // 终态守卫与状态机推进委托给 `Meeting::apply_message`（纯逻辑单一来源），
+        // 与 `apply_convergence` 共享 `is_terminal()` 判定。apply_message 消费 msg 并返回
+        // 被追加的消息，消除热路径上的多余 clone（原实现 `msg.clone()` 后原 msg 又作为
+        // 返回值，等价两份拷贝）。返回 Err 时提前退出，不落盘。
+        let pushed = {
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
             let m = v.iter_mut().find(|m| m.id == id).ok_or("会议不存在")?;
-            m.apply_message(msg.clone())?;
-        }
+            m.apply_message(msg)?
+        };
         self.save_meetings();
-        Ok(msg)
+        Ok(pushed)
     }
 
     /// Step2：结束会议并回填共识。requested_by 需为 owner / admin，否则拒绝。
@@ -1170,6 +1179,12 @@ impl AgentCore {
             let m = v.iter_mut().find(|m| m.id == id).ok_or("会议不存在")?;
             if m.owner_user_id != requested_by && !is_admin {
                 return Err("仅拥有者或管理员可结束会议".to_string());
+            }
+            // 幂等：已终态（status=done 或 phase=Done）直接返回，不覆盖既有共识、
+            // 不重复落盘 / 触发二次 ended 广播。防止重复 `/end`（空 consensus）把用户共识抹掉、
+            // 让订阅端收到两次 ended 事件。
+            if m.is_terminal() {
+                return Ok(());
             }
             m.status = STATUS_DONE.to_string();
             m.phase = Some(MeetingPhase::Done);
@@ -1266,9 +1281,24 @@ impl AgentCore {
                 None => None,
             }
         };
-        // 未发生变更时不落盘，避免无谓 IO 与状态倒退
+        // 未发生变更时不落盘，避免无谓 IO 与状态倒退。
+        // 发生变更时，把磁盘 IO（全量序列化 + 写文件）移出当前 async worker：
+        // 仅转移「数据」(序列化后的字节串，Send + 'static)，不捕获 &self，
+        // 用 spawn_blocking 在阻塞线程执行，避免阻塞收敛回调所在的 tokio 任务
+        // （save_meetings 含 std::fs 同步写，久则拖垮同 executor 上的其他异步任务）。
         if out.is_some() {
-            self.save_meetings();
+            if let Some(payload) = self.serialize_meetings() {
+                tokio::task::spawn_blocking(move || {
+                    let path = match std::env::current_dir() {
+                        Ok(d) => d.join("meetings.json"),
+                        Err(_) => return,
+                    };
+                    let tmp = path.with_extension("tmp");
+                    if std::fs::write(&tmp, &payload).is_ok() {
+                        let _ = std::fs::rename(&tmp, &path);
+                    }
+                });
+            }
         }
         out
     }
@@ -1316,20 +1346,22 @@ impl AgentCore {
     }
 
     /// 会议持久化：落盘 cwd/meetings.json（原子写）
+    /// 把内存会议序列化为 JSON 字符串（仅持锁做序列化，不触碰磁盘）。
+    /// 返回的 `String` 是 `Send + 'static`，可移入 `spawn_blocking` 做磁盘写入，
+    /// 从而把慢 IO 从 async worker 剥离（见 `finish_meeting`）。
+    fn serialize_meetings(&self) -> Option<String> {
+        let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+        let payload = serde_json::json!({ "meetings": v.iter().collect::<Vec<_>>() });
+        serde_json::to_string_pretty(&payload).ok()
+    }
+
     pub fn save_meetings(&self) {
         let cwd = match std::env::current_dir() {
             Ok(d) => d,
             Err(_) => return,
         };
         let path = cwd.join("meetings.json");
-        let s = {
-            let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
-            let payload = serde_json::json!({ "meetings": v.iter().collect::<Vec<_>>() });
-            match serde_json::to_string_pretty(&payload) {
-                Ok(s) => s,
-                Err(_) => return,
-            }
-        };
+        let Some(s) = self.serialize_meetings() else { return; };
         let tmp = path.with_extension("tmp");
         if std::fs::write(&tmp, &s).is_ok() {
             let _ = std::fs::rename(&tmp, &path);

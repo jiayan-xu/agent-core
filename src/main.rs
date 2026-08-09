@@ -46,7 +46,7 @@ use tracing_subscriber::EnvFilter;
 use wry::WebViewBuilder;
 
 use agent_core::agent::{
-    AgentConfig, AgentCore, AgentIdentity, EventKind, MeetingEvent, MeetingPhase,
+    AgentConfig, AgentCore, AgentIdentity, EventKind, MeetingEvent, is_terminal_state,
 };
 use agent_core::audit::AuditLogger;
 use agent_core::meta_evolve::{MetaEvolutionConfig, SafetyConfig};
@@ -2298,7 +2298,7 @@ async fn handle_panel_discuss(
         // 否则订阅者永远看不到本次跃迁，停留在陈旧状态。
         if !meeting_id_c.is_empty() {
             if let Some((status, phase)) = agent.finish_meeting(&meeting_id_c, &consensus) {
-                let terminal = status == "done" || phase == Some(MeetingPhase::Done);
+                let terminal = is_terminal_state(&status, phase);
                 if terminal {
                     broadcast_meeting_event(
                         &st,
@@ -2670,9 +2670,11 @@ async fn handle_meeting_stream(
         g.as_ref().and_then(|a| a.meeting_state(&id2))
     };
     // 终态快照：status != running 或 phase == Done 都表示会议已结束。
+    // 终态判定统一委托给 agent_core::agent::is_terminal_state（status/phase 单一来源），
+    // 避免各 handler 各写一份 `s == "done" || p == Some(Done)`，新增终态时漏改导致分歧。
     let terminal = state
         .as_ref()
-        .map_or(true, |(s, p, _)| s == "done" || *p == Some(MeetingPhase::Done));
+        .map_or(true, |(s, p, _)| is_terminal_state(s, *p));
     match state {
         Some((status, phase, count)) => {
             let changed = match &snap {
@@ -2683,7 +2685,8 @@ async fn handle_meeting_stream(
                 // 仅在确实变化时克隆完整会议（用于快照序列化），避免每次订阅全量 clone
                 let g = st.agent.lock().await;
                 if let Some(cur) = g.as_ref().and_then(|a| a.get_meeting(&id2)) {
-                    snap = Some(cur.clone());
+                    // `get_meeting` 已返回 owned 克隆，直接 move 进 snap，无需二次 clone。
+                    snap = Some(cur);
                 }
             }
         }
@@ -2743,27 +2746,37 @@ async fn handle_meeting_stream(
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    let online = {
-                        let map = st2.meeting_presence.lock().await;
-                        match map.get(&id2) {
-                            Some(p) => p
-                                .iter()
-                                .filter(|(_, t)| t.elapsed().as_secs() < 15)
-                                .map(|(k, _)| k.clone())
-                                .collect::<Vec::<_>>(),
-                            None => Vec::new(),
+                    // 在线表裁剪与「无存活则删除会议键」在**同一次锁**内完成，
+                    // 消除 check-then-act 竞态：否则并发心跳可能在两次加锁之间插入新条目，
+                    // 被本次 remove 误删，导致在线表丢失刚上报的心跳、复活刚被清理的状态。
+                    let online: Vec<String> = {
+                        let mut map = st2.meeting_presence.lock().await;
+                        let online: Vec<String> = map
+                            .get(&id2)
+                            .map(|p| {
+                                p.iter()
+                                    .filter(|(_, t)| t.elapsed().as_secs() < 15)
+                                    .map(|(k, _)| k.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if online.is_empty() {
+                            map.remove(&id2);
                         }
+                        online
                     };
-                    // 在线表无存活条目时移除该会议键，防止 meeting_presence 随会议数无界增长
-                    if online.is_empty() {
-                        st2.meeting_presence.lock().await.remove(&id2);
-                    }
-                    // 客户端断开（Closed）或已失活致缓冲写满（Full）时立即退出，避免任务与内存泄漏
-                    if tx.try_send(Ok(SseEvent::default().event("presence").data(
-                        serde_json::json!({ "online": online }).to_string(),
-                    ))).is_err() { break; }
+                    // 非关键心跳事件：客户端断开(Closed)才结束任务；慢客户端缓冲写满(Full)直接丢弃，不断流
+                    if !send_meeting_event(
+                        &tx,
+                        SseEvent::default()
+                            .event("presence")
+                            .data(serde_json::json!({ "online": online }).to_string()),
+                        false,
+                    )
+                    .await
+                    { break; }
                     // SSE 注释行心跳：axum 以 ':' 前缀发出，客户端忽略，不产生伪 message 事件
-                    if tx.try_send(Ok(SseEvent::default().comment("ping"))).is_err() { break; }
+                    if !send_meeting_event(&tx, SseEvent::default().comment("ping"), false).await { break; }
                 }
                 msg = rx.recv() => {
                     match msg {
@@ -2787,9 +2800,15 @@ async fn handle_meeting_stream(
                                     snap_msg_keys.insert(key);
                                 }
                             }
-                            if tx
-                                .try_send(Ok(SseEvent::default().event(ev.kind.as_str()).data(ev.payload.to_string())))
-                                .is_err()
+                            // 关键实时事件：区分 Closed(断开→结束) 与 Full(慢客户端→背压 2s，避免重连风暴)
+                            if !send_meeting_event(
+                                &tx,
+                                SseEvent::default()
+                                    .event(ev.kind.as_str())
+                                    .data(ev.payload.to_string()),
+                                true,
+                            )
+                            .await
                             { break; }
                             if ended { break; }
                         }
@@ -2842,7 +2861,8 @@ async fn handle_meeting_stream(
                 }
             }
         }
-        let _ = tx.try_send(Ok(SseEvent::default().event("done").data("")));
+        // 不再下发无契约的裸 `done` 事件：流的结束由连接关闭 / 终态 `ended` 事件表达，
+        // 一个空 payload 的 `done` 无 SSE 契约、客户端不应依赖（见 ocr-review finding #8）。
         cleanup_meeting_channel(&st2, &id2);
     });
     let mut resp = Sse::new(ReceiverStream::new(rx_out)).into_response();
@@ -2855,6 +2875,41 @@ async fn handle_meeting_stream(
         axum::http::HeaderValue::from_static("no"),
     );
     resp
+}
+
+/// Step3：SSE 背压助手——区分客户端真正断开(Closed)与慢客户端缓冲写满(Full)。
+///
+/// - `Closed` → 返回 `false`，调用方 `break` 结束任务，避免僵尸流；
+/// - `Full`   → 非关键事件(心跳/ping)直接丢弃、关键事件(发言/快照)带超时 `await` 施加背压，
+///   避免浏览器节流导致缓冲写满时直接拆流、客户端无限重连风暴（见 ocr-review finding #7）。
+///
+/// `tx` 为会议 SSE 的 mpsc 发送端；`ev` 为待下发事件；`critical` 标记是否为关键实时事件。
+async fn send_meeting_event(
+    tx: &tokio::sync::mpsc::Sender<Result<SseEvent, Infallible>>,
+    ev: SseEvent,
+    critical: bool,
+) -> bool {
+    match tx.try_send(Ok::<_, Infallible>(ev)) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(inner)) => {
+            if !critical {
+                return true; // 非关键事件满则丢弃，不断流
+            }
+            // inner 即本次未能入队的原始值 Result<SseEvent, Infallible>，
+            // Infallible 不可构造，故必为 Ok(SseEvent)。背压：带超时 await send。
+            let ev = match inner {
+                Ok(e) => e,
+                Err(_) => return false,
+            };
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tx.send(Ok::<_, Infallible>(ev)),
+            )
+            .await
+            .is_ok()
+        }
+    }
 }
 
 /// Step3：实时同步 —— 心跳保活。记录调用者在该会议的在线状态，返回当前在线列表。
@@ -2891,7 +2946,7 @@ async fn handle_meeting_heartbeat(
         let terminal = g.as_ref().map_or(true, |agent| {
             agent
                 .meeting_state(&id)
-                .map_or(true, |(s, p, _)| s == "done" || p == Some(MeetingPhase::Done))
+                .map_or(true, |(s, p, _)| is_terminal_state(&s, p))
         });
         if terminal {
             st.meeting_presence.lock().await.remove(&id);
