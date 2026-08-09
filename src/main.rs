@@ -2444,12 +2444,19 @@ async fn handle_meeting_message(
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
     // 发言资格判定需 admin 身份；在获取全局 agent 锁之前算好，避免持锁期间 await。
     let admin = is_admin(&headers, &st).await;
+    // 【round-14 #5 安全对齐】发言前先做可见性门禁（与 SSE 订阅 / 心跳同一判定 meeting_visible，
+    // 含 scope 成员）：(a) 让可订阅会议的 scope 成员也能发言，读写权限一致；(b) 会议不存在与
+    // 无权统一返回 403「无权访问」，避免通过区分「会议不存在」/「发言者非邀请」错误串探测私有
+    // 会议 ID 是否存在（add_meeting_message 的鉴权错误不再暴露）。可见即可评，与政策一致。
+    if !meeting_visible(&st, &id, &caller, &caller_ns, admin).await {
+        return (axum::http::StatusCode::FORBIDDEN, "无权访问该会议").into_response();
+    }
     let v = match body {
         Some(Json(v)) => v,
         None => return (axum::http::StatusCode::BAD_REQUEST, "missing body").into_response(),
@@ -2467,13 +2474,13 @@ async fn handle_meeting_message(
     // 避免后续 A2A 网络投递（collab_send_raw）与实时广播（broadcast 通道锁）在持全局锁期间
     // await 而拉长全局 agent 锁持有时长、并引入脆弱的 agent→presence/agent→meeting_tx 锁顺序
     // （reviewer round-10 F1）。collab_send_raw 需 agent 引用，故克隆 Arc 在锁外调用。
-    let (msg, targets, state, agent_arc) = {
+    let (msg, targets, agent_arc) = {
         let g = st.agent.lock().await;
         let Some(ref agent) = *g else {
             return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
         };
         let agent_arc = agent.clone();
-        let msg = match agent.add_meeting_message(&id, &from, "human", &content, admin) {
+        let msg = match agent.add_meeting_message(&id, &from, &caller_ns, "human", &content, admin) {
             Ok(m) => m,
             Err(e) => {
                 return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))
@@ -2485,10 +2492,14 @@ async fn handle_meeting_message(
             .into_iter()
             .filter(|a| *a != from)
             .collect();
-        let state = agent.meeting_state(&id);
-        (msg, targets, state, agent_arc)
+        (msg, targets, agent_arc)
     };
-    // 全局 st.agent 锁已释放；以下 A2A 网络投递与实时广播均在锁外进行。
+    // 全局 st.agent 锁已释放。落盘（消息入内存后持久化）移到锁外执行：
+    // add_meeting_message 已不再内部落盘（round-14 #4），此处须在释放全局锁后、于锁外调用
+    // save_meetings，避免把同步全量写盘拖进持 st.agent 全局锁的临界区（否则慢磁盘阻塞所有
+    // agent 操作）。save_meetings 内部仍持轻量 persist_lock 串行化，保进程崩溃不丢已确认发言。
+    agent_arc.save_meetings();
+    // 以下 A2A 网络投递与实时广播均在锁外进行。
     let mut delivered = 0usize;
     for t in &targets {
         let envelope = serde_json::json!({
@@ -2512,8 +2523,11 @@ async fn handle_meeting_message(
     // 而 `collab_send_raw` 会 await 网络 I/O（可能耗时数秒）；若期间并发 end/delete/finish 提交，
     // 直接沿用该陈旧 state 广播会让订阅端先收到 Ended/State 事件、再收到一条携带
     // status:"running"/旧 phase 的 Message 事件——可见的状态倒退。故在 A2A 循环**之后**、广播
-    // **之前**用 agent_arc 重读一次会议状态：会议已消失则丢弃广播；状态已变化则用新状态。
-    if let Some((status, phase, _)) = agent_arc.meeting_state(&id).or(state) {
+    // **之前**用 agent_arc 重读一次会议状态，作为广播的唯一来源。
+    // 【round-14 #2】绝不可用 `.or(state)` 回退到锁内旧状态：`meeting_state` 返回 None 仅当会议
+    // 已被并发删除；此时 `.or(state)` 会复活 ESM 的陈旧 running 状态，仍向已不存在的会议广播
+    // Message 事件，让订阅端状态机回滚到 running——正是我们要防的倒退。故会议已消失则直接丢弃广播。
+    if let Some((status, phase, _)) = agent_arc.meeting_state(&id) {
         broadcast_meeting_event(
             &st,
             &id,
@@ -2681,22 +2695,21 @@ fn spawn_meeting_presence_sweeper(st: Arc<AppState>) {
                 let p = st.meeting_presence.lock().await;
                 p.keys().cloned().collect()
             };
+            if ids.is_empty() {
+                continue;
+            }
+            // 【round-14 #3 性能】单次取全局 agent 锁批量判定全部 id（而非逐个获取 N 次全局锁），
+            // 消除每 60s 对 N 个 presence 条目做 N 次全局锁获取的周期性序列化争用。判定逻辑：
+            // 会议不存在 或 已终态（status=done / phase=Done）→ true（应清理 presence）。
+            let should_clear: Vec<bool> = {
+                let g = st.agent.lock().await;
+                g.as_ref()
+                    .map(|a| a.meetings_need_presence_clear(&ids))
+                    .unwrap_or_else(|| vec![true; ids.len()])
+            };
             let mut missing = Vec::new();
-            for id in &ids {
-                // 既清「会议已不存在」的孤儿，也清「已终态但仍存在」的会议 presence：
-                // 终态会议仍保留在 meetings 中，原 is_none() 谓词匹配不到，导致 presence 无界泄漏
-                // （reviewer round-11 F1）。终态会议的心跳会返回 online:[] 并移除 presence，
-                // 但存在竞态窗口，此处作为确定性兜底一并清理。
-                let should_clear = {
-                    let g = st.agent.lock().await;
-                    g.as_ref()
-                        .map(|a| {
-                            a.meeting_state(id)
-                                .map_or(true, |(s, p, _)| is_terminal_state(&s, p))
-                        })
-                        .unwrap_or(true)
-                };
-                if should_clear {
+            for (id, clear) in ids.iter().zip(should_clear.iter()) {
+                if *clear {
                     missing.push(id.clone());
                 }
             }

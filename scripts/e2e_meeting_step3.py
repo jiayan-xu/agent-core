@@ -214,7 +214,7 @@ def main() -> int:
         # `agent/admin` 且非空（apply_message 仅当受邀真人发言才推进），且 msg.from 被强制绑定到
         # 已认证 caller=agent/admin。若断言失败，先核对种子是否满足该前置，勿误判为服务状态机回归。
         ok &= is_delta and phase == "discussing"
-        if phase != "discussing" and not is_delta is None:
+        if phase != "discussing":
             print("   !! phase 未推进到 discussing：请核对种子 mtg_e2e_step3 的 participant_agents"
                   " 是否含 agent/admin（前置条件，见 apply_message）")
     except Exception as e:  # noqa: BLE001

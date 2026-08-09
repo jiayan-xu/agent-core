@@ -1194,24 +1194,32 @@ impl AgentCore {
         &self,
         id: &str,
         from: &str,
+        caller_ns: &[String],
         kind: &str,
         content: &str,
         is_admin: bool,
     ) -> Result<MeetingMessage, String> {
-        // 入库前强制校验发送者身份（reviewer round-12 #2）：私有会议仅 owner / admin / 受邀
-        // participant_agents 成员可发言；公开会议（可见即可评）允许任何已认证用户发言。
-        // 此前任何已认证用户只要猜到会议 ID，就能向任意（含私有）会议注入发言、污染圆桌记录，
-        // 且 `add_meeting_message` 不查 owner / scope / is_private。可见性由 handler 层
-        // `meeting_visible` 兜底；此处保证「能入库发言者必是受邀方或公开会议参与者」。
+        // 入库前强制校验发言资格（reviewer round-12 #2 / round-14 #5）：发言权须与可见性
+        // `meeting_visible` **完全一致**（owner / admin / 公开 / scope 成员 / participant_agents
+        // 成员），读写权限单一来源，杜绝「能订阅却发言被拒」的读写不对称。
+        // 会议不存在与无权统一返回同一个错误串（不区分），避免借错误串探测私有会议 ID 是否存在
+        // （meeting_visible 同样以「无权」掩盖不存在，此处保持一致）。
         let pushed = {
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
-            let m = v.iter_mut().find(|m| m.id == id).ok_or("会议不存在")?;
-            let authorized = is_admin
+            let m = v.iter_mut().find(|m| m.id == id);
+            let Some(m) = m else {
+                // 统一错误，不泄露「不存在 / 无权」
+                return Err("无权访问该会议".to_string());
+            };
+            let authorized = m.owner_user_id == from
+                || is_admin
                 || !m.is_private
-                || m.owner_user_id == from
-                || m.participant_agents.iter().any(|a| a == from);
+                || m.participant_agents.iter().any(|a| a == from)
+                || m.scope
+                    .as_ref()
+                    .is_some_and(|s| scope_matches_caller(s, caller_ns));
             if !authorized {
-                return Err("发言者非会议拥有者或受邀参与者".to_string());
+                return Err("无权访问该会议".to_string());
             }
             let msg = MeetingMessage {
                 from: from.to_string(),
@@ -1224,7 +1232,11 @@ impl AgentCore {
             // 被追加的消息，消除热路径上的多余 clone。返回 Err 时提前退出，不落盘。
             m.apply_message(msg)?
         };
-        self.save_meetings();
+        // 【round-14 #4 性能】不再在此处同步落盘：本方法是消息热路径（每条真人发言都调用），
+        // 且调用方（handle_meeting_message）在持 st.agent 全局锁时调用。若在此同步全量写盘，
+        // 慢磁盘会阻塞所有 agent 操作（process-wide）。落盘职责上移给调用方：异步 handler
+        // 在释放 st.agent 锁后、于锁外调用 `save_meetings()`（仍持轻量 persist_lock 串行化，
+        // 保进程崩溃不丢已确认消息，但不再阻塞全局 agent 锁 / tokio worker）。
         Ok(pushed)
     }
 
@@ -1278,7 +1290,12 @@ impl AgentCore {
     }
 
     /// Step3：只取会议的轻量状态 `(status, phase, 发言数)`，不克隆 messages 历史。
-    /// 供增量广播（message/ended）与 SSE 订阅复核使用，把每次调用从 O(n) 降为 O(1)。
+    /// 供增量广播（message/ended）与 SSE 订阅复核使用。
+    /// 复杂度（reviewer round-14 #7，纠正此前「O(1)」的错误声明）：内部仍是 `v.iter().find`
+    /// 对全部会议做 O(#meetings) 线性扫描 + 一次 `status.clone()` 堆分配，均在全局 meetings 锁内。
+    /// 与 `get_meeting`（克隆完整历史）相比，它只避免克隆 messages history，而**不**是 O(1)。
+    /// 当前会议数规模小（E2E / 单机），线性扫描可接受；若未来会议数显著增长，须引入
+    /// id → index 索引（如 HashMap）以真正达到 O(1)。
     pub fn meeting_state(&self, id: &str) -> Option<(String, Option<MeetingPhase>, usize)> {
         let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
         v.iter()
@@ -1308,6 +1325,22 @@ impl AgentCore {
                     .as_ref()
                     .is_some_and(|s| scope_matches_caller(s, caller_ns))
         })
+    }
+
+    /// Step3：批量判定一组会议 id 是否需要清理 presence（会议不存在 **或** 已终态）。
+    /// **单次**获取全局 meetings 锁完成全部判定，避免 presence sweeper 对每个 id 各取一次
+    /// 全局 agent 锁（reviewer round-14 #3：每 60s 对 N 个条目做 N 次全局锁获取，造成周期性
+    /// 序列化争用）。返回 `Vec<bool>`，与入参 ids 一一对应；`true` 表示该会议应清理其 presence。
+    pub fn meetings_need_presence_clear(&self, ids: &[String]) -> Vec<bool> {
+        let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+        ids.iter()
+            .map(|id| match v.iter().find(|m| m.id == *id) {
+                // 会议不存在 → 应清理
+                None => true,
+                // 会议存在但已终态（status=done 或 phase=Done）→ 应清理（终态后无心跳，presence 泄漏）
+                Some(m) => is_terminal_state(&m.status, m.phase),
+            })
+            .collect()
     }
 
     /// 圆桌收敛完成后回填共识。
@@ -1452,9 +1485,13 @@ impl AgentCore {
         self.write_meetings_file(&s);
     }
 
-    /// 把已序列化的会议 JSON 原子写入 cwd/meetings.json（tmp + rename）。
+    /// 把已序列化的会议 JSON 原子写入 cwd/meetings.json（tmp + 原子 rename + fsync）。
     /// 不含任何锁：调用方负责在 self.meetings 内部锁临界区内完成序列化（如 `finish_meeting`），
     /// 本函数只做磁盘 IO，可安全在锁外调用，避免把慢速 fs 写挡在全局内存锁上。
+    /// 持久性保证（reviewer round-14 #6）：tmp+rename 对**进程崩溃**原子（rename 前旧文件完整、
+    /// rename 后新文件完整）；写 tmp 后 `sync_all`（fsync）使数据落盘，再 rename，以覆盖
+    /// OS 崩溃 / 断电场景（否则 rename 的文件可能为空或陈旧）。rename 后目录未 fsync，故
+    /// 「断电后文件名永久丢失」仍无法 100% 保证——文档如实声明，不夸大。
     fn write_meetings_file(&self, s: &str) {
         let cwd = match std::env::current_dir() {
             Ok(d) => d,
@@ -1465,8 +1502,16 @@ impl AgentCore {
         };
         let path = cwd.join("meetings.json");
         let tmp = path.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp, s) {
-            tracing::warn!(error = %e, path = %tmp.display(), "write_meetings_file: 临时文件写入失败");
+        // 用 File::create + write_all + sync_all 而非 std::fs::write：后者不保证数据落盘，
+        // OS 崩溃 / 断电后可能丢数据。sync_all 把 tmp 内容刷到磁盘，再做原子 rename。
+        let write_res = (|| -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, s.as_bytes())?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            tracing::warn!(error = %e, path = %tmp.display(), "write_meetings_file: 临时文件写入/fsync 失败");
             return;
         }
         if let Err(e) = std::fs::rename(&tmp, &path) {
