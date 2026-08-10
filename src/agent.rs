@@ -568,9 +568,19 @@ impl<'de> serde::Deserialize<'de> for Meeting {
                     (None, Some(other.to_string()))
                 }
                 None => {
-                    // 非字符串值（数字/对象/数组）：宽容降级，不使整条反序列化失败
-                    tracing::warn!("反序列化会议 phase 遇到非字符串值，回退为 None（宽容兼容跨版本）");
-                    (None, None)
+                    // 非字符串值（数字/对象/数组）：以 JSON 文本形式存入 phase_raw，round-trip 无损
+                    // （reviewer round-24 #6 maintainability·low）。此前回退 (None,None) 会让下次
+                    // save_meetings 因 phase_written=false 而**整体省略 phase 键**，静默擦除未来版本
+                    // 写入的非字符串 phase 数据——与 phase_raw 的「无损前向兼容」目标不一致。现在
+                    // 把原始值 to_string（JSON 文本）存入 phase_raw，序列化时 phase_written=true 会
+                    // 以该文本原样写回 phase 键，round-trip 无损。注意：phase_raw 存的是 JSON 文本，
+                    // 序列化时直接写回字符串——对非字符串原始值，写回的是其 JSON 文本形式（如
+                    // `"3"` / `{"x":1}` 作为字符串），虽非逐字节还原、但保留数据不再擦除。
+                    tracing::warn!(
+                        phase_value = %v,
+                        "反序列化会议 phase 遇到非字符串值，以 JSON 文本保留原文（宽容兼容跨版本）"
+                    );
+                    (None, Some(v.to_string()))
                 }
             },
         };
@@ -1692,7 +1702,13 @@ impl AgentCore {
                     continue;
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, path = %tmp.display(), "write_meetings_file: 临时文件写入/fsync 失败");
+                    // 【reviewer round-24 #4 bug·medium】写失败（非 AlreadyExists）路径也 best-effort
+                    // 清理刚创建的 tmp——open 用 create_new 已建文件，若随后 write_all/sync_all 失败
+                    // （ENOSPC/EIO 等），此处直接 return，tmp（含完整会议 PII，0600）会残留在 cwd。
+                    // round-23 #1 只补了 rename 失败清理，写失败遗漏了同一类清理；反复瞬态写失败
+                    // 会在运行期无限累积 PII 文件且无回收路径（启动清理仅冷启动、只清本 pid）。
+                    let _ = std::fs::remove_file(&tmp);
+                    tracing::warn!(error = %e, path = %tmp.display(), "write_meetings_file: 临时文件写入/fsync 失败（已清理临时文件）");
                     return Err(format!("临时文件写入失败: {e}"));
                 }
             }
@@ -11809,6 +11825,49 @@ mod whitelist_preroute_tests {
         let missing = r#"{"id":"m","topic":"t","owner_user_id":"u","participant_personas":[],"is_private":true,"created_at":"2026-08-01T00:00:00Z","status":"running","consensus":null,"scope":null,"participant_agents":[],"messages":[]}"#;
         let m: Meeting = serde_json::from_str(missing).unwrap();
         assert_eq!(m.phase, None, "缺 phase 键（旧格式）应解析为 None");
+    }
+
+    /// Step3（reviewer round-24 #5 maintainability·low）：手工 snake_case 字符串（serialize 的
+    /// `match self.phase`）与 `#[serde(rename_all = "snake_case")]` 派生是同一枚举的两份独立映射，
+    /// 必须一致。新增变体会被 serialize 的非穷尽 match 拦下，但**重命名**变体（如
+    /// AwaitingHumans → WaitingForHumans）会静默改变派生 serde 名而手工 match 仍写旧字符串，
+    /// 导致 meetings.json 写入与反序列化不一致的 phase 值。此测试断言每个变体的 serde 名与
+    /// 手工字符串一致（与 event_kind_serde_matches_sse_name 同类）。
+    #[test]
+    fn meeting_phase_serde_name_matches_manual_string() {
+        // 手工 match（serialize）里写的字符串，与枚举 serde 名必须一致。
+        let manual = [
+            ("ai_speaking", MeetingPhase::AiSpeaking),
+            ("awaiting_humans", MeetingPhase::AwaitingHumans),
+            ("discussing", MeetingPhase::Discussing),
+            ("done", MeetingPhase::Done),
+        ];
+        for (expected, variant) in manual {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(
+                json, format!("\"{expected}\""),
+                "变体 {variant:?} 的 serde 名与手工字符串不一致——重命名枚举变体后需同步更新 serialize 的手工 match"
+            );
+        }
+    }
+
+    /// Step3（reviewer round-24 #6 maintainability·low）：非字符串 phase 值必须以 JSON 文本
+    /// 存入 phase_raw 实现 round-trip 无损，而非 (None,None) 静默擦除（否则下次 save_meetings
+    /// 会整体省略 phase 键，丢失未来版本的非字符串 phase 数据）。
+    #[test]
+    fn non_string_phase_preserved_in_phase_raw() {
+        for raw in ["42", "{\"x\":1}", "[1,2]", "true"] {
+            let json = format!(r#"{{"id":"m","topic":"t","owner_user_id":"u","participant_personas":[],"is_private":true,"created_at":"2026-08-01T00:00:00Z","status":"running","consensus":null,"scope":null,"participant_agents":[],"messages":[],"phase":{raw}}}"#);
+            let m: Meeting = serde_json::from_str(&json).unwrap();
+            assert_eq!(m.phase, None, "非字符串 phase {raw} 应回退为 None");
+            assert!(
+                m.phase_raw.is_some(),
+                "非字符串 phase {raw} 必须以 JSON 文本存入 phase_raw（round-trip 无损）"
+            );
+            // 回盘必须保留 phase 键（phase_written=true），不静默擦除
+            let rt = serde_json::to_string(&m).unwrap();
+            assert!(rt.contains("\"phase\""), "非字符串 phase {raw} 回盘必须保留 phase 键，实际: {rt}");
+        }
     }
 }
 

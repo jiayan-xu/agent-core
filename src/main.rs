@@ -2324,16 +2324,14 @@ async fn handle_panel_discuss(
         // 否则订阅者永远看不到本次跃迁，停留在陈旧状态。
         if !meeting_id_c.is_empty() {
             if let Some((status, phase)) = agent.finish_meeting(&meeting_id_c, &consensus) {
-                // 【round-17 #5】finish_meeting 已不再内部落盘：在锁外、用 spawn_blocking 持久化
-                // 收敛后的状态，避免同步 fsync 阻塞 tokio worker（与 message/end/delete 一致）。
-                let _ = persist_meetings_for(&agent_arc, |e| {
-                    tracing::error!(error = %e, meeting = %meeting_id_c, "roundtable: 共识已回填但落盘失败（可能进程崩溃丢失，请排查磁盘）");
-                }).await;
-                // 【reviewer round-20 #5 maintainability·low】终态判定用 meeting_state 的
-                // terminal flag（单一来源，覆盖 phase_raw 未知 phase）而非在此用
-                // is_terminal_state(&status, phase) 重推导——后者漏掉 phase_raw，与 stream 侧
-                // round-19 #1 明确防的「重推导导致的谓词漂移」同类。finish_meeting 内部已保证
-                // status/phase 已知，但统一走权威谓词避免未来新增终态时此处漏改。
+                // 【reviewer round-24 #2 performance·medium】**先广播实时事件 + 清理 presence，
+                // 再后台持久化**——与 handle_meeting_message（round-21 #1）的原则一致。persist 是
+                // spawn_blocking 全文件序列化 + fsync 且被 persist_lock 串行化，若 await 它再广播，
+                // 磁盘延迟会排在实时 phase 转换（ai_speaking → awaiting_humans，正是真人订阅者等待
+                // 的信号）之前，并发写时订阅者要多等一次 fsync。持久化是 best-effort（失败仅 error
+                // 日志、会议已在内存、后续 save 会带上），故把实时广播/清理放最前。
+                // 【round-20 #5】终态判定用 meeting_state 的 terminal flag（单一来源，覆盖 phase_raw）：
+                // finish_meeting 内部已保证 status/phase 已知，但统一走权威谓词避免未来新增终态漏改。
                 let terminal = agent
                     .meeting_state(&meeting_id_c)
                     .map_or(true, |(_, _, _, term)| term);
@@ -2344,10 +2342,8 @@ async fn handle_panel_discuss(
                         EventKind::Ended,
                         serde_json::json!({ "status": status, "phase": phase, "terminal": true }),
                     ).await;
-                    // 【reviewer round-20 #6 maintainability·low】纯 AI 圆桌收敛到终态时，须与
-                    // handle_meeting_end / handle_meeting_delete 一致地移除 presence 条目，否则
-                    // 该会议已终态、无人再心跳，presence 条目会滞留直到 60s sweeper 兜底清理。
-                    // 显式移除使各终态转移路径行为一致（sweeper 仍作为兜底）。
+                    // 【round-20 #6】纯 AI 圆桌收敛到终态时，与 handle_meeting_end / delete 一致
+                    // 移除 presence 条目，避免该会议已终态、无人再心跳而滞留（sweeper 仍兜底）。
                     st.meeting_presence.lock().await.remove(&meeting_id_c);
                 } else {
                     broadcast_meeting_event(
@@ -2357,6 +2353,11 @@ async fn handle_panel_discuss(
                         serde_json::json!({ "status": status, "phase": phase }),
                     ).await;
                 }
+                // 【round-17 #5 + round-24 #2】收敛状态持久化移到广播**之后**：spawn_blocking 迁移
+                // 写盘到阻塞线程池，避免同步 fsync 阻塞 tokio worker / 挡住实时广播。
+                let _ = persist_meetings_for(&agent_arc, |e| {
+                    tracing::error!(error = %e, meeting = %meeting_id_c, "roundtable: 共识已回填但落盘失败（可能进程崩溃丢失，请排查磁盘）");
+                }).await;
             }
         }
         // 最佳努力写入 Memoria（调用者自身 ns）
@@ -2440,8 +2441,12 @@ async fn handle_meeting_delete(
     // meeting_visible 判定）：会议不存在与无权统一返回 403「无权访问该会议」，避免通过 DELETE
     // 的错误串差异探测私有会议 ID 是否存在（remove_meeting 内部此前区分「无权删除该会议」/
     // 「会议不存在」，会暴露存在性）。可见即可删（配 remove_meeting 的 owner/admin 校验）。
-    if !meeting_visible(&st, &id, &caller, &caller_ns, admin).await {
-        return (axum::http::StatusCode::FORBIDDEN, "无权访问该会议").into_response();
+    // 【round-24 #3】agent 未就绪（meeting_visible 返回 None）→ 503 而非 403，避免未就绪被
+    // 误报成鉴权失败。
+    match meeting_visible(&st, &id, &caller, &caller_ns, admin).await {
+        None => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "服务尚未就绪").into_response(),
+        Some(false) => return (axum::http::StatusCode::FORBIDDEN, "无权访问该会议").into_response(),
+        Some(true) => {}
     }
     // 在 agent 锁短作用域完成删除判定，随即释放全局锁，避免 presence 清理 / 实时广播
     // 在持全局锁期间 await 而拉长全局锁持有时长、并引入脆弱的锁顺序（reviewer round-10 F1）。
@@ -2501,8 +2506,11 @@ async fn handle_meeting_message(
     // 含 scope 成员）：(a) 让可订阅会议的 scope 成员也能发言，读写权限一致；(b) 会议不存在与
     // 无权统一返回 403「无权访问」，避免通过区分「会议不存在」/「发言者非邀请」错误串探测私有
     // 会议 ID 是否存在（add_meeting_message 的鉴权错误不再暴露）。可见即可评，与政策一致。
-    if !meeting_visible(&st, &id, &caller, &caller_ns, admin).await {
-        return (axum::http::StatusCode::FORBIDDEN, "无权访问该会议").into_response();
+    // 【round-24 #3】agent 未就绪（None）→ 503 而非 403。
+    match meeting_visible(&st, &id, &caller, &caller_ns, admin).await {
+        None => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "服务尚未就绪").into_response(),
+        Some(false) => return (axum::http::StatusCode::FORBIDDEN, "无权访问该会议").into_response(),
+        Some(true) => {}
     }
     let v = match body {
         Some(Json(v)) => v,
@@ -2623,8 +2631,11 @@ async fn handle_meeting_end(
     // 【round-15 #1 反枚举】结束会议前先做可见性门禁（与 message/SSE/心跳同一 meeting_visible
     // 判定）：会议不存在与无权统一返回 403「无权访问该会议」，避免通过 /end 的错误串差异探测
     // 私有会议 ID 是否存在（end_meeting 内部的错误串也已统一）。
-    if !meeting_visible(&st, &id, &caller, &caller_ns, admin).await {
-        return (axum::http::StatusCode::FORBIDDEN, "无权访问该会议").into_response();
+    // 【round-24 #3】agent 未就绪（None）→ 503 而非 403。
+    match meeting_visible(&st, &id, &caller, &caller_ns, admin).await {
+        None => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "服务尚未就绪").into_response(),
+        Some(false) => return (axum::http::StatusCode::FORBIDDEN, "无权访问该会议").into_response(),
+        Some(true) => {}
     }
     let v = match body {
         Some(Json(v)) => v,
@@ -2808,24 +2819,41 @@ fn spawn_meeting_presence_sweeper(st: Arc<AppState>) {
             if ids.is_empty() {
                 continue;
             }
+            // 【reviewer round-24 #1 bug·medium】sweeper 除清理「会议缺失/终态」的 presence 外，
+            // 还要回收「内层全 stale」的键：非终态会议（如 awaiting_humans）若客户端只通过
+            // /heartbeat 保活、不常开 SSE 流（或流已关闭），内层 map 在 15s 保留后清空，但**外层
+            // 键会一直存活**——跨大量长期会议会无界增长。故对每个键检查：会议缺失 / 已终态 /
+            // 内层全部条目已超过 15s 保留（无人心跳）→ 回收该键。注意非终态会议若仍有活跃心跳
+            // 不应被误清（内层有 fresh 条目），仅全 stale 才回收。
+            // 先取「内层全 stale」的 id 集合（仅 presence 锁，O(内层)）；再与缺失/终态判定合并。
+            let mut stale_ids: Vec<String> = Vec::new();
+            {
+                let p = st.meeting_presence.lock().await;
+                for (id, inner) in p.iter() {
+                    let all_stale = inner.values().all(|h| h.elapsed().as_secs() >= 15);
+                    if all_stale {
+                        stale_ids.push(id.clone());
+                    }
+                }
+            }
             // 【round-14 #3 性能】单次取全局 agent 锁批量判定全部 id（而非逐个获取 N 次全局锁），
             // 消除每 60s 对 N 个 presence 条目做 N 次全局锁获取的周期性序列化争用。判定逻辑：
-            // 会议不存在 或 已终态（status=done / phase=Done）→ true（应清理 presence）。
+            // 会议不存在 或 已终态（status=done / phase=Done / 含 phase_raw 未知 phase）→ true。
             let should_clear: Vec<bool> = {
                 let g = st.agent.lock().await;
                 g.as_ref()
                     .map(|a| a.meetings_need_presence_clear(&ids))
                     .unwrap_or_else(|| vec![true; ids.len()])
             };
-            let mut missing = Vec::new();
+            let mut to_remove: Vec<String> = Vec::new();
             for (id, clear) in ids.iter().zip(should_clear.iter()) {
-                if *clear {
-                    missing.push(id.clone());
+                if *clear || stale_ids.contains(id) {
+                    to_remove.push(id.clone());
                 }
             }
-            if !missing.is_empty() {
+            if !to_remove.is_empty() {
                 let mut p = st.meeting_presence.lock().await;
-                for id in &missing {
+                for id in &to_remove {
                     p.remove(id);
                 }
             }
@@ -2842,20 +2870,21 @@ fn spawn_meeting_presence_sweeper(st: Arc<AppState>) {
 /// 释放锁，再在 presence 锁内写在线态（见 `handle_meeting_heartbeat`）。两条路径共享
 /// `AgentCore::meeting_visible` 这一权威判定，但取锁策略各自独立，勿混淆。
 ///
-/// 会议不存在时返回 false（不区分「不存在 / 无权」，避免被用来探测会议 ID）。
+/// 会议不存在/无权时返回 `Some(false)`；**agent 尚未就绪（st.agent 为 None）返回 `None`**。
+/// 调用方须将 `None` 映射为 503「服务未就绪」，而非 403「无权」——否则服务启动期所有会议
+/// 端点（message/end/delete/stream）会把未就绪误报成鉴权失败，误导客户端与健康监控
+/// （reviewer round-24 #3 bug·low）。
 async fn meeting_visible(
     st: &Arc<AppState>,
     id: &str,
     caller: &str,
     caller_ns: &[String],
     admin: bool,
-) -> bool {
+) -> Option<bool> {
     let g = st.agent.lock().await;
     match &*g {
-        Some(agent) => agent
-            .meeting_visible(id, caller, caller_ns, admin)
-            .unwrap_or(false),
-        None => false,
+        Some(agent) => agent.meeting_visible(id, caller, caller_ns, admin),
+        None => None,
     }
 }
 
@@ -2872,8 +2901,11 @@ async fn handle_meeting_stream(
     };
     let admin = is_admin(&headers, &st).await;
     // 可见性校验：owner / admin / scope 成员 / 公开会议 可订阅（与心跳共用同一判定）
-    if !meeting_visible(&st, &id, &caller, &caller_ns, admin).await {
-        return (axum::http::StatusCode::FORBIDDEN, "无权订阅该会议").into_response();
+    // 【round-24 #3】agent 未就绪（None）→ 503 而非 403。
+    match meeting_visible(&st, &id, &caller, &caller_ns, admin).await {
+        None => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "服务尚未就绪").into_response(),
+        Some(false) => return (axum::http::StatusCode::FORBIDDEN, "无权订阅该会议").into_response(),
+        Some(true) => {}
     }
 
     // Step3 顺序关键：先克隆快照（锁内），再订阅**该会议**专属通道，订阅后立刻复核会议是否
@@ -3185,16 +3217,21 @@ async fn handle_meeting_heartbeat(
     // （每 60s 兜底清理「会议已不存在」的孤儿条目）兜底，杜绝无界泄漏，故此处无需在 presence 锁内
     // 反向回查 agent（会破坏 agent→presence 锁顺序、引发死锁）。锁顺序始终保持 agent → presence。
     // 会议不存在时同样按「无权」返回，避免任意认证用户借错误码探测会议 ID 是否存在。
-    let (visible, terminal) = {
+    // 【round-24 #3】agent 未就绪（g 为 None）→ 503 而非 403。
+    let (ready, visible, terminal) = {
         let g = st.agent.lock().await;
         let agent_opt = g.as_ref();
+        let ready = agent_opt.is_some();
         let visible = agent_opt
             .map(|a| a.meeting_visible(&id, &caller, &caller_ns, admin).unwrap_or(false))
             .unwrap_or(false);
         let terminal = agent_opt
             .map_or(true, |a| a.meeting_state(&id).map_or(true, |(_, _, _, term)| term));
-        (visible, terminal)
+        (ready, visible, terminal)
     };
+    if !ready {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "服务尚未就绪").into_response();
+    }
     if !visible {
         return (axum::http::StatusCode::FORBIDDEN, "无权访问该会议").into_response();
     }
