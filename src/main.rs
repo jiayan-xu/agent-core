@@ -2534,7 +2534,10 @@ async fn handle_meeting_message(
     // 安全：发言身份强制绑定到已认证的 caller，忽略请求体中的 `from` 伪造。
     // 否则任意认证用户可伪装成受邀参与者 (participant_agents)，强制把状态机推进到
     // discussing，干扰圆桌收敛（见 round-9 F3）。
-    let from = caller.clone();
+    // 【reviewer round-26 #3 security·medium】授权身份与显示字段在 add_meeting_message 签名层
+    // 分离：授权以 caller（已认证主体）判定，sender 仅作 msg.from 显示字段。此处 sender=caller
+    // （两者同源），不变式由签名强制而非注释约束。
+    let sender = caller.clone();
     let content = match v.get("content").and_then(|x| x.as_str()) {
         Some(c) if !c.trim().is_empty() => c.to_string(),
         _ => return (axum::http::StatusCode::BAD_REQUEST,
@@ -2550,7 +2553,7 @@ async fn handle_meeting_message(
             return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
         };
         let agent_arc = agent.clone();
-        let msg = match agent.add_meeting_message(&id, &from, &caller_ns, "human", &content, admin) {
+        let msg = match agent.add_meeting_message(&id, &caller, &sender, &caller_ns, "human", &content, admin) {
             Ok(m) => m,
             Err(e) => {
                 return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))
@@ -2560,7 +2563,7 @@ async fn handle_meeting_message(
         let targets: Vec<String> = agent
             .meeting_agent_participants(&id)
             .into_iter()
-            .filter(|a| *a != from)
+            .filter(|a| *a != sender)
             .collect();
         (msg, targets, agent_arc)
     };
@@ -2612,9 +2615,9 @@ async fn handle_meeting_message(
     for t in &targets {
         let envelope = serde_json::json!({
             "type": "meeting",
-            "subject": format!("会议 {}：{} 发言", id, from),
+            "subject": format!("会议 {}：{} 发言", id, sender),
             "meeting": id,
-            "from": from,
+            "from": sender,
             "content": content,
             "kind": "human-message",
         });

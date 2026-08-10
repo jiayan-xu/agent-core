@@ -454,7 +454,9 @@ pub struct Meeting {
 // 序列化：phase=Some(已知) → 写枚举 snake_case；phase=None 但 phase_raw=Some(未知字符串) →
 // 原样写回；两者皆空 → 省略 phase 键（旧数据兼容）。
 // 反序列化：已知字符串 → 解析为枚举；未知**字符串** → phase=None + phase_raw=Some(原文)；
-// 非字符串值（数字/对象）→ 两者皆空（宽容降级，不使整条反序列化失败）。
+// 非字符串值（数字/对象/数组）→ 以 JSON 文本存入 phase_raw（round-24 #6，round-trip 无损，
+// **不再降级为两者皆空**——否则下次 save_meetings 因 phase_written=false 整体省略 phase 键，
+// 静默擦除未来版本的非字符串 phase 数据）。
 //
 // 【round-19 #3 maintainability·low】必选字段名与计数收拢为单一清单 `MEETING_REQUIRED_SER_FIELDS`，
 // 序列化计数 = 清单长度，字段名与计数同源。新增字段只需往清单加一项并把 serialize_field 一并
@@ -656,17 +658,27 @@ impl Meeting {
         if self.consensus.is_some() {
             return false;
         }
-        if self.participant_agents.is_empty() {
-            // 纯 AI 圆桌：收敛即终局
+        // 真人参与判定：以「实际已有真人发言（phase==Discussing）」为准，而非仅看
+        // participant_agents 列表（reviewer round-26 #2 bug·medium 状态机不一致）。
+        // `apply_message`（round-17 #7）允许任一已授权真人发言者（owner/admin/scope 成员/
+        // 公开参与者）把 phase 推进到 Discussing，即使 participant_agents 为空。若此处仍只按
+        // `participant_agents.is_empty()` 判「纯 AI → done」，一个空 agent 列表但真人已发言
+        // （phase==Discussing）的会议，会被延迟到达的收敛回调强制置 done，中断真人讨论——
+        // 与「有真人参会：保持 running，等待真人接手讨论」及 else 分支保留 Discussing 相矛盾。
+        // 统一判据：真人已发言（Discussing）→ 必须保持 running；否则（纯 AI 或受邀未发言）
+        // 收敛即终局 / 等待真人。
+        let human_spoke = self.phase == Some(MeetingPhase::Discussing);
+        if self.participant_agents.is_empty() && !human_spoke {
+            // 纯 AI 圆桌且无真人发言：收敛即终局
             self.status = STATUS_DONE.to_string();
             self.phase = Some(MeetingPhase::Done);
         } else {
-            // 有真人参会：保持 running，等待真人接手讨论。
+            // 有真人参与（受邀待接手 或 已发言）：保持 running，等待真人接手讨论。
             // 终态守卫：若延迟到达的收敛回调到来时真人已切入 Discussing，
             // 不再回退成 awaiting_humans（否则状态倒退 + 订阅端观察到抖动）。
             // 共识文本仍照常回填。
             self.status = STATUS_RUNNING.to_string();
-            if self.phase != Some(MeetingPhase::Discussing) {
+            if !human_spoke {
                 self.phase = Some(MeetingPhase::AwaitingHumans);
             }
         }
@@ -1356,10 +1368,19 @@ impl AgentCore {
 
     /// Step2：追加一条会议发言。仅当会议存在且为 running 时才允许。
     /// 返回被追加的 MeetingMessage 供上层 A2A 投递；会议不存在 / 已结束 / 无发言资格返回 Err。
+    ///
+    /// 【reviewer round-26 #3 security·medium】**授权身份与发言者显示字段分离**：
+    /// `caller` 是已认证主体（用于 `is_authorized` 授权判定），`sender` 是**单独**的发言者
+    /// **显示**字段（写入 `msg.from`）。二者在**类型层面**独立，杜绝「把请求体可控的 `from`
+    /// 既当授权主体又当存储发送者」的隐患——即使未来某调用点误传请求体字段给 `sender`，
+    /// 授权仍以 `caller` 为准，不会因 `sender` 伪造而绕过 `is_authorized` 门禁（否则攻击者
+    /// 可看/说私有会议、伪造参与人信息、把状态机推进到 discussing）。当前唯一调用点在
+    /// main.rs 将 `caller` 绑定到已认证身份、`sender=caller`；不变式由签名强制，而非靠注释。
     pub fn add_meeting_message(
         &self,
         id: &str,
-        from: &str,
+        caller: &str,
+        sender: &str,
         caller_ns: &[String],
         kind: &str,
         content: &str,
@@ -1370,6 +1391,7 @@ impl AgentCore {
         // 成员），二者都委托给 `Meeting::is_authorized` 单一实现（reviewer round-17 #1），杜绝
         // 「能订阅却发言被拒」的读写不对称。会议不存在与无权统一返回同一个错误串（不区分），
         // 避免借错误串探测私有会议 ID 是否存在（meeting_visible 同样以「无权」掩盖不存在）。
+        // 授权以 `caller`（已认证主体）判定，`sender` 仅作显示字段（round-26 #3）。
         let pushed = {
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
             let m = v.iter_mut().find(|m| m.id == id);
@@ -1377,12 +1399,12 @@ impl AgentCore {
                 // 统一错误，不泄露「不存在 / 无权」
                 return Err("无权访问该会议".to_string());
             };
-            let authorized = m.is_authorized(from, caller_ns, is_admin);
+            let authorized = m.is_authorized(caller, caller_ns, is_admin);
             if !authorized {
                 return Err("无权访问该会议".to_string());
             }
             let msg = MeetingMessage {
-                from: from.to_string(),
+                from: sender.to_string(),
                 kind: kind.to_string(),
                 content: content.to_string(),
                 at: chrono::Utc::now().to_rfc3339(),
@@ -11654,6 +11676,41 @@ mod whitelist_preroute_tests {
         assert!(with_human.apply_convergence("结论B"));
         assert_eq!(with_human.status, "running", "有真人参会须保持 running");
         assert_eq!(with_human.phase, Some(MeetingPhase::AwaitingHumans));
+    }
+
+    /// Step3（reviewer round-26 #2 bug·medium 回归锚点）：空 participant_agents 列表但真人已发言
+    /// （phase==Discussing）的会议，延迟到达的收敛回调**不得**按「纯 AI → done」强制终态——
+    /// `apply_message` 允许任一已授权真人（owner/admin/scope 成员/公开参与者）把 phase 推进到
+    /// Discussing，即使 agent 列表为空。若按 `participant_agents.is_empty()` 判纯 AI，会中断真人讨论。
+    /// 统一判据：真人已发言（Discussing）→ 保持 running 等待真人，与 apply_message 一致。
+    #[test]
+    fn apply_convergence_human_spoke_with_empty_agents_keeps_running() {
+        // 空 agent 列表但真人已发言（phase==Discussing）
+        let mut m = mk_meeting("running", Some(MeetingPhase::Discussing), vec![]);
+        assert!(m.apply_convergence("AI 共识"));
+        assert_eq!(m.status, "running", "真人已发言必须保持 running，不得被收敛回调强制 done");
+        assert_eq!(m.phase, Some(MeetingPhase::Discussing), "不得回退为 awaiting_humans");
+        assert_eq!(m.consensus.as_deref(), Some("AI 共识"), "共识仍照常回填");
+
+        // 空 agent 列表且无人发言（phase==AiSpeaking）仍按纯 AI 收敛即 done
+        let mut ai = mk_meeting("running", Some(MeetingPhase::AiSpeaking), vec![]);
+        assert!(ai.apply_convergence("AI 共识"));
+        assert_eq!(ai.status, "done");
+        assert_eq!(ai.phase, Some(MeetingPhase::Done));
+
+        // 空 agent 列表且真人已发言：apply_message 后 phase 为 Discussing，收敛不得推翻
+        let mut m2 = mk_meeting("running", Some(MeetingPhase::AiSpeaking), vec![]);
+        m2.apply_message(MeetingMessage {
+            from: "agent/admin".into(),
+            kind: MSG_KIND_HUMAN.into(),
+            content: "真人发言".into(),
+            at: "2026-08-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        assert_eq!(m2.phase, Some(MeetingPhase::Discussing));
+        assert!(m2.apply_convergence("AI 共识"));
+        assert_eq!(m2.status, "running", "真人发言后收敛不得强制 done");
+        assert_eq!(m2.phase, Some(MeetingPhase::Discussing));
     }
 
     /// Step3（ocr-review test·low）：`add_meeting_message` 的状态机分支必须有回归锚点。

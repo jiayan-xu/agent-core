@@ -279,11 +279,14 @@ def main() -> int:
         print(f"   !! ended payload 解析失败: {e}")
         ok = False
     # 【reviewer round-26 #3 bug·low】仅 try/except 包住 json.loads 不够：若 ended 事件被服务端
-    # payload 形状改成了**非对象** JSON（布尔/数组/字符串），上面的 try 成功、但下方
-    # `end_obj.get("deleted")` 会对非 dict 调用 `.get` 抛 AttributeError，以裸 traceback 崩溃脚本，
-    # 违背「清晰 FAIL 而非异常」的 E2E 诊断目标。故在此显式把解析结果约束为 dict：非 dict 视为
-    # 形状不符、降级为 FAIL（并打印诊断），而不是让属性访问抛异常。
-    if end_obj is not None and not isinstance(end_obj, dict):
+    # payload 形状改成了**非对象** JSON（布尔/数组/字符串，甚至 `null`），上面的 try 成功、但
+    # 下方 `end_obj.get("deleted")` 会对非 dict 调用 `.get` 抛 AttributeError，以裸 traceback
+    # 崩溃脚本，违背「清晰 FAIL 而非异常」的 E2E 诊断目标。故在此显式把解析结果约束为 dict：
+    # 非 dict 视为形状不符、降级为 FAIL（并打印诊断），而不是让属性访问抛异常。
+    # 注意（reviewer round-26 二轮 #4 bug·low）：不能用 `is not None and not isinstance(...)`——
+    # `json.loads("null")` 返回 `None`，会通过该条件让 `end_obj` 保持 `None`，下一行 `.get()`
+    # 仍抛 AttributeError。必须**无条件**把所有非 dict（含 null）统一归一为 `{}`。
+    if not isinstance(end_obj, dict):
         print(f"   !! ended payload 非对象 JSON（形状不符），实际类型: {type(end_obj).__name__}")
         end_obj = {}
         ok = False
