@@ -459,7 +459,13 @@ pub struct Meeting {
 // 【round-19 #3 maintainability·low】必选字段名与计数收拢为单一清单 `MEETING_REQUIRED_SER_FIELDS`，
 // 序列化计数 = 清单长度，字段名与计数同源。新增字段只需往清单加一项并把 serialize_field 一并
 // 写出（用 `MEETING_REQUIRED_SER_FIELDS.len()` 作计数，编译器保证计数不会漏加/多写），
-// 避免此前手工维护「11」字面量导致新增字段时计数漂移、bincode/postcard 等严格格式损坏。
+// 避免此前手工维护「11」字面量导致新增字段时计数漂移。
+// 【round-23 #2 maintainability·low 收窄】上述计数同源机制的正确性动机**仅限 JSON**：本 Meeting 的
+// 自定义 serde 依赖 JSON 自描述性——反序列化把 `phase` 读成 `Option<serde_json::Value>` 再按值
+// 解析，在 bincode/postcard 等非自描述严格格式下 `serde_json::Value` 无法反序列化、会失败。
+// 故「避免 bincode/postcard 严格格式损坏」的声明应收窄为「避免 JSON 序列化计数漂移」；Meeting
+// 目前仅以 JSON 持久化（meetings.json），不宣称支持严格格式。若未来接入严格格式，须让 phase
+// 宽容处理与格式无关（如对未知 phase 保留原始字符串，不引入 serde_json::Value）。
 const MEETING_REQUIRED_SER_FIELDS: &[&str] = &[
     "id",
     "topic",
@@ -1703,7 +1709,12 @@ impl AgentCore {
             }
         };
         if let Err(e) = std::fs::rename(&tmp, &path) {
-            tracing::warn!(error = %e, path = %path.display(), "write_meetings_file: 重命名落盘失败");
+            // 【reviewer round-23 #1 bug·medium】rename 失败时 best-effort 清理已写好的 tmp——
+            // 它含完整会议 PII（0600），若持续失败（如 meetings.json 被替换为目录 / 跨文件系统 /
+            // 权限变化），每次落盘都会在 cwd 累积一份 PII 文件且运行期无回收路径（启动清理只在
+            // 进程冷启动跑一次）。与本节「自愈」语义一致，避免运行期无限堆积。
+            let _ = std::fs::remove_file(&tmp);
+            tracing::warn!(error = %e, path = %path.display(), "write_meetings_file: 重命名落盘失败（已清理临时文件）");
             return Err(format!("重命名落盘失败: {e}"));
         }
         Ok(())
