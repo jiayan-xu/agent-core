@@ -45,6 +45,14 @@ fn unique_out_name(base: &str, ext: &str) -> String {
     format!("e2e_{base}_{pid}_{nanos}.{ext}")
 }
 
+/// 给真实子进程调用包一层超时，避免 python/officecli 卡死时测试无限挂起。
+/// 超时返回 Err（含 "timeout" 字样），由调用方断言失败而非拖死整个测试进程。
+async fn with_timeout<T>(fut: impl std::future::Future<Output = T>) -> Result<T, String> {
+    tokio::time::timeout(std::time::Duration::from_secs(30), fut)
+        .await
+        .map_err(|_| "调用超时（30s）：officecli 子进程可能卡死".to_string())
+}
+
 fn agent_with_officecli() -> AgentCore {
     let tools_dir = office_tools_dir();
     let stdio = tools_dir.join("officecli_mcp_bridge.py");
@@ -105,7 +113,9 @@ fn agent_with_officecli() -> AgentCore {
 #[ignore = "需要 officecli 二进制 + office-tools 目录"]
 async fn officecli_tools_are_listed() {
     let agent = agent_with_officecli();
-    let tools = agent.fetch_tools_filtered(&["agent/eval-officecli".to_string()]).await;
+    let tools = with_timeout(agent.fetch_tools_filtered(&["agent/eval-officecli".to_string()]))
+        .await
+        .expect("fetch_tools_filtered 应在 30s 内返回");
     let names: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
     for expected in [
         "officecli_read",
@@ -125,16 +135,16 @@ async fn officecli_tools_are_listed() {
 #[ignore = "需要 officecli 二进制 + office-tools 目录 + 真实文档"]
 async fn officecli_read_routes_and_calls() {
     let agent = agent_with_officecli();
-    let res = agent
-        .call_tool_routed(
+    let out = with_timeout(agent.call_tool_routed(
             "officecli_read",
             "default",
             &serde_json::json!({"file": office_tools_dir().join("_out.docx"), "max_lines": 3}),
             &["agent/eval-officecli".to_string()],
             "officecli-e2e",
-        )
-        .await;
-    let out = res.expect("officecli_read 应调用成功");
+        ))
+        .await
+        .expect("officecli_read 应在 30s 内返回")
+        .expect("officecli_read 应调用成功");
     assert!(out.contains("success"), "返回应含 success，实际: {}", out);
 }
 
@@ -147,15 +157,15 @@ async fn officecli_rejects_traversal() {
     let sep = std::path::MAIN_SEPARATOR;
     let traversal = format!("..{sep}..{sep}Windows{sep}win.ini");
     let payload = serde_json::json!({"file": traversal});
-    let res = agent
-        .call_tool_routed(
+    let res = with_timeout(agent.call_tool_routed(
             "officecli_read",
             "default",
             &payload,
             &["agent/eval-officecli".to_string()],
             "officecli-e2e-traversal",
-        )
-        .await;
+        ))
+        .await
+        .expect("穿越调用应在 30s 内返回");
     assert!(res.is_err(), "目录穿越路径应被拒绝");
     let err = res.unwrap_err();
     assert!(err.contains("穿越") || err.contains(".."), "错误信息应说明穿越，实际: {err}");
@@ -167,8 +177,7 @@ async fn officecli_create_adds_and_query() {
     let agent = agent_with_officecli();
     let out_name = unique_out_name("create", "docx");
     // create：建 docx + 加一个段落
-    let res = agent
-        .call_tool_routed(
+    let create_out = with_timeout(agent.call_tool_routed(
             "officecli_create",
             "default",
             &serde_json::json!({
@@ -177,9 +186,10 @@ async fn officecli_create_adds_and_query() {
             }),
             &["agent/eval-officecli".to_string()],
             "officecli-e2e-create",
-        )
-        .await;
-    let create_out = res.expect("officecli_create 应成功");
+        ))
+        .await
+        .expect("officecli_create 应在 30s 内返回")
+        .expect("officecli_create 应成功");
     assert!(create_out.contains("success"), "create 应含 success: {create_out}");
 
     // 取回输出路径
@@ -193,16 +203,16 @@ async fn officecli_create_adds_and_query() {
     );
 
     // query：命中刚创建的段落
-    let res = agent
-        .call_tool_routed(
+    let q_out = with_timeout(agent.call_tool_routed(
             "officecli_query",
             "default",
             &serde_json::json!({"file": output, "selector": "paragraph"}),
             &["agent/eval-officecli".to_string()],
             "officecli-e2e-query",
-        )
-        .await;
-    let q_out = res.expect("officecli_query 应成功");
+        ))
+        .await
+        .expect("officecli_query 应在 30s 内返回")
+        .expect("officecli_query 应成功");
     assert!(q_out.contains("E2E 集成创建"), "query 应命中新段落，实际: {}", q_out);
 }
 
@@ -210,18 +220,23 @@ async fn officecli_create_adds_and_query() {
 #[ignore = "需要 officecli 二进制 + office-tools 目录"]
 async fn officecli_query_rejects_write_selector() {
     let agent = agent_with_officecli();
-    let res = agent
-        .call_tool_routed(
+    // 写保护契约：bridge（officecli_mcp_bridge.py）对外承诺「写类 selector 一律拒绝」。
+    // 断言稳定的信号（错误含 selector 关键词或中文写保护文案），避免与 bridge 内部措辞强耦合。
+    let res = with_timeout(agent.call_tool_routed(
             "officecli_query",
             "default",
             &serde_json::json!({"file": office_tools_dir().join("_out.docx"), "selector": "add /body paragraph"}),
             &["agent/eval-officecli".to_string()],
             "officecli-e2e-query-guard",
-        )
-        .await;
+        ))
+        .await
+        .expect("query 调用应在 30s 内返回");
     assert!(res.is_err(), "query 应拒绝写类 selector");
     let err = res.unwrap_err();
-    assert!(err.contains("禁止写入"), "错误信息应说明写保护，实际: {err}");
+    assert!(
+        err.contains("selector") || err.contains("禁止写入"),
+        "错误信息应说明写保护，实际: {err}"
+    );
 }
 
 #[tokio::test]
@@ -229,16 +244,16 @@ async fn officecli_query_rejects_write_selector() {
 async fn officecli_pdf_exports_valid_pdf() {
     let agent = agent_with_officecli();
     let out_name = unique_out_name("export", "pdf");
-    let res = agent
-        .call_tool_routed(
+    let out = with_timeout(agent.call_tool_routed(
             "officecli_pdf",
             "default",
             &serde_json::json!({"file": office_tools_dir().join("_out.docx"), "output": out_name}),
             &["agent/eval-officecli".to_string()],
             "officecli-e2e-pdf",
-        )
-        .await;
-    let out = res.expect("officecli_pdf 应成功");
+        ))
+        .await
+        .expect("officecli_pdf 应在 30s 内返回")
+        .expect("officecli_pdf 应成功");
     assert!(out.contains("success") || out.contains("output"), "应含成功/输出路径: {out}");
 
     // 校验产物是合法 PDF

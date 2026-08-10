@@ -225,7 +225,7 @@ pub fn ops_playbook_prompt() -> &'static str {
 ### 通用办公地基复用（P1，与 officecli 引擎协作）
 - Excel / Word / PPT / PDF / 网页等**通用文档操作优先调用 officecli 引擎**（全局可见）：
   `officecli_read` / `officecli_query` / `officecli_create` / `officecli_merge` / `officecli_pdf` / `officecli_validate` / `officecli_issues` / `officecli_render`
-- 文件系统/URL/分析底座走 fsutil 源：`list_dir` / `find_files` / `file_info` / `move_file` / `delete_path` / `summarize_url` / `data_analysis`
+- 文件系统/URL/分析底座走 fsutil 源：`list_dir` / `find_files` / `file_info` / `summarize_url` / `data_analysis`（只读）；`move_file` / `delete_path` 为**破坏性写操作**，须先经用户确认或 HumanInLoop 审批，禁止静默执行
 - **禁止**在本部门 skill 内重复实现 openpyxl / docx / fpdf 样板；新需求一律走 officecli 引擎
 "#
 }
