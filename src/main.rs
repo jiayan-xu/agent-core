@@ -2242,7 +2242,10 @@ async fn handle_panel_discuss(
     // spawn_blocking 持久化新建会议，避免同步 fsync 阻塞 tokio worker / 全局锁。
     if let Some(arc) = &create_arc {
         let _ = persist_meetings_for(arc, |e| {
-            tracing::error!(error = %e, meeting = %meeting_id, "handle_meetings_create: 会议已创建但落盘失败（可能进程崩溃丢失，请排查磁盘）");
+            // reviewer round-21 #2 maintainability·low：日志标签用实际 handler——本路径由
+            // `handle_panel_discuss`（/api/roundtable）创建会议，非「handle_meetings_create」，
+            // 错误标签会误导排障者定位错误 handler。
+            tracing::error!(error = %e, meeting = %meeting_id, "roundtable: 会议已创建但落盘失败（可能进程崩溃丢失，请排查磁盘）");
         }).await;
     }
 
@@ -2538,24 +2541,18 @@ async fn handle_meeting_message(
             .collect();
         (msg, targets, agent_arc)
     };
-    // 全局 st.agent 锁已释放。落盘（消息入内存后持久化）移到锁外执行：
-    // add_meeting_message 已不再内部落盘（round-14 #4），此处须在释放全局锁后、于锁外调用
-    // save_meetings，避免把同步全量写盘拖进持 st.agent 全局锁的临界区（否则慢磁盘阻塞所有
-    // agent 操作）。save_meetings 内部仍持轻量 persist_lock 串行化，保进程崩溃不丢已确认发言。
-    // 【round-15 #3】落盘失败以 **error 级**日志记录「已确认但未持久化」的发言（含会议 id），
-    // 使审计域可发现；但不因此拒绝已成功的发言请求（客户端已确认，内存状态已生效，仅持久化失败）。
-    // 【round-17 #5】改用 spawn_blocking 迁移写盘到阻塞线程池，避免同步 fsync 阻塞 tokio worker。
-    let _ = persist_meetings_for(&agent_arc, |e| {
-        tracing::error!(error = %e, meeting = %id, "handle_meeting_message: 发言已确认但落盘失败（可能进程崩溃丢失，请排查磁盘）");
-    }).await;
-    // 以下 A2A 网络投递与实时广播均在锁外进行。
-    // 【reviewer round-20 #4 performance·medium】先在 A2A 循环**之前**广播增量 Message 事件，
-    // 再进入 A2A 串行投递。理由：A2A 每对端最多 5s 超时（round-17 #9），N 个不可达对端会把
-    // 串行循环拖到 5×N 秒；若广播放在循环后，订阅端要等这么久才看到新消息，实时更新被最慢
-    // 对端耦合——与本段注释「避免实时更新被最慢对端耦合」的意图矛盾。提前广播后，订阅端立即
-    // 收到 Message，A2A 循环只影响 HTTP 响应的 delivered 计数，不影响订阅侧实时性。
-    // 顺序正确性：本 handler 发出的 Message 必在任何后续 ended/state 之前落广播（本 handler 的
-    // ended 由并发 end/delete 产生，其广播必然晚于本 Message 的提前广播），订阅端不会看到倒退。
+    // 全局 st.agent 锁已释放。先广播增量 Message 实时事件，再后台持久化、再 A2A 投递。
+    // 【reviewer round-20 #4 + round-21 re-review #1 performance·medium】实时广播必须放在
+    // persist await **之前**：persist_meetings_for 内部是 spawn_blocking 全文件序列化 + fsync，
+    // 且被 persist_lock 串行化——并发写多会议时磁盘延迟会排队，若 await 它再广播，订阅端就被
+    // 累积的磁盘延迟挡住（部分抵消 round-20 #4 让广播脱离关键路径的目标）。持久化是 best-effort
+    // （失败仅 error 日志、消息已在内存、后续 save 会带上它），故：
+    //   1) 先广播 Message（订阅端立即收到，实时性不受磁盘/对端影响）；
+    //   2) 再 spawn 后台持久化（best-effort，也被 spawn_blocking 迁移到阻塞线程池，不占 tokio worker）；
+    //   3) 最后 A2A 串行投递（只影响 HTTP 响应的 delivered 计数）。
+    // 这也让 round-20 #4 注释「Message 必在任何后续 ended/state 之前落广播」真正成立：today 若
+    // persist 在广播前、并发 end/delete 的（无 fsync gating 的）persist 先完成，会先广播 ended
+    // 再让本 handler 广播 Message——状态倒退。广播移到最前则本 handler 的 Message 必先落。
     // 广播**增量**（仅新发言 + 状态字段）：不再序列化完整 Meeting（round-13），避免 O(n²)。
     // 仅在会议仍存在时广播：add_meeting_message 成功后到此处读状态之间若被并发删除，
     // meeting_state 返回 None，不应伪造 status:"running" 广播针对已不存在会议的消息。
@@ -2570,6 +2567,20 @@ async fn handle_meeting_message(
             serde_json::json!({ "message": msg, "status": status, "phase": phase }),
         ).await;
     }
+    // 后台持久化（best-effort，不阻塞实时广播）：add_meeting_message 已不再内部落盘（round-14 #4），
+    // 此处 spawn 后台任务落盘，避免同步全量写盘挡在广播/A2A 关键路径。save_meetings 内部仍持
+    // 轻量 persist_lock 串行化，保进程崩溃不丢已确认发言。
+    // 【round-15 #3】落盘失败以 **error 级**日志记录「已确认但未持久化」的发言（含会议 id），
+    // 使审计域可发现；但不因此拒绝已成功的发言请求（客户端已确认，内存状态已生效，仅持久化失败）。
+    // 【round-17 #5】persist_meetings_for 用 spawn_blocking 迁移写盘到阻塞线程池，避免同步 fsync
+    // 阻塞 tokio worker。
+    let pa = agent_arc.clone();
+    let pid = id.clone();
+    tokio::spawn(async move {
+        persist_meetings_for(&pa, |e| {
+            tracing::error!(error = %e, meeting = %pid, "handle_meeting_message: 发言已确认但落盘失败（可能进程崩溃丢失，请排查磁盘）");
+        }).await;
+    });
     let mut delivered = 0usize;
     // 【reviewer round-17 #9 性能】A2A 投递加每目标超时：`collab_send_raw` 每对端最多重试
     // 3 次 × 30s reqwest 超时（mcp_client.rs timeout_secs=30），单个不可达对端可把串行循环
@@ -3132,9 +3143,10 @@ async fn send_meeting_event(
             }
             // inner 即本次未能入队的原始值 Result<SseEvent, Infallible>，
             // Infallible 不可构造，故必为 Ok(SseEvent)。背压：带超时 await send。
+            // （reviewer round-21 #3 maintainability·low：仅匹配 Ok(e) 即对 Result<T, Infallible>
+            // 穷尽——Infallible 无法构造，Err 分支是不可达死代码，已移除。）
             let ev = match inner {
                 Ok(e) => e,
-                Err(_) => return false,
             };
             // 区分内层结果：外层 Ok 仅代表「send 调用已返回」，不代表客户端仍在线。
             // - Ok(Ok(()))：真正下发成功；
