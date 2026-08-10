@@ -41,11 +41,13 @@ while read local_ref local_oid remote_ref remote_oid; do
       # 仅放行 annotated tag（git object type == tag），防 lightweight tag 滥用。
       # 发版纪律见 docs/RELEASING.md（bump + tag + CHANGELOG 三步绑定）。
       if git cat-file -t "$local_oid" 2>/dev/null | grep -qx 'tag'; then
-        : ;;  # 放行 annotated v* 版本 tag
+        : # 放行 annotated v* 版本 tag
+      else
+        echo "BLOCKED: tag '$local_ref' is not an annotated tag." >&2
+        echo "         Version tags must be annotated (git tag -a vX.Y.Z -m msg). Aborting." >&2
+        exit 1
       fi
-      echo "BLOCKED: tag '$local_ref' is not an annotated tag." >&2
-      echo "         Version tags must be annotated (git tag -a vX.Y.Z -m msg). Aborting." >&2
-      exit 1 ;;
+      ;;
     refs/tags/*)
       echo "BLOCKED: tag push is restricted to annotated version tags (refs/tags/v*)." >&2
       echo "         Only feat/* branches and annotated v* tags may be pushed." >&2
