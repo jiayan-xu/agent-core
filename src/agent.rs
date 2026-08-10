@@ -445,7 +445,9 @@ impl serde::Serialize for Meeting {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let phase_written = self.phase.is_some() || self.phase_raw.is_some();
-        let mut st = serializer.serialize_struct("Meeting", 12 + phase_written as usize)?;
+        // 11 个必选字段（id/topic/owner_user_id/participant_personas/is_private/created_at/
+        // status/consensus/scope/participant_agents/messages）+ 可选 phase（reviewer round-18 #1）。
+        let mut st = serializer.serialize_struct("Meeting", 11 + phase_written as usize)?;
         st.serialize_field("id", &self.id)?;
         st.serialize_field("topic", &self.topic)?;
         st.serialize_field("owner_user_id", &self.owner_user_id)?;
@@ -554,7 +556,10 @@ impl Meeting {
     /// `add_meeting_message` 与 `apply_convergence` 共享此单一来源，避免两处谓词漂移
     /// （否则新增状态如 paused/cancelled 会在两处表现不一致）。
     pub fn is_terminal(&self) -> bool {
-        is_terminal_state(&self.status, self.phase)
+        // 未知 phase（phase_raw 非空，reviewer round-18 #2）也视为终态：
+        // 未来版本写入的未知 phase（如 "cancelled"）表明该会议已进入本版本无法识别的状态，
+        // 保守地拒绝对其继续写入消息 / 收敛 / 心跳，避免破坏 phase_raw 保留的前向兼容标记。
+        self.phase_raw.is_some() || is_terminal_state(&self.status, self.phase)
     }
 
     /// 会议读写授权谓词（**单一权威来源**，reviewer round-17 #1 maintainability·medium）。
@@ -1570,14 +1575,21 @@ impl AgentCore {
         let tmp = path.with_extension("tmp");
         // 用 OpenOptions 显式建文件而非 File::create：后者默认 0644（owner 读写 + 组/其他读），
         // 含完整会议记录（真人发言、参会者、共识等 PII）的全文会被**任意本地用户**读取
-        // （reviewer round-17 #8 security·low）。限制为 0600（仅 owner 读写）：
+        // （reviewer round-17 #8 security·low）。限制为 0600（仅 owner 读写）。
+        // 【reviewer round-18 #3 security·medium】用 `create_new(true)`（O_CREAT|O_EXCL）而非
+        // `create(true).truncate(true)`：后者会**跟随已存在的符号链接**——若 cwd 中被人预置
+        // `meetings.tmp -> ~/.bashrc` 等软链，每次落盘都会把含 PII 的会议 JSON 截断写入被链接
+        // 文件（数据泄露 + 任意文件破坏），使 0600 权限收紧失效（0600 只保护新 inode，不防
+        // symlink）。create_new 遇已存在的文件（含符号链接）即报 AlreadyExists，我们据此报错
+        // 退出而非跟随。正常流程下 tmp 在 rename 后被移除，下次写入总能新建；仅崩溃残留的
+        // 陈旧 tmp 会触发 AlreadyExists——此时安全地失败并告警，让运维清理，而非冒险跟随。
         //   - Unix：OpenOptionsExt::mode(0o600) 在 umask 基础上再收紧，tmp/最终文件仅 owner 可读写；
         //   - Windows：OpenOptions 同样工作，mode 被忽略（Windows 无 POSIX 权限位），
         //     细粒度 ACL 属系统目录管理职责，单用户桌面场景下可接受。
         // 写 tmp 后 sync_all（fsync）使数据落盘，再做原子 rename（覆盖 OS 崩溃/断电丢数据）。
         let write_res = (|| -> std::io::Result<()> {
             let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
+            opts.write(true).create_new(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -11552,6 +11564,26 @@ mod whitelist_preroute_tests {
         assert!(is_terminal_state("paused", Some(MeetingPhase::AiSpeaking)));
         // 空 status 视为未知，不判终态
         assert!(!is_terminal_state("", None));
+    }
+
+    /// Step3（reviewer round-18 #2 bug·medium）：未知 phase（phase_raw 非空）的会议必须视为
+    /// 终态，且 apply_message / apply_convergence 不得改写其 phase、不得接收后续发言。
+    #[test]
+    fn unknown_phase_raw_is_terminal_and_immutable() {
+        // 从带未知 phase 的 JSON 反序列化出会议（status 仍 "running"）
+        let json = r#"{"id":"mtg_x","topic":"t","owner_user_id":"u","participant_personas":[],"is_private":true,"created_at":"2026-08-01T00:00:00Z","status":"running","consensus":null,"scope":null,"participant_agents":[],"messages":[],"phase":"cancelled"}"#;
+        let mut m: Meeting = serde_json::from_str(json).unwrap();
+        // 未知 phase → 视为终态
+        assert!(m.is_terminal(), "phase_raw 非空必须视为终态");
+        // apply_convergence 拒绝回填
+        assert!(!m.apply_convergence("AI 共识"), "未知 phase 会议不得回填共识");
+        // apply_message 拒绝发言
+        let msg = MeetingMessage { from: "agent/admin".into(), kind: "human".into(), content: "x".into(), at: "2026-08-01T00:00:00Z".into() };
+        assert!(m.apply_message(msg).is_err(), "未知 phase 会议不得接收发言");
+        // phase_raw 未被改写，round-trip 后仍无损
+        assert_eq!(m.phase_raw.as_deref(), Some("cancelled"));
+        let rt = serde_json::to_string(&m).unwrap();
+        assert!(rt.contains("\"phase\":\"cancelled\""), "phase_raw 标记必须保留，实际: {rt}");
     }
 
     /// Step3（ocr-review maintainability·medium）：EventKind 的 serde 名与 SSE 事件名必须一致，
