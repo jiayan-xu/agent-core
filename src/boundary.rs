@@ -338,6 +338,13 @@ impl ExecutionSandbox {
         "file_info",
         "move_file",
         "delete_path",
+        // officecli 文档引擎读类工具（officecli_mcp_bridge.py）：接受 file 路径读取文档内容，
+        // 必须过沙箱敏感目录 deny 与沙箱根越界检查，防止读出 .ssh/.gnupg/.aws 等敏感文件内容
+        "officecli_read",
+        "officecli_validate",
+        "officecli_issues",
+        "officecli_query",
+        "officecli_render",
     ];
     const REQUIRES_REVIEW: &'static [&'static str] = &["delete_", "batch_", "shutdown_"];
 
@@ -485,6 +492,7 @@ fn extract_path_arg(args: &serde_json::Value) -> Option<&Path> {
         "dir",
         "directory",
         "target",
+        "src", // move_file 的源路径参数（fsutil 源），用于沙箱敏感目录门闸
     ];
     if let Some(obj) = args.as_object() {
         for k in KEYS {

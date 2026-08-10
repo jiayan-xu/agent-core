@@ -79,14 +79,39 @@ fn require_fixture() -> std::path::PathBuf {
 }
 
 /// 把 bridge 返回的 output 路径解析为绝对路径。
-/// bridge 契约：输出锚定到 office-tools/_out/（_out_path 返回绝对路径）；若意外返回裸文件名，
-/// 则基于 office_tools_dir()/_out/ 解析，而非 office-tools 根（避免校验错目录）。
+/// bridge 契约：输出锚定到 office-tools/_out/（_out_path 返回绝对路径）；若意外返回裸文件名
+/// 或已含 `_out/` 前缀的相对路径，统一解析到 office-tools/_out/ 下，避免拼出 _out/_out/ 错目录。
 fn resolve_output(output: &str) -> std::path::PathBuf {
     let p = std::path::Path::new(output);
     if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        office_tools_dir().join("_out").join(p)
+        return p.to_path_buf();
+    }
+    let out_dir = office_tools_dir().join("_out");
+    // 防御：若相对路径已带 `_out/` 前缀，去重避免 out_dir/_out/<name>
+    match p.strip_prefix("_out") {
+        Ok(rel) => out_dir.join(rel),
+        Err(_) => out_dir.join(p),
+    }
+}
+
+/// 产物清理守卫：drop 时 best-effort 删除文件，即使中间断言 panic 也不泄漏 _out/ 产物。
+struct OutputGuard {
+    path: std::path::PathBuf,
+    armed: bool,
+}
+impl OutputGuard {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for OutputGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -154,7 +179,7 @@ async fn officecli_tools_are_listed() {
         .await
         .expect("fetch_tools_filtered 应在 30s 内返回");
     let names: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
-    for expected in [
+    let expected = [
         "officecli_read",
         "officecli_validate",
         "officecli_issues",
@@ -163,9 +188,24 @@ async fn officecli_tools_are_listed() {
         "officecli_pdf",
         "officecli_create",
         "officecli_query",
-    ] {
-        assert!(names.contains(&expected), "应列出 {expected}，实际: {names:?}");
+    ];
+    for exp in expected {
+        assert!(names.contains(&exp), "应列出 {exp}，实际: {names:?}");
     }
+    // 精确性：officecli 源应恰好暴露这 8 个工具，不允许多出/遗漏
+    let officecli_names: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| n.starts_with("officecli_"))
+        .collect();
+    let mut sorted = officecli_names.clone();
+    sorted.sort_unstable();
+    let mut expected_sorted = expected.to_vec();
+    expected_sorted.sort_unstable();
+    assert_eq!(
+        sorted, expected_sorted,
+        "officecli 源工具集应精确匹配，实际: {officecli_names:?}"
+    );
 }
 
 #[tokio::test]
@@ -254,6 +294,8 @@ async fn officecli_create_adds_and_query() {
     assert!(output.ends_with(&out_name), "output 应指向 {out_name}: {output}");
     // bridge 锚定输出到 office-tools/_out/；resolve_output 统一解析（绝对路径直接用，裸名补 _out/）
     let abs_output = resolve_output(output);
+    // RAII 清理：即使后续 query/断言 panic 也不泄漏 _out/ 产物
+    let _guard = OutputGuard::new(abs_output.clone());
     assert!(abs_output.is_file(), "create 产物应已落盘: {abs_output:?}");
 
     // query：命中刚创建的段落
@@ -276,8 +318,6 @@ async fn officecli_create_adds_and_query() {
         q_text.contains("E2E 集成创建"),
         "query 应命中新段落，实际: {q_out}"
     );
-    // best-effort 清理产物，避免 repeated/CI 运行在 _out/ 累积垃圾
-    let _ = std::fs::remove_file(&abs_output);
 }
 
 #[tokio::test]
@@ -327,6 +367,8 @@ async fn officecli_pdf_exports_valid_pdf() {
         serde_json::from_str(&out).expect("pdf 返回应为 JSON");
     let pdf_path = val["output"].as_str().expect("应含 output 路径");
     let pdf_path_abs = resolve_output(pdf_path);
+    // RAII 清理：即使后续断言 panic 也不泄漏 _out/ 产物
+    let _guard = OutputGuard::new(pdf_path_abs.clone());
     let bytes = std::fs::read(&pdf_path_abs).expect("PDF 文件应存在");
     assert!(bytes.len() > 100, "PDF 不应为空");
     assert!(
@@ -334,6 +376,4 @@ async fn officecli_pdf_exports_valid_pdf() {
         "应以 %PDF 魔数开头，实际: {:?}",
         &bytes[..5.min(bytes.len())]
     );
-    // best-effort 清理产物，避免 repeated/CI 运行在 _out/ 累积垃圾
-    let _ = std::fs::remove_file(&pdf_path_abs);
 }
