@@ -46,7 +46,7 @@ use tracing_subscriber::EnvFilter;
 use wry::WebViewBuilder;
 
 use agent_core::agent::{
-    AgentConfig, AgentCore, AgentIdentity, EventKind, MeetingEvent, is_terminal_state,
+    AgentConfig, AgentCore, AgentIdentity, EventKind, MeetingEvent,
 };
 use agent_core::audit::AuditLogger;
 use agent_core::meta_evolve::{MetaEvolutionConfig, SafetyConfig};
@@ -2326,7 +2326,14 @@ async fn handle_panel_discuss(
                 let _ = persist_meetings_for(&agent_arc, |e| {
                     tracing::error!(error = %e, meeting = %meeting_id_c, "roundtable: 共识已回填但落盘失败（可能进程崩溃丢失，请排查磁盘）");
                 }).await;
-                let terminal = is_terminal_state(&status, phase);
+                // 【reviewer round-20 #5 maintainability·low】终态判定用 meeting_state 的
+                // terminal flag（单一来源，覆盖 phase_raw 未知 phase）而非在此用
+                // is_terminal_state(&status, phase) 重推导——后者漏掉 phase_raw，与 stream 侧
+                // round-19 #1 明确防的「重推导导致的谓词漂移」同类。finish_meeting 内部已保证
+                // status/phase 已知，但统一走权威谓词避免未来新增终态时此处漏改。
+                let terminal = agent
+                    .meeting_state(&meeting_id_c)
+                    .map_or(true, |(_, _, _, term)| term);
                 if terminal {
                     broadcast_meeting_event(
                         &st,
@@ -2334,6 +2341,11 @@ async fn handle_panel_discuss(
                         EventKind::Ended,
                         serde_json::json!({ "status": status, "phase": phase, "terminal": true }),
                     ).await;
+                    // 【reviewer round-20 #6 maintainability·low】纯 AI 圆桌收敛到终态时，须与
+                    // handle_meeting_end / handle_meeting_delete 一致地移除 presence 条目，否则
+                    // 该会议已终态、无人再心跳，presence 条目会滞留直到 60s sweeper 兜底清理。
+                    // 显式移除使各终态转移路径行为一致（sweeper 仍作为兜底）。
+                    st.meeting_presence.lock().await.remove(&meeting_id_c);
                 } else {
                     broadcast_meeting_event(
                         &st,
@@ -2537,12 +2549,32 @@ async fn handle_meeting_message(
         tracing::error!(error = %e, meeting = %id, "handle_meeting_message: 发言已确认但落盘失败（可能进程崩溃丢失，请排查磁盘）");
     }).await;
     // 以下 A2A 网络投递与实时广播均在锁外进行。
+    // 【reviewer round-20 #4 performance·medium】先在 A2A 循环**之前**广播增量 Message 事件，
+    // 再进入 A2A 串行投递。理由：A2A 每对端最多 5s 超时（round-17 #9），N 个不可达对端会把
+    // 串行循环拖到 5×N 秒；若广播放在循环后，订阅端要等这么久才看到新消息，实时更新被最慢
+    // 对端耦合——与本段注释「避免实时更新被最慢对端耦合」的意图矛盾。提前广播后，订阅端立即
+    // 收到 Message，A2A 循环只影响 HTTP 响应的 delivered 计数，不影响订阅侧实时性。
+    // 顺序正确性：本 handler 发出的 Message 必在任何后续 ended/state 之前落广播（本 handler 的
+    // ended 由并发 end/delete 产生，其广播必然晚于本 Message 的提前广播），订阅端不会看到倒退。
+    // 广播**增量**（仅新发言 + 状态字段）：不再序列化完整 Meeting（round-13），避免 O(n²)。
+    // 仅在会议仍存在时广播：add_meeting_message 成功后到此处读状态之间若被并发删除，
+    // meeting_state 返回 None，不应伪造 status:"running" 广播针对已不存在会议的消息。
+    // TOCTOU（reviewer round-13 #5）：此处用 agent_arc 重读会议状态作为广播的唯一来源。
+    // 【round-14 #2】绝不可用回退到锁内旧状态：`meeting_state` 返回 None 仅当会议已被并发删除；
+    // 会议已消失则直接丢弃广播（不复活 ESM 的陈旧 running 状态）。
+    if let Some((status, phase, _, _)) = agent_arc.meeting_state(&id) {
+        broadcast_meeting_event(
+            &st,
+            &id,
+            EventKind::Message,
+            serde_json::json!({ "message": msg, "status": status, "phase": phase }),
+        ).await;
+    }
     let mut delivered = 0usize;
     // 【reviewer round-17 #9 性能】A2A 投递加每目标超时：`collab_send_raw` 每对端最多重试
     // 3 次 × 30s reqwest 超时（mcp_client.rs timeout_secs=30），单个不可达对端可把串行循环
-    // 阻塞 ~90s，且期间订阅端收不到 Message 事件、请求悬挂。用短超时（5s）把慢对端从
-    // 关键路径隔离：超时按未送达处理（不抛出、不阻塞其余对端），但要广播的 Message 事件
-    // 仍由本方法在循环后照常发出，避免实时更新被最慢对端耦合。
+    // 阻塞 ~90s。用短超时（5s）把慢对端从实时路径隔离：超时按未送达处理（不抛出、不阻塞
+    // 其余对端）。广播已在上方提前发出，此处循环只影响 HTTP 响应的 delivered 计数。
     for t in &targets {
         let envelope = serde_json::json!({
             "type": "meeting",
@@ -2559,27 +2591,6 @@ async fn handle_meeting_message(
         if ok_delivered {
             delivered += 1;
         }
-    }
-    // Step3 实时同步：广播**增量**（仅新发言 + 状态字段）。
-    // 不再序列化完整 Meeting：否则每条发言都是 O(n)，broadcast 通道又保留最近 256 条，
-    // 长会议会累积 O(n²) 的数据量。完整快照只保留给初始订阅 / Lagged 重同步路径。
-    // 仅在会议仍存在时广播增量事件：add_meeting_message 成功后到此处读状态之间若被并发删除，
-    // meeting_state 返回 None，不应伪造 status:"running" 广播针对已不存在会议的消息。
-    // TOCTOU（reviewer round-13 #5）：上面的 `state` 是在 agent 锁内、A2A 投递**之前**读取的，
-    // 而 `collab_send_raw` 会 await 网络 I/O（可能耗时数秒）；若期间并发 end/delete/finish 提交，
-    // 直接沿用该陈旧 state 广播会让订阅端先收到 Ended/State 事件、再收到一条携带
-    // status:"running"/旧 phase 的 Message 事件——可见的状态倒退。故在 A2A 循环**之后**、广播
-    // **之前**用 agent_arc 重读一次会议状态，作为广播的唯一来源。
-    // 【round-14 #2】绝不可用 `.or(state)` 回退到锁内旧状态：`meeting_state` 返回 None 仅当会议
-    // 已被并发删除；此时 `.or(state)` 会复活 ESM 的陈旧 running 状态，仍向已不存在的会议广播
-    // Message 事件，让订阅端状态机回滚到 running——正是我们要防的倒退。故会议已消失则直接丢弃广播。
-    if let Some((status, phase, _, _)) = agent_arc.meeting_state(&id) {
-        broadcast_meeting_event(
-            &st,
-            &id,
-            EventKind::Message,
-            serde_json::json!({ "message": msg, "status": status, "phase": phase }),
-        ).await;
     }
     Json(serde_json::json!({"ok": true, "delivered": delivered, "targets": targets.len()})).into_response()
 }

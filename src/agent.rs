@@ -497,7 +497,15 @@ impl serde::Serialize for Meeting {
                 Some(MeetingPhase::Done) => "done",
                 None => match &self.phase_raw {
                     Some(raw) => raw.as_str(),
-                    None => unreachable!("phase_written 已保证二者至少其一为 Some"),
+                    // reviewer round-20 #3 maintainability·low：不变量违反时返 serde error 而非
+                    // unreachable!() panic——serialize 位于落盘关键路径（进程要写盘时触发），panic 会
+                    // 让整个 agent 崩溃且不可恢复；返 Err 与 impl 其余部分一致地经 Result 传播失败，
+                    // 调用方（save_meetings）会 warn + 跳过落盘，保持持久化可恢复。
+                    None => {
+                        return Err(serde::ser::Error::custom(
+                            "phase_written 为真但 phase 与 phase_raw 均为 None（状态机不变量被破坏）",
+                        ))
+                    }
                 },
             };
             st.serialize_field("phase", phase_str)?;
@@ -1605,9 +1613,12 @@ impl AgentCore {
     ///   - 固定名 + `create_new(true)`（round-18 #3 防 symlink 跟随）存在可恢复性回归——进程崩溃
     ///     残留的陈旧 tmp 会令**之后每一次**落盘都 `AlreadyExists` 失败且无自愈（旧 `std::fs::write`
     ///     可截断自愈）。唯一名让每次写入都落在新文件上，崩溃残留不再阻塞后续落盘。
-    ///   - 唯一名同时**保留**并强化了防 symlink 能力：攻击者无法预知 tmp 名（含随机 pit + 递增计数），
-    ///     无法预置同名软链；`create_new(true)` 仍拒绝任何已存在的目标（含软链），绝不跟随。
-    ///   - 🧹 残留 tmp（`meetings.tmp.*`）由 `load_meetings_from_disk` 启动时清理（见下）。
+    ///   - 唯一名同时**保留**了防 symlink 能力（reviewer round-20 #2 documentation·low）：tmp 名仅含
+    ///     `pid + 递增计数`，**不含随机成分**——pid 可预测且会复用、计数器重启后归零，故「攻击者
+    ///     无法预知 tmp 名」是过度声明。防 symlink 真正依赖 `create_new(true)` 拒绝任何已存在目标
+    ///     （含软链）而非文件名保密；唯一名只是避免崩溃残留阻塞后续落盘。
+    ///   - 🧹 残留 tmp（`meetings.tmp.<pid>.*`）由 `load_meetings_from_disk` 启动时**仅清本进程 pid
+    ///     前缀**残留（见下），避免误删其他运行实例的 in-flight tmp 或用户同名文件。
     fn write_meetings_file(&self, s: &str) -> Result<(), String> {
         let cwd = match std::env::current_dir() {
             Ok(d) => d,
@@ -1665,14 +1676,19 @@ impl AgentCore {
         // 清理崩溃残留的临时文件（reviewer round-19 #2 bug·medium）：唯一 tmp 名
         // `meetings.tmp.<pid>.<计数>` 保证每次落盘都能新建，但若进程在 rename 前崩溃，会遗留
         // 一个孤儿 tmp。下一条 rewrite 不依赖它（新名），但积累会占用磁盘且可能含 PII，故启动时
-        // 扫 cwd 删除所有 `meetings.tmp.*` 残留。仅删匹配前缀的 tmp，不碰 meetings.json 本体。
+        // 扫 cwd 清理残留。**仅限本进程**的 `meetings.tmp.<本pid>.` 前缀（reviewer round-20 #1
+        // bug·medium）：两个实例共享同一 cwd（滚动重启 / dev/test harness）时，若按宽前缀
+        // `meetings.tmp.` 清理，会误删另一运行实例在 write_all→rename 之间的 in-flight tmp，
+        // 使对方 rename 失败、写盘丢失；也会误删用户恰好同名的文件（如手动备份
+        // `meetings.tmp.2026-08-01`）。pid 前缀精确命中本实例的崩溃孤儿，不碰其他实例 / 用户文件。
         if let Ok(rd) = std::fs::read_dir(&cwd) {
+            let own_prefix = format!("meetings.tmp.{}.", std::process::id());
             for entry in rd.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name.starts_with("meetings.tmp.") {
+                if name.starts_with(&own_prefix) {
                     let _ = std::fs::remove_file(entry.path());
-                    tracing::info!(tmp = %name, "load_meetings_from_disk: 清理崩溃残留的临时文件");
+                    tracing::info!(tmp = %name, "load_meetings_from_disk: 清理本进程残留的临时文件");
                 }
             }
         }
