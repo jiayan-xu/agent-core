@@ -58,12 +58,14 @@ def agent_key() -> str:
     解析规则与 `start_agent_core.py`（服务端启动器）逐条对齐，否则同一份 .env 会被
     两边解释成不同的值，导致 E2E 拿到与服务实际加载的不一致的 key 而 403：
       - 环境变量**存在即权威**：启动器仅在 `AGENT_API_KEY` 不在 env 时才读 .env；
-        故 env 中已设置（含空串）直接返回，不回退 .env，避免两边解释不一致而 403；
+        故 env 中已设置直接返回、不回退 .env，避免两边解释不一致而 403；
+        但**空串视为配置错误**（reviewer round-17 #2）：不返回空 key，立即失败，
+        以免带着空 key 跑到 403 才暴露；
       - 按 `=` 首次出现切分，key / value 两侧 strip（支持 `AGENT_API_KEY = xxx`）；
       - value 剥去成对包裹的引号（支持 `AGENT_API_KEY="xxx"` / `'xxx'`）；
       - 跳过空行、`#` 注释行、不含 `=` 的行；utf-8-sig 自动剔除 BOM。
     """
-    # env 中存在即权威（与启动器一致），含空值也直接返回，不回退 .env
+    # env 中存在即权威（与启动器一致），含空值视为配置错误立即失败，不回退 .env
     if "AGENT_API_KEY" in os.environ:
         key = os.environ["AGENT_API_KEY"]
         # reviewer round-17 #2：env 中键存在但值为空串 = 配置错误，应尽早清晰失败，

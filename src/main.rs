@@ -2220,20 +2220,31 @@ async fn handle_panel_discuss(
     if !has_agent {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
     }
-    let meeting_id = {
+    let (meeting_id, create_arc) = {
         let g = st.agent.lock().await;
         match &*g {
-            Some(ref agent) => agent.create_meeting(
-                &topic,
-                &caller,
-                participants.clone(),
-                participant_agents,
-                is_private,
-                scope.clone(),
-            ),
-            None => String::new(),
+            Some(ref agent) => {
+                let arc = agent.clone();
+                let id = agent.create_meeting(
+                    &topic,
+                    &caller,
+                    participants.clone(),
+                    participant_agents,
+                    is_private,
+                    scope.clone(),
+                );
+                (id, Some(arc))
+            }
+            None => (String::new(), None),
         }
     };
+    // 【round-17 #2】create_meeting 已不再内部落盘：在全局 st.agent 锁释放后、于锁外用
+    // spawn_blocking 持久化新建会议，避免同步 fsync 阻塞 tokio worker / 全局锁。
+    if let Some(arc) = &create_arc {
+        let _ = persist_meetings_for(arc, |e| {
+            tracing::error!(error = %e, meeting = %meeting_id, "handle_meetings_create: 会议已创建但落盘失败（可能进程崩溃丢失，请排查磁盘）");
+        }).await;
+    }
 
     let st_clone = st.clone();
     let (tx, rx): (
@@ -2310,6 +2321,11 @@ async fn handle_panel_discuss(
         // 否则订阅者永远看不到本次跃迁，停留在陈旧状态。
         if !meeting_id_c.is_empty() {
             if let Some((status, phase)) = agent.finish_meeting(&meeting_id_c, &consensus) {
+                // 【round-17 #5】finish_meeting 已不再内部落盘：在锁外、用 spawn_blocking 持久化
+                // 收敛后的状态，避免同步 fsync 阻塞 tokio worker（与 message/end/delete 一致）。
+                let _ = persist_meetings_for(&agent_arc, |e| {
+                    tracing::error!(error = %e, meeting = %meeting_id_c, "roundtable: 共识已回填但落盘失败（可能进程崩溃丢失，请排查磁盘）");
+                }).await;
                 let terminal = is_terminal_state(&status, phase);
                 if terminal {
                     broadcast_meeting_event(
@@ -2400,11 +2416,18 @@ async fn handle_meeting_delete(
     axum::extract::Path(id): axum::extract::Path<String>,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
     let admin = is_admin(&headers, &st).await;
+    // 【reviewer round-17 #8 反枚举】删除前先做可见性门禁（与 message/end/SSE/心跳同一
+    // meeting_visible 判定）：会议不存在与无权统一返回 403「无权访问该会议」，避免通过 DELETE
+    // 的错误串差异探测私有会议 ID 是否存在（remove_meeting 内部此前区分「无权删除该会议」/
+    // 「会议不存在」，会暴露存在性）。可见即可删（配 remove_meeting 的 owner/admin 校验）。
+    if !meeting_visible(&st, &id, &caller, &caller_ns, admin).await {
+        return (axum::http::StatusCode::FORBIDDEN, "无权访问该会议").into_response();
+    }
     // 在 agent 锁短作用域完成删除判定，随即释放全局锁，避免 presence 清理 / 实时广播
     // 在持全局锁期间 await 而拉长全局锁持有时长、并引入脆弱的锁顺序（reviewer round-10 F1）。
     // presence / 广播均在 agent 锁释放后进行，无 agent→presence 嵌套。
@@ -2416,6 +2439,8 @@ async fn handle_meeting_delete(
         let agent_arc = agent.clone();
         match agent.remove_meeting(&id, &caller, admin) {
             Ok(()) => agent_arc,
+            // 门禁已把「不存在 / 无权」挡在 403，此处仅剩合法删除的内部错误（如竞态），
+            // 仍以统一错误返回，不泄露存在性。
             Err(e) => {
                 return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))
                     .into_response()
@@ -2513,6 +2538,11 @@ async fn handle_meeting_message(
     }).await;
     // 以下 A2A 网络投递与实时广播均在锁外进行。
     let mut delivered = 0usize;
+    // 【reviewer round-17 #9 性能】A2A 投递加每目标超时：`collab_send_raw` 每对端最多重试
+    // 3 次 × 30s reqwest 超时（mcp_client.rs timeout_secs=30），单个不可达对端可把串行循环
+    // 阻塞 ~90s，且期间订阅端收不到 Message 事件、请求悬挂。用短超时（5s）把慢对端从
+    // 关键路径隔离：超时按未送达处理（不抛出、不阻塞其余对端），但要广播的 Message 事件
+    // 仍由本方法在循环后照常发出，避免实时更新被最慢对端耦合。
     for t in &targets {
         let envelope = serde_json::json!({
             "type": "meeting",
@@ -2522,7 +2552,11 @@ async fn handle_meeting_message(
             "content": content,
             "kind": "human-message",
         });
-        if agent_arc.collab_send_raw(t, &envelope).await.is_ok() {
+        let ok_delivered =
+            tokio::time::timeout(Duration::from_secs(5), agent_arc.collab_send_raw(t, &envelope))
+                .await
+                .map_or(false, |r| r.is_ok());
+        if ok_delivered {
             delivered += 1;
         }
     }
@@ -2856,10 +2890,12 @@ async fn handle_meeting_stream(
             if changed {
                 // 仅在确实变化时克隆完整会议（用于快照序列化），避免每次订阅全量 clone
                 let g = st.agent.lock().await;
-                if let Some(cur) = g.as_ref().and_then(|a| a.get_meeting(&id2)) {
-                    // `get_meeting` 已返回 owned 克隆，直接 move 进 snap，无需二次 clone。
-                    snap = Some(cur);
-                }
+                // 【reviewer round-17 #7 bug·medium】无条件赋值（含 None）：
+                // 若 get_meeting 返回 None（复核窗口内被并发删除），snap 必须置 None，
+                // 与下方 `state == None` 分支一致地走 ended(deleted) 终止路径，而不是保留
+                // 陈旧的（非终态 running）快照——否则会用过期 status 发「running + terminal:true」
+                // 的矛盾 ended payload，且丢失 deleted 标记。
+                snap = g.as_ref().and_then(|a| a.get_meeting(&id2));
             }
         }
         None => {

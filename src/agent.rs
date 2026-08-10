@@ -376,42 +376,6 @@ pub enum MeetingPhase {
     Done,
 }
 
-/// 宽容反序列化 `Option<MeetingPhase>`（reviewer round-12 #4 / round-13 #4）：
-/// 未知 phase 字符串（如未来版本写入的 "paused"）或**非字符串**值（数字/对象/数组）
-/// 一律回退为 None 并告警，而非让整条会议反序列化失败被 `load_meetings_from_disk`
-/// 静默跳过、随后被 `save_meetings` 覆盖永久丢失。
-/// 序列化仍走 `MeetingPhase` 的标准 snake_case，向后兼容旧 meetings.json。
-fn deserialize_phase_tolerant<'de, D>(d: D) -> Result<Option<MeetingPhase>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    // 先解成 serde_json::Value 而非带 #[serde(other)] 的字符串枚举：
-    // 后者对「非字符串」值（数字/对象）仍会报类型错误，无法达到宽容兼容目的。
-    let raw = Option::<serde_json::Value>::deserialize(d)?;
-    Ok(match raw {
-        None => None,
-        Some(v) => {
-            let s = match v.as_str() {
-                Some(s) => s,
-                None => {
-                    tracing::warn!(?v, "反序列化会议 phase 遇到非字符串值，回退为 None（宽容兼容跨版本）");
-                    return Ok(None);
-                }
-            };
-            match s {
-                "ai_speaking" => Some(MeetingPhase::AiSpeaking),
-                "awaiting_humans" => Some(MeetingPhase::AwaitingHumans),
-                "discussing" => Some(MeetingPhase::Discussing),
-                "done" => Some(MeetingPhase::Done),
-                _ => {
-                    tracing::warn!(phase = %s, "反序列化会议 phase 遇到未知值，回退为 None（宽容兼容跨版本）");
-                    None
-                }
-            }
-        }
-    })
-}
-
 /// 圆桌会议记录（Phase 6 增强）：默认私有，仅拥有者 / admin 可见；持久化到 cwd/meetings.json
 /// 会议 `status` 字段的取值常量，替代散落的魔法字符串。
 ///
@@ -428,10 +392,17 @@ pub const STATUS_DONE: &str = "done";
 /// 时必然漏改其中一处，造成「SSE 认为已结束、心跳认为还活着」这类分歧。
 /// [`Meeting::is_terminal`] 亦委托至此。
 pub fn is_terminal_state(status: &str, phase: Option<MeetingPhase>) -> bool {
-    status == STATUS_DONE || phase == Some(MeetingPhase::Done)
+    // 保守判定（reviewer round-17 #4 bug·low）：除已知的 running 外，任何**非空**的 status
+    // 都视为终态。原因：`Meeting::deserialize` 会把未来版本的未知 phase（如 "cancelled"）
+    // 存进 phase_raw（phase=None），而未知 status 字符串（"cancelled"/"paused"）原样保留——若
+    // 这里只认 status=="done" / phase==Some(Done)，一个未来版本标记为终止的会议会被误判为
+    // running，导致心跳重建 presence、消息/收敛继续写入、sweeper 也不清理。保守地把「非
+    // running 的非空 status」一律视为终态，避免对已终止状态继续操作。空 status 视为未知，不判终态。
+    let status_terminal = !status.is_empty() && status != STATUS_RUNNING;
+    status_terminal || phase == Some(MeetingPhase::Done)
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Meeting {
     pub id: String,
     pub topic: String,
@@ -444,24 +415,131 @@ pub struct Meeting {
     pub status: String,
     pub consensus: Option<String>,
     /// NEW(会议升级 Step1)：会议层级范围，如 "dept:engineering" / "org:cs-pufa-2nd-thermal"。
-    /// None = 旧版私有圆桌（仅拥有者 / admin 可见）。serde default 兼容旧 meetings.json。
-    #[serde(default)]
+    /// None = 旧版私有圆桌（仅拥有者 / admin 可见）。
     pub scope: Option<String>,
     /// NEW(会议升级 Step2)：真人实例 agent_id 列表（A2A 参会）。
-    /// 通过 A2A 投递消息到这些实例的收件箱。serde default 兼容旧 meetings.json。
-    #[serde(default)]
     pub participant_agents: Vec<String>,
     /// NEW(会议升级 Step2)：会议发言记录（AI 分身 + 真人）。
-    /// serde default 兼容旧 meetings.json。
-    #[serde(default)]
     pub messages: Vec<MeetingMessage>,
     /// NEW(会议升级 Step3)：实时状态机阶段。
     /// "ai_speaking" | "awaiting_humans" | "discussing" | "done"。
-    /// None = 旧数据（无该字段）。读侧 serde default 兼容旧 meetings.json；
-    /// 写侧 skip_serializing_if 保证 None 时**不写出该键**，旧数据回盘后
-    /// 仍是原样（不会凭空多出 `"phase": null`），老前端 / 老 fixture 不受影响。
-    #[serde(default, deserialize_with = "deserialize_phase_tolerant", skip_serializing_if = "Option::is_none")]
+    /// None = 旧数据（无该字段）或未来版本传入的未知 phase 字符串。
     pub phase: Option<MeetingPhase>,
+    /// 未来版本写入的**未知** phase 原始字符串（reviewer round-17 #3 bug·low）。
+    ///
+    /// 目的：`phase` 字段只认已知的四个枚举值，未来版本（如 "paused"/"cancelled"）写入的
+    /// 未知字符串在反序列化时会被宽容地回退成 `phase=None`。若没有本字段，回盘时
+    /// skip_serializing_if 会**永久擦除**未来版本的数据（toleration 变成静默降级）。
+    /// 本字段在反序列化时捕获原始未知字符串，序列化时若 `phase` 为 None 且本字段非空，
+    /// 就把原始未知字符串原样写回，保证 round-trip 无损（前向兼容数据不被抹除）。
+    /// 内部字段，不直接进出 JSON（由自定义 Serialize/Deserialize 处理）。
+    pub phase_raw: Option<String>,
+}
+
+// 自定义 serde：让未知 phase 字符串 round-trip 无损（reviewer round-17 #3）。
+// 序列化：phase=Some(已知) → 写枚举 snake_case；phase=None 但 phase_raw=Some(未知字符串) →
+// 原样写回；两者皆空 → 省略 phase 键（旧数据兼容）。
+// 反序列化：已知字符串 → 解析为枚举；未知**字符串** → phase=None + phase_raw=Some(原文)；
+// 非字符串值（数字/对象）→ 两者皆空（宽容降级，不使整条反序列化失败）。
+impl serde::Serialize for Meeting {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let phase_written = self.phase.is_some() || self.phase_raw.is_some();
+        let mut st = serializer.serialize_struct("Meeting", 12 + phase_written as usize)?;
+        st.serialize_field("id", &self.id)?;
+        st.serialize_field("topic", &self.topic)?;
+        st.serialize_field("owner_user_id", &self.owner_user_id)?;
+        st.serialize_field("participant_personas", &self.participant_personas)?;
+        st.serialize_field("is_private", &self.is_private)?;
+        st.serialize_field("created_at", &self.created_at)?;
+        st.serialize_field("status", &self.status)?;
+        st.serialize_field("consensus", &self.consensus)?;
+        st.serialize_field("scope", &self.scope)?;
+        st.serialize_field("participant_agents", &self.participant_agents)?;
+        st.serialize_field("messages", &self.messages)?;
+        if phase_written {
+            // 优先写已知枚举；否则写回原始未知字符串（无损前向兼容）。
+            let phase_str = match self.phase {
+                Some(MeetingPhase::AiSpeaking) => "ai_speaking",
+                Some(MeetingPhase::AwaitingHumans) => "awaiting_humans",
+                Some(MeetingPhase::Discussing) => "discussing",
+                Some(MeetingPhase::Done) => "done",
+                None => match &self.phase_raw {
+                    Some(raw) => raw.as_str(),
+                    None => unreachable!("phase_written 已保证二者至少其一为 Some"),
+                },
+            };
+            st.serialize_field("phase", phase_str)?;
+        }
+        st.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Meeting {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // 不 deny_unknown_fields：宽容忽略未来版本新增的字段，避免跨版本 meetings.json
+        // 因多出字段而整条反序列化失败（与宽容 phase 一致，见 reviewer round-17 #3）。
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            id: String,
+            topic: String,
+            owner_user_id: String,
+            #[serde(default)]
+            participant_personas: Vec<String>,
+            #[serde(default = "default_true")]
+            is_private: bool,
+            created_at: String,
+            status: String,
+            #[serde(default)]
+            consensus: Option<String>,
+            #[serde(default)]
+            scope: Option<String>,
+            #[serde(default)]
+            participant_agents: Vec<String>,
+            #[serde(default)]
+            messages: Vec<MeetingMessage>,
+            #[serde(default)]
+            phase: Option<serde_json::Value>,
+        }
+        fn default_true() -> bool {
+            true
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let (phase, phase_raw) = match raw.phase {
+            None => (None, None),
+            Some(v) => match v.as_str() {
+                Some("ai_speaking") => (Some(MeetingPhase::AiSpeaking), None),
+                Some("awaiting_humans") => (Some(MeetingPhase::AwaitingHumans), None),
+                Some("discussing") => (Some(MeetingPhase::Discussing), None),
+                Some("done") => (Some(MeetingPhase::Done), None),
+                Some(other) => {
+                    // 未来版本的未知 phase 字符串：phase=None + 保留原文，round-trip 无损
+                    tracing::warn!(phase = %other, "反序列化会议 phase 遇到未知值，保留原文（宽容兼容跨版本）");
+                    (None, Some(other.to_string()))
+                }
+                None => {
+                    // 非字符串值（数字/对象/数组）：宽容降级，不使整条反序列化失败
+                    tracing::warn!("反序列化会议 phase 遇到非字符串值，回退为 None（宽容兼容跨版本）");
+                    (None, None)
+                }
+            },
+        };
+        Ok(Meeting {
+            id: raw.id,
+            topic: raw.topic,
+            owner_user_id: raw.owner_user_id,
+            participant_personas: raw.participant_personas,
+            is_private: raw.is_private,
+            created_at: raw.created_at,
+            status: raw.status,
+            consensus: raw.consensus,
+            scope: raw.scope,
+            participant_agents: raw.participant_agents,
+            messages: raw.messages,
+            phase,
+            phase_raw,
+        })
+    }
 }
 
 impl Meeting {
@@ -477,6 +555,24 @@ impl Meeting {
     /// （否则新增状态如 paused/cancelled 会在两处表现不一致）。
     pub fn is_terminal(&self) -> bool {
         is_terminal_state(&self.status, self.phase)
+    }
+
+    /// 会议读写授权谓词（**单一权威来源**，reviewer round-17 #1 maintainability·medium）。
+    ///
+    /// 判定 caller 对 `self` 这份会议是否有读/写（发言）权限：owner / admin / 公开 /
+    /// participant_agents 成员 / scope 成员。`meeting_visible`（SSE 订阅 / 心跳）与
+    /// `add_meeting_message`（发言入库前校验）必须共用本方法，否则两份内联副本一旦漂移
+    /// （如给可见性加了一条路径、没给发言加）就会产生「能订阅却发言被拒」的读写不对称，
+    /// 让客户端能订阅却发不了言（或反之）。任何未来权限变更都只改这里。
+    pub fn is_authorized(&self, caller: &str, caller_ns: &[String], is_admin: bool) -> bool {
+        self.owner_user_id == caller
+            || is_admin
+            || !self.is_private
+            || self.participant_agents.iter().any(|a| a == caller)
+            || self
+                .scope
+                .as_ref()
+                .is_some_and(|s| scope_matches_caller(s, caller_ns))
     }
 
     pub fn apply_convergence(&mut self, consensus: &str) -> bool {
@@ -1175,13 +1271,16 @@ impl AgentCore {
             participant_agents,
             messages: Vec::new(),
             phase: Some(MeetingPhase::AiSpeaking),
+            phase_raw: None,
         };
         self.meetings
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(meeting);
-        // 低频创建路径：落盘失败已在 save_meetings 内 warn，此处忽略 Result（返回 id 不因 IO 失败而变）
-        let _ = self.save_meetings();
+        // 【round-17 #2 性能】不再在此处同步落盘：本方法由 handle_meetings_create 在持
+        // st.agent 全局锁内调用，若在此同步 fsync 写盘，慢磁盘会阻塞所有 agent 操作
+        // （与 add_meeting_message / end_meeting / remove_meeting 的 round-15/17 重构同一原则）。
+        // 落盘职责上移给调用方：释放全局锁后于锁外调 persist_meetings_for()（spawn_blocking）。
         id
     }
 
@@ -1198,9 +1297,9 @@ impl AgentCore {
     ) -> Result<MeetingMessage, String> {
         // 入库前强制校验发言资格（reviewer round-12 #2 / round-14 #5）：发言权须与可见性
         // `meeting_visible` **完全一致**（owner / admin / 公开 / scope 成员 / participant_agents
-        // 成员），读写权限单一来源，杜绝「能订阅却发言被拒」的读写不对称。
-        // 会议不存在与无权统一返回同一个错误串（不区分），避免借错误串探测私有会议 ID 是否存在
-        // （meeting_visible 同样以「无权」掩盖不存在，此处保持一致）。
+        // 成员），二者都委托给 `Meeting::is_authorized` 单一实现（reviewer round-17 #1），杜绝
+        // 「能订阅却发言被拒」的读写不对称。会议不存在与无权统一返回同一个错误串（不区分），
+        // 避免借错误串探测私有会议 ID 是否存在（meeting_visible 同样以「无权」掩盖不存在）。
         let pushed = {
             let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
             let m = v.iter_mut().find(|m| m.id == id);
@@ -1208,13 +1307,7 @@ impl AgentCore {
                 // 统一错误，不泄露「不存在 / 无权」
                 return Err("无权访问该会议".to_string());
             };
-            let authorized = m.owner_user_id == from
-                || is_admin
-                || !m.is_private
-                || m.participant_agents.iter().any(|a| a == from)
-                || m.scope
-                    .as_ref()
-                    .is_some_and(|s| scope_matches_caller(s, caller_ns));
+            let authorized = m.is_authorized(from, caller_ns, is_admin);
             if !authorized {
                 return Err("无权访问该会议".to_string());
             }
@@ -1326,15 +1419,7 @@ impl AgentCore {
         is_admin: bool,
     ) -> Option<bool> {
         let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
-        v.iter().find(|m| m.id == id).map(|m| {
-            m.owner_user_id == caller
-                || is_admin
-                || !m.is_private
-                || m.participant_agents.iter().any(|a| a == caller)
-                || m.scope
-                    .as_ref()
-                    .is_some_and(|s| scope_matches_caller(s, caller_ns))
-        })
+        v.iter().find(|m| m.id == id).map(|m| m.is_authorized(caller, caller_ns, is_admin))
     }
 
     /// Step3：批量判定一组会议 id 是否需要清理 presence（会议不存在 **或** 已终态）。
@@ -1366,72 +1451,31 @@ impl AgentCore {
     ///
     /// 返回值供调用方（圆桌后台任务）向订阅端广播 `state` / `ended` 实时事件——
     /// 否则订阅者会持有陈旧的 phase/status，直到真人发言或会议被结束/删除（见 `handle_meeting_stream`）。
+    ///
+    /// 【round-17 #5 性能】本方法**只做内存状态跃迁，不落盘**：状态跃迁与结果读取在**同一次**
+    /// self.meetings 锁内完成（消除 TOCTOU——锁内直接克隆返回值，避免锁外重读被并发端/删改）,
+    /// 但磁盘写（save_meetings 的同步 fsync）不再在此处发生。调用方（tokio 上下文）在锁外、
+    /// 且用 `persist_meetings_for()`（spawn_blocking）持久化，避免把慢速 fsync 拖进 tokio worker
+    /// （head-of-line blocking）。持久化内容是跃迁后的当前会议状态，与内存严格一致。
     pub fn finish_meeting(&self, id: &str, consensus: &str) -> Option<(String, Option<MeetingPhase>)> {
-        // 状态跃迁、结果读取与「序列化」必须在**同一次加锁**内完成（消除 TOCTOU 窗口，见下）。
-        // 序列化的字节串随返回值一并带出锁外落盘：串行化保证来自 self.meetings 内部锁
-        // （而非任何外部 AgentCore 锁），确保落盘内容严格对应本次内存变更、无撕裂读 / lost update。
-        // 反例（TOCTOU）：先在锁 A 内 apply_convergence、释放锁、save_meetings()（全量序列化，慢），
-        // 再在锁 B 内重读 (status, phase)。两锁之间其他线程可能：
-        //   - 真人发言把 phase 推进到 Discussing → 广播出去的不是本次收敛的结果；
-        //   - end_meeting 置 done → 广播 state 而非 ended，订阅端永远等不到终态；
-        //   - 删除会议 → 重读得 None，调用方以为「未变更」而完全不广播。
-        // 因此在锁内直接克隆出返回值与序列化结果，锁外只做磁盘 IO。
-        // persist_lock 跨「序列化（持 self.meetings）+ 写盘（tmp + rename）」整个关键区，
-        // 保证任意两次持久化严格按获取 persist_lock 的顺序串行：较旧序列化结果不可能在
-        // 较新文件之后 rename 覆盖（reviewer round-12 #1，lost update / 撕裂写）。
-        // self.meetings 仅在序列化期间持有，写盘前释放，避免把磁盘 IO 拖进全局会议锁
-        // （见 round-9 F1 / round-11）。锁顺序：persist_lock → self.meetings，全代码唯一顺序。
-        let _pg = self.persist_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let (out, serialized) = {
-            let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
-            // 先确定是否变更并取出结果（变更后随即释放对 m 的可变借用），
-            // 再在锁内以只读方式序列化，避免 m 可变借用与 v.iter() 只读借用冲突。
-            let out_opt = match v.iter_mut().find(|m| m.id == id) {
-                Some(m) => {
-                    if m.apply_convergence(consensus) {
-                        Some((m.status.clone(), m.phase))
-                    } else {
-                        None
-                    }
+        // 状态跃迁与结果读取必须在**同一次加锁**内完成（消除 TOCTOU 窗口）：
+        // 反例——先在锁 A 内 apply_convergence、释放锁、再在锁 B 内重读 (status, phase)。
+        // 两锁之间其他线程可能：真人发言推进 Discussing、end_meeting 置 done、删除会议，
+        // 导致广播的不是本次收敛结果 / 广播 state 而非 ended / 重读得 None 而完全不广播。
+        // 故在锁内直接克隆出返回值，锁外（调用方）只做持久化。
+        let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+        let out_opt = match v.iter_mut().find(|m| m.id == id) {
+            Some(m) => {
+                if m.apply_convergence(consensus) {
+                    Some((m.status.clone(), m.phase))
+                } else {
+                    None
                 }
-                // 会议不存在 / 已终态 / 已幂等回填
-                None => None,
-            };
-            // 同一把内部锁内完成「序列化」：带出的 serialized 严格对应本次内存状态。
-            let serialized = if out_opt.is_some() {
-                serde_json::to_string_pretty(
-                    &serde_json::json!({ "meetings": v.iter().collect::<Vec<_>>() }),
-                )
-                .map_err(|e| {
-                    tracing::warn!(error = %e, "finish_meeting: 序列化会议失败，跳过落盘");
-                    e
-                })
-                .ok()
-            } else {
-                None
-            };
-            (out_opt, serialized)
-        };
-        // 发生变更时落盘：在 persist_lock 临界区内、self.meetings 释放后做磁盘 IO（tmp + 原子 rename）。
-        // 不另起 spawn_blocking：fire-and-forget 异步写会与其他持久化路径竞争同一 tmp 文件
-        // （lost update），且在 tokio runtime 外 panic、JoinHandle 被丢弃导致写失败静默（见 round-9 F1）。
-        //
-        // 【accepted ceiling · reviewer round-13 #3】这里的同步磁盘 IO 在 tokio worker 线程上执行，
-        // 且持 persist_lock。这是**有意取舍**：(a) 写盘前已释放 self.meetings 全局会议锁，只持
-        // 轻量 persist_lock，不阻塞会议内存读写；(b) 持久化调用点低频（会议创建 / 结束 / 删除 /
-        // 收敛落盘，非高频热路径），单次 IO 为小文件 tmp+rename 原子写，量级毫秒；(c) 同步写保证
-        // 进程崩溃不丢已确认的状态，且经 persist_lock 串行化杜绝 lost update / 撕裂写。若未来
-        // 会议并发量显著上升，可在调用方（tokio 上下文）用 spawn_blocking 只迁移写盘、保留本函数
-        // 的序列化在 self.meetings 锁内以维持 TOCTOU 保证。
-        if let Some(s) = serialized {
-            // 低频收敛落盘：写失败须以 **error 级**日志记录「已确认但未持久化的共识」，
-            // 使审计域可发现（与 handle_meeting_message/end 的落盘失败处理一致，round-15 #3
-            // 原则）。write_meetings_file 内部已 warn 具体 IO 错误，此处补会议 id 上下文。
-            if let Err(e) = self.write_meetings_file(&s) {
-                tracing::error!(error = %e, meeting = %id, "finish_meeting: 共识已回填但落盘失败（可能进程崩溃丢失，请排查磁盘）");
             }
-        }
-        out
+            // 会议不存在 / 已终态 / 已幂等回填
+            None => None,
+        };
+        out_opt
     }
 
     /// 列出调用者可见的会议：公开 或 拥有者 或 admin，或调用者属该 scope。
@@ -11354,6 +11398,7 @@ mod whitelist_preroute_tests {
             scope: None,
             participant_agents: vec!["agent/admin".into()],
             phase: Some(MeetingPhase::Discussing),
+            phase_raw: None,
             messages: vec![
                 MeetingMessage { from: "ai1".into(), kind: "ai".into(), content: "立场".into(), at: "2026-08-01T00:00:01Z".into() },
                 MeetingMessage { from: "agent/admin".into(), kind: "human".into(), content: "意见".into(), at: "2026-08-01T00:00:02Z".into() },
@@ -11380,6 +11425,7 @@ mod whitelist_preroute_tests {
             scope: None,
             participant_agents: agents,
             phase,
+            phase_raw: None,
             messages: vec![],
         }
     }
@@ -11474,6 +11520,38 @@ mod whitelist_preroute_tests {
         let m2 = mk_meeting("running", Some(MeetingPhase::AwaitingHumans), vec![]);
         let s2 = serde_json::to_string(&m2).unwrap();
         assert!(s2.contains("\"phase\":\"awaiting_humans\""), "实际: {s2}");
+    }
+
+    /// Step3（reviewer round-17 #3 bug·low）：未来版本的未知 phase 字符串必须 round-trip 无损，
+    /// 不得因宽容回退 None + 省略序列化而永久擦除前向兼容数据。
+    #[test]
+    fn meeting_unknown_phase_roundtrips_losslessly() {
+        // 未来版本写入的未知 phase（如 "cancelled"）→ 反序列化 phase=None + phase_raw 保留原文
+        let json = r#"{"id":"mtg_x","topic":"t","owner_user_id":"u","participant_personas":[],"is_private":true,"created_at":"2026-08-01T00:00:00Z","status":"running","consensus":null,"scope":null,"participant_agents":[],"messages":[],"phase":"cancelled"}"#;
+        let m: Meeting = serde_json::from_str(json).unwrap();
+        assert_eq!(m.phase, None, "未知 phase 字符串应宽容为 None");
+        assert_eq!(m.phase_raw.as_deref(), Some("cancelled"), "原始未知值必须保留");
+
+        // 回盘（序列化）必须把原始未知字符串原样写回，而非省略 phase 键
+        let rt = serde_json::to_string(&m).unwrap();
+        assert!(rt.contains("\"phase\":\"cancelled\""), "回盘必须无损写回未知 phase，实际: {rt}");
+    }
+
+    /// Step3（reviewer round-17 #4 bug·low）：未来版本的未知 status/phase 应保守判为终态，
+    /// 不能被当作 running 继续接收心跳 / 写入消息。
+    #[test]
+    fn is_terminal_state_conservative_on_unknown() {
+        // 已知终态
+        assert!(is_terminal_state("done", None));
+        assert!(is_terminal_state("running", Some(MeetingPhase::Done)));
+        // running 非终态
+        assert!(!is_terminal_state("running", None));
+        assert!(!is_terminal_state("running", Some(MeetingPhase::AiSpeaking)));
+        // 未知 status（未来版本终态标记）→ 保守判为终态
+        assert!(is_terminal_state("cancelled", None), "未知 status 应保守视为终态");
+        assert!(is_terminal_state("paused", Some(MeetingPhase::AiSpeaking)));
+        // 空 status 视为未知，不判终态
+        assert!(!is_terminal_state("", None));
     }
 
     /// Step3（ocr-review maintainability·medium）：EventKind 的 serde 名与 SSE 事件名必须一致，
