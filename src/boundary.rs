@@ -1136,8 +1136,6 @@ impl ToolClassifier {
             "officecli_create",
             "officecli_merge",
             "officecli_pdf",
-            // fsutil 源写操作：move_file（移动/改名，破坏性，需人审）；delete_path 归 dangerous 不列入
-            "move_file",
             // P0-1 场景沙箱：写生命周期（创建/加变更/提交/丢弃；commit 强制审批）
             "scenario_create",
             "scenario_add_change",
@@ -1174,7 +1172,8 @@ impl ToolClassifier {
             "manage_whitelist",
             "edit_code",
             "sync_exception_correction",
-            // fsutil 源删除操作（office-tools/skills/delete_path）：破坏性，明确归危险
+            // fsutil 源破坏性操作（office-tools/skills/）：移动/改名可覆盖，删除破坏数据，均明确归危险触发审批
+            "move_file",
             "delete_path",
         ] {
             c.dangerous_tools.insert(t.to_string());
@@ -2087,7 +2086,7 @@ mod tests {
         for t in ["list_dir", "find_files", "file_info", "summarize_url", "data_analysis"] {
             assert_eq!(c.classify(t), "read", "{t} 应分类为 read（文件系统/URL 只读查询）");
         }
-        assert_eq!(c.classify("move_file"), "write", "move_file 应分类为 write（破坏性移动，需审批）");
+        assert_eq!(c.classify("move_file"), "dangerous", "move_file 应分类为 dangerous（移动可覆盖，需审批）");
         assert_eq!(c.classify("delete_path"), "dangerous", "delete_path 应分类为 dangerous（删除，危险地板）");
     }
 

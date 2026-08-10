@@ -31,7 +31,10 @@ fn office_tools_dir() -> std::path::PathBuf {
 }
 
 fn python_bin() -> String {
-    std::env::var("PYTHON_BIN").unwrap_or_else(|_| "python".to_string())
+    std::env::var("PYTHON_BIN").unwrap_or_else(|_| {
+        // Windows 通常装 python；Unix 系多只有 python3
+        if cfg!(windows) { "python".to_string() } else { "python3".to_string() }
+    })
 }
 
 /// 生成带进程唯一后缀的输出文件名，避免 repeated/concurrent 测试互相覆盖。
@@ -51,6 +54,17 @@ async fn with_timeout<T>(fut: impl std::future::Future<Output = T>) -> Result<T,
     tokio::time::timeout(std::time::Duration::from_secs(30), fut)
         .await
         .map_err(|_| "调用超时（30s）：officecli 子进程可能卡死".to_string())
+}
+
+/// 返回 read/query-guard/pdf 共用的输入 fixture（office-tools/_out.docx），并断言其存在，
+/// 避免 fixture 缺失时错误深埋在子进程内难以诊断。
+fn require_fixture() -> std::path::PathBuf {
+    let fixture = office_tools_dir().join("_out.docx");
+    assert!(
+        fixture.is_file(),
+        "fixture 缺失: {fixture:?}（office-tools 目录需预置 _out.docx）"
+    );
+    fixture
 }
 
 fn agent_with_officecli() -> AgentCore {
@@ -135,10 +149,11 @@ async fn officecli_tools_are_listed() {
 #[ignore = "需要 officecli 二进制 + office-tools 目录 + 真实文档"]
 async fn officecli_read_routes_and_calls() {
     let agent = agent_with_officecli();
+    let fixture = require_fixture();
     let out = with_timeout(agent.call_tool_routed(
             "officecli_read",
             "default",
-            &serde_json::json!({"file": office_tools_dir().join("_out.docx"), "max_lines": 3}),
+            &serde_json::json!({"file": fixture, "max_lines": 3}),
             &["agent/eval-officecli".to_string()],
             "officecli-e2e",
         ))
@@ -231,19 +246,28 @@ async fn officecli_create_adds_and_query() {
         .await
         .expect("officecli_query 应在 30s 内返回")
         .expect("officecli_query 应成功");
-    assert!(q_out.contains("E2E 集成创建"), "query 应命中新段落，实际: {}", q_out);
+    // query 返回 JSON 字符串；解析后对解码的字符串值做包含检查，
+    // 避免 bridge 用 ensure_ascii 转义中文（\uXXXX）时字面子串匹配失败。
+    let q_val: serde_json::Value =
+        serde_json::from_str(&q_out).expect("query 返回应为合法 JSON");
+    let q_text = serde_json::to_string(&q_val).unwrap_or_default();
+    assert!(
+        q_text.contains("E2E 集成创建"),
+        "query 应命中新段落，实际: {q_out}"
+    );
 }
 
 #[tokio::test]
 #[ignore = "需要 officecli 二进制 + office-tools 目录"]
 async fn officecli_query_rejects_write_selector() {
     let agent = agent_with_officecli();
+    let fixture = require_fixture();
     // 写保护契约：bridge（officecli_mcp_bridge.py）对外承诺「写类 selector 一律拒绝」。
     // 断言稳定的信号（错误含 selector 关键词或中文写保护文案），避免与 bridge 内部措辞强耦合。
     let res = with_timeout(agent.call_tool_routed(
             "officecli_query",
             "default",
-            &serde_json::json!({"file": office_tools_dir().join("_out.docx"), "selector": "add /body paragraph"}),
+            &serde_json::json!({"file": fixture, "selector": "add /body paragraph"}),
             &["agent/eval-officecli".to_string()],
             "officecli-e2e-query-guard",
         ))
@@ -261,11 +285,12 @@ async fn officecli_query_rejects_write_selector() {
 #[ignore = "需要 officecli 二进制 + office-tools 目录 + PDF exporter 插件"]
 async fn officecli_pdf_exports_valid_pdf() {
     let agent = agent_with_officecli();
+    let fixture = require_fixture();
     let out_name = unique_out_name("export", "pdf");
     let out = with_timeout(agent.call_tool_routed(
             "officecli_pdf",
             "default",
-            &serde_json::json!({"file": office_tools_dir().join("_out.docx"), "output": out_name}),
+            &serde_json::json!({"file": fixture, "output": out_name}),
             &["agent/eval-officecli".to_string()],
             "officecli-e2e-pdf",
         ))
