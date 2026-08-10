@@ -65,7 +65,13 @@ def agent_key() -> str:
     """
     # env 中存在即权威（与启动器一致），含空值也直接返回，不回退 .env
     if "AGENT_API_KEY" in os.environ:
-        return os.environ["AGENT_API_KEY"]
+        key = os.environ["AGENT_API_KEY"]
+        # reviewer round-17 #2：env 中键存在但值为空串 = 配置错误，应尽早清晰失败，
+        # 而非带着空 key 跑到 403 才暴露（与下方 .env 空值分支一致的守卫）。
+        if not key:
+            print("  !! AGENT_API_KEY 在环境中为空值（配置错误）")
+            raise SystemExit(1)
+        return key
 
     path = os.path.join(ROOT, ".env")
     try:
@@ -225,13 +231,26 @@ def main() -> int:
         is_delta = "message" in p and "messages" not in p
         phase = p.get("phase")
         print(f"   payload 为增量(不含完整历史) = {is_delta}; phase={phase}")
-        # phase 推进到 discussing 依赖种子前置：`mtg_e2e_step3` 的 participant_agents 必须含
-        # `agent/admin` 且非空（apply_message 仅当受邀真人发言才推进），且 msg.from 被强制绑定到
-        # 已认证 caller=agent/admin。若断言失败，先核对种子是否满足该前置，勿误判为服务状态机回归。
+        # phase 推进到 discussing：任一真人发言都推进（reviewer round-17 #7），
+        # 且 msg.from 被强制绑定到已认证 caller=agent/admin。若断言失败，
+        # 先核对服务是否正常响应发言，勿误判为状态机回归。
         ok &= is_delta and phase == "discussing"
         if phase != "discussing":
             print("   !! phase 未推进到 discussing：请核对种子 mtg_e2e_step3 的 participant_agents"
                   " 是否含 agent/admin（前置条件，见 apply_message）")
+        # reviewer round-17 #1：增量广播必须携带刚发的消息本身（内容 + 发送者），
+        # 而非仅「有一条 message 事件」——否则订阅端收不到实际发言内容即视为缺陷。
+        inner = p.get("message")
+        got_msg = (
+            isinstance(inner, dict)
+            and inner.get("content") == "第一条真人发言"
+            and inner.get("from") == "agent/admin"
+        )
+        print(f"   广播携带发言内容+发送者 = {got_msg}")
+        ok &= got_msg
+        if not got_msg:
+            print("   !! message 增量未携带预期发言（content=第一条真人发言, from=agent/admin）"
+                  f"，实际内层: {inner if inner is not None else '(无 message 键)'}")
     except Exception as e:  # noqa: BLE001
         print(f"   !! message payload 解析失败: {e}")
         ok = False

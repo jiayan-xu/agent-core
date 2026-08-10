@@ -2408,20 +2408,27 @@ async fn handle_meeting_delete(
     // 在 agent 锁短作用域完成删除判定，随即释放全局锁，避免 presence 清理 / 实时广播
     // 在持全局锁期间 await 而拉长全局锁持有时长、并引入脆弱的锁顺序（reviewer round-10 F1）。
     // presence / 广播均在 agent 锁释放后进行，无 agent→presence 嵌套。
-    {
+    let agent_arc = {
         let g = st.agent.lock().await;
         let Some(ref agent) = *g else {
             return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
         };
+        let agent_arc = agent.clone();
         match agent.remove_meeting(&id, &caller, admin) {
-            Ok(()) => {}
+            Ok(()) => agent_arc,
             Err(e) => {
                 return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))
                     .into_response()
             }
         }
-    }
-    // 全局 st.agent 锁已释放：presence 清理与实时广播均在锁外进行。
+    };
+    // 全局 st.agent 锁已释放：落盘（删除后持久化）移到锁外、且用 spawn_blocking 迁移到
+    // 阻塞线程池，避免同步 fsync 写盘阻塞 tokio worker（reviewer round-17 #3/#5）。
+    // remove_meeting 已不再内部落盘（round-17 #3），此处须在锁外显式持久化。
+    let _ = persist_meetings_for(&agent_arc, |e| {
+        tracing::error!(error = %e, meeting = %id, "handle_meeting_delete: 会议已删除但落盘失败（可能进程崩溃后残留，请排查磁盘）");
+    }).await;
+    // presence 清理与实时广播均在锁外进行。
     st.meeting_presence.lock().await.remove(&id);
     // Step3 实时同步：广播终止事件。会议已被删除，get_meeting 之后恒为 None，
     // 若不广播，订阅端拿不到任何终止信号 → 本地状态永久陈旧、SSE 任务空转到客户端断开为止。
@@ -2429,7 +2436,7 @@ async fn handle_meeting_delete(
         &st,
         &id,
         EventKind::Ended,
-        serde_json::json!({ "deleted": true, "status": "done" }),
+        serde_json::json!({ "deleted": true, "terminal": true, "status": "done", "phase": "done" }),
     )
     .await;
     Json(serde_json::json!({"ok": true, "removed": id})).into_response()
@@ -2500,9 +2507,10 @@ async fn handle_meeting_message(
     // agent 操作）。save_meetings 内部仍持轻量 persist_lock 串行化，保进程崩溃不丢已确认发言。
     // 【round-15 #3】落盘失败以 **error 级**日志记录「已确认但未持久化」的发言（含会议 id），
     // 使审计域可发现；但不因此拒绝已成功的发言请求（客户端已确认，内存状态已生效，仅持久化失败）。
-    if let Err(e) = agent_arc.save_meetings() {
+    // 【round-17 #5】改用 spawn_blocking 迁移写盘到阻塞线程池，避免同步 fsync 阻塞 tokio worker。
+    let _ = persist_meetings_for(&agent_arc, |e| {
         tracing::error!(error = %e, meeting = %id, "handle_meeting_message: 发言已确认但落盘失败（可能进程崩溃丢失，请排查磁盘）");
-    }
+    }).await;
     // 以下 A2A 网络投递与实时广播均在锁外进行。
     let mut delivered = 0usize;
     for t in &targets {
@@ -2593,9 +2601,10 @@ async fn handle_meeting_end(
     // （已终态幂等返回时状态未变，无需写盘）。
     if transitioned {
         // 【round-15 #3】落盘失败以 error 级日志记录（含会议 id），使审计域可发现
-        if let Err(e) = agent_arc.save_meetings() {
+        // 【round-17 #5】改用 spawn_blocking 迁移写盘到阻塞线程池，避免同步 fsync 阻塞 tokio worker
+        let _ = persist_meetings_for(&agent_arc, |e| {
             tracing::error!(error = %e, meeting = %id, "handle_meeting_end: 会议已结束但共识落盘失败（可能进程崩溃丢失，请排查磁盘）");
-        }
+        }).await;
     }
     // 以下 presence 清理与广播均在锁外进行。
     match transitioned {
@@ -2610,6 +2619,7 @@ async fn handle_meeting_end(
                 serde_json::json!({
                     "status": "done",
                     "phase": "done",
+                    "terminal": true,
                     "consensus": consensus,
                 }),
             ).await;
@@ -2621,6 +2631,29 @@ async fn handle_meeting_end(
             st.meeting_presence.lock().await.remove(&id);
             Json(serde_json::json!({"ok": true, "ended": id, "already_terminal": true})).into_response()
         }
+    }
+}
+
+/// 会议持久化的异步入口：把 `save_meetings()`（同步 full-file 序列化 + fsync）迁移到
+/// tokio **阻塞线程池**（spawn_blocking），避免同步磁盘 IO 阻塞 tokio worker 线程
+/// （head-of-line blocking，reviewer round-17 #5 / #6）。
+///
+/// 调用点（handle_meeting_message / end / delete）都已在持 st.agent 全局锁的临界区**之外**
+/// 调用本函数，因此写盘不会拉长全局锁持有时间；spawn_blocking 再进一步把 fsync 从当前
+/// worker 线程挪走，保证单次会议的慢磁盘不会拖慢所有 tokio 任务。
+///
+/// 落盘失败时调用 `on_err`（error 级日志，援引会议 id 上下文，「已确认但未持久化」可审计）。
+/// 返回 `()`：持久化是 best-effort，失败不拒绝已成功的业务请求（内存状态已生效，仅持久化
+/// 失败）。`save_meetings` 内部仍持轻量 persist_lock 串行化，保进程崩溃不丢已确认状态。
+async fn persist_meetings_for<F>(agent_arc: &Arc<AgentCore>, on_err: F)
+where
+    F: FnOnce(String),
+{
+    let a = agent_arc.clone();
+    match tokio::task::spawn_blocking(move || a.save_meetings()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => on_err(e),
+        Err(e) => on_err(format!("spawn_blocking 任务失败: {e}")),
     }
 }
 
@@ -2866,8 +2899,12 @@ async fn handle_meeting_stream(
             if terminal {
                 // 快照已是终态（status != running 或 phase == Done）：无后续事件，
                 // 立即发 ended 并终止流，避免客户端持有永不关闭的 zombie 连接。
+                // 携带 status/phase（来自快照会议），统一 ended payload 契约。
+                let ended_payload = serde_json::json!({
+                    "status": m.status, "phase": m.phase, "terminal": true,
+                });
                 let _ = tx.try_send(Ok(SseEvent::default().event("ended").data(
-                    serde_json::json!({ "terminal": true }).to_string(),
+                    ended_payload.to_string(),
                 )));
                 cleanup_meeting_channel(&st2, &id2).await;
                 return;
@@ -2875,7 +2912,7 @@ async fn handle_meeting_stream(
         } else {
             // 复核窗口内会议已被删除：立即发 ended(deleted) 终止，不留 zombie 流。
             let _ = tx.try_send(Ok(SseEvent::default().event("ended").data(
-                serde_json::json!({ "deleted": true }).to_string(),
+                serde_json::json!({ "deleted": true, "terminal": true }).to_string(),
             )));
             cleanup_meeting_channel(&st2, &id2).await;
             return;
@@ -2986,7 +3023,9 @@ async fn handle_meeting_stream(
                                     // 若会议已结束/删除则补发 ended 并终止，避免 zombie 流。
                                     if m.is_terminal() {
                                         let _ = tx.try_send(Ok(SseEvent::default().event("ended").data(
-                                            serde_json::json!({ "terminal": true }).to_string(),
+                                            serde_json::json!({
+                                                "status": m.status, "phase": m.phase, "terminal": true,
+                                            }).to_string(),
                                         )));
                                         // 【round-15 #4】此处不再重复调 cleanup_meeting_channel：
                                         // break 后的 post-loop 会统一清理同一通道（receiver_count()
@@ -2998,7 +3037,7 @@ async fn handle_meeting_stream(
                                 None => {
                                     // 会议已被删除：不再重同步，转发终止避免永久阻塞 rx.recv()
                                     let _ = tx.try_send(Ok(SseEvent::default().event("ended").data(
-                                        serde_json::json!({ "deleted": true }).to_string(),
+                                        serde_json::json!({ "deleted": true, "terminal": true }).to_string(),
                                     )));
                                     break;
                                 }

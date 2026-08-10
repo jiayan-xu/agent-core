@@ -511,25 +511,21 @@ impl Meeting {
     /// Step3：追加一条发言并推进状态机（纯逻辑，便于单测；与 `apply_convergence` 同构）。
     ///
     /// 终态（status=done 或 phase=Done）拒绝发言，返回 `Err`。
-    /// 仅**受邀真人**发言推进到 `Discussing`：
-    /// AI 发言不推进（保持 ai_speaking / awaiting_humans）；
-    /// 纯 AI 圆桌（`participant_agents` 为空）即使收到旁路真人发言也不推进——
-    /// 该类会议「收敛即终局」，其生命周期里不存在 Discussing 阶段，
-    /// 无条件推进会让订阅端看到 ai_speaking → discussing → done 的伪跃迁。
-    /// 发言本身照常入库，只是不改 phase。
+    /// **任一** 真人发言（kind == human）推进到 `Discussing`：AI 发言不推进
+    /// （保持 ai_speaking / awaiting_humans）。
+    ///
+    /// 【reviewer round-17 #7 反伪造】不再按 `participant_agents` 白名单限制推进：
+    /// 伪造 `from` 的攻击面已由上游 `add_meeting_message` 堵死——它强制校验发言资格
+    /// （owner / admin / 公开 / scope 成员 / participant_agents 成员），且调用方
+    /// `handle_meeting_message` 把 `from` 绑定到已认证 caller，请求体不可控。因此能进入
+    /// 本函数的真人发言必来自已授权说话者；若仍按参与人白名单限制，admin / scope 成员 /
+    /// 公开会议参与者（`participant_agents` 可能为空）的真人发言会被存储但 phase 永不
+    /// 推进，状态机卡死在 ai_speaking / awaiting_humans。真人发言即证明会议进入讨论阶段。
     pub fn apply_message(&mut self, msg: MeetingMessage) -> Result<MeetingMessage, String> {
         if self.is_terminal() {
             return Err("会议已结束，无法发言".to_string());
         }
-        // 仅受邀真人（msg.from 须为会议 `participant_agents` 之一）发言才推进到 Discussing。
-        // 否则伪造 `from`（请求体可控、会议 ID 可猜）即可强行把 phase 推进到 discussing，
-        // 干扰状态机。`participant_agents` 为空（纯 AI 圆桌）时本分支恒不成立——该类会议
-        // 「收敛即终局」，生命周期里不存在 Discussing 阶段。
-        let advances = msg.kind == MSG_KIND_HUMAN
-            && !self.participant_agents.is_empty()
-            && (self.owner_user_id == msg.from
-                || self.participant_agents.iter().any(|a| a == &msg.from));
-        if advances {
+        if msg.kind == MSG_KIND_HUMAN {
             self.phase = Some(MeetingPhase::Discussing);
         }
         let idx = self.messages.len();
@@ -1237,7 +1233,11 @@ impl AgentCore {
         // 且调用方（handle_meeting_message）在持 st.agent 全局锁时调用。若在此同步全量写盘，
         // 慢磁盘会阻塞所有 agent 操作（process-wide）。落盘职责上移给调用方：异步 handler
         // 在释放 st.agent 锁后、于锁外调用 `save_meetings()`（仍持轻量 persist_lock 串行化，
-        // 保进程崩溃不丢已确认消息，但不再阻塞全局 agent 锁 / tokio worker）。
+        // 保进程崩溃不丢已确认消息，但不再阻塞全局 agent 锁）。
+        // 【round-17 #6 诚实声明】注意：`save_meetings()` 本身是同步 full-file 序列化 + fsync，
+        // 若在 tokio 上下文直接调用仍会阻塞该 worker 线程。调用方已改用 `persist_meetings_for()`
+        // （spawn_blocking 迁移写盘到阻塞线程池），故「不阻塞 tokio worker」的保证来自调用方，
+        // 而非本方法。本方法自身不落盘、也就谈不上阻塞任何线程。
         Ok(pushed)
     }
 
@@ -1424,8 +1424,12 @@ impl AgentCore {
         // 会议并发量显著上升，可在调用方（tokio 上下文）用 spawn_blocking 只迁移写盘、保留本函数
         // 的序列化在 self.meetings 锁内以维持 TOCTOU 保证。
         if let Some(s) = serialized {
-            // 低频收敛落盘：写失败已在 write_meetings_file 内 warn，此处忽略 Result
-            let _ = self.write_meetings_file(&s);
+            // 低频收敛落盘：写失败须以 **error 级**日志记录「已确认但未持久化的共识」，
+            // 使审计域可发现（与 handle_meeting_message/end 的落盘失败处理一致，round-15 #3
+            // 原则）。write_meetings_file 内部已 warn 具体 IO 错误，此处补会议 id 上下文。
+            if let Err(e) = self.write_meetings_file(&s) {
+                tracing::error!(error = %e, meeting = %id, "finish_meeting: 共识已回填但落盘失败（可能进程崩溃丢失，请排查磁盘）");
+            }
         }
         out
     }
@@ -1464,9 +1468,10 @@ impl AgentCore {
                     return Err("无权删除该会议".to_string());
                 }
                 v.remove(i);
-                drop(v);
-                // 低频删除路径：落盘失败已在 save_meetings 内 warn，此处忽略 Result
-                let _ = self.save_meetings();
+                // 【round-17 #3 性能】不再在此处同步落盘：本方法由 handle_meeting_delete 在持
+                // st.agent 全局锁内调用，若在此同步 fsync 写盘，慢磁盘会阻塞所有 agent 操作
+                // （与 add_meeting_message / end_meeting 重构同一原则）。落盘职责上移给调用方，
+                // 在释放全局锁后于锁外调 save_meetings()（仍持轻量 persist_lock 串行化）。
                 Ok(())
             }
             None => Err("会议不存在".to_string()),
@@ -1477,11 +1482,14 @@ impl AgentCore {
     /// 在 persist_lock 临界区内完成「序列化（持 self.meetings）+ 写盘」，与 `finish_meeting`
     /// 共用同一把 persist_lock，保证任意两次持久化严格按获取顺序串行（reviewer round-12 #1，
     /// 杜绝较旧序列化结果后 rename 覆盖较新文件）。self.meetings 仅在序列化期间持有，写盘前释放。
-    /// 调用方（remove_meeting / end_meeting / add_meeting_message）须在释放 self.meetings 锁后
-    /// 调用本方法，避免 persist_lock / self.meetings 嵌套顺序不一致（锁顺序恒为 persist_lock → self.meetings）。
-    /// 返回 `Result`（reviewer round-15 #3）：调用方（如 handle_meeting_message / end）在落盘
-    /// 失败时可用 error 级日志记录「已确认但未持久化的状态」，使审计域可发现。内部低频调用点
-    /// （create_meeting / remove_meeting）可忽略返回值（写失败已在此处 warn 日志）。
+    /// 调用方须在释放 self.meetings 锁后调用本方法，避免 persist_lock / self.meetings 嵌套顺序
+    /// 不一致（锁顺序恒为 persist_lock → self.meetings）。
+    /// 返回 `Result`（reviewer round-15 #3）：调用方（如 handle_meeting_message / end / delete）
+    /// 在落盘失败时可用 error 级日志记录「已确认但未持久化的状态」，使审计域可发现。内部低频
+    /// 调用点（create_meeting）可忽略返回值（写失败已在此处 warn 日志）。
+    /// ⚠️ 本方法含同步 fsync 磁盘 IO，**不应在持 st.agent 全局锁 / tokio worker 热路径上调用**。
+    /// 调用方（main.rs 的 handler，tokio 上下文）应优先用 `persist_meetings_for()`（spawn_blocking
+    /// 迁移写盘）规避 head-of-line blocking（reviewer round-17 #5 / #6）。
     pub fn save_meetings(&self) -> Result<(), String> {
         // persist_lock 跨「序列化 + 写盘」整个关键区（见 finish_meeting 注释）。
         let _pg = self.persist_lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -1516,10 +1524,22 @@ impl AgentCore {
         };
         let path = cwd.join("meetings.json");
         let tmp = path.with_extension("tmp");
-        // 用 File::create + write_all + sync_all 而非 std::fs::write：后者不保证数据落盘，
-        // OS 崩溃 / 断电后可能丢数据。sync_all 把 tmp 内容刷到磁盘，再做原子 rename。
+        // 用 OpenOptions 显式建文件而非 File::create：后者默认 0644（owner 读写 + 组/其他读），
+        // 含完整会议记录（真人发言、参会者、共识等 PII）的全文会被**任意本地用户**读取
+        // （reviewer round-17 #8 security·low）。限制为 0600（仅 owner 读写）：
+        //   - Unix：OpenOptionsExt::mode(0o600) 在 umask 基础上再收紧，tmp/最终文件仅 owner 可读写；
+        //   - Windows：OpenOptions 同样工作，mode 被忽略（Windows 无 POSIX 权限位），
+        //     细粒度 ACL 属系统目录管理职责，单用户桌面场景下可接受。
+        // 写 tmp 后 sync_all（fsync）使数据落盘，再做原子 rename（覆盖 OS 崩溃/断电丢数据）。
         let write_res = (|| -> std::io::Result<()> {
-            let mut f = std::fs::File::create(&tmp)?;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
             std::io::Write::write_all(&mut f, s.as_bytes())?;
             f.sync_all()?;
             Ok(())
@@ -11399,8 +11419,8 @@ mod whitelist_preroute_tests {
     }
 
     /// Step3（ocr-review test·low）：`add_meeting_message` 的状态机分支必须有回归锚点。
-    /// 覆盖四条路径：受邀真人 → Discussing；AI 发言不推进；纯 AI 会议真人发言不推进；
-    /// 终态会议拒绝任何发言。
+    /// 覆盖四条路径：真人发言 → Discussing（受邀或非受邀都推进，见 reviewer round-17 #7）；
+    /// AI 发言不推进；纯 AI 会议真人发言推进；终态会议拒绝任何发言。
     #[test]
     fn add_meeting_message_phase_transitions() {
         let mk_msg = |kind: &str| MeetingMessage {
@@ -11425,10 +11445,11 @@ mod whitelist_preroute_tests {
         assert!(m.apply_message(mk_msg(MSG_KIND_AI)).is_ok());
         assert_eq!(m.phase, Some(MeetingPhase::AwaitingHumans), "AI 发言不得推进 phase");
 
-        // 3) 纯 AI 会议（无 participant_agents）即使收到旁路真人发言也不得出现 Discussing
+        // 3) 纯 AI 会议（无 participant_agents）收到真人发言仍推进到 Discussing
+        //    （reviewer round-17 #7：授权已由上游 add_meeting_message 保证，真人发言即进入讨论）
         let mut m = mk_meeting(STATUS_RUNNING, Some(MeetingPhase::AiSpeaking), vec![]);
         assert!(m.apply_message(mk_msg(MSG_KIND_HUMAN)).is_ok());
-        assert_eq!(m.phase, Some(MeetingPhase::AiSpeaking), "纯 AI 会议不存在 discussing 阶段");
+        assert_eq!(m.phase, Some(MeetingPhase::Discussing), "真人发言必须推进到 discussing");
         assert_eq!(m.messages.len(), 1, "发言本身仍须入库");
 
         // 4) 终态会议拒绝发言（status=done 与 phase=Done 任一命中都算终态）
