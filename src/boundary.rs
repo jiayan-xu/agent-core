@@ -490,7 +490,7 @@ fn is_repo_ws_payload(tool_name: &str, key: &str) -> bool {
 /// 从工具参数中抽取显式文件路径参数做门闸（命令型参数 command/code/sql 不含路径，不抽）
 /// 提取 args 中所有路径类参数（path/file/file_path/filepath/dir/directory/target/src/dst）。
 /// 返回全部匹配路径，使 move_file 的 src+dst 都能过沙箱门闸（而非只查第一个）。
-fn extract_path_arg(args: &serde_json::Value) -> Vec<PathBuf> {
+fn extract_path_arg(tool_name: &str, args: &serde_json::Value) -> Vec<PathBuf> {
     const KEYS: &[&str] = &[
         "path",
         "file",
@@ -504,11 +504,23 @@ fn extract_path_arg(args: &serde_json::Value) -> Vec<PathBuf> {
         "template", // officecli_merge 的模板源路径，需过沙箱门闸防读敏感文件
         "output",   // officecli_create/pdf 等的输出写目标，沙箱根越界检查约束写位置
     ];
+    // officecli 写类工具的 `output` 若是裸文件名（无目录分隔、非绝对路径），由 bridge 锚定到
+    // office-tools/_out/ 固定目录，不是 agent 可控的真实文件路径；此时若按 process cwd 拼接再去
+    // 过沙箱根越界检查，会校验一个与 bridge 实际写入目标不同的路径（语义错位）。故裸名跳过门闸，
+    // 仅对含目录分隔/绝对形式的 output 按真实路径继续门闸。
+    let bridge_anchored_out = matches!(tool_name, "officecli_create" | "officecli_pdf" | "officecli_merge");
     let mut out = Vec::new();
     if let Some(obj) = args.as_object() {
         for k in KEYS {
             if let Some(v) = obj.get(*k) {
                 if let Some(s) = v.as_str() {
+                    if bridge_anchored_out && *k == "output" {
+                        let pb = PathBuf::from(s);
+                        let is_bare = !s.contains('/') && !s.contains('\\') && !pb.is_absolute();
+                        if is_bare {
+                            continue; // 裸名由 bridge 锚定，跳过门闸
+                        }
+                    }
                     out.push(PathBuf::from(s));
                 }
             }
@@ -810,7 +822,7 @@ impl ComplianceBoundary {
         if GovernanceGuard::is_governance(tool_name) {
             return Some(ToolCheck::red(&format!("红线：{} 属于治理层，Agent 不可修改", tool_name)));
         }
-        let sandbox = ExecutionSandbox::check(tool_name, &extract_path_arg(args));
+        let sandbox = ExecutionSandbox::check(tool_name, &extract_path_arg(tool_name, args));
         if !sandbox.allow {
             return Some(sandbox);
         }
@@ -896,7 +908,7 @@ impl ComplianceBoundary {
         }
 
         // ── ② 代码与执行隔离 ──
-        let sandbox = ExecutionSandbox::check(tool_name, &extract_path_arg(args));
+        let sandbox = ExecutionSandbox::check(tool_name, &extract_path_arg(tool_name, args));
         if !sandbox.allow {
             return sandbox;
         }
@@ -1892,6 +1904,30 @@ mod tests {
             ],
         );
         assert!(r.allow, "move_file 全安全路径应放行");
+    }
+
+    #[test]
+    fn test_officecli_bare_output_skips_root_gate() {
+        // officecli 写类工具的裸文件名 output 由 bridge 锚定到 _out/，不应按 cwd 拼接去过沙箱根越界
+        // 检查（否则门闸校验的路径与实际写入目标不一致，语义错位）。
+        let bare_args = serde_json::json!({"file": "C:/workspace/tpl.docx", "output": "out.docx"});
+        let paths = extract_path_arg("officecli_pdf", &bare_args);
+        // 裸名 output 跳过门闸，只剩真实的 file 路径被提取
+        assert_eq!(paths.len(), 1, "裸名 output 不应进入门闸路径集合");
+        assert_eq!(paths[0], PathBuf::from("C:/workspace/tpl.docx"));
+
+        // 带目录分隔的 output 仍按真实路径提取并过门闸
+        let abs_args = serde_json::json!({"file": "C:/workspace/tpl.docx", "output": "C:/test/.ssh/id_ed25519"});
+        let paths = extract_path_arg("officecli_pdf", &abs_args);
+        assert_eq!(paths.len(), 2, "含路径的 output 应进入门闸路径集合");
+        let r = ExecutionSandbox::check("officecli_pdf", &paths);
+        assert!(!r.allow, "敏感 output 路径应触发沙箱门闸");
+        assert_eq!(r.level, Some(BlockLevel::Red));
+
+        // 非写类工具（officecli_query）的 output 不适用裸名豁免，仍按原逻辑提取
+        let q_args = serde_json::json!({"output": "x.docx"});
+        let paths = extract_path_arg("officecli_query", &q_args);
+        assert_eq!(paths.len(), 1, "非写类工具 output 仍提取");
     }
 
     #[test]

@@ -95,7 +95,22 @@ fn resolve_output(output: &str) -> std::path::PathBuf {
     // 词法锚定后 canonicalize（防中间 symlink 逃逸 _out），再对真实路径重新锚定校验；
     // out_dir 与 resolved 都 canonicalize，保证大小写/分隔符规范化后前缀比较一致。
     let out_dir_c = std::fs::canonicalize(&out_dir).unwrap_or(out_dir.clone());
-    let resolved = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+    // canonicalize 失败（文件未落盘/权限拒绝/Windows \\?\ verbatim 前缀）时，回退到词法规范化：
+    // 逐组件去 `..`/`.`，避免 _out 内 symlink 指向外部时词法 starts_with 误判通过，
+    // 从而让 OutputGuard::drop 删除 _out 之外的文件。
+    let resolved = std::fs::canonicalize(&resolved).unwrap_or_else(|_| {
+        let mut out = std::path::PathBuf::new();
+        for c in resolved.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
+    });
     // 拒绝逃逸 _out 的路径（.. 或任意绝对路径或 symlink 逃逸），避免删除守卫误删 _out 之外文件
     assert!(
         resolved.starts_with(&out_dir_c)
@@ -309,11 +324,16 @@ async fn officecli_create_adds_and_query() {
 
     // query：命中刚创建的段落。
     // file 用 bridge 返回的原始绝对路径（_out_path 返回 os.path.abspath 拼接，非 navigate verbatim）；
-    // 若意外为相对路径则用词法绝对路径（不经 canonicalize，避免 Windows \\?\ verbatim 前缀触发文件锁）
+    // 若意外为相对路径，则与 resolve_output 用同一套 _out strip 前缀逻辑（避免 output 已带 _out/ 时
+    // 产生 office-tools/_out/_out/<name> 双前缀），再转词法绝对路径（不经 canonicalize，
+    // 避免 Windows \\?\ verbatim 前缀触发文件锁）
     let query_file = if std::path::Path::new(output).is_absolute() {
         output.to_string()
     } else {
-        office_tools_dir().join("_out").join(output).to_string_lossy().to_string()
+        let rel = std::path::Path::new(output)
+            .strip_prefix("_out")
+            .unwrap_or(std::path::Path::new(output));
+        office_tools_dir().join("_out").join(rel).to_string_lossy().to_string()
     };
     let q_out = with_timeout(agent.call_tool_routed(
             "officecli_query",
