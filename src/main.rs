@@ -2467,13 +2467,18 @@ async fn handle_meeting_delete(
             }
         }
     };
-    // 全局 st.agent 锁已释放：落盘（删除后持久化）移到锁外、且用 spawn_blocking 迁移到
-    // 阻塞线程池，避免同步 fsync 写盘阻塞 tokio worker（reviewer round-17 #3/#5）。
-    // remove_meeting 已不再内部落盘（round-17 #3），此处须在锁外显式持久化。
-    let _ = persist_meetings_for(&agent_arc, |e| {
-        tracing::error!(error = %e, meeting = %id, "handle_meeting_delete: 会议已删除但落盘失败（可能进程崩溃后残留，请排查磁盘）");
-    }).await;
-    // presence 清理与实时广播均在锁外进行。
+    // 【reviewer round-25 #8 security·low】门禁已把「不存在/无权」挡在 403，此处错误串仅剩
+    // remove_meeting 的防御性返回（竞态窗口内被并发删除 / 权限变化），且已统一为中立串
+    // 「无权访问该会议」（round-25 #2），不会再经此回显会议存在性。客户端见到的任何错误
+    // 都是同一中立串，无法借 DELETE 探测私有 ID。
+    // 【reviewer round-25 #3 performance·medium】**先广播、后后台持久化**（与 handle_meeting_message
+    // round-22 #1 同一「实时优先 + 先广播后持久化」原则）：persist_meetings_for 内部是 spawn_blocking
+    // 全文件序列化 + fsync，且被 persist_lock 串行化——并发写多会议时磁盘延迟会排队，若 await 它
+    // 再广播 Ended，订阅端就被累积的磁盘延迟挡住，会议已删除却迟迟收不到终止信号。持久化是
+    // best-effort（失败仅 error 日志、删除已在内存生效、后续 save 不会再带上它），故：
+    //   1) presence 清理 + Ended 广播移到最前（订阅端立即收到终止信号，实时性不受磁盘影响）；
+    //   2) 再 spawn 后台持久化（best-effort，spawn_blocking 迁移到阻塞线程池，不占 tokio worker）。
+    // 全局 st.agent 锁已释放：presence 清理与实时广播均在锁外进行。
     st.meeting_presence.lock().await.remove(&id);
     // Step3 实时同步：广播终止事件。会议已被删除，get_meeting 之后恒为 None，
     // 若不广播，订阅端拿不到任何终止信号 → 本地状态永久陈旧、SSE 任务空转到客户端断开为止。
@@ -2484,6 +2489,16 @@ async fn handle_meeting_delete(
         serde_json::json!({ "deleted": true, "terminal": true, "status": "done", "phase": "done" }),
     )
     .await;
+    // 后台持久化（best-effort，不阻塞实时广播与响应）：remove_meeting 已不再内部落盘（round-17 #3），
+    // 此处 spawn 后台任务落盘，避免同步全量写盘挡在广播/响应关键路径。save_meetings 内部仍持轻量
+    // persist_lock 串行化，保进程崩溃不把已删除会议重新写回。
+    let pa = agent_arc.clone();
+    let pid = id.clone();
+    tokio::spawn(async move {
+        persist_meetings_for(&pa, |e| {
+            tracing::error!(error = %e, meeting = %pid, "handle_meeting_delete: 会议已删除但落盘失败（可能进程崩溃后残留，请排查磁盘）");
+        }).await;
+    });
     Json(serde_json::json!({"ok": true, "removed": id})).into_response()
 }
 
@@ -2662,23 +2677,20 @@ async fn handle_meeting_end(
             }
         }
     };
-    // 全局 st.agent 锁已释放。落盘移到锁外（round-15 #2）：end_meeting 已不再内部落盘，
-    // 此处须在释放全局锁后于锁外调用 save_meetings，避免把同步 fsync 写盘拖进持 st.agent
-    // 全局锁的临界区（否则慢磁盘阻塞所有 agent 操作）。仅当实际发生终态跃迁才落盘
+    // 全局 st.agent 锁已释放。end_meeting 已不再内部落盘（round-15 #2），此处须在锁外持久化，
+    // 避免把同步 fsync 写盘拖进持 st.agent 全局锁的临界区。仅当实际发生终态跃迁才写盘
     // （已终态幂等返回时状态未变，无需写盘）。
-    if transitioned {
-        // 【round-15 #3】落盘失败以 error 级日志记录（含会议 id），使审计域可发现
-        // 【round-17 #5】改用 spawn_blocking 迁移写盘到阻塞线程池，避免同步 fsync 阻塞 tokio worker
-        let _ = persist_meetings_for(&agent_arc, |e| {
-            tracing::error!(error = %e, meeting = %id, "handle_meeting_end: 会议已结束但共识落盘失败（可能进程崩溃丢失，请排查磁盘）");
-        }).await;
-    }
+    // 【reviewer round-25 #4 performance·medium】**先广播、后后台持久化**（与 handle_meeting_message
+    // round-22 #1 / handle_meeting_delete round-25 #3 同一「实时优先 + 先广播后持久化」原则）：
+    // persist_meetings_for 内部是 spawn_blocking 全文件序列化 + fsync，且被 persist_lock 串行化——
+    // 若 await 它再广播 Ended，磁盘慢时订阅端滞留非终态 + /end 响应被延迟。故把 presence 清理 +
+    // Ended 广播移到最前，持久化 spawn 后台执行（best-effort，失败仅 error 日志、内存终态已生效、
+    // 后续 save 会带上它）。
     // 以下 presence 清理与广播均在锁外进行。
     match transitioned {
         true => {
-            // 实际发生终态跃迁：清理在线态并广播 ended 事件
+            // 实际发生终态跃迁：清理在线态并广播 ended 事件（增量，不含完整消息历史）
             st.meeting_presence.lock().await.remove(&id);
-            // Step3 实时同步：广播结束事件（增量，不含完整消息历史）
             broadcast_meeting_event(
                 &st,
                 &id,
@@ -2690,6 +2702,14 @@ async fn handle_meeting_end(
                     "consensus": consensus,
                 }),
             ).await;
+            // 后台持久化（best-effort，不阻塞实时广播与响应）：仅终态跃迁后才 spawn 落盘。
+            let pa = agent_arc.clone();
+            let pid = id.clone();
+            tokio::spawn(async move {
+                persist_meetings_for(&pa, |e| {
+                    tracing::error!(error = %e, meeting = %pid, "handle_meeting_end: 会议已结束但共识落盘失败（可能进程崩溃丢失，请排查磁盘）");
+                }).await;
+            });
             Json(serde_json::json!({"ok": true, "ended": id})).into_response()
         }
         false => {
@@ -2826,13 +2846,15 @@ fn spawn_meeting_presence_sweeper(st: Arc<AppState>) {
             // 内层全部条目已超过 15s 保留（无人心跳）→ 回收该键。注意非终态会议若仍有活跃心跳
             // 不应被误清（内层有 fresh 条目），仅全 stale 才回收。
             // 先取「内层全 stale」的 id 集合（仅 presence 锁，O(内层)）；再与缺失/终态判定合并。
-            let mut stale_ids: Vec<String> = Vec::new();
+            // 【reviewer round-25 #6 performance·low】用 HashSet 而非 Vec.contains：下方 O(ids) 循环
+            // 内做成员测试，Vec 是 O(n²)（每个都线性扫），HashSet 摊还 O(1)。
+            let mut stale_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
             {
                 let p = st.meeting_presence.lock().await;
                 for (id, inner) in p.iter() {
                     let all_stale = inner.values().all(|h| h.elapsed().as_secs() >= 15);
                     if all_stale {
-                        stale_ids.push(id.clone());
+                        stale_ids.insert(id.clone());
                     }
                 }
             }
@@ -2845,16 +2867,32 @@ fn spawn_meeting_presence_sweeper(st: Arc<AppState>) {
                     .map(|a| a.meetings_need_presence_clear(&ids))
                     .unwrap_or_else(|| vec![true; ids.len()])
             };
-            let mut to_remove: Vec<String> = Vec::new();
+            // to_remove: (id, force_clear)。force_clear=true 表示该会议已被 agent 判定为缺失/终态
+            // （删除无条件安全）；force_clear=false 表示仅因「内层全 stale」入选，须在最终锁内复核。
+            let mut to_remove: Vec<(String, bool)> = Vec::new();
             for (id, clear) in ids.iter().zip(should_clear.iter()) {
-                if *clear || stale_ids.contains(id) {
-                    to_remove.push(id.clone());
+                if *clear {
+                    to_remove.push((id.clone(), true));
+                } else if stale_ids.contains(id) {
+                    to_remove.push((id.clone(), false));
                 }
             }
             if !to_remove.is_empty() {
                 let mut p = st.meeting_presence.lock().await;
-                for id in &to_remove {
-                    p.remove(id);
+                for (id, force) in &to_remove {
+                    if *force {
+                        // 会议缺失/终态：删除无条件安全（心跳对缺失/终态会议恒 403，不会重建）。
+                        p.remove(id);
+                    } else if let Some(inner) = p.get(id) {
+                        // 【reviewer round-25 #5 bug·medium】消除 check-then-act 竞态：stale_ids 判定在
+                        // 上方**另一把锁**内完成，从判定到此处 remove 之间，并发心跳可能已把该条目刷新为
+                        // fresh（15s 窗口内），若仍按陈旧判定删除，会误删刚上报的在线态（客户端认为在线、
+                        // 服务器却已把它清掉）。故在**同一把锁**内复核该条目仍全 stale 才 remove——
+                        // 刚被心跳刷新的条目此处判定非 stale，跳过删除，避免丢失最新在线态。
+                        if inner.values().all(|h| h.elapsed().as_secs() >= 15) {
+                            p.remove(id);
+                        }
+                    }
                 }
             }
         }
@@ -2908,14 +2946,27 @@ async fn handle_meeting_stream(
         Some(true) => {}
     }
 
-    // Step3 顺序关键：先克隆快照（锁内），再订阅**该会议**专属通道，订阅后立刻复核会议是否
+    // Step3 顺序关键：先克隆快照，再订阅**该会议**专属通道，订阅后立刻复核会议是否
     // 在「克隆→订阅」窗口内发生变化（如并发发言）；若变化则重新克隆，使快照包含该事件，
     // 避免该事件既在快照中又被 rx 重放导致前端重复应用（subscribe/snapshot 竞态修复）。
+    // 【reviewer round-25 #7 performance·low】克隆快照**移出全局 agent 锁**：全局 `st.agent`
+    // 锁只守卫 `Option<Arc<AgentCore>>` 槽位，一旦取到 `Arc`，其内部方法各自用 `self.meetings`
+    // 的内部锁保护数据（与 handle_meeting_message/end/delete 的 `agent.clone()` 后锁外调用同一
+    // 模式）。此前在 `st.agent` 锁内 clone 完整 Meeting（O(会议大小)），大会议 / 多订阅者会在
+    // 全局锁临界区内做全量深拷贝，阻塞所有 agent 操作。改为短锁取 `agent_arc` 后立即释放，
+    // get_meeting / meeting_state 全在锁外进行（内部 meetings 锁仍串行化单次访问）。
     let id2 = id.clone();
-    let mut snap = {
+    let agent_arc = {
         let g = st.agent.lock().await;
-        g.as_ref().and_then(|a| a.get_meeting(&id2))
+        // 门禁 meeting_visible 已确认 Some(true)；此处再取一次以防「门禁→取句柄」窗口内
+        // agent 从就绪变未就绪（实际启动期设置后不再变化，防御性处理）。None → 503。
+        match &*g {
+            Some(a) => a.clone(),
+            None => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "服务尚未就绪").into_response(),
+        }
     };
+    // 锁外克隆初始快照与轻量状态（内部 meetings 锁串行化，不驻留全局锁）。
+    let mut snap = agent_arc.get_meeting(&id2);
     let mut rx = {
             let mut map = st.meeting_tx.lock().await;
             map.entry(id2.clone())
@@ -2925,10 +2976,7 @@ async fn handle_meeting_stream(
     // 复核窗口：用 meeting_state()（仅取 status/phase/发言数/终态标记，不克隆整会）判断快照是否过期，
     // 仅在确实变化时再克隆完整会议用于序列化，避免每次订阅都做全量 clone 占用全局 agent 锁、
     // 拖慢大会议的所有 agent 操作（发言 / A2A / 生命周期 handler）。
-    let state = {
-        let g = st.agent.lock().await;
-        g.as_ref().and_then(|a| a.meeting_state(&id2))
-    };
+    let state = agent_arc.meeting_state(&id2);
     // 终态快照：status != running / phase == Done / 含 phase_raw 的未知 phase 都表示会议已结束。
     // 终态判定统一委托给 agent_core::agent::Meeting::is_terminal()（reviewer round-19 #1）——
     // 它覆盖 phase_raw 未知 phase 的保守判定，是 status/phase/phase_raw 的单一来源，避免各
@@ -2942,14 +2990,14 @@ async fn handle_meeting_stream(
                 None => true,
             };
             if changed {
-                // 仅在确实变化时克隆完整会议（用于快照序列化），避免每次订阅全量 clone
-                let g = st.agent.lock().await;
+                // 仅在确实变化时克隆完整会议（用于快照序列化），避免每次订阅全量 clone。
+                // 在 agent_arc 上调用（锁外，内部 meetings 锁串行化），不驻留全局 agent 锁。
                 // 【reviewer round-17 #7 bug·medium】无条件赋值（含 None）：
                 // 若 get_meeting 返回 None（复核窗口内被并发删除），snap 必须置 None，
                 // 与下方 `state == None` 分支一致地走 ended(deleted) 终止路径，而不是保留
                 // 陈旧的（非终态 running）快照——否则会用过期 status 发「running + terminal:true」
                 // 的矛盾 ended payload，且丢失 deleted 标记。
-                snap = g.as_ref().and_then(|a| a.get_meeting(&id2));
+                snap = agent_arc.get_meeting(&id2);
             }
         }
         None => {
@@ -2967,8 +3015,10 @@ async fn handle_meeting_stream(
         .unwrap_or_default();
     let (tx, rx_out) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(64);
     let st2 = st.clone();
+    // 把 agent_arc 克隆进流任务，供 Lagged 重同步锁外克隆（避免每 60s 持全局 agent 锁）。
+    let agent_arc2 = agent_arc.clone();
     tokio::spawn(async move {
-        // 初始快照：克隆已在上方锁内完成，此处仅序列化并发送。
+        // 初始快照：克隆已在上方锁外完成，此处仅序列化并发送。
         if let Some(m) = snap {
             // 序列化失败不应静默下发空快照（会污染客户端会议状态）；记录诊断并终止流。
             let data = match serde_json::to_string(&m) {
@@ -3087,11 +3137,9 @@ async fn handle_meeting_stream(
                         Ok(_) => {}
                         // 客户端落后超过缓冲：重新发送完整快照以重同步，避免静默丢事件
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            // 同初始快照：克隆在锁内、序列化在锁外
-                            let m = {
-                                let g = st2.agent.lock().await;
-                                g.as_ref().and_then(|a| a.get_meeting(&id2))
-                            };
+                            // 同初始快照：克隆在 agent_arc 上做（锁外，内部 meetings 锁串行化）；
+                            // 此前在 st2.agent 全局锁内克隆，Lagged 高频时反复驻留全局锁。
+                            let m = agent_arc2.get_meeting(&id2);
                             match m {
                                 Some(m) => {
                                     let s = match serde_json::to_string(&m) {

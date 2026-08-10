@@ -1572,7 +1572,13 @@ impl AgentCore {
         out
     }
 
-    /// 删除会议（私有且非拥有者 / 非 admin 则拒）
+    /// 删除会议（私有且非拥有者 / 非 admin 则拒）。
+    /// 【reviewer round-25 #2 bug·low 反枚举】会议不存在与「无权删除」统一返回同一个
+    /// **中立错误串**「无权访问该会议」，绝不区分「会议不存在」/「无权删除该会议」——
+    /// 否则 HTTP 层即便用 meeting_visible 门禁挡在前面，仍存在门禁通过后到 remove_meeting
+    /// 之间的竞态窗口（会议被并发删除 / 权限变化），错误串差异经该窗口回显给客户端，
+    /// 会被用来探测私有会议 ID 是否存在（与 add_meeting_message / end_meeting 的 round-15
+    /// 反枚举策略一致）。可见即可删，权威授权判定在调用方（main.rs 的 meeting_visible）。
     pub fn remove_meeting(&self, id: &str, caller: &str, is_admin: bool) -> Result<(), String> {
         let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
         let pos = v.iter().position(|m| m.id == id);
@@ -1580,7 +1586,7 @@ impl AgentCore {
             Some(i) => {
                 let m = &v[i];
                 if m.is_private && !is_admin && m.owner_user_id != caller {
-                    return Err("无权删除该会议".to_string());
+                    return Err("无权访问该会议".to_string());
                 }
                 v.remove(i);
                 // 【round-17 #3 性能】不再在此处同步落盘：本方法由 handle_meeting_delete 在持
@@ -1589,7 +1595,7 @@ impl AgentCore {
                 // 在释放全局锁后于锁外调 save_meetings()（仍持轻量 persist_lock 串行化）。
                 Ok(())
             }
-            None => Err("会议不存在".to_string()),
+            None => Err("无权访问该会议".to_string()),
         }
     }
 
@@ -1610,11 +1616,25 @@ impl AgentCore {
         let _pg = self.persist_lock.lock().unwrap_or_else(|p| p.into_inner());
         let serialized = {
             let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
-            match serde_json::to_string_pretty(&serde_json::json!({ "meetings": v.iter().collect::<Vec<_>>() }))
-            {
+            // 【reviewer round-25 #1 bug·medium】不用 `serde_json::json!({ "meetings": v.iter().collect() })`
+            // 宏：`json!` 会对非字面量表达式内部执行 `to_value(&$other).unwrap()`，一旦某个会议
+            // `Meeting::Serialize` 返回防御性 Err（round-20 #3 的恢复路径），会在宏内 **panic**，
+            // 使下方 `return Err(...)` 的恢复路径不可达。改为显式逐会议 `serde_json::to_value`，
+            // 把单个会议序列化失败转成可恢复的 `Err`，真正让「序列化失败跳过落盘」的分支可达。
+            let mut vals = Vec::with_capacity(v.len());
+            for m in v.iter() {
+                match serde_json::to_value(m) {
+                    Ok(val) => vals.push(val),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "save_meetings: 序列化单个会议失败，跳过落盘");
+                        return Err(format!("序列化会议失败: {e}"));
+                    }
+                }
+            }
+            match serde_json::to_string_pretty(&serde_json::json!({ "meetings": vals })) {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!(error = %e, "save_meetings: 序列化会议失败，跳过落盘");
+                    tracing::warn!(error = %e, "save_meetings: 序列化会议列表失败，跳过落盘");
                     return Err(format!("序列化会议失败: {e}"));
                 }
             }
