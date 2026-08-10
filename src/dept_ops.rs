@@ -222,10 +222,11 @@ pub fn ops_playbook_prompt() -> &'static str {
 - **禁止**改 `.env` / 密钥 / `*.db`
 - 允许仓仅：dashboard / agent-core / agent-base
 
-### 通用办公地基复用（P1，与 office 层协作）
-- Excel / Word / PPT / PDF / 网页等**通用文档操作优先调用通用办公工具**（全局可见的 office 地基）：
-  `read_xlsx` / `write_xlsx` / `create_docx` / `read_docx` / `create_pptx` / `generate_pdf` / `summarize_url`
-- **禁止**在本部门 skill 内重复实现 openpyxl / docx / fpdf 样板；新需求一律走 office 地基
+### 通用办公地基复用（P1，与 officecli 引擎协作）
+- Excel / Word / PPT / PDF / 网页等**通用文档操作优先调用 officecli 引擎**（全局可见）：
+  `officecli_read` / `officecli_query` / `officecli_create` / `officecli_merge` / `officecli_pdf` / `officecli_validate` / `officecli_issues` / `officecli_render`
+- 文件系统/URL/分析底座走 fsutil 源：`list_dir` / `find_files` / `file_info` / `move_file` / `delete_path` / `summarize_url` / `data_analysis`
+- **禁止**在本部门 skill 内重复实现 openpyxl / docx / fpdf 样板；新需求一律走 officecli 引擎
 "#
 }
 

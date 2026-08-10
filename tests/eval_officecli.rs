@@ -1,0 +1,233 @@
+//! officecli MCP 源连通性集成测试（P1 最小可验证闭环）
+//!
+//! 用真实 stdio 源（officecli_mcp_bridge.py）验证：
+//!   1. tools/list 能列出 5 个 officecli_* 工具
+//!   2. call_tool_routed 能跨源路由并实际调用 officecli_read
+//!   3. 目录穿越路径被 bridge 拒绝
+//!
+//! 依赖 officecli-win-x64.exe + officecli_mcp_bridge.py 存在于 office-tools 目录。
+//! 运行：cargo test --test eval_officecli -- --ignored --nocapture
+
+use agent_core::agent::{AgentConfig, AgentCore, AgentIdentity};
+use agent_core::boundary::PermissionLevel;
+use agent_core::checkpoint::CheckpointStore;
+use agent_core::harness::HarnessStore;
+use agent_core::llm::LlmConfig;
+use agent_core::meta_evolve::{MetaEvolutionConfig, SafetyConfig};
+use agent_core::resources::LocalResourceSnapshot;
+use std::sync::{Arc, Mutex};
+
+// office-tools 目录通过环境变量 OFFICE_TOOLS 注入（避免在公开仓库提交本机绝对路径）。
+// 缺省回退到仓库旁的 office-tools（相对路径），便于本地跑。
+fn office_tools_dir() -> std::path::PathBuf {
+    std::env::var("OFFICE_TOOLS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("office-tools")
+        })
+}
+
+fn python_bin() -> String {
+    std::env::var("PYTHON_BIN").unwrap_or_else(|_| "python".to_string())
+}
+
+fn agent_with_officecli() -> AgentCore {
+    let tools_dir = office_tools_dir();
+    let stdio = tools_dir.join("officecli_mcp_bridge.py");
+    let config = AgentConfig {
+        identity: AgentIdentity {
+            agent_id: "eval-officecli".into(),
+            namespace: "agent/eval-officecli".into(),
+            badge_token: String::new(),
+            ns_full_path: None,
+            persona_id: None,
+            owner_user_id: None,
+            workspace_dir: None,
+            tool_allowlist: Vec::new(),
+            memory_namespace: None,
+        },
+        llm: LlmConfig::default(),
+        memoria_url: String::new(),
+        additional_mcp: vec![(
+            "officecli".to_string(),
+            String::new(), // stdio 源 url 置空
+            String::new(),
+            Some((
+                python_bin(),
+                vec![stdio.to_string_lossy().to_string()],
+            )),
+            None, // namespace 留空 = 全局可见
+        )],
+        skill_whitelist: None,
+        max_tool_rounds: 3,
+        parent_permission: PermissionLevel::Write,
+        enable_compositional_routing: true,
+        compositional_preview: true,
+        strict_schema: false,
+        system_prompt_template: None,
+        approver_id: None,
+        meta_evolution: MetaEvolutionConfig::default(),
+        safety: SafetyConfig::default(),
+        human_approval: false,
+        features: agent_core::agent::FeatureFlags::default(),
+        lats: agent_core::lats::LatsConfig::default(),
+        multiagent: agent_core::multiagent::MultiAgentConfig::default(),
+        ttc: agent_core::ttc::TtcConfig::default(),
+        intake_filter: agent_core::intake_filter::IntakeFilterConfig::default(),
+    };
+    let harness = HarnessStore::open_memory().unwrap();
+    let cp = CheckpointStore::open_memory().unwrap();
+    let local_resources = Arc::new(Mutex::new(LocalResourceSnapshot::default()));
+    AgentCore::new(
+        config,
+        harness,
+        cp,
+        local_resources,
+        Arc::new(agent_core::metrics::MetricsRegistry::default()),
+    )
+}
+
+#[tokio::test]
+#[ignore = "需要 officecli 二进制 + office-tools 目录"]
+async fn officecli_tools_are_listed() {
+    let agent = agent_with_officecli();
+    let tools = agent.fetch_tools_filtered(&["agent/eval-officecli".to_string()]).await;
+    let names: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
+    for expected in [
+        "officecli_read",
+        "officecli_validate",
+        "officecli_issues",
+        "officecli_merge",
+        "officecli_render",
+        "officecli_pdf",
+        "officecli_create",
+        "officecli_query",
+    ] {
+        assert!(names.contains(&expected), "应列出 {expected}，实际: {names:?}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "需要 officecli 二进制 + office-tools 目录 + 真实文档"]
+async fn officecli_read_routes_and_calls() {
+    let agent = agent_with_officecli();
+    let res = agent
+        .call_tool_routed(
+            "officecli_read",
+            "default",
+            &serde_json::json!({"file": office_tools_dir().join("_out.docx"), "max_lines": 3}),
+            &["agent/eval-officecli".to_string()],
+            "officecli-e2e",
+        )
+        .await;
+    let out = res.expect("officecli_read 应调用成功");
+    assert!(out.contains("success"), "返回应含 success，实际: {}", out);
+}
+
+#[tokio::test]
+#[ignore = "需要 officecli 二进制 + office-tools 目录"]
+async fn officecli_rejects_traversal() {
+    let agent = agent_with_officecli();
+    let res = agent
+        .call_tool_routed(
+            "officecli_read",
+            "default",
+            &serde_json::json!({"file": r"..\..\Windows\win.ini"}),
+            &["agent/eval-officecli".to_string()],
+            "officecli-e2e-traversal",
+        )
+        .await;
+    assert!(res.is_err(), "目录穿越路径应被拒绝");
+    let err = res.unwrap_err();
+    assert!(err.contains("穿越") || err.contains(".."), "错误信息应说明穿越，实际: {err}");
+}
+
+#[tokio::test]
+#[ignore = "需要 officecli 二进制 + office-tools 目录"]
+async fn officecli_create_adds_and_query() {
+    let agent = agent_with_officecli();
+    // create：建 docx + 加一个段落
+    let res = agent
+        .call_tool_routed(
+            "officecli_create",
+            "default",
+            &serde_json::json!({
+                "output": "e2e_create.docx",
+                "adds": [{"type": "paragraph", "parent": "/body", "props": {"text": "E2E 集成创建"}}],
+            }),
+            &["agent/eval-officecli".to_string()],
+            "officecli-e2e-create",
+        )
+        .await;
+    let create_out = res.expect("officecli_create 应成功");
+    assert!(create_out.contains("success"), "create 应含 success: {create_out}");
+
+    // 取回输出路径
+    let val: serde_json::Value =
+        serde_json::from_str(&create_out).expect("create 返回应为 JSON");
+    let output = val["output"].as_str().expect("应含 output 路径");
+    assert!(output.ends_with("e2e_create.docx"), "output 应指向 e2e_create.docx: {output}");
+
+    // query：命中刚创建的段落
+    let res = agent
+        .call_tool_routed(
+            "officecli_query",
+            "default",
+            &serde_json::json!({"file": output, "selector": "paragraph"}),
+            &["agent/eval-officecli".to_string()],
+            "officecli-e2e-query",
+        )
+        .await;
+    let q_out = res.expect("officecli_query 应成功");
+    assert!(q_out.contains("E2E 集成创建"), "query 应命中新段落，实际: {}", q_out);
+}
+
+#[tokio::test]
+#[ignore = "需要 officecli 二进制 + office-tools 目录"]
+async fn officecli_query_rejects_write_selector() {
+    let agent = agent_with_officecli();
+    let res = agent
+        .call_tool_routed(
+            "officecli_query",
+            "default",
+            &serde_json::json!({"file": office_tools_dir().join("_out.docx"), "selector": "add /body paragraph"}),
+            &["agent/eval-officecli".to_string()],
+            "officecli-e2e-query-guard",
+        )
+        .await;
+    assert!(res.is_err(), "query 应拒绝写类 selector");
+    let err = res.unwrap_err();
+    assert!(err.contains("禁止写入"), "错误信息应说明写保护，实际: {err}");
+}
+
+#[tokio::test]
+#[ignore = "需要 officecli 二进制 + office-tools 目录 + PDF exporter 插件"]
+async fn officecli_pdf_exports_valid_pdf() {
+    let agent = agent_with_officecli();
+    let res = agent
+        .call_tool_routed(
+            "officecli_pdf",
+            "default",
+            &serde_json::json!({"file": office_tools_dir().join("_out.docx"), "output": "e2e_export.pdf"}),
+            &["agent/eval-officecli".to_string()],
+            "officecli-e2e-pdf",
+        )
+        .await;
+    let out = res.expect("officecli_pdf 应成功");
+    assert!(out.contains("success") || out.contains("output"), "应含成功/输出路径: {out}");
+
+    // 校验产物是合法 PDF
+    let val: serde_json::Value =
+        serde_json::from_str(&out).expect("pdf 返回应为 JSON");
+    let pdf_path = val["output"].as_str().expect("应含 output 路径");
+    let bytes = std::fs::read(pdf_path).expect("PDF 文件应存在");
+    assert!(bytes.len() > 100, "PDF 不应为空");
+    assert!(
+        bytes.starts_with(b"%PDF"),
+        "应以 %PDF 魔数开头，实际: {:?}",
+        &bytes[..5.min(bytes.len())]
+    );
+}

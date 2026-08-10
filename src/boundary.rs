@@ -1049,8 +1049,6 @@ impl ToolClassifier {
             "code_reader",
             "verify_code",
             "summarize_url",
-            "read_docx",
-            "read_xlsx",
             // 真实 MCP 工具名（dashboard stdio skills）兜底，避免首轮 learn 前被误判
             "execute_sql",
             "fuzzy_match_plate",
@@ -1083,10 +1081,13 @@ impl ToolClassifier {
             "predict_vehicle_flow",
             "review_data",
             "generate_report",
-            "create_docx",
-            "create_pptx",
-            "generate_pdf",
             "summarize_url",
+            // OfficeCLI 文档引擎只读能力（officecli 源）：读/查/校验/健康/渲染
+            "officecli_read",
+            "officecli_query",
+            "officecli_validate",
+            "officecli_issues",
+            "officecli_render",
             // Memoria 只读：前缀 memory_ 不在 query_/search_/get_ 启发式内，必须显式列入
             "memory_search",
             "memory_search_v2",
@@ -1127,6 +1128,10 @@ impl ToolClassifier {
             "entity_add_mention",
             "entity_add_edge",
             "repo_ws_diff", // 轨二：白名单仓改动（应用 diff，本质写；危险地板由 HARD_DANGEROUS 兜底）
+            // OfficeCLI 文档引擎写能力（officecli 源）：建文档/模板合并/PDF 导出（产出到 _out/，非破坏性）
+            "officecli_create",
+            "officecli_merge",
+            "officecli_pdf",
             // P0-1 场景沙箱：写生命周期（创建/加变更/提交/丢弃；commit 强制审批）
             "scenario_create",
             "scenario_add_change",
@@ -2044,8 +2049,24 @@ mod tests {
             "check_media_files",
             "analyze_manifest_anomaly",
             "predict_vehicle_flow",
+            // P2b：officecli 文档引擎只读能力
+            "officecli_read",
+            "officecli_query",
+            "officecli_validate",
+            "officecli_issues",
+            "officecli_render",
         ] {
             assert_eq!(c.classify(t), "read", "{t} 应分类为 read（纯查询，不得审批）");
+        }
+    }
+
+    #[test]
+    fn test_officecli_write_tools_classified_write() {
+        // P2b：officecli 写类工具（create/merge/pdf）产出到 _out/，应分类为 write 需审批
+        let b = ComplianceBoundary::new(None);
+        let c = b.classifier.lock().unwrap();
+        for t in ["officecli_create", "officecli_merge", "officecli_pdf"] {
+            assert_eq!(c.classify(t), "write", "{t} 应分类为 write（产出文件，需写权限）");
         }
     }
 
