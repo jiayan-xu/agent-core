@@ -44,6 +44,13 @@
   **不得**混入业务代码改动。
 - tag 是**不可变**锚点：打错 tag 只能删除重建，禁止 `--force` 覆盖已有 tag。
 
+## tag 推送策略（2026-08-10 起生效）
+
+- `.githooks/pre-push` 已放开 **annotated 语义化版本 tag（`refs/tags/v*`）** 推送，
+  作为发版锚点；**其余 tag 仍拦截**（防 lightweight tag 滥用）。
+- tag 必须用 annotated 创建：`git tag -a vX.Y.Z -m "说明"`。
+- 推送：`git push origin refs/tags/vX.Y.Z`（或 `git push --tags` 一并推送）。
+
 ## 与 office 迁移（P2）的协调
 
 - office 迁移（本地源改名 `fsutil` + officecli 接入）涉及 `agent.toml` / `boundary.rs` /
