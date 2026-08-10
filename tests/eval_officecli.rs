@@ -7,6 +7,10 @@
 //!
 //! 依赖 officecli-win-x64.exe + officecli_mcp_bridge.py 存在于 office-tools 目录。
 //! 运行：cargo test --test eval_officecli -- --ignored --nocapture
+//!
+//! 说明：本文件是标记 #[ignore] 的真实子进程集成测试（需 officecli 二进制 + office-tools 目录），
+//! 非默认单元测试。少量输入/产物校验使用同步 std::fs（file 小、量少），对 tokio 运行时影响可忽略；
+//! 关键前置检查（require_fixture）已放在 async 段之前执行。
 
 use agent_core::agent::{AgentConfig, AgentCore, AgentIdentity};
 use agent_core::boundary::PermissionLevel;
@@ -65,6 +69,18 @@ fn require_fixture() -> std::path::PathBuf {
         "fixture 缺失: {fixture:?}（office-tools 目录需预置 _out.docx）"
     );
     fixture
+}
+
+/// 把 bridge 返回的 output 路径解析为绝对路径。
+/// bridge 契约：输出锚定到 office-tools/_out/（_out_path 返回绝对路径）；若意外返回裸文件名，
+/// 则基于 office_tools_dir()/_out/ 解析，而非 office-tools 根（避免校验错目录）。
+fn resolve_output(output: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(output);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        office_tools_dir().join("_out").join(p)
+    }
 }
 
 fn agent_with_officecli() -> AgentCore {
@@ -180,6 +196,8 @@ async fn officecli_rejects_traversal() {
     let agent = agent_with_officecli();
     // 用平台原生分隔符构造穿越路径（Windows `..\..\Windows\win.ini`，Unix `../../etc/passwd`），
     // 避免硬编码单平台反斜杠导致平台不健壮。
+    // bridge 契约（_safe_input_path）：先验 `..` 穿越（L159-160），再验文件存在（L162），
+    // 因此含 `..` 的输入必然触发「禁止目录穿越」拒绝，与目标文件是否存在无关。
     let sep = std::path::MAIN_SEPARATOR;
     let traversal = format!("..{sep}..{sep}Windows{sep}win.ini");
     let payload = serde_json::json!({"file": traversal});
@@ -194,7 +212,8 @@ async fn officecli_rejects_traversal() {
         .expect("穿越调用应在 30s 内返回");
     assert!(res.is_err(), "目录穿越路径应被拒绝");
     let err = res.unwrap_err();
-    assert!(err.contains("穿越") || err.contains(".."), "错误信息应说明穿越，实际: {err}");
+    // 只认 bridge 的显式穿越拒绝信号（「禁止目录穿越」），不匹配 `..` 回显——避免「文件不存在」导致的误通过
+    assert!(err.contains("穿越"), "错误信息应说明穿越拒绝，实际: {err}");
 }
 
 #[tokio::test]
@@ -226,13 +245,8 @@ async fn officecli_create_adds_and_query() {
     );
     let output = val["output"].as_str().expect("应含 output 路径");
     assert!(output.ends_with(&out_name), "output 应指向 {out_name}: {output}");
-    // bridge 锚定输出到 office-tools/_out/；若返回相对路径则基于 office_tools_dir() 解析再校验落盘
-    let output_path = std::path::Path::new(output);
-    let abs_output = if output_path.is_absolute() {
-        output_path.to_path_buf()
-    } else {
-        office_tools_dir().join(output_path)
-    };
+    // bridge 锚定输出到 office-tools/_out/；resolve_output 统一解析（绝对路径直接用，裸名补 _out/）
+    let abs_output = resolve_output(output);
     assert!(abs_output.is_file(), "create 产物应已落盘: {abs_output:?}");
 
     // query：命中刚创建的段落
@@ -255,6 +269,8 @@ async fn officecli_create_adds_and_query() {
         q_text.contains("E2E 集成创建"),
         "query 应命中新段落，实际: {q_out}"
     );
+    // best-effort 清理产物，避免 repeated/CI 运行在 _out/ 累积垃圾
+    let _ = std::fs::remove_file(&abs_output);
 }
 
 #[tokio::test]
@@ -303,12 +319,7 @@ async fn officecli_pdf_exports_valid_pdf() {
     let val: serde_json::Value =
         serde_json::from_str(&out).expect("pdf 返回应为 JSON");
     let pdf_path = val["output"].as_str().expect("应含 output 路径");
-    let pdf_path_abs = std::path::Path::new(pdf_path);
-    let pdf_path_abs = if pdf_path_abs.is_absolute() {
-        pdf_path_abs.to_path_buf()
-    } else {
-        office_tools_dir().join(pdf_path_abs)
-    };
+    let pdf_path_abs = resolve_output(pdf_path);
     let bytes = std::fs::read(&pdf_path_abs).expect("PDF 文件应存在");
     assert!(bytes.len() > 100, "PDF 不应为空");
     assert!(
@@ -316,4 +327,6 @@ async fn officecli_pdf_exports_valid_pdf() {
         "应以 %PDF 魔数开头，实际: {:?}",
         &bytes[..5.min(bytes.len())]
     );
+    // best-effort 清理产物，避免 repeated/CI 运行在 _out/ 累积垃圾
+    let _ = std::fs::remove_file(&pdf_path_abs);
 }
