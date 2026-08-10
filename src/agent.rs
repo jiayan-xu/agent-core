@@ -33,6 +33,11 @@ pub const CONFIRM_PREFIXES: &[&str] = &["确认", "同意", "批准", "执行吧
 /// 与 `std::process::id()` 拼成唯一临时名 `meetings.tmp.<pid>.<计数>`，每次写入都落在新文件上，
 /// 崩溃残留的陈旧 tmp 不再阻塞后续落盘（固定名 + create_new 的可恢复性回归，见 write_meetings_file）。
 static WRITE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 临时文件写入的自愈重试上限（reviewer round-22 #2 security·low）：create_new 遇 AlreadyExists
+/// （目标被预创建 / 残留）时换下一计数重试，最多本上限次。有界防止本地攻击者预创建大量文件
+/// 无限拖长落盘，同时保留 create_new 防 symlink —— 攻击者需预创建全部上线数量的文件才可能让
+/// 一次落盘失败，且只是有界失败、不触发 symlink 跟随。
+const WRITE_TMP_MAX_TRIES: usize = 64;
 /// 复核/核查前缀：单独不算确认（用户要核对信息），仅当后续含明确确认 token 才算。
 pub const REVIEW_PREFIXES: &[&str] = &["确认一下", "确认下", "确认后"];
 use crate::checkpoint::{CheckpointState, CheckpointStore};
@@ -1474,16 +1479,17 @@ impl AgentCore {
     /// 序列化争用）。返回 `Vec<bool>`，与入参 ids 一一对应；`true` 表示该会议应清理其 presence。
     pub fn meetings_need_presence_clear(&self, ids: &[String]) -> Vec<bool> {
         let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+        // 【reviewer round-22 #1 performance·low】单次构建 `id -> is_terminal` 映射（O(#meetings)），
+        // 再对每个 id 用 HashMap 查找（O(ids)）——总线性 O(ids + #meetings)。原先对每个 id 都
+        // `v.iter().find`（O(ids × #meetings)），在 presence set / 会议数增长时，每 60s 的 sweeper
+        // 会长时间持有 meetings 锁，阻塞 add_meeting_message / end_meeting 等（它们都抢同一把锁）。
+        // 会议不存在 → 应清理（HashMap 查不到即 true）。
+        let terminal_map: std::collections::HashMap<&str, bool> = v
+            .iter()
+            .map(|m| (m.id.as_str(), m.is_terminal()))
+            .collect();
         ids.iter()
-            .map(|id| match v.iter().find(|m| m.id == *id) {
-                // 会议不存在 → 应清理
-                None => true,
-                // 会议存在但已终态（status=done / phase=Done / 含 phase_raw 的未知 phase）→ 应清理
-                // （终态后无心跳，presence 泄漏）。统一用 Meeting::is_terminal()（reviewer round-19 #1）：
-                // 它覆盖 phase_raw 未知 phase 的保守终态判定，与 meeting_state / 心跳侧共享同一谓词，
-                // 避免此处仍用 is_terminal_state(&m.status, m.phase) 而把含 phase_raw 的会议漏判为活跃。
-                Some(m) => m.is_terminal(),
-            })
+            .map(|id| terminal_map.get(id.as_str()).copied().unwrap_or(true))
             .collect()
     }
 
@@ -1617,6 +1623,13 @@ impl AgentCore {
     ///     `pid + 递增计数`，**不含随机成分**——pid 可预测且会复用、计数器重启后归零，故「攻击者
     ///     无法预知 tmp 名」是过度声明。防 symlink 真正依赖 `create_new(true)` 拒绝任何已存在目标
     ///     （含软链）而非文件名保密；唯一名只是避免崩溃残留阻塞后续落盘。
+    ///   - 【reviewer round-22 #2 security·low】可预测名 + create_new 存在 DoS 面：本地已可写 cwd
+    ///     的攻击者可预创建未来几个 `meetings.tmp.<pid>.<n>` 文件，使每次 create_new 都 AlreadyExists
+    ///     失败——把「唯一名避免崩溃残留阻塞」的意图反转成永久持久的落盘 DoS。故在 AlreadyExists
+    ///     时**自愈重试下一计数**（有界 `WRITE_TMP_MAX_TRIES` 次）：每次 create_new 失败后换下一个
+    ///     n 重试，攻击者要预创建全部上限数量的文件才可能卡死（不再是一击即永久卡死），且即便如此
+    ///     也只是有界次的失败、不触发 symlink 跟随（create_new 依旧拒绝已存在目标）。自愈保留
+    ///     create_new 防 symlink 属性，同时消除「可永久 wedge 持久化」的 DoS。
     ///   - 🧹 残留 tmp（`meetings.tmp.<pid>.*`）由 `load_meetings_from_disk` 启动时**仅清本进程 pid
     ///     前缀**残留（见下），避免误删其他运行实例的 in-flight tmp 或用户同名文件。
     fn write_meetings_file(&self, s: &str) -> Result<(), String> {
@@ -1629,37 +1642,66 @@ impl AgentCore {
         };
         let path = cwd.join("meetings.json");
         // 线程进程内自增计数，保证同进程内多次写入 tmp 名互不冲突（pid 已区分跨进程）。
-        let n = WRITE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), n));
+        let pid = std::process::id();
         // 用 OpenOptions 显式建文件而非 File::create：后者默认 0644（owner 读写 + 组/其他读），
         // 含完整会议记录（真人发言、参会者、共识等 PII）的全文会被**任意本地用户**读取
         // （reviewer round-17 #8 security·low）。限制为 0600（仅 owner 读写）。
-        // 【reviewer round-18 #3 security·medium】用 `create_new(true)`（O_CREAT|O_EXCL）而非
-        // `create(true).truncate(true)`：后者会**跟随已存在的符号链接**——若 cwd 中被人预置软链，
-        // 每次落盘都会把含 PII 的会议 JSON 截断写入被链接文件（数据泄露 + 任意文件破坏），使 0600
-        // 权限收紧失效（0600 只保护新 inode，不防 symlink）。配合**唯一 tmp 名**（round-19 #2），
-        // 攻击者无法预知文件名预置软链；create_new 遇任何已存在目标（含软链）即报 AlreadyExists。
+        // 【reviewer round-18 #3 security·medium + round-22 #2 security·low】用 `create_new(true)`
+        // （O_CREAT|O_EXCL）而非 `create(true).truncate(true)`：后者会**跟随已存在的符号链接**——
+        // 若 cwd 中被人预置软链，每次落盘都会把含 PII 的会议 JSON 截断写入被链接文件（数据泄露 +
+        // 任意文件破坏），使 0600 权限收紧失效。create_new 遇任何已存在目标（含软链）即报
+        // AlreadyExists，绝不跟随。配合唯一 tmp 名 + AlreadyExists 自愈重试（见下），既有防 symlink
+        // 又不会被预置文件永久 wedge。
         //   - Unix：OpenOptionsExt::mode(0o600) 在 umask 基础上再收紧，tmp/最终文件仅 owner 可读写；
         //   - Windows：OpenOptions 同样工作，mode 被忽略（Windows 无 POSIX 权限位），
         //     细粒度 ACL 属系统目录管理职责，单用户桌面场景下可接受。
         // 写 tmp 后 sync_all（fsync）使数据落盘，再做原子 rename（覆盖 OS 崩溃/断电丢数据）。
-        let write_res = (|| -> std::io::Result<()> {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
+        // 【round-22 #2】写盘失败（尤其 AlreadyExists）时自愈：换下一个计数重试，最多
+        // WRITE_TMP_MAX_TRIES 次，避免可预测名被本地攻击者预创建文件后永久卡死持久化。
+        let mut written: Option<std::path::PathBuf> = None;
+        for _ in 0..WRITE_TMP_MAX_TRIES {
+            let n = WRITE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp = path.with_extension(format!("tmp.{}.{}", pid, n));
+            let write_res = (|| -> std::io::Result<()> {
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                let mut f = opts.open(&tmp)?;
+                std::io::Write::write_all(&mut f, s.as_bytes())?;
+                f.sync_all()?;
+                Ok(())
+            })();
+            match write_res {
+                Ok(()) => {
+                    written = Some(tmp);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // 目标已被占用（崩溃残留 / 本地攻击者预创建）：换下一计数自愈重试。
+                    tracing::warn!(error = %e, path = %tmp.display(), "write_meetings_file: 临时文件已存在，换下一计数自愈重试");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %tmp.display(), "write_meetings_file: 临时文件写入/fsync 失败");
+                    return Err(format!("临时文件写入失败: {e}"));
+                }
             }
-            let mut f = opts.open(&tmp)?;
-            std::io::Write::write_all(&mut f, s.as_bytes())?;
-            f.sync_all()?;
-            Ok(())
-        })();
-        if let Err(e) = write_res {
-            tracing::warn!(error = %e, path = %tmp.display(), "write_meetings_file: 临时文件写入/fsync 失败");
-            return Err(format!("临时文件写入失败: {e}"));
         }
+        let tmp = match written {
+            Some(t) => t,
+            None => {
+                let msg = format!(
+                    "临时文件写入失败：连续 {} 次 AlreadyExists（目标被人为预创建或残留未清理）",
+                    WRITE_TMP_MAX_TRIES
+                );
+                tracing::warn!(path = %path.display(), "{msg}");
+                return Err(msg);
+            }
+        };
         if let Err(e) = std::fs::rename(&tmp, &path) {
             tracing::warn!(error = %e, path = %path.display(), "write_meetings_file: 重命名落盘失败");
             return Err(format!("重命名落盘失败: {e}"));
