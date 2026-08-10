@@ -331,6 +331,13 @@ impl ExecutionSandbox {
         "local_fs_write",
         "local_fs_list",
         "local_fs_stat",
+        // fsutil 源路径类工具（office-tools/skills/）：目录枚举/文件查找/移动/删除会访问任意路径，
+        // 必须过沙箱敏感目录 deny(.ssh/.gnupg/.aws/.azure/.config/gcloud) 与沙箱根越界检查，防止枚举敏感文件元数据
+        "list_dir",
+        "find_files",
+        "file_info",
+        "move_file",
+        "delete_path",
     ];
     const REQUIRES_REVIEW: &'static [&'static str] = &["delete_", "batch_", "shutdown_"];
 

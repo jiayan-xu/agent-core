@@ -11,6 +11,11 @@
 //! 说明：本文件是标记 #[ignore] 的真实子进程集成测试（需 officecli 二进制 + office-tools 目录），
 //! 非默认单元测试。少量输入/产物校验使用同步 std::fs（file 小、量少），对 tokio 运行时影响可忽略；
 //! 关键前置检查（require_fixture）已放在 async 段之前执行。
+//!
+//! bridge 错误契约（office-tools/officecli_mcp_bridge.py，仓库外，但为稳定对外承诺）：
+//! - 目录穿越：含 `..` 的输入 file 一律拒绝，错误含「禁止目录穿越」（先验穿越、后验文件存在）。
+//! - 写保护：officecli_query 的 selector 以 set/add/remove/move/swap 开头即拒绝，错误含「禁止写入」。
+//! 测试据此断言稳定信号；若 bridge 措辞调整，需同步更新此处契约与对应断言。
 
 use agent_core::agent::{AgentConfig, AgentCore, AgentIdentity};
 use agent_core::boundary::PermissionLevel;
@@ -54,10 +59,12 @@ fn unique_out_name(base: &str, ext: &str) -> String {
 
 /// 给真实子进程调用包一层超时，避免 python/officecli 卡死时测试无限挂起。
 /// 超时返回 Err（含 "timeout" 字样），由调用方断言失败而非拖死整个测试进程。
+/// 注意：外层预算须大于 stdio 客户端内部超时（mcp_client::StdioMcpClient，30s），
+/// 否则外层先触发会 drop 掉内部的 kill-and-restart 路径，导致子进程残留并锁住 _out/ 产物。
 async fn with_timeout<T>(fut: impl std::future::Future<Output = T>) -> Result<T, String> {
-    tokio::time::timeout(std::time::Duration::from_secs(30), fut)
+    tokio::time::timeout(std::time::Duration::from_secs(60), fut)
         .await
-        .map_err(|_| "调用超时（30s）：officecli 子进程可能卡死".to_string())
+        .map_err(|_| "调用超时（60s）：officecli 子进程可能卡死".to_string())
 }
 
 /// 返回 read/query-guard/pdf 共用的输入 fixture（office-tools/_out.docx），并断言其存在，
@@ -196,8 +203,8 @@ async fn officecli_rejects_traversal() {
     let agent = agent_with_officecli();
     // 用平台原生分隔符构造穿越路径（Windows `..\..\Windows\win.ini`，Unix `../../etc/passwd`），
     // 避免硬编码单平台反斜杠导致平台不健壮。
-    // bridge 契约（_safe_input_path）：先验 `..` 穿越（L159-160），再验文件存在（L162），
-    // 因此含 `..` 的输入必然触发「禁止目录穿越」拒绝，与目标文件是否存在无关。
+    // bridge 错误契约（见文件顶部注释）：对含 `..` 的输入，先验穿越、后验文件存在，
+    // 因此必然触发「禁止目录穿越」拒绝，与目标文件是否存在无关。
     let sep = std::path::MAIN_SEPARATOR;
     let traversal = format!("..{sep}..{sep}Windows{sep}win.ini");
     let payload = serde_json::json!({"file": traversal});
@@ -209,7 +216,7 @@ async fn officecli_rejects_traversal() {
             "officecli-e2e-traversal",
         ))
         .await
-        .expect("穿越调用应在 30s 内返回");
+        .expect("穿越调用应在 60s 内返回");
     assert!(res.is_err(), "目录穿越路径应被拒绝");
     let err = res.unwrap_err();
     // 只认 bridge 的显式穿越拒绝信号（「禁止目录穿越」），不匹配 `..` 回显——避免「文件不存在」导致的误通过
