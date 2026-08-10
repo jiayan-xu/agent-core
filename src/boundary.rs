@@ -500,6 +500,8 @@ fn extract_path_arg(args: &serde_json::Value) -> Vec<PathBuf> {
         "target",
         "src", // move_file 的源路径参数（fsutil 源），用于沙箱敏感目录门闸
         "dst", // move_file 的目标路径参数，同样需过沙箱门闸
+        "template", // officecli_merge 的模板源路径，需过沙箱门闸防读敏感文件
+        "output",   // officecli_create/pdf 等的输出写目标，沙箱根越界检查约束写位置
     ];
     let mut out = Vec::new();
     if let Some(obj) = args.as_object() {
