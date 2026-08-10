@@ -78,29 +78,20 @@ fn require_fixture() -> std::path::PathBuf {
     fixture
 }
 
-/// 把 bridge 返回的 output 路径解析为绝对路径，并强制锚定在 office-tools/_out/ 内。
-/// 防御：若 bridge 返回 `..` 或任意绝对路径逃逸 _out，直接断言失败——
-/// 因为 OutputGuard::drop 会删除该路径，绝不允许误删 _out 之外的文件。
-fn resolve_output(output: &str) -> std::path::PathBuf {
-    let out_dir = office_tools_dir().join("_out");
-    let p = std::path::Path::new(output);
-    let resolved = if p.is_absolute() {
+/// 统一的路径规范化：先把相对路径按 process cwd 拼成绝对路径，再 canonicalize 消解 symlink；
+/// canonicalize 失败（文件未落盘/权限拒绝/Windows \\?\ verbatim 前缀）时回退词法规范化——
+/// 逐组件去 `..`/`.`，保证两侧（out_dir 与 resolved）用同一套规范化后前缀比较一致。
+fn normalize_path(p: &std::path::Path) -> std::path::PathBuf {
+    let abs = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        match p.strip_prefix("_out") {
-            Ok(rel) => out_dir.join(rel),
-            Err(_) => out_dir.join(p),
-        }
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(p)
     };
-    // 词法锚定后 canonicalize（防中间 symlink 逃逸 _out），再对真实路径重新锚定校验；
-    // out_dir 与 resolved 都 canonicalize，保证大小写/分隔符规范化后前缀比较一致。
-    let out_dir_c = std::fs::canonicalize(&out_dir).unwrap_or(out_dir.clone());
-    // canonicalize 失败（文件未落盘/权限拒绝/Windows \\?\ verbatim 前缀）时，回退到词法规范化：
-    // 逐组件去 `..`/`.`，避免 _out 内 symlink 指向外部时词法 starts_with 误判通过，
-    // 从而让 OutputGuard::drop 删除 _out 之外的文件。
-    let resolved = std::fs::canonicalize(&resolved).unwrap_or_else(|_| {
+    abs.canonicalize().unwrap_or_else(|_| {
         let mut out = std::path::PathBuf::new();
-        for c in resolved.components() {
+        for c in abs.components() {
             match c {
                 std::path::Component::ParentDir => {
                     out.pop();
@@ -110,13 +101,32 @@ fn resolve_output(output: &str) -> std::path::PathBuf {
             }
         }
         out
-    });
+    })
+}
+
+/// 把 bridge 返回的 output 路径解析为绝对路径，并强制锚定在 office-tools/_out/ 内。
+/// 防御：若 bridge 返回 `..` 或任意绝对路径逃逸 _out，直接断言失败——
+/// 因为 OutputGuard::drop 会删除该路径，绝不允许误删 _out 之外的文件。
+fn resolve_output(output: &str) -> std::path::PathBuf {
+    let out_dir = normalize_path(&office_tools_dir().join("_out"));
+    let p = std::path::Path::new(output);
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        match p.strip_prefix("_out") {
+            Ok(rel) => office_tools_dir().join("_out").join(rel),
+            Err(_) => office_tools_dir().join("_out").join(p),
+        }
+    };
+    // 两侧用同一套 normalize_path（先词法转绝对再 canonicalize，失败去 `..`/`.`），
+    // 保证 OFFICE_TOOLS 为相对路径或 Windows \\?\ verbatim 前缀时前缀比较仍一致。
+    let resolved = normalize_path(&resolved);
     // 拒绝逃逸 _out 的路径（.. 或任意绝对路径或 symlink 逃逸），避免删除守卫误删 _out 之外文件
     assert!(
-        resolved.starts_with(&out_dir_c)
+        resolved.starts_with(&out_dir)
             && !resolved
-                .strip_prefix(&out_dir_c)
-                .unwrap_or(&out_dir_c)
+                .strip_prefix(&out_dir)
+                .unwrap_or(&out_dir)
                 .components()
                 .any(|c| c == std::path::Component::ParentDir),
         "bridge 输出路径逃逸 _out 目录: {output}"
@@ -125,6 +135,8 @@ fn resolve_output(output: &str) -> std::path::PathBuf {
 }
 
 /// 产物清理守卫：drop 时 best-effort 删除文件，即使中间断言 panic 也不泄漏 _out/ 产物。
+/// 只在 resolve 时已确认存在的文件才删除；删除前对父目录+文件名重新 canonicalize 并再次锚定
+/// 校验，规避 TOCTOU——避免 resolve 后、drop 前中间 symlink 变化导致误删 _out 之外的文件。
 struct OutputGuard {
     path: std::path::PathBuf,
 }
@@ -135,6 +147,19 @@ impl OutputGuard {
 }
 impl Drop for OutputGuard {
     fn drop(&mut self) {
+        // 文件不存在则无需清理（也可能是测试失败未产出），直接返回
+        if !self.path.exists() {
+            return;
+        }
+        // 删除前重新 canonicalize 父目录+文件名并锚定校验，防止 resolve 后 symlink 变化逃逸 _out
+        let out_dir = std::fs::canonicalize(&office_tools_dir().join("_out"));
+        let Ok(out_dir) = out_dir else { return };
+        let rechecked = std::fs::canonicalize(&self.path);
+        if let Ok(rechecked) = rechecked {
+            if !rechecked.starts_with(&out_dir) {
+                return; // 已逃逸 _out，拒绝删除（宁可泄漏也不误删外部文件）
+            }
+        }
         let _ = std::fs::remove_file(&self.path);
     }
 }

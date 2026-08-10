@@ -488,11 +488,13 @@ fn is_repo_ws_payload(tool_name: &str, key: &str) -> bool {
 }
 
 /// 从工具参数中抽取显式文件路径参数做门闸（命令型参数 command/code/sql 不含路径，不抽）
-/// 提取 args 中所有路径类参数（path/file/file_path/filepath/dir/directory/target/src/dst）。
-/// 返回全部匹配路径，使 move_file 的 src+dst 都能过沙箱门闸（而非只查第一个）。
+/// 提取 args 中所有路径类参数（path/file/file_path/filepath/dir/directory/target/src/dst/paths）。
+/// 返回全部匹配路径，使 move_file 的 src+dst 都能过沙箱门闸（而非只查第一个）；数组值（如
+/// `paths: [...]`）逐元素展开，避免数组/glob 路径被静默忽略而绕过 path_violation/under_root。
 fn extract_path_arg(tool_name: &str, args: &serde_json::Value) -> Vec<PathBuf> {
     const KEYS: &[&str] = &[
         "path",
+        "paths", // 数组形式的多路径参数（如 find 的 paths 列表），逐元素展开
         "file",
         "file_path",
         "filepath",
@@ -504,24 +506,40 @@ fn extract_path_arg(tool_name: &str, args: &serde_json::Value) -> Vec<PathBuf> {
         "template", // officecli_merge 的模板源路径，需过沙箱门闸防读敏感文件
         "output",   // officecli_create/pdf 等的输出写目标，沙箱根越界检查约束写位置
     ];
-    // officecli 写类工具的 `output` 若是裸文件名（无目录分隔、非绝对路径），由 bridge 锚定到
-    // office-tools/_out/ 固定目录，不是 agent 可控的真实文件路径；此时若按 process cwd 拼接再去
-    // 过沙箱根越界检查，会校验一个与 bridge 实际写入目标不同的路径（语义错位）。故裸名跳过门闸，
-    // 仅对含目录分隔/绝对形式的 output 按真实路径继续门闸。
+    // officecli 写类工具的 `output` 若是裸文件名（无目录分隔、非绝对、非 drive-relative、非 `.`/`..`），
+    // 由 bridge 锚定到 office-tools/_out/ 固定目录，不是 agent 可控的真实文件路径；此时若按 process cwd
+    // 拼接再去过沙箱根越界检查，会校验一个与 bridge 实际写入目标不同的路径（语义错位）。故严格裸名跳过
+    // 门闸，仅对含目录分隔/绝对/drive-relative/穿越形式的 output 按真实路径继续门闸。
+    //
+    // 注意：drive-relative（如 Windows `C:out.pdf`，无 `/`/`\` 且 is_absolute()==false）不是裸名——
+    // Python os.path.join(_out, "C:out.pdf") 会保留 C: 前缀逃逸 _out/，必须按真实路径门闸。
     let bridge_anchored_out = matches!(tool_name, "officecli_create" | "officecli_pdf" | "officecli_merge");
     let mut out = Vec::new();
     if let Some(obj) = args.as_object() {
         for k in KEYS {
-            if let Some(v) = obj.get(*k) {
-                if let Some(s) = v.as_str() {
-                    if bridge_anchored_out && *k == "output" {
-                        let pb = PathBuf::from(s);
-                        let is_bare = !s.contains('/') && !s.contains('\\') && !pb.is_absolute();
-                        if is_bare {
-                            continue; // 裸名由 bridge 锚定，跳过门闸
-                        }
+            let Some(v) = obj.get(*k) else { continue };
+            // 标量：直接取其字符串
+            if let Some(s) = v.as_str() {
+                if bridge_anchored_out && *k == "output" {
+                    let pb = PathBuf::from(s);
+                    let is_bare = !s.contains('/')
+                        && !s.contains('\\')
+                        && !s.contains(':') // 排除 drive-relative（C:out.pdf）
+                        && s != "."
+                        && s != ".."
+                        && !pb.is_absolute();
+                    if is_bare {
+                        continue; // 严格裸名由 bridge 锚定，跳过门闸
                     }
-                    out.push(PathBuf::from(s));
+                }
+                out.push(PathBuf::from(s));
+            }
+            // 数组（如 paths: [...]）：逐元素展开提取字符串路径
+            if let Some(arr) = v.as_array() {
+                for el in arr {
+                    if let Some(s) = el.as_str() {
+                        out.push(PathBuf::from(s));
+                    }
                 }
             }
         }
@@ -1928,6 +1946,26 @@ mod tests {
         let q_args = serde_json::json!({"output": "x.docx"});
         let paths = extract_path_arg("officecli_query", &q_args);
         assert_eq!(paths.len(), 1, "非写类工具 output 仍提取");
+
+        // drive-relative（Windows C:out.pdf，无 /\\ 且 is_absolute()==false）不是裸名，必须按真实路径门闸
+        let rel_args = serde_json::json!({"file": "C:/workspace/tpl.docx", "output": "C:out.pdf"});
+        let paths = extract_path_arg("officecli_pdf", &rel_args);
+        assert_eq!(paths.len(), 2, "drive-relative output 不豁免，应进入门闸");
+        assert_eq!(paths[1], PathBuf::from("C:out.pdf"));
+
+        // `..` / `.` 不是裸名，必须按真实路径门闸（防 os.path.join(_out, "..") 逃逸 _out）
+        let dotdot_args = serde_json::json!({"output": ".."});
+        let paths = extract_path_arg("officecli_pdf", &dotdot_args);
+        assert_eq!(paths.len(), 1, "`..` 不豁免，应进入门闸");
+        assert_eq!(paths[0], PathBuf::from(".."));
+
+        // paths 数组参数逐元素展开，避免数组路径绕过门闸
+        let arr_args = serde_json::json!({"paths": ["C:/workspace/a.txt", "C:/test/.ssh/id_ed25519"]});
+        let paths = extract_path_arg("find_files", &arr_args);
+        assert_eq!(paths.len(), 2, "paths 数组应逐元素展开");
+        let r = ExecutionSandbox::check("find_files", &paths);
+        assert!(!r.allow, "paths 数组中的敏感路径应触发沙箱门闸");
+        assert_eq!(r.level, Some(BlockLevel::Red));
     }
 
     #[test]
