@@ -78,20 +78,31 @@ fn require_fixture() -> std::path::PathBuf {
     fixture
 }
 
-/// 把 bridge 返回的 output 路径解析为绝对路径。
-/// bridge 契约：输出锚定到 office-tools/_out/（_out_path 返回绝对路径）；若意外返回裸文件名
-/// 或已含 `_out/` 前缀的相对路径，统一解析到 office-tools/_out/ 下，避免拼出 _out/_out/ 错目录。
+/// 把 bridge 返回的 output 路径解析为绝对路径，并强制锚定在 office-tools/_out/ 内。
+/// 防御：若 bridge 返回 `..` 或任意绝对路径逃逸 _out，直接断言失败——
+/// 因为 OutputGuard::drop 会删除该路径，绝不允许误删 _out 之外的文件。
 fn resolve_output(output: &str) -> std::path::PathBuf {
-    let p = std::path::Path::new(output);
-    if p.is_absolute() {
-        return p.to_path_buf();
-    }
     let out_dir = office_tools_dir().join("_out");
-    // 防御：若相对路径已带 `_out/` 前缀，去重避免 out_dir/_out/<name>
-    match p.strip_prefix("_out") {
-        Ok(rel) => out_dir.join(rel),
-        Err(_) => out_dir.join(p),
-    }
+    let p = std::path::Path::new(output);
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        match p.strip_prefix("_out") {
+            Ok(rel) => out_dir.join(rel),
+            Err(_) => out_dir.join(p),
+        }
+    };
+    // 拒绝逃逸 _out 的路径（.. 或任意绝对路径），避免删除守卫误删 _out 之外文件
+    assert!(
+        resolved.starts_with(&out_dir)
+            && !resolved
+                .strip_prefix(&out_dir)
+                .unwrap_or(&out_dir)
+                .components()
+                .any(|c| c == std::path::Component::ParentDir),
+        "bridge 输出路径逃逸 _out 目录: {output}"
+    );
+    resolved
 }
 
 /// 产物清理守卫：drop 时 best-effort 删除文件，即使中间断言 panic 也不泄漏 _out/ 产物。
@@ -338,10 +349,8 @@ async fn officecli_query_rejects_write_selector() {
         .expect("query 调用应在 30s 内返回");
     assert!(res.is_err(), "query 应拒绝写类 selector");
     let err = res.unwrap_err();
-    assert!(
-        err.contains("selector") || err.contains("禁止写入"),
-        "错误信息应说明写保护，实际: {err}"
-    );
+    // 只认文件顶部契约文档声明的稳定标记「禁止写入」；若 bridge 的写保护回归（如误报 selector 格式错误），本断言会失败——这正是要检测的
+    assert!(err.contains("禁止写入"), "错误信息应含写保护标记，实际: {err}");
 }
 
 #[tokio::test]

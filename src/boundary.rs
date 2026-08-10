@@ -345,6 +345,10 @@ impl ExecutionSandbox {
         "officecli_issues",
         "officecli_query",
         "officecli_render",
+        // officecli 写类工具也接受输入 file/template 路径（PDF 导出源、merge 模板），
+        // 同样需过沙箱门闸，防经 PDF/merge 路径读敏感文件
+        "officecli_pdf",
+        "officecli_merge",
     ];
     const REQUIRES_REVIEW: &'static [&'static str] = &["delete_", "batch_", "shutdown_"];
 
@@ -358,9 +362,9 @@ impl ExecutionSandbox {
     }
 
     /// 检查工具是否需在沙箱内执行。
-    /// - `path`：可选的文件路径参数，命中敏感 deny 列表或越出严格沙箱根时红闸拦截。
+    /// - `paths`：所有文件路径参数，逐个命中敏感 deny 列表或越出严格沙箱根时红闸拦截。
     /// - 沙箱未启用 → 任何 require-sandbox 工具硬拦（绝不裸跑）。
-    pub fn check(tool_name: &str, path: Option<&Path>) -> ToolCheck {
+    pub fn check(tool_name: &str, paths: &[PathBuf]) -> ToolCheck {
         let requires = Self::REQUIRES_SANDBOX
             .iter()
             .any(|p| tool_name == *p || tool_name.starts_with(p));
@@ -371,7 +375,7 @@ impl ExecutionSandbox {
                     tool_name
                 ));
             }
-            if let Some(p) = path {
+            for p in paths {
                 if let Some(reason) = Self::path_violation(p) {
                     return ToolCheck::red(&format!("{} 沙箱路径门闸：{}", tool_name, reason));
                 }
@@ -483,7 +487,9 @@ fn is_repo_ws_payload(tool_name: &str, key: &str) -> bool {
 }
 
 /// 从工具参数中抽取显式文件路径参数做门闸（命令型参数 command/code/sql 不含路径，不抽）
-fn extract_path_arg(args: &serde_json::Value) -> Option<&Path> {
+/// 提取 args 中所有路径类参数（path/file/file_path/filepath/dir/directory/target/src/dst）。
+/// 返回全部匹配路径，使 move_file 的 src+dst 都能过沙箱门闸（而非只查第一个）。
+fn extract_path_arg(args: &serde_json::Value) -> Vec<PathBuf> {
     const KEYS: &[&str] = &[
         "path",
         "file",
@@ -493,17 +499,19 @@ fn extract_path_arg(args: &serde_json::Value) -> Option<&Path> {
         "directory",
         "target",
         "src", // move_file 的源路径参数（fsutil 源），用于沙箱敏感目录门闸
+        "dst", // move_file 的目标路径参数，同样需过沙箱门闸
     ];
+    let mut out = Vec::new();
     if let Some(obj) = args.as_object() {
         for k in KEYS {
             if let Some(v) = obj.get(*k) {
                 if let Some(s) = v.as_str() {
-                    return Some(Path::new(s));
+                    out.push(PathBuf::from(s));
                 }
             }
         }
     }
-    None
+    out
 }
 
 // ══════════════════════════════════════════════════════
@@ -799,7 +807,7 @@ impl ComplianceBoundary {
         if GovernanceGuard::is_governance(tool_name) {
             return Some(ToolCheck::red(&format!("红线：{} 属于治理层，Agent 不可修改", tool_name)));
         }
-        let sandbox = ExecutionSandbox::check(tool_name, extract_path_arg(args));
+        let sandbox = ExecutionSandbox::check(tool_name, &extract_path_arg(args));
         if !sandbox.allow {
             return Some(sandbox);
         }
@@ -885,7 +893,7 @@ impl ComplianceBoundary {
         }
 
         // ── ② 代码与执行隔离 ──
-        let sandbox = ExecutionSandbox::check(tool_name, extract_path_arg(args));
+        let sandbox = ExecutionSandbox::check(tool_name, &extract_path_arg(args));
         if !sandbox.allow {
             return sandbox;
         }
@@ -1813,22 +1821,22 @@ mod tests {
 
     #[test]
     fn test_execution_sandbox() {
-        use std::path::Path;
+        use std::path::PathBuf;
 
         // 沙箱默认启用
         ExecutionSandbox::set_enabled(true);
 
         // exec_* 在沙箱内放行（不再"永被硬拦但无实现"）
-        let r = ExecutionSandbox::check("exec_shell", None);
+        let r = ExecutionSandbox::check("exec_shell", &[]);
         assert!(r.allow);
 
         // 非执行类工具不受沙箱门控
-        let r = ExecutionSandbox::check("query_plate", None);
+        let r = ExecutionSandbox::check("query_plate", &[]);
         assert!(r.allow);
 
         // 沙箱未启用 → 任何 require-sandbox 工具硬拦（绝不裸跑）
         ExecutionSandbox::set_enabled(false);
-        let r = ExecutionSandbox::check("exec_shell", None);
+        let r = ExecutionSandbox::check("exec_shell", &[]);
         assert!(!r.allow);
         assert_eq!(r.level, Some(BlockLevel::Red));
         ExecutionSandbox::set_enabled(true);
@@ -1836,17 +1844,17 @@ mod tests {
         // 路径门闸：命中 .ssh 敏感目录 → 红闸
         let r = ExecutionSandbox::check(
             "exec_shell",
-            Some(Path::new("C:/test/.ssh/id_ed25519")),
+            &[PathBuf::from("C:/test/.ssh/id_ed25519")],
         );
         assert!(!r.allow);
         assert_eq!(r.level, Some(BlockLevel::Red));
 
         // 路径门闸：工作区内路径允许
-        let r = ExecutionSandbox::check("exec_shell", Some(Path::new("C:/workspace/script.py")));
+        let r = ExecutionSandbox::check("exec_shell", &[PathBuf::from("C:/workspace/script.py")]);
         assert!(r.allow);
 
         // REVIEW 类仍走黄线
-        let r = ExecutionSandbox::check("delete_user", None);
+        let r = ExecutionSandbox::check("delete_user", &[]);
         assert!(!r.allow);
         assert_eq!(r.level, Some(BlockLevel::Yellow));
     }
