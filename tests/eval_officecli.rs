@@ -1,7 +1,7 @@
 //! officecli MCP 源连通性集成测试（P1 最小可验证闭环）
 //!
 //! 用真实 stdio 源（officecli_mcp_bridge.py）验证：
-//!   1. tools/list 能列出 5 个 officecli_* 工具
+//!   1. tools/list 能列出 8 个 officecli_* 工具
 //!   2. call_tool_routed 能跨源路由并实际调用 officecli_read
 //!   3. 目录穿越路径被 bridge 拒绝
 //!
@@ -32,6 +32,17 @@ fn office_tools_dir() -> std::path::PathBuf {
 
 fn python_bin() -> String {
     std::env::var("PYTHON_BIN").unwrap_or_else(|_| "python".to_string())
+}
+
+/// 生成带进程唯一后缀的输出文件名，避免 repeated/concurrent 测试互相覆盖。
+/// 输出仍由 bridge 锚定到 office-tools/_out/ 下（见 _out_path），不会污染仓库根。
+fn unique_out_name(base: &str, ext: &str) -> String {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("e2e_{base}_{pid}_{nanos}.{ext}")
 }
 
 fn agent_with_officecli() -> AgentCore {
@@ -131,11 +142,16 @@ async fn officecli_read_routes_and_calls() {
 #[ignore = "需要 officecli 二进制 + office-tools 目录"]
 async fn officecli_rejects_traversal() {
     let agent = agent_with_officecli();
+    // 用平台原生分隔符构造穿越路径（Windows `..\..\Windows\win.ini`，Unix `../../etc/passwd`），
+    // 避免硬编码单平台反斜杠导致平台不健壮。
+    let sep = std::path::MAIN_SEPARATOR;
+    let traversal = format!("..{sep}..{sep}Windows{sep}win.ini");
+    let payload = serde_json::json!({"file": traversal});
     let res = agent
         .call_tool_routed(
             "officecli_read",
             "default",
-            &serde_json::json!({"file": r"..\..\Windows\win.ini"}),
+            &payload,
             &["agent/eval-officecli".to_string()],
             "officecli-e2e-traversal",
         )
@@ -149,13 +165,14 @@ async fn officecli_rejects_traversal() {
 #[ignore = "需要 officecli 二进制 + office-tools 目录"]
 async fn officecli_create_adds_and_query() {
     let agent = agent_with_officecli();
+    let out_name = unique_out_name("create", "docx");
     // create：建 docx + 加一个段落
     let res = agent
         .call_tool_routed(
             "officecli_create",
             "default",
             &serde_json::json!({
-                "output": "e2e_create.docx",
+                "output": out_name,
                 "adds": [{"type": "paragraph", "parent": "/body", "props": {"text": "E2E 集成创建"}}],
             }),
             &["agent/eval-officecli".to_string()],
@@ -169,7 +186,11 @@ async fn officecli_create_adds_and_query() {
     let val: serde_json::Value =
         serde_json::from_str(&create_out).expect("create 返回应为 JSON");
     let output = val["output"].as_str().expect("应含 output 路径");
-    assert!(output.ends_with("e2e_create.docx"), "output 应指向 e2e_create.docx: {output}");
+    assert!(output.ends_with(&out_name), "output 应指向 {out_name}: {output}");
+    assert!(
+        std::path::Path::new(output).is_file(),
+        "create 产物应已落盘: {output}"
+    );
 
     // query：命中刚创建的段落
     let res = agent
@@ -207,11 +228,12 @@ async fn officecli_query_rejects_write_selector() {
 #[ignore = "需要 officecli 二进制 + office-tools 目录 + PDF exporter 插件"]
 async fn officecli_pdf_exports_valid_pdf() {
     let agent = agent_with_officecli();
+    let out_name = unique_out_name("export", "pdf");
     let res = agent
         .call_tool_routed(
             "officecli_pdf",
             "default",
-            &serde_json::json!({"file": office_tools_dir().join("_out.docx"), "output": "e2e_export.pdf"}),
+            &serde_json::json!({"file": office_tools_dir().join("_out.docx"), "output": out_name}),
             &["agent/eval-officecli".to_string()],
             "officecli-e2e-pdf",
         )
