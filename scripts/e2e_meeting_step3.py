@@ -275,8 +275,18 @@ def main() -> int:
     end_obj: dict = {}
     try:
         end_obj = json.loads(end_ev)
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001
+        print(f"   !! ended payload 解析失败: {e}")
+        ok = False
+    # 【reviewer round-26 #3 bug·low】仅 try/except 包住 json.loads 不够：若 ended 事件被服务端
+    # payload 形状改成了**非对象** JSON（布尔/数组/字符串），上面的 try 成功、但下方
+    # `end_obj.get("deleted")` 会对非 dict 调用 `.get` 抛 AttributeError，以裸 traceback 崩溃脚本，
+    # 违背「清晰 FAIL 而非异常」的 E2E 诊断目标。故在此显式把解析结果约束为 dict：非 dict 视为
+    # 形状不符、降级为 FAIL（并打印诊断），而不是让属性访问抛异常。
+    if end_obj is not None and not isinstance(end_obj, dict):
+        print(f"   !! ended payload 非对象 JSON（形状不符），实际类型: {type(end_obj).__name__}")
+        end_obj = {}
+        ok = False
     # 简化为直接比较（reviewer round-19 #5 style·low：bool(x is True) 冗余）
     ok &= end_obj.get("deleted") is True
 

@@ -617,7 +617,14 @@ impl Meeting {
         // 未知 phase（phase_raw 非空，reviewer round-18 #2）也视为终态：
         // 未来版本写入的未知 phase（如 "cancelled"）表明该会议已进入本版本无法识别的状态，
         // 保守地拒绝对其继续写入消息 / 收敛 / 心跳，避免破坏 phase_raw 保留的前向兼容标记。
-        self.phase_raw.is_some() || is_terminal_state(&self.status, self.phase)
+        // 【reviewer round-26 #2 bug·low】仅当 phase_raw **非空**才判终态——与 `is_terminal_state`
+        // 对空 status 的「未知、非终态」语义保持一致。否则同一会议 phase=""/status="" 时两个谓词
+        // 给出相反结论；更实际的是外部/未来工具写入 `"phase":""` 时，`phase_raw = Some("")` 会把
+        // 会议**误冻结**：apply_message/apply_convergence 拒绝一切写入、end_meeting 因 is_terminal()
+        // 幂等返回 Ok(false)，用户连收尾共识都无法设置（Rust 的 String 无 nullable 空语义，空串是
+        // 合法但无信息的值，不应仅因「存在」就判定终态）。
+        self.phase_raw.as_deref().is_some_and(|s| !s.is_empty())
+            || is_terminal_state(&self.status, self.phase)
     }
 
     /// 会议读写授权谓词（**单一权威来源**，reviewer round-17 #1 maintainability·medium）。
@@ -1631,7 +1638,16 @@ impl AgentCore {
                     }
                 }
             }
-            match serde_json::to_string_pretty(&serde_json::json!({ "meetings": vals })) {
+            // 【reviewer round-26 #1 performance·low】不用 `serde_json::json!({ "meetings": vals })`
+            // 收尾：`json!` 对非字面量表达式 `vals` 仍走 `json_internal!` 的 `to_value(&$other).unwrap()`
+            // 分支，会把已序列化的 `Vec<Value>` 深拷贝成新 `Value::Array`，随后 `to_string_pretty`
+            // 再序列化一次——每次落盘都多一次全量深拷贝，会议历史增长时开销放大。直接构造
+            // `serde_json::Value::Object` 包装 `Value::Array(vals)`（serde_json::Value 内部已是
+            // Arc，包装零拷贝），省掉 `json!` 宏这一层无谓拷贝；绕开 `json!` 的 unwrap 意图不变。
+            let root = serde_json::Value::Object(
+                std::iter::once(("meetings".to_string(), serde_json::Value::Array(vals))).collect(),
+            );
+            match serde_json::to_string_pretty(&root) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(error = %e, "save_meetings: 序列化会议列表失败，跳过落盘");
