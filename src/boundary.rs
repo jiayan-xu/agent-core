@@ -1103,6 +1103,10 @@ impl ToolClassifier {
             "audit_query",
             "entity_search",
             "memory_graph",
+            // fsutil 源只读底座（office-tools/skills/ 动态扫描）：文件系统/URL 只读查询
+            "list_dir",
+            "find_files",
+            "file_info",
         ] {
             c.read_tools.insert(t.to_string());
         }
@@ -1132,6 +1136,8 @@ impl ToolClassifier {
             "officecli_create",
             "officecli_merge",
             "officecli_pdf",
+            // fsutil 源写操作：move_file（移动/改名，破坏性，需人审）；delete_path 归 dangerous 不列入
+            "move_file",
             // P0-1 场景沙箱：写生命周期（创建/加变更/提交/丢弃；commit 强制审批）
             "scenario_create",
             "scenario_add_change",
@@ -1168,6 +1174,8 @@ impl ToolClassifier {
             "manage_whitelist",
             "edit_code",
             "sync_exception_correction",
+            // fsutil 源删除操作（office-tools/skills/delete_path）：破坏性，明确归危险
+            "delete_path",
         ] {
             c.dangerous_tools.insert(t.to_string());
         }
@@ -2068,6 +2076,19 @@ mod tests {
         for t in ["officecli_create", "officecli_merge", "officecli_pdf"] {
             assert_eq!(c.classify(t), "write", "{t} 应分类为 write（产出文件，需写权限）");
         }
+    }
+
+    #[test]
+    fn test_fsutil_tools_classification() {
+        // P2b：fsutil 源工具分类——只读底座(read) / 破坏性写(write/dangerous)，
+        // 与 dept_ops 提示文本保持一致，避免 LLM 按提示调用却被 enforcement 拦截。
+        let b = ComplianceBoundary::new(None);
+        let c = b.classifier.lock().unwrap();
+        for t in ["list_dir", "find_files", "file_info", "summarize_url", "data_analysis"] {
+            assert_eq!(c.classify(t), "read", "{t} 应分类为 read（文件系统/URL 只读查询）");
+        }
+        assert_eq!(c.classify("move_file"), "write", "move_file 应分类为 write（破坏性移动，需审批）");
+        assert_eq!(c.classify("delete_path"), "dangerous", "delete_path 应分类为 dangerous（删除，危险地板）");
     }
 
     #[test]

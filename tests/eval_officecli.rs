@@ -145,7 +145,18 @@ async fn officecli_read_routes_and_calls() {
         .await
         .expect("officecli_read 应在 30s 内返回")
         .expect("officecli_read 应调用成功");
-    assert!(out.contains("success"), "返回应含 success，实际: {}", out);
+    // 解析 JSON 断言 success==true（而非 contains("success")，避免错误负载含 success 字样蒙混过关）
+    let val: serde_json::Value =
+        serde_json::from_str(&out).expect("read 返回应为合法 JSON");
+    assert_eq!(
+        val["success"].as_bool(),
+        Some(true),
+        "read 应 success==true，实际: {out}"
+    );
+    assert!(
+        val["data"].is_object() || val["raw"].is_string(),
+        "read 应含 data/raw 内容，实际: {out}"
+    );
 }
 
 #[tokio::test]
@@ -190,17 +201,24 @@ async fn officecli_create_adds_and_query() {
         .await
         .expect("officecli_create 应在 30s 内返回")
         .expect("officecli_create 应成功");
-    assert!(create_out.contains("success"), "create 应含 success: {create_out}");
-
-    // 取回输出路径
+    // 解析 JSON 断言 success==true，并取回输出路径
     let val: serde_json::Value =
         serde_json::from_str(&create_out).expect("create 返回应为 JSON");
+    assert_eq!(
+        val["success"].as_bool(),
+        Some(true),
+        "create 应 success==true，实际: {create_out}"
+    );
     let output = val["output"].as_str().expect("应含 output 路径");
     assert!(output.ends_with(&out_name), "output 应指向 {out_name}: {output}");
-    assert!(
-        std::path::Path::new(output).is_file(),
-        "create 产物应已落盘: {output}"
-    );
+    // bridge 锚定输出到 office-tools/_out/；若返回相对路径则基于 office_tools_dir() 解析再校验落盘
+    let output_path = std::path::Path::new(output);
+    let abs_output = if output_path.is_absolute() {
+        output_path.to_path_buf()
+    } else {
+        office_tools_dir().join(output_path)
+    };
+    assert!(abs_output.is_file(), "create 产物应已落盘: {abs_output:?}");
 
     // query：命中刚创建的段落
     let q_out = with_timeout(agent.call_tool_routed(
@@ -254,13 +272,19 @@ async fn officecli_pdf_exports_valid_pdf() {
         .await
         .expect("officecli_pdf 应在 30s 内返回")
         .expect("officecli_pdf 应成功");
-    assert!(out.contains("success") || out.contains("output"), "应含成功/输出路径: {out}");
-
-    // 校验产物是合法 PDF
+    // 解析 JSON 取回输出路径校验产物是合法 PDF。
+    // 注意：pdf 插件的 `view pdf` 输出是纯文件路径文本（非 JSON），bridge 以 {"raw": path, "output": path} 返回，
+    // 因此这里不要求 success==true——以 %PDF 魔数 + 非空作为成功判据。
     let val: serde_json::Value =
         serde_json::from_str(&out).expect("pdf 返回应为 JSON");
     let pdf_path = val["output"].as_str().expect("应含 output 路径");
-    let bytes = std::fs::read(pdf_path).expect("PDF 文件应存在");
+    let pdf_path_abs = std::path::Path::new(pdf_path);
+    let pdf_path_abs = if pdf_path_abs.is_absolute() {
+        pdf_path_abs.to_path_buf()
+    } else {
+        office_tools_dir().join(pdf_path_abs)
+    };
+    let bytes = std::fs::read(&pdf_path_abs).expect("PDF 文件应存在");
     assert!(bytes.len() > 100, "PDF 不应为空");
     assert!(
         bytes.starts_with(b"%PDF"),
