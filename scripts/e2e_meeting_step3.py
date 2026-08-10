@@ -140,8 +140,15 @@ def subscribe():
                 line = bline.decode("utf-8", "replace").rstrip("\r\n")
                 _append_raw(line)
                 if line == "":
-                    # 空行 = 事件块结束：结算当前缓冲的 event/data
-                    if data is not None:
+                    # 空行 = 事件块结束：结算当前缓冲的 event/data。
+                    # 注意（reviewer round-26 #1，bug·high）：axum 0.8.9 对仅含 comment 的 `: ping`
+                    # 心跳块也会先写一行 `data:`（data 为空串），若用 `if data is not None:` 会把
+                    # 空 payload 也派发成 `("message", "")` 伪事件——首个 tick 紧接 snapshot 触发，
+                    # 步骤4的 wait_for 会因 _kinds() 已含 "message" 立即返回，随后 json.loads("")
+                    # 抛 JSONDecodeError，测试**确定性误报 FAIL** 且从未校验真实广播。改为仅当
+                    # data **非空**才结算：所有真实事件（snapshot/message/state/ended/presence）
+                    # 都携带 JSON data，空串只可能是 comment 块的伪 data:。
+                    if data:
                         _append_event(name or "message", data)
                     name, data = None, None
                 elif line.startswith("event:"):
@@ -150,8 +157,9 @@ def subscribe():
                     piece = line[5:].strip()
                     # 多行 data 按 SSE 规范用换行拼接
                     data = f"{data}\n{piece}" if data is not None else piece
-            # 流结束（服务端关闭）时若仍有未结算缓冲，一并结算，避免丢最后一个事件
-            if data is not None:
+            # 流结束（服务端关闭）时若仍有未结算缓冲，一并结算，避免丢最后一个事件。
+            # 与上方块结算同一守卫：仅 data 非空才派发（comment 块的伪空 data: 不派发）。
+            if data:
                 _append_event(name or "message", data)
     except urllib.error.HTTPError as e:
         # 403 等：清晰记录失败并立即打印，由 main 的超时断言判 FAIL，不抛原始 traceback
