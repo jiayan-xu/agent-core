@@ -2573,7 +2573,7 @@ async fn handle_meeting_message(
     // 【round-14 #2】绝不可用 `.or(state)` 回退到锁内旧状态：`meeting_state` 返回 None 仅当会议
     // 已被并发删除；此时 `.or(state)` 会复活 ESM 的陈旧 running 状态，仍向已不存在的会议广播
     // Message 事件，让订阅端状态机回滚到 running——正是我们要防的倒退。故会议已消失则直接丢弃广播。
-    if let Some((status, phase, _)) = agent_arc.meeting_state(&id) {
+    if let Some((status, phase, _, _)) = agent_arc.meeting_state(&id) {
         broadcast_meeting_event(
             &st,
             &id,
@@ -2868,21 +2868,21 @@ async fn handle_meeting_stream(
                 .or_insert_with(|| broadcast::channel(256).0)
                 .subscribe()
         };
-    // 复核窗口：用 meeting_state()（仅取 status/phase/发言数，O(1) 不克隆整会）判断快照是否过期，
+    // 复核窗口：用 meeting_state()（仅取 status/phase/发言数/终态标记，不克隆整会）判断快照是否过期，
     // 仅在确实变化时再克隆完整会议用于序列化，避免每次订阅都做全量 clone 占用全局 agent 锁、
     // 拖慢大会议的所有 agent 操作（发言 / A2A / 生命周期 handler）。
     let state = {
         let g = st.agent.lock().await;
         g.as_ref().and_then(|a| a.meeting_state(&id2))
     };
-    // 终态快照：status != running 或 phase == Done 都表示会议已结束。
-    // 终态判定统一委托给 agent_core::agent::is_terminal_state（status/phase 单一来源），
-    // 避免各 handler 各写一份 `s == "done" || p == Some(Done)`，新增终态时漏改导致分歧。
-    let terminal = state
-        .as_ref()
-        .map_or(true, |(s, p, _)| is_terminal_state(s, *p));
+    // 终态快照：status != running / phase == Done / 含 phase_raw 的未知 phase 都表示会议已结束。
+    // 终态判定统一委托给 agent_core::agent::Meeting::is_terminal()（reviewer round-19 #1）——
+    // 它覆盖 phase_raw 未知 phase 的保守判定，是 status/phase/phase_raw 的单一来源，避免各
+    // handler 各写一份 `s == "done" || p == Some(Done)`，新增终态时漏改导致分歧。meeting_state
+    // 直接返回该布尔值，避免调用方用 is_terminal_state(&s, p) 重建而漏掉 phase_raw。
+    let terminal = state.as_ref().map_or(true, |(_, _, _, term)| *term);
     match state {
-        Some((status, phase, count)) => {
+        Some((status, phase, count, _)) => {
             let changed = match &snap {
                 Some(s) => s.messages.len() != count || s.status != status || s.phase != phase,
                 None => true,
@@ -3169,7 +3169,7 @@ async fn handle_meeting_heartbeat(
             .map(|a| a.meeting_visible(&id, &caller, &caller_ns, admin).unwrap_or(false))
             .unwrap_or(false);
         let terminal = agent_opt
-            .map_or(true, |a| a.meeting_state(&id).map_or(true, |(s, p, _)| is_terminal_state(&s, p)));
+            .map_or(true, |a| a.meeting_state(&id).map_or(true, |(_, _, _, term)| term));
         (visible, terminal)
     };
     if !visible {

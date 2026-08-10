@@ -28,6 +28,11 @@ pub const MEMBERSHIP_PHRASES: &[&str] = &[
 /// 强确认前缀：明确批准语义的开头（ocr maintainability·low(v22) 抽为常量，is_confirm /
 /// confirm_but_query / is_confirm_prefix 三处复用，消除漂移）。
 pub const CONFIRM_PREFIXES: &[&str] = &["确认", "同意", "批准", "执行吧"];
+
+/// 落盘临时文件名的进程内自增计数（reviewer round-19 #2 bug·medium）。
+/// 与 `std::process::id()` 拼成唯一临时名 `meetings.tmp.<pid>.<计数>`，每次写入都落在新文件上，
+/// 崩溃残留的陈旧 tmp 不再阻塞后续落盘（固定名 + create_new 的可恢复性回归，见 write_meetings_file）。
+static WRITE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// 复核/核查前缀：单独不算确认（用户要核对信息），仅当后续含明确确认 token 才算。
 pub const REVIEW_PREFIXES: &[&str] = &["确认一下", "确认下", "确认后"];
 use crate::checkpoint::{CheckpointState, CheckpointStore};
@@ -433,7 +438,11 @@ pub struct Meeting {
     /// 本字段在反序列化时捕获原始未知字符串，序列化时若 `phase` 为 None 且本字段非空，
     /// 就把原始未知字符串原样写回，保证 round-trip 无损（前向兼容数据不被抹除）。
     /// 内部字段，不直接进出 JSON（由自定义 Serialize/Deserialize 处理）。
-    pub phase_raw: Option<String>,
+    /// 可见性（reviewer round-19 #4 maintainability·low）：`pub(crate)` 而非 `pub`——本字段是
+    /// 状态机的**内部不变量**（未知 phase 时会议须视为终态、不可继续写入），若暴露为 pub 公开，
+    /// 外部 crate 可任意改写它而跳过 `Meeting::is_terminal()` 的守卫，破坏状态机不变式。
+    /// 本 crate 内（含测试）可读可写；外部只能通过「未知 phase 反序列化」隐式产生，无法直接设置。
+    pub(crate) phase_raw: Option<String>,
 }
 
 // 自定义 serde：让未知 phase 字符串 round-trip 无损（reviewer round-17 #3）。
@@ -441,13 +450,33 @@ pub struct Meeting {
 // 原样写回；两者皆空 → 省略 phase 键（旧数据兼容）。
 // 反序列化：已知字符串 → 解析为枚举；未知**字符串** → phase=None + phase_raw=Some(原文)；
 // 非字符串值（数字/对象）→ 两者皆空（宽容降级，不使整条反序列化失败）。
+//
+// 【round-19 #3 maintainability·low】必选字段名与计数收拢为单一清单 `MEETING_REQUIRED_SER_FIELDS`，
+// 序列化计数 = 清单长度，字段名与计数同源。新增字段只需往清单加一项并把 serialize_field 一并
+// 写出（用 `MEETING_REQUIRED_SER_FIELDS.len()` 作计数，编译器保证计数不会漏加/多写），
+// 避免此前手工维护「11」字面量导致新增字段时计数漂移、bincode/postcard 等严格格式损坏。
+const MEETING_REQUIRED_SER_FIELDS: &[&str] = &[
+    "id",
+    "topic",
+    "owner_user_id",
+    "participant_personas",
+    "is_private",
+    "created_at",
+    "status",
+    "consensus",
+    "scope",
+    "participant_agents",
+    "messages",
+];
+
 impl serde::Serialize for Meeting {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let phase_written = self.phase.is_some() || self.phase_raw.is_some();
-        // 11 个必选字段（id/topic/owner_user_id/participant_personas/is_private/created_at/
-        // status/consensus/scope/participant_agents/messages）+ 可选 phase（reviewer round-18 #1）。
-        let mut st = serializer.serialize_struct("Meeting", 11 + phase_written as usize)?;
+        // 计数 = 必选字段清单长度 + 可选 phase（reviewer round-18 #1）。字段名与计数同源，
+        // 见 MEETING_REQUIRED_SER_FIELDS 注释（round-19 #3）。
+        let mut st = serializer
+            .serialize_struct("Meeting", MEETING_REQUIRED_SER_FIELDS.len() + phase_written as usize)?;
         st.serialize_field("id", &self.id)?;
         st.serialize_field("topic", &self.topic)?;
         st.serialize_field("owner_user_id", &self.owner_user_id)?;
@@ -1397,18 +1426,22 @@ impl AgentCore {
         v.iter().find(|m| m.id == id).cloned()
     }
 
-    /// Step3：只取会议的轻量状态 `(status, phase, 发言数)`，不克隆 messages 历史。
+    /// Step3：只取会议的轻量状态 `(status, phase, 发言数, 终态标记)`，不克隆 messages 历史。
     /// 供增量广播（message/ended）与 SSE 订阅复核使用。
     /// 复杂度（reviewer round-14 #7，纠正此前「O(1)」的错误声明）：内部仍是 `v.iter().find`
     /// 对全部会议做 O(#meetings) 线性扫描 + 一次 `status.clone()` 堆分配，均在全局 meetings 锁内。
     /// 与 `get_meeting`（克隆完整历史）相比，它只避免克隆 messages history，而**不**是 O(1)。
     /// 当前会议数规模小（E2E / 单机），线性扫描可接受；若未来会议数显著增长，须引入
     /// id → index 索引（如 HashMap）以真正达到 O(1)。
-    pub fn meeting_state(&self, id: &str) -> Option<(String, Option<MeetingPhase>, usize)> {
+    /// 终态标记（reviewer round-19 #1 bug·medium）：直接复用 `Meeting::is_terminal()`（含 phase_raw
+    /// 未知 phase 的保守终态判定），而不是让调用方各自用 `is_terminal_state(&s, p)` 重建一份——
+    /// 否则含 phase_raw 的会议在心跳/SSE 侧会被误判为**非终态**而继续接收心跳 / 重建 presence，
+    /// 与 `meetings_need_presence_clear` 的清理判定产生分歧（两套谓词漂移）。
+    pub fn meeting_state(&self, id: &str) -> Option<(String, Option<MeetingPhase>, usize, bool)> {
         let v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
         v.iter()
             .find(|m| m.id == id)
-            .map(|m| (m.status.clone(), m.phase, m.messages.len()))
+            .map(|m| (m.status.clone(), m.phase, m.messages.len(), m.is_terminal()))
     }
 
     /// Step3：会议可见性判定（owner / admin / scope 成员 / 公开会议）。
@@ -1437,8 +1470,11 @@ impl AgentCore {
             .map(|id| match v.iter().find(|m| m.id == *id) {
                 // 会议不存在 → 应清理
                 None => true,
-                // 会议存在但已终态（status=done 或 phase=Done）→ 应清理（终态后无心跳，presence 泄漏）
-                Some(m) => is_terminal_state(&m.status, m.phase),
+                // 会议存在但已终态（status=done / phase=Done / 含 phase_raw 的未知 phase）→ 应清理
+                // （终态后无心跳，presence 泄漏）。统一用 Meeting::is_terminal()（reviewer round-19 #1）：
+                // 它覆盖 phase_raw 未知 phase 的保守终态判定，与 meeting_state / 心跳侧共享同一谓词，
+                // 避免此处仍用 is_terminal_state(&m.status, m.phase) 而把含 phase_raw 的会议漏判为活跃。
+                Some(m) => m.is_terminal(),
             })
             .collect()
     }
@@ -1563,6 +1599,15 @@ impl AgentCore {
     /// rename 后新文件完整）；写 tmp 后 `sync_all`（fsync）使数据落盘，再 rename，以覆盖
     /// OS 崩溃 / 断电场景（否则 rename 的文件可能为空或陈旧）。rename 后目录未 fsync，故
     /// 「断电后文件名永久丢失」仍无法 100% 保证——文档如实声明，不夸大。
+    ///
+    /// 临时文件名（reviewer round-19 #2 bug·medium）：**每次写入用唯一名** `meetings.tmp.<pid>.<计数>`
+    /// 而非固定 `meetings.tmp`。理由：
+    ///   - 固定名 + `create_new(true)`（round-18 #3 防 symlink 跟随）存在可恢复性回归——进程崩溃
+    ///     残留的陈旧 tmp 会令**之后每一次**落盘都 `AlreadyExists` 失败且无自愈（旧 `std::fs::write`
+    ///     可截断自愈）。唯一名让每次写入都落在新文件上，崩溃残留不再阻塞后续落盘。
+    ///   - 唯一名同时**保留**并强化了防 symlink 能力：攻击者无法预知 tmp 名（含随机 pit + 递增计数），
+    ///     无法预置同名软链；`create_new(true)` 仍拒绝任何已存在的目标（含软链），绝不跟随。
+    ///   - 🧹 残留 tmp（`meetings.tmp.*`）由 `load_meetings_from_disk` 启动时清理（见下）。
     fn write_meetings_file(&self, s: &str) -> Result<(), String> {
         let cwd = match std::env::current_dir() {
             Ok(d) => d,
@@ -1572,17 +1617,17 @@ impl AgentCore {
             }
         };
         let path = cwd.join("meetings.json");
-        let tmp = path.with_extension("tmp");
+        // 线程进程内自增计数，保证同进程内多次写入 tmp 名互不冲突（pid 已区分跨进程）。
+        let n = WRITE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), n));
         // 用 OpenOptions 显式建文件而非 File::create：后者默认 0644（owner 读写 + 组/其他读），
         // 含完整会议记录（真人发言、参会者、共识等 PII）的全文会被**任意本地用户**读取
         // （reviewer round-17 #8 security·low）。限制为 0600（仅 owner 读写）。
         // 【reviewer round-18 #3 security·medium】用 `create_new(true)`（O_CREAT|O_EXCL）而非
-        // `create(true).truncate(true)`：后者会**跟随已存在的符号链接**——若 cwd 中被人预置
-        // `meetings.tmp -> ~/.bashrc` 等软链，每次落盘都会把含 PII 的会议 JSON 截断写入被链接
-        // 文件（数据泄露 + 任意文件破坏），使 0600 权限收紧失效（0600 只保护新 inode，不防
-        // symlink）。create_new 遇已存在的文件（含符号链接）即报 AlreadyExists，我们据此报错
-        // 退出而非跟随。正常流程下 tmp 在 rename 后被移除，下次写入总能新建；仅崩溃残留的
-        // 陈旧 tmp 会触发 AlreadyExists——此时安全地失败并告警，让运维清理，而非冒险跟随。
+        // `create(true).truncate(true)`：后者会**跟随已存在的符号链接**——若 cwd 中被人预置软链，
+        // 每次落盘都会把含 PII 的会议 JSON 截断写入被链接文件（数据泄露 + 任意文件破坏），使 0600
+        // 权限收紧失效（0600 只保护新 inode，不防 symlink）。配合**唯一 tmp 名**（round-19 #2），
+        // 攻击者无法预知文件名预置软链；create_new 遇任何已存在目标（含软链）即报 AlreadyExists。
         //   - Unix：OpenOptionsExt::mode(0o600) 在 umask 基础上再收紧，tmp/最终文件仅 owner 可读写；
         //   - Windows：OpenOptions 同样工作，mode 被忽略（Windows 无 POSIX 权限位），
         //     细粒度 ACL 属系统目录管理职责，单用户桌面场景下可接受。
@@ -1617,6 +1662,20 @@ impl AgentCore {
             Ok(d) => d,
             Err(_) => return,
         };
+        // 清理崩溃残留的临时文件（reviewer round-19 #2 bug·medium）：唯一 tmp 名
+        // `meetings.tmp.<pid>.<计数>` 保证每次落盘都能新建，但若进程在 rename 前崩溃，会遗留
+        // 一个孤儿 tmp。下一条 rewrite 不依赖它（新名），但积累会占用磁盘且可能含 PII，故启动时
+        // 扫 cwd 删除所有 `meetings.tmp.*` 残留。仅删匹配前缀的 tmp，不碰 meetings.json 本体。
+        if let Ok(rd) = std::fs::read_dir(&cwd) {
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("meetings.tmp.") {
+                    let _ = std::fs::remove_file(entry.path());
+                    tracing::info!(tmp = %name, "load_meetings_from_disk: 清理崩溃残留的临时文件");
+                }
+            }
+        }
         let path = cwd.join("meetings.json");
         let s = match std::fs::read_to_string(&path) {
             Ok(s) => s,
@@ -11584,6 +11643,53 @@ mod whitelist_preroute_tests {
         assert_eq!(m.phase_raw.as_deref(), Some("cancelled"));
         let rt = serde_json::to_string(&m).unwrap();
         assert!(rt.contains("\"phase\":\"cancelled\""), "phase_raw 标记必须保留，实际: {rt}");
+    }
+
+    /// Step3（reviewer round-19 #3 maintainability·low）：自定义 Serialize 的**全部必选字段**
+    /// 必须 round-trip 无损——这是字段清单 `MEETING_REQUIRED_SER_FIELDS` 与 serialize_field 逐字段
+    /// 写出的锚点。若新增字段漏写 serialize_field / 漏进清单 / 计数漂移，此断言会失败。
+    #[test]
+    fn meeting_all_required_fields_roundtrip_losslessly() {
+        let m = Meeting {
+            id: "mtg_rt".into(),
+            topic: "固废监管圆桌".into(),
+            owner_user_id: "owner1".into(),
+            participant_personas: vec!["ai1".into(), "ai2".into()],
+            is_private: true,
+            created_at: "2026-08-01T00:00:00Z".into(),
+            status: "running".into(),
+            consensus: Some("已达成一致".into()),
+            scope: Some("scope/sz".into()),
+            participant_agents: vec!["agent/admin".into(), "agent/human".into()],
+            phase: Some(MeetingPhase::Discussing),
+            phase_raw: None,
+            messages: vec![MeetingMessage {
+                from: "agent/admin".into(),
+                kind: "human".into(),
+                content: "第一条意见".into(),
+                at: "2026-08-01T00:01:00Z".into(),
+            }],
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        let back: Meeting = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.id, "mtg_rt");
+        assert_eq!(back.topic, "固废监管圆桌");
+        assert_eq!(back.owner_user_id, "owner1");
+        assert_eq!(back.participant_personas, vec!["ai1", "ai2"]);
+        assert_eq!(back.is_private, true);
+        assert_eq!(back.created_at, "2026-08-01T00:00:00Z");
+        assert_eq!(back.status, "running");
+        assert_eq!(back.consensus.as_deref(), Some("已达成一致"));
+        assert_eq!(back.scope.as_deref(), Some("scope/sz"));
+        assert_eq!(back.participant_agents, vec!["agent/admin", "agent/human"]);
+        assert_eq!(back.phase, Some(MeetingPhase::Discussing));
+        assert_eq!(back.phase_raw, None);
+        assert_eq!(back.messages.len(), 1);
+        assert_eq!(back.messages[0].content, "第一条意见");
+        assert!(s.contains("\"status\":\"running\""), "全字段序列化遗漏 status，实际: {s}");
+        assert!(s.contains("\"consensus\":\"已达成一致\""), "全字段序列化遗漏 consensus，实际: {s}");
+        assert!(s.contains("\"scope\":\"scope/sz\""), "全字段序列化遗漏 scope，实际: {s}");
+        assert!(s.contains("\"participant_agents\""), "全字段序列化遗漏 participant_agents，实际: {s}");
     }
 
     /// Step3（ocr-review maintainability·medium）：EventKind 的 serde 名与 SSE 事件名必须一致，

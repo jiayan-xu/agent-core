@@ -269,7 +269,8 @@ def main() -> int:
         end_obj = json.loads(end_ev)
     except Exception:
         pass
-    ok &= bool(end_obj.get("deleted") is True)
+    # 简化为直接比较（reviewer round-19 #5 style·low：bool(x is True) 冗余）
+    ok &= end_obj.get("deleted") is True
 
     print("6) 心跳注释行保活存在")
     has_ping = any(line.startswith(": ping") or line == ":ping" for line in _snapshot_raw())
