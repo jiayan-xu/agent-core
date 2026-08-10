@@ -2,6 +2,12 @@
 
 ## 2026-08-10
 
+### v0.5.0 · OfficeCLI 文档引擎接入 + office 源收窄为 fsutil 底座（安全边界发版锚点）
+- **改动**：接入 OfficeCLI（iOfficeAI/OfficeCLI v1.0.143）作为新 MCP 源，形成完整文档引擎（read / validate / issues / merge / render / pdf / create / query，350+ 公式引擎）；本地 `office` 源改名 `fsutil` 收窄为文件系统 + URL + 分析底座，职责彻底分离；新增 `tests/eval_officecli.rs` 集成测试（6 用例）。
+- **效果**：文档读写/转换/创建/查询统一走 OfficeCLI 引擎，fsutil 只负责文件系统与 URL 分析；boundary.rs 白名单同步收紧，读/写权限分级清晰。
+- **动机**：此迁移属安全边界改动，按 `docs/RELEASING.md` 作为 `0.4.0 -> 0.5.0` 的 minor 发版锚点；版本号与 tag、CHANGELOG 三件套绑定同一次合并。
+- **关联**：`src/boundary.rs` / `src/agent.rs` / `src/dept_ops.rs` / `tests/eval_officecli.rs` / `office-tools/officecli_mcp_bridge.py` / `office-tools/plugins/exporter/pdf/plugin.exe`。
+
 ### 版本管理补齐（发版纪律落地）
 - **改动**：新增 `docs/RELEASING.md` 发版纪律，明确「bump 版本号 + 打 tag + 写 CHANGELOG」三步绑定同一合并。
 - **动机**：`v0.4.0`（2026-07-12）后版本号近一个月零 bump（360+ commit），CHANGELOG 停在 07-15，无可回溯稳定点。
