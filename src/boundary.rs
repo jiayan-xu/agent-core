@@ -349,6 +349,7 @@ impl ExecutionSandbox {
         // 同样需过沙箱门闸，防经 PDF/merge 路径读敏感文件
         "officecli_pdf",
         "officecli_merge",
+        "officecli_create",
     ];
     const REQUIRES_REVIEW: &'static [&'static str] = &["delete_", "batch_", "shutdown_"];
 
@@ -1859,6 +1860,38 @@ mod tests {
         let r = ExecutionSandbox::check("delete_user", &[]);
         assert!(!r.allow);
         assert_eq!(r.level, Some(BlockLevel::Yellow));
+
+        // 多路径门闸：move_file 安全 src + 恶意 dst（.ssh）→ 红闸（第二个路径触发）
+        let r = ExecutionSandbox::check(
+            "move_file",
+            &[
+                PathBuf::from("C:/workspace/a.txt"),
+                PathBuf::from("C:/test/.ssh/id_ed25519"),
+            ],
+        );
+        assert!(!r.allow, "move_file 恶意 dst 应触发沙箱门闸");
+        assert_eq!(r.level, Some(BlockLevel::Red));
+
+        // officecli_pdf 敏感 file + 合法 output → 红闸（源路径触发）
+        let r = ExecutionSandbox::check(
+            "officecli_pdf",
+            &[
+                PathBuf::from("C:/test/.ssh/id_ed25519"),
+                PathBuf::from("C:/workspace/out.pdf"),
+            ],
+        );
+        assert!(!r.allow, "officecli_pdf 敏感 file 应触发沙箱门闸");
+        assert_eq!(r.level, Some(BlockLevel::Red));
+
+        // 多路径都为安全路径 → 放行
+        let r = ExecutionSandbox::check(
+            "move_file",
+            &[
+                PathBuf::from("C:/workspace/a.txt"),
+                PathBuf::from("C:/workspace/b.txt"),
+            ],
+        );
+        assert!(r.allow, "move_file 全安全路径应放行");
     }
 
     #[test]

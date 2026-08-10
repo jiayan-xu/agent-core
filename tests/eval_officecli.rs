@@ -92,12 +92,16 @@ fn resolve_output(output: &str) -> std::path::PathBuf {
             Err(_) => out_dir.join(p),
         }
     };
-    // 拒绝逃逸 _out 的路径（.. 或任意绝对路径），避免删除守卫误删 _out 之外文件
+    // 词法锚定后 canonicalize（防中间 symlink 逃逸 _out），再对真实路径重新锚定校验；
+    // out_dir 与 resolved 都 canonicalize，保证大小写/分隔符规范化后前缀比较一致。
+    let out_dir_c = std::fs::canonicalize(&out_dir).unwrap_or(out_dir.clone());
+    let resolved = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+    // 拒绝逃逸 _out 的路径（.. 或任意绝对路径或 symlink 逃逸），避免删除守卫误删 _out 之外文件
     assert!(
-        resolved.starts_with(&out_dir)
+        resolved.starts_with(&out_dir_c)
             && !resolved
-                .strip_prefix(&out_dir)
-                .unwrap_or(&out_dir)
+                .strip_prefix(&out_dir_c)
+                .unwrap_or(&out_dir_c)
                 .components()
                 .any(|c| c == std::path::Component::ParentDir),
         "bridge 输出路径逃逸 _out 目录: {output}"
@@ -108,21 +112,15 @@ fn resolve_output(output: &str) -> std::path::PathBuf {
 /// 产物清理守卫：drop 时 best-effort 删除文件，即使中间断言 panic 也不泄漏 _out/ 产物。
 struct OutputGuard {
     path: std::path::PathBuf,
-    armed: bool,
 }
 impl OutputGuard {
     fn new(path: std::path::PathBuf) -> Self {
-        Self { path, armed: true }
-    }
-    fn disarm(&mut self) {
-        self.armed = false;
+        Self { path }
     }
 }
 impl Drop for OutputGuard {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -188,7 +186,7 @@ async fn officecli_tools_are_listed() {
     let agent = agent_with_officecli();
     let tools = with_timeout(agent.fetch_tools_filtered(&["agent/eval-officecli".to_string()]))
         .await
-        .expect("fetch_tools_filtered 应在 30s 内返回");
+        .expect("fetch_tools_filtered 应在 60s 内返回");
     let names: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
     let expected = [
         "officecli_read",
@@ -232,7 +230,7 @@ async fn officecli_read_routes_and_calls() {
             "officecli-e2e",
         ))
         .await
-        .expect("officecli_read 应在 30s 内返回")
+        .expect("officecli_read 应在 60s 内返回")
         .expect("officecli_read 应调用成功");
     // 解析 JSON 断言 success==true（而非 contains("success")，避免错误负载含 success 字样蒙混过关）
     let val: serde_json::Value =
@@ -291,7 +289,7 @@ async fn officecli_create_adds_and_query() {
             "officecli-e2e-create",
         ))
         .await
-        .expect("officecli_create 应在 30s 内返回")
+        .expect("officecli_create 应在 60s 内返回")
         .expect("officecli_create 应成功");
     // 解析 JSON 断言 success==true，并取回输出路径
     let val: serde_json::Value =
@@ -309,16 +307,23 @@ async fn officecli_create_adds_and_query() {
     let _guard = OutputGuard::new(abs_output.clone());
     assert!(abs_output.is_file(), "create 产物应已落盘: {abs_output:?}");
 
-    // query：命中刚创建的段落
+    // query：命中刚创建的段落。
+    // file 用 bridge 返回的原始绝对路径（_out_path 返回 os.path.abspath 拼接，非 navigate verbatim）；
+    // 若意外为相对路径则用词法绝对路径（不经 canonicalize，避免 Windows \\?\ verbatim 前缀触发文件锁）
+    let query_file = if std::path::Path::new(output).is_absolute() {
+        output.to_string()
+    } else {
+        office_tools_dir().join("_out").join(output).to_string_lossy().to_string()
+    };
     let q_out = with_timeout(agent.call_tool_routed(
             "officecli_query",
             "default",
-            &serde_json::json!({"file": output, "selector": "paragraph"}),
+            &serde_json::json!({"file": query_file, "selector": "paragraph"}),
             &["agent/eval-officecli".to_string()],
             "officecli-e2e-query",
         ))
         .await
-        .expect("officecli_query 应在 30s 内返回")
+        .expect("officecli_query 应在 60s 内返回")
         .expect("officecli_query 应成功");
     // query 返回 JSON 字符串；解析后对解码的字符串值做包含检查，
     // 避免 bridge 用 ensure_ascii 转义中文（\uXXXX）时字面子串匹配失败。
@@ -346,7 +351,7 @@ async fn officecli_query_rejects_write_selector() {
             "officecli-e2e-query-guard",
         ))
         .await
-        .expect("query 调用应在 30s 内返回");
+        .expect("query 调用应在 60s 内返回");
     assert!(res.is_err(), "query 应拒绝写类 selector");
     let err = res.unwrap_err();
     // 只认文件顶部契约文档声明的稳定标记「禁止写入」；若 bridge 的写保护回归（如误报 selector 格式错误），本断言会失败——这正是要检测的
@@ -367,7 +372,7 @@ async fn officecli_pdf_exports_valid_pdf() {
             "officecli-e2e-pdf",
         ))
         .await
-        .expect("officecli_pdf 应在 30s 内返回")
+        .expect("officecli_pdf 应在 60s 内返回")
         .expect("officecli_pdf 应成功");
     // 解析 JSON 取回输出路径校验产物是合法 PDF。
     // 注意：pdf 插件的 `view pdf` 输出是纯文件路径文本（非 JSON），bridge 以 {"raw": path, "output": path} 返回，
