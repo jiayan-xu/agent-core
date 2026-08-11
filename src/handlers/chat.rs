@@ -15,7 +15,7 @@ use axum::Json;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::auth::AuthContext;
-use crate::caller_ns_covers;
+use crate::handlers::identity::caller_ns_covers;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]

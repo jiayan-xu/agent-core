@@ -4,7 +4,10 @@
 //! crate::state / crate::auth / crate::config。四预算自治封套（AutonomyBudget）落点 = evolve.rs。
 
 pub mod admin;
+pub mod approval;
 pub mod chat;
+pub mod collab;
 pub mod evolve;
+pub mod identity;
 pub mod meetings;
 pub mod system;

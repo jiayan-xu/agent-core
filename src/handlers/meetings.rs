@@ -18,7 +18,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use agent_core::agent::{AgentCore, EventKind, MeetingEvent};
 
 use crate::auth::authenticate;
-use crate::is_admin;
+use crate::handlers::approval::is_admin;
 use crate::state::AppState;
 
 pub(crate) async fn handle_meetings_list(

@@ -13,7 +13,7 @@ use axum::Json;
 
 
 use crate::auth::{authenticate, unauthorized};
-use crate::build_agent;
+use crate::handlers::identity::build_agent;
 use crate::config::{resolve_config_for_runtime, save_config};
 use crate::handlers::chat::{SetupRequest, SetupResponse};
 use crate::state::{AppState, BackgroundEvent};
