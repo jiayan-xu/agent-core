@@ -5326,7 +5326,10 @@ impl AgentCore {
         // P1-C：checkpoint 缺失/过期的兜底——已执行步骤若本地无结果，尝试从
         // memoria 外置召回（perf·medium：外置不能 write-only，读侧在续跑闭环
         // 补齐；仅对缺失步骤召回，避免无谓 MCP 调用）。
-        if !step_results.is_empty() {
+        // bug·medium（第二轮）：此前 `if !step_results.is_empty()` 守卫在空结果时
+        // 跳过召回——恰是 checkpoint 全丢的场景，条件反了；去掉守卫，一律对
+        // 缺失步骤尝试召回（本计划步骤数有限，MCP 调用量有界）。
+        {
             let step_ns = allowed_ns
                 .first()
                 .cloned()
@@ -7965,11 +7968,12 @@ impl AgentCore {
 
     /// 注册一个持久子 agent（句柄入注册表 + 落盘 sub_agents.json）。
     /// 返回子 agent id；后续经 `sub_agent_send` 投递消息、`sub_agent_list` 查看状态。
+    /// save 失败返回 Err（other·low：不能返回成功 id 却未持久化——断线续跑承诺失效）。
     pub(crate) async fn sub_agent_spawn(
         &self,
         task_desc: &str,
         ns: &str,
-    ) -> String {
+    ) -> Result<String, String> {
         let seq = self
             .sub_agent_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7981,10 +7985,13 @@ impl AgentCore {
         );
         self.sub_agents.lock().await.insert(agent);
         // 统一用构造时固定路径（sub_agents_file），与 load 同一 cwd（bug·medium）
-        if let Err(e) = crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file).await {
-            tracing::warn!(target: "agent.sub_agents", "子 agent 注册表持久化失败: {}", e);
-        }
-        id
+        crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file)
+            .await
+            .map_err(|e| {
+                tracing::warn!(target: "agent.sub_agents", "子 agent 注册表持久化失败: {}", e);
+                format!("子 agent 注册失败（未持久化）: {}", e)
+            })?;
+        Ok(id)
     }
 
     /// 向持久子 agent 投递消息（入其收件箱；未找到返回 Err，可回落 A2A 原生投递）。
@@ -8023,10 +8030,21 @@ impl AgentCore {
         &self,
         sub_id: &str,
     ) -> Vec<crate::persistent_subagent::SubAgentMessage> {
-        let mut reg = self.sub_agents.lock().await;
-        reg.get_mut(sub_id)
-            .map(|a| std::mem::take(&mut a.inbox))
-            .unwrap_or_default()
+        let taken = {
+            let mut reg = self.sub_agents.lock().await;
+            reg.get_mut(sub_id)
+                .map(|a| std::mem::take(&mut a.inbox))
+                .unwrap_or_default()
+        };
+        // 清空后落盘（bug·high：不清盘则重启后已消费消息重现 = 重复处理）
+        if !taken.is_empty() {
+            if let Err(e) =
+                crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file).await
+            {
+                tracing::warn!(target: "agent.sub_agents", "消费收件箱后持久化失败: {}", e);
+            }
+        }
+        taken
     }
 
     /// 取同组织已注册 Agent 通讯录（Memoria `agent_list`，需 admin）。

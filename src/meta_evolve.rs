@@ -775,12 +775,20 @@ impl MetaEvolver {
             .unwrap_or_default();
         let mut samples = Self::parse_negative_samples(&raw);
         // P1-A：追加 experience_memo 样本（第二源；best-effort）。
-        // 检索 agent **根 ns** `agent/{id}`（非 identity.ns() 的完整路径
-        // `agent/{id}/{path}`）——经验 memo 面向跨会话全局经验，故在根 ns 检索
-        // （与 recall_failure_lesson 的 root_ns 用法一致；ocr 2026-08-12 bug·medium
-        // 修正注释：此前「与 identity.ns() 一致」表述不准，实为根 ns 约定）。
+        // **双 ns 检索**（ocr 2026-08-12 bug·high）：record_experience_memo 写入
+        // 会话 ns（execute_tool_calls 的 allowed_ns.first()），而 collect 在根 ns——
+        // 单查根 ns 会漏掉会话 ns 下刚写未同步的 memo。故根 ns + 当前会话 ns 都查，
+        // 合并去重；根 ns 是跨会话全局经验主源（与 recall_failure_lesson 一致）。
         let root_ns = format!("agent/{}", self.agent_id);
-        let memos = crate::experience_memo::collect_memo_samples(mem_client, &root_ns, limit).await;
+        let mut memos = crate::experience_memo::collect_memo_samples(mem_client, &root_ns, limit).await;
+        // 会话 ns 补充：agent/{id}/default（与 execute_tool_calls 默认 memo 写入
+        // 位置一致的兜底；查无内容则空，无副作用）
+        let session_ns = format!("agent/{}/default", self.agent_id);
+        if session_ns != root_ns {
+            let session_memos =
+                crate::experience_memo::collect_memo_samples(mem_client, &session_ns, limit).await;
+            memos.extend(session_memos);
+        }
         // 去重键：change_type + old_value 复合（仅 old_value 会误并不同样本，
         // bug·low——同错误文本可能来自不同工具/场景，change_type 承载工具名）
         let mut known: std::collections::HashSet<(String, String)> = samples

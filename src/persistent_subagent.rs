@@ -146,6 +146,10 @@ impl SubAgentRegistry {
 
 /// 消息投递：入收件箱 + 通知（若子 agent 已注册 notify 通道）。
 /// 未找到目标子 agent 返回 Err（调用方可用 A2A 原生投递兜底）。
+/// 锁序修复（ocr 2026-08-12 bug·high）：先把 notify 的 sender **克隆出来**
+/// （UnboundedSender 是 Clone 的），在 registry 锁内只做收件箱写入，
+/// 锁外再 send——避免 registry 锁跨 `ntf.lock().await`（防与其它
+/// notify 持锁路径形成锁序环 / 长时间阻塞其它注册表操作）。
 pub async fn deliver(
     registry: &Arc<Mutex<SubAgentRegistry>>,
     to_sub_id: &str,
@@ -157,14 +161,22 @@ pub async fn deliver(
         content: content.to_string(),
         ts: now_iso(),
     };
-    let mut reg = registry.lock().await;
-    let agent = reg
-        .get_mut(to_sub_id)
-        .ok_or_else(|| format!("子 agent {} 不存在", to_sub_id))?;
-    agent.inbox.push(msg.clone());
-    agent.last_active = now_unix();
-    if let Some(ntf) = &agent.notify {
-        let _ = ntf.lock().await.send(msg);
+    let notify_sender = {
+        let mut reg = registry.lock().await;
+        let agent = reg
+            .get_mut(to_sub_id)
+            .ok_or_else(|| format!("子 agent {} 不存在", to_sub_id))?;
+        agent.inbox.push(msg.clone());
+        agent.last_active = now_unix();
+        // UnboundedSender: Clone 后可在锁外安全 send（不发则丢弃）。
+        // try_lock：notify 锁被占用时跳过通知（不阻塞收件箱写入）。
+        match &agent.notify {
+            Some(ntf) => ntf.try_lock().ok().map(|g| g.clone()),
+            None => None,
+        }
+    };
+    if let Some(sender) = notify_sender {
+        let _ = sender.send(msg);
     }
     Ok(())
 }
