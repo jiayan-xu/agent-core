@@ -259,6 +259,19 @@ pub enum MembershipVerdict {
     Unknown,
 }
 
+/// 首个变更（非只读）工具执行前的会话快照（Phase B，GenOffice snapshotBefore 借鉴）。
+/// 供回滚 UI / 自进化 dry_run 复用；每次 run 起始重置，首个写工具前捕获一次。
+#[derive(Debug, Clone)]
+pub struct MutationSnapshot {
+    /// 触发快照的写工具名
+    pub tool_name: String,
+    /// 捕获时该 run 的消息列表（含系统 prompt 与已执行工具结果）
+    pub messages_before: Vec<crate::llm::Message>,
+    pub session_id: String,
+    pub trace_id: String,
+    pub captured_at_ms: u64,
+}
+
 /// Agent 核心
 pub struct AgentCore {
     pub config: AgentConfig,
@@ -294,6 +307,9 @@ pub struct AgentCore {
     /// P1-1: 会话历史摘要缓存（session_id → (已摘要条数, 摘要文本, 已摘要区间指纹)）——滑动窗口+摘要层。
     /// 指纹防「外部历史替换但条数不变」场景返回过期摘要（P1 审查#3）。
     history_summary_cache: tokio::sync::Mutex<HashMap<String, (usize, String, u64)>>,
+    /// Phase B（GenOffice snapshotBefore 借鉴）：本次 run 首个非只读工具执行前的消息快照，
+    /// 供回滚 UI / 自进化 dry_run 复用。每次 run 起始重置，首个写工具执行前捕获一次。
+    pub mutation_snapshot: tokio::sync::Mutex<Option<MutationSnapshot>>,
     /// P2-1: 命名空间级配额与成本（tool 轮次 / 日 token 预算 / 并发会话）
     pub quota: Arc<std::sync::Mutex<NsQuotaStore>>,
     /// 白龙马 A3: Focus Stack → Thread 模型 —— 已归档话题（episode）软隐藏索引
@@ -1001,6 +1017,7 @@ impl AgentCore {
             inbox_cache: tokio::sync::Mutex::new(InboxCache::new()),
             session_manager: SessionManager::new(),
             history_summary_cache: tokio::sync::Mutex::new(HashMap::new()),
+            mutation_snapshot: tokio::sync::Mutex::new(None),
             audit_logger: AuditLogger::new(mcp_for_audit),
             tool_route_cache: tokio::sync::Mutex::new(HashMap::new()),
             namespace_registry: std::sync::Mutex::new(NamespaceRegistry::new()),
@@ -6597,6 +6614,9 @@ impl AgentCore {
         // 反复重试 6-7 轮 → 70s+）。Hard 任务保持 20 轮（固废多步推理）。
         let max_rounds = if is_easy_query { 3u32 } else { self.config.max_tool_rounds };
 
+        // Phase B：每次 run 起始重置变更前快照（首个写工具执行时重新捕获）
+        *self.mutation_snapshot.lock().await = None;
+
         for _round in 0..max_rounds {
             // P2-1: 日 token 预算预估（请求上下文体量），超限硬拒
             let ctx_chars: usize = ctx
@@ -6775,6 +6795,8 @@ impl AgentCore {
                 ToolExecOutcome::Abort(reply) => return reply,
                 ToolExecOutcome::Executed(any) => ctx.did_work |= any,
             }
+            // Phase B：每轮工具执行后按字节预算截断陈旧 tool 输出（防跨轮载荷越滚越大）
+            Self::squash_stale_tool_outputs(&mut ctx.messages);
         }
 
         // 轮数耗尽，最后让 LLM 总结
@@ -7202,6 +7224,45 @@ impl AgentCore {
         out
     }
 
+    /// 运行中超预算时截断**陈旧** tool 输出（对齐 GenOffice loop.ts squashStaleToolOutputs）：
+    /// 保留结构（tool 消息成对完整）、保最近 N 条原文，更早的只截内容并加截断标记。
+    /// 避免多轮工具循环里历史 tool 结果越滚越大、每轮重发超大载荷。
+    fn squash_stale_tool_outputs(messages: &mut Vec<Message>) {
+        const BUDGET_BYTES: usize = 256 * 1024;
+        const KEEP_RECENT: usize = 2;
+        const OUTPUT_MAX: usize = 2_000;
+        let total: usize = messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
+            .sum();
+        if total <= BUDGET_BYTES {
+            return;
+        }
+        let mut recent = 0;
+        for m in messages.iter_mut().rev() {
+            if m.role != "tool" {
+                continue;
+            }
+            recent += 1;
+            if recent <= KEEP_RECENT {
+                continue;
+            }
+            if let Some(c) = &m.content {
+                if c.len() > OUTPUT_MAX {
+                    let head: String = c.chars().take(OUTPUT_MAX).collect();
+                    m.content = Some(format!("{}…(output truncated: too long)", head));
+                }
+            }
+        }
+    }
+
+    /// 取走本次 run 的变更前快照（首个非只读工具执行前的消息列表），
+    /// 供回滚 UI / 自进化 dry_run 复用；None = 本次 run 无写工具执行。
+    pub async fn take_mutation_snapshot(&self) -> Option<MutationSnapshot> {
+        self.mutation_snapshot.lock().await.take()
+    }
+
     /// 执行 LLM 返回的工具调用（重构 L 阶段：Agents SDK turn 语义——校验→审批→执行→回灌）。
     /// 返回 ToolExecOutcome：Executed(是否执行了工具) 或 Abort(提前终止文案，llm_loop 直接返回)。
     async fn execute_tool_calls(
@@ -7484,6 +7545,26 @@ impl AgentCore {
                         tool_call_id: None,
                     });
                     continue;
+                }
+            }
+
+            // Phase B：首个非只读（写）工具执行前捕获变更前快照（GenOffice snapshotBefore 借鉴），
+            // 供回滚 UI / 自进化 dry_run 复用；每次 run 只捕获一次（run 起始已重置）。
+            if !crate::boundary::is_read_only_tool(&tc.name) {
+                let mut snap = self.mutation_snapshot.lock().await;
+                if snap.is_none() {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    *snap = Some(MutationSnapshot {
+                        tool_name: tc.name.clone(),
+                        messages_before: messages.clone(),
+                        session_id: session_id.to_string(),
+                        trace_id: trace_id.to_string(),
+                        captured_at_ms: now_ms,
+                    });
+                    tracing::info!(tool = %tc.name, session = %session_id, "mutation_snapshot_captured");
                 }
             }
 
