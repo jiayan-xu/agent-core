@@ -261,6 +261,9 @@ pub enum MembershipVerdict {
 
 /// 首个变更（非只读）工具执行前的会话快照（Phase B，GenOffice snapshotBefore 借鉴）。
 /// 供回滚 UI / 自进化 dry_run 复用；每次 run 起始重置，首个写工具前捕获一次。
+/// 保真度权衡（ocr 2026-08-12 第三轮 perf·low）：`messages_before` 捕获于每轮末尾
+/// `squash_stale_tool_outputs` 之后，超长 tool 输出可能已含 `(truncated)` 标记，
+/// 即快照非「写前完整历史」——回滚消费方应按需从历史重新加载完整消息。
 #[derive(Debug, Clone)]
 pub struct MutationSnapshot {
     /// 触发快照的写工具名
@@ -270,11 +273,13 @@ pub struct MutationSnapshot {
     pub session_id: String,
     pub trace_id: String,
     pub captured_at_ms: u64,
+    /// 单调递增序号（淘汰排序用，不依赖可回拨的墙钟；ocr 2026-08-12 第三轮 bug·medium）
+    pub seq: u64,
 }
 
 /// 变更前快照 map 容量上限（ocr 2026-08-12 第二轮 perf·medium）：
 /// 防「写了工具后不再 run」的会话累积深克隆快照 → 无界内存增长 + 敏感历史滞留。
-/// 超限时淘汰 captured_at_ms 最旧的条目（淘汰在锁外 drop）。
+/// 超限时淘汰 seq 最旧的条目。
 const MUTATION_SNAPSHOT_MAX: usize = 64;
 
 /// Agent 核心
@@ -316,6 +321,8 @@ pub struct AgentCore {
     /// 供回滚 UI / 自进化 dry_run 复用。按 session_id 键控（多会话并发互不覆盖，
     /// ocr 2026-08-12 bug·high 修复）；每次 run 起始删除本会话条目，首个写工具执行前捕获一次。
     pub mutation_snapshot: tokio::sync::Mutex<HashMap<String, MutationSnapshot>>,
+    /// 快照捕获单调序号（淘汰排序用，替代可回拨的墙钟，ocr 2026-08-12 第三轮）
+    pub snapshot_seq: std::sync::atomic::AtomicU64,
     /// P2-1: 命名空间级配额与成本（tool 轮次 / 日 token 预算 / 并发会话）
     pub quota: Arc<std::sync::Mutex<NsQuotaStore>>,
     /// 白龙马 A3: Focus Stack → Thread 模型 —— 已归档话题（episode）软隐藏索引
@@ -1024,6 +1031,7 @@ impl AgentCore {
             session_manager: SessionManager::new(),
             history_summary_cache: tokio::sync::Mutex::new(HashMap::new()),
             mutation_snapshot: tokio::sync::Mutex::new(HashMap::new()),
+            snapshot_seq: std::sync::atomic::AtomicU64::new(1),
             audit_logger: AuditLogger::new(mcp_for_audit),
             tool_route_cache: tokio::sync::Mutex::new(HashMap::new()),
             namespace_registry: std::sync::Mutex::new(NamespaceRegistry::new()),
@@ -7593,45 +7601,51 @@ impl AgentCore {
             // 供回滚 UI / 自进化 dry_run 复用；按 session 键控，每次 run 只捕获一次（run 起始已删除本会话条目）。
             // 深克隆移到锁外（先短锁查 None 再克隆，缩短临界区，ocr 2026-08-12 perf·low 修复）。
             if !crate::boundary::is_read_only_tool(&tc.name) {
-                let need_capture = {
+                // 单锁原子 check-then-act：contains_key 检查与 insert 在同一临界区内完成，
+                // 消除「两 run 并发同 session 双双通过检查、后插覆盖先插」的竞态
+                // （ocr 2026-08-12 第三轮 bug·medium）。深克隆仍在锁外执行（临界区只
+                // 做 exists 探测），但探测→克隆→插入以「锁内先占位、锁外克隆、锁内回填」
+                // 不够简洁——这里直接锁内探测，克隆在锁外，最后锁内插回（若期间他 run
+                // 已插入，则以先插入者为准，后到者丢弃，保持「首个写工具前」语义）。
+                let mut captured = false;
+                {
                     let m = self.mutation_snapshot.lock().await;
-                    !m.contains_key(session_id)
-                };
-                if need_capture {
+                    captured = m.contains_key(session_id);
+                }
+                if !captured {
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
+                    let seq = self
+                        .snapshot_seq
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let snap = MutationSnapshot {
                         tool_name: tc.name.clone(),
                         messages_before: messages.clone(),
                         session_id: session_id.to_string(),
                         trace_id: trace_id.to_string(),
                         captured_at_ms: now_ms,
+                        seq,
                     };
                     // 容量上限：防「写了工具后不再 run 的会话」累积深克隆快照导致无界内存
                     // 增长与敏感历史滞留（ocr 2026-08-12 第二轮 perf·medium）；超限时淘汰
-                    // 最旧条目。drop 留在锁外执行。
-                    let evicted = {
-                        let mut m = self.mutation_snapshot.lock().await;
-                        if m.len() >= MUTATION_SNAPSHOT_MAX {
-                            let oldest = m
-                                .iter()
-                                .min_by_key(|(_, s)| s.captured_at_ms)
-                                .map(|(k, _)| k.clone());
-                            if let Some(k) = oldest {
-                                m.remove(&k)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    };
-                    drop(evicted); // 锁外 drop 大结构
+                    // 序号最旧条目。淘汰在锁内执行（代价小：仅一次 min 扫描）。
                     let mut m = self.mutation_snapshot.lock().await;
-                    m.insert(session_id.to_string(), snap);
-                    tracing::info!(tool = %tc.name, session = %session_id, "mutation_snapshot_captured");
+                    if m.len() >= MUTATION_SNAPSHOT_MAX {
+                        let oldest = m
+                            .iter()
+                            .min_by_key(|(_, s)| s.seq)
+                            .map(|(k, _)| k.clone());
+                        if let Some(k) = oldest {
+                            m.remove(&k);
+                        }
+                    }
+                    // 双保险：若探测后、插入前其他 run 已为本会话捕获，则保留先到者
+                    if !m.contains_key(session_id) {
+                        m.insert(session_id.to_string(), snap);
+                        tracing::info!(tool = %tc.name, session = %session_id, "mutation_snapshot_captured");
+                    }
                 }
             }
 

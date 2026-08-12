@@ -1967,3 +1967,80 @@ mod quick_difficulty_tests {
         assert_eq!(classify_heuristic(&m), TaskDifficulty::Hard);
     }
 }
+
+#[cfg(test)]
+mod sanitize_messages_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_fast_path_when_no_redaction() {
+        // 无敏感内容：常见路径应零克隆（Cow::Borrowed）
+        let msgs = vec![
+            Message {
+                role: "system".into(),
+                content: Some("你是助手".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "user".into(),
+                content: Some("帮我查一下今天的固废进厂车辆".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "assistant".into(),
+                content: Some("好的".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        let out = sanitize_messages(&msgs);
+        assert!(matches!(out, Cow::Borrowed(_)), "无敏感内容应走 Borrowed 快速路径");
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn owned_path_only_clones_affected_user_message() {
+        let msgs = vec![
+            Message {
+                role: "system".into(),
+                content: Some("你是助手".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "user".into(),
+                content: Some("我的 key 是 sk-abc1234567890abcdefgh".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "assistant".into(),
+                content: Some("收到".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        let out = sanitize_messages(&msgs);
+        assert!(matches!(out, Cow::Owned(_)), "有敏感内容应走 Owned 路径");
+        assert_eq!(out[0].content, msgs[0].content, "system 消息应原样保留");
+        assert_eq!(out[2].content, msgs[2].content, "assistant 消息应原样保留");
+        assert_ne!(out[1].content, msgs[1].content, "user 消息应被脱敏");
+        assert!(out[1].content.as_ref().unwrap().contains("[REDACTED_API_KEY]"));
+    }
+
+    #[test]
+    fn tool_message_untouched() {
+        // tool 消息含类似 key 的文本也不应脱敏（只处理 role=user）
+        let msgs = vec![Message {
+            role: "tool".into(),
+            content: Some("result sk-abc1234567890abcdefgh".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let out = sanitize_messages(&msgs);
+        assert!(matches!(out, Cow::Borrowed(_)), "tool 消息不在脱敏范围，应走 Borrowed");
+        assert_eq!(out[0].content.as_ref().unwrap(), "result sk-abc1234567890abcdefgh");
+    }
+}

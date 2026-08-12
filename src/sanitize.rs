@@ -9,14 +9,21 @@
 //!      （scheme 识别不区分大小写；userinfo 分隔符取最后一个 `@`，RFC 3986 语义）
 //!   3. `password|passwd|secret_key|private_key` 赋值（`=`/`:` 后引号包裹值）→ `[REDACTED_SECURE_TOKEN]`
 //!      （收尾引号扫描跳过 `\` 转义序列、遇换行即止，防跨行/转义引号导致漏脱敏或过度脱敏）
+//!
+//! 覆盖边界（安全·low 文档化，ocr 2026-08-12 第三轮）：
+//!   - 规则 3 仅覆盖**引号包裹**的值；无引号赋值（`key=abc`）与无 scheme 的
+//!     `user:pass@host` 形式不在传输层脱敏范围（避免误伤正常对话文本），
+//!     调用方须知悉该边界。
 
-/// 快速判定文本是否**需要**脱敏（非分配实现，供调用方在常见无敏感路径上零成本短路；
-/// ocr 2026-08-12 第二轮 perf·medium：sanitize_messages 的检测 pass 不得再整段分配）。
+/// 快速判定文本是否**需要**脱敏（**零分配**实现：直接字节扫描，不物化 Vec；
+/// ocr 2026-08-12 第二/三轮 perf·medium：sanitize_messages 的检测 pass 不得整段分配）。
 /// 检测：规则 1/2/3 任一触发模式存在即返回 true。逻辑与 `sanitize_agent_payload`
 /// 保持同源（触发条件一致，只做存在性判断，不重建输出）。
 pub fn needs_redaction(payload: &str) -> bool {
-    let chars: Vec<char> = payload.chars().collect();
-    let n = chars.len();
+    let bytes = payload.as_bytes();
+    let n = bytes.len();
+    // 字节级大小写不敏感前缀匹配（pattern 全 ASCII 小写；只对 ASCII 字节转小写，
+    // ≥0x80 的多字节字符首字节与 ASCII pattern 永不相交，天然避免 Unicode 误匹配）
     let starts_with_ci = |i: usize, pat: &str| -> bool {
         let pb = pat.as_bytes();
         if i + pb.len() > n {
@@ -24,17 +31,23 @@ pub fn needs_redaction(payload: &str) -> bool {
         }
         pb.iter()
             .enumerate()
-            .all(|(k, &b)| chars[i + k].to_ascii_lowercase() as u8 == b)
+            .all(|(k, &b)| bytes[i + k].to_ascii_lowercase() == b)
     };
+    // 词边界：i 之前必须是「非 token 字节」（防 task-123... 里的 sk- 误命中）
     let at_word_boundary = |i: usize| -> bool {
         i == 0
-            || !(chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_' || chars[i - 1] == '-')
+            || !(bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'_'
+                || bytes[i - 1] == b'-')
     };
-    let consume_token_chars = |mut j: usize| -> (usize, bool) {
+    // 消费 [A-Za-z0-9_-]，返回消费掉的字节数；同时检测 token 内是否含下划线
+    let consume_token_bytes = |mut j: usize| -> (usize, bool) {
         let start = j;
         let mut has_underscore = false;
-        while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '_' || chars[j] == '-') {
-            if chars[j] == '_' {
+        while j < n
+            && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
+        {
+            if bytes[j] == b'_' {
                 has_underscore = true;
             }
             j += 1;
@@ -48,21 +61,21 @@ pub fn needs_redaction(payload: &str) -> bool {
             .iter()
             .find(|p| at_word_boundary(i) && starts_with_ci(i, p));
         if let Some(p) = prefix_matched {
-            let (token_len, has_underscore) = consume_token_chars(i + p.len());
+            let (token_len, has_underscore) = consume_token_bytes(i + p.len());
             if token_len >= 16 && !has_underscore {
                 return true;
             }
         }
         // 规则 2：URL userinfo（scheme://...:...@...）
-        if chars[i] == ':' && starts_with_ci(i, "://") {
+        if bytes[i] == b':' && starts_with_ci(i, "://") {
             let mut scheme_start = i;
-            while scheme_start > 0 && chars[scheme_start - 1].is_ascii_alphabetic() {
+            while scheme_start > 0 && bytes[scheme_start - 1].is_ascii_alphabetic() {
                 scheme_start -= 1;
             }
             let scheme_len = i - scheme_start;
             if (1..=32).contains(&scheme_len) {
-                if let Some(at) = find_userinfo_at(&chars, i) {
-                    if find_userinfo_colon(&chars, i, at).is_some() {
+                if let Some(at) = find_userinfo_at_bytes(bytes, i) {
+                    if find_userinfo_colon_bytes(bytes, i, at).is_some() {
                         return true;
                     }
                 }
@@ -82,17 +95,17 @@ pub fn needs_redaction(payload: &str) -> bool {
         };
         if key_len > 0 {
             let mut j = i + key_len;
-            while j < n && (chars[j] == ' ' || chars[j] == '\t') {
+            while j < n && (bytes[j] == b' ' || bytes[j] == b'\t') {
                 j += 1;
             }
-            if j < n && (chars[j] == '=' || chars[j] == ':') {
+            if j < n && (bytes[j] == b'=' || bytes[j] == b':') {
                 let mut k = j + 1;
-                while k < n && (chars[k] == ' ' || chars[k] == '\t') {
+                while k < n && (bytes[k] == b' ' || bytes[k] == b'\t') {
                     k += 1;
                 }
-                if k < n && (chars[k] == '"' || chars[k] == '\'') {
-                    let quote = chars[k];
-                    if find_closing_quote(&chars, k + 1, quote).is_some() {
+                if k < n && (bytes[k] == b'"' || bytes[k] == b'\'') {
+                    let quote = bytes[k] as char;
+                    if find_closing_quote_bytes(bytes, k + 1, quote).is_some() {
                         return true;
                     }
                 }
@@ -110,14 +123,15 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
     let n = chars.len();
     let mut i = 0usize;
 
-    // 检查从 i 起是否匹配指定的 ASCII 序列（大小写不敏感；pattern 全小写，比较时 char 转小写）
+    // 检查从 i 起是否匹配指定的 ASCII 序列（大小写不敏感；pattern 全小写）
     let starts_with_ci = |i: usize, pat: &str| -> bool {
         let pb = pat.as_bytes();
         if i + pb.len() > n {
             return false;
         }
         pb.iter().enumerate().all(|(k, &b)| {
-            chars[i + k].to_ascii_lowercase() as u8 == b
+            // eq_ignore_ascii_case 而非 `as u8` 截断（同 needs_redaction，ocr 第三轮 bug·medium）
+            chars[i + k].eq_ignore_ascii_case(&(b as char))
         })
     };
 
@@ -238,6 +252,20 @@ fn find_closing_quote(chars: &[char], start: usize, quote: char) -> Option<usize
     None
 }
 
+/// 字节版收尾引号查找（供零分配 `needs_redaction` 使用，语义同 `find_closing_quote`）。
+fn find_closing_quote_bytes(bytes: &[u8], start: usize, quote: char) -> Option<usize> {
+    let mut j = start;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2, // 跳过转义序列（含 \" 本身）
+            b'\n' | b'\r' => return None,
+            q if q as char == quote => return Some(j - start),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
 /// 在 `://` 之后寻找 URL userinfo 的 `@`：必须出现在首个 `/`、`?`、`#` 或空白之前。
 /// 多个 `@` 时取**最后一个**（RFC 3986：userinfo 内嵌 @ 须百分号编码，最后一个才是分隔符）。
 /// `colon_pos` 为 ':' 的位置（"://" 起点）。
@@ -257,11 +285,40 @@ fn find_userinfo_at(chars: &[char], colon_pos: usize) -> Option<usize> {
     last_at
 }
 
+/// 字节版 userinfo `@` 查找（供零分配 `needs_redaction` 使用，语义同 `find_userinfo_at`）。
+fn find_userinfo_at_bytes(bytes: &[u8], colon_pos: usize) -> Option<usize> {
+    let mut j = colon_pos + 3; // 跳过 "://"
+    let mut last_at: Option<usize> = None;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'@' => {
+                last_at = Some(j);
+                j += 1;
+            }
+            b'/' | b'?' | b'#' | b' ' | b'\t' | b'\n' | b'\r' => return last_at,
+            _ => j += 1,
+        }
+    }
+    last_at
+}
+
 /// 在 `://` 与 `@` 之间找 `:`（userinfo 的 user:pass 分隔）。无冒号则不算凭据（如 "user@host"）。
 fn find_userinfo_colon(chars: &[char], colon_pos: usize, at: usize) -> Option<usize> {
     let mut j = colon_pos + 3;
     while j < at {
         if chars[j] == ':' {
+            return Some(j);
+        }
+        j += 1;
+    }
+    None
+}
+
+/// 字节版 userinfo `:` 查找（供零分配 `needs_redaction` 使用，语义同 `find_userinfo_colon`）。
+fn find_userinfo_colon_bytes(bytes: &[u8], colon_pos: usize, at: usize) -> Option<usize> {
+    let mut j = colon_pos + 3;
+    while j < at {
+        if bytes[j] == b':' {
             return Some(j);
         }
         j += 1;
@@ -418,5 +475,51 @@ mod tests {
         );
         assert!(out.contains("[REDACTED_CREDENTIALS]"), "got: {out}");
         assert!(out.contains("[REDACTED_API_KEY]"), "got: {out}");
+    }
+
+    #[test]
+    fn needs_redaction_matches_payload_change_property() {
+        // 关键不变量：needs_redaction(s) == (sanitize_agent_payload(s) != s)。
+        // 两者实现同源但独立（字节扫描 vs 字符重建），防漂移导致「检测说无需脱敏、
+        // 实际却会改写」→ 明文凭证漏发 LLM（ocr 2026-08-12 第三轮 test·medium）。
+        let cases: Vec<&str> = vec![
+            // 需脱敏
+            "sk-abc1234567890abcdefgh",
+            "SK-ABCDEFGHIJKLMNOPQRSTUVWX",
+            "AIzaSyA1234567890abcdefghijklmnopqrstuv",
+            "ghp_1234567890abcdefghijkl",
+            "secret_abcdefghijklmnopqrstuvwxyz1",
+            "connect https://admin:hunter2@example.com:5432/db",
+            "connect HTTPS://admin:hunter2@example.com/db",
+            "https://user:p@ss@host.com/x",
+            "password = \"hunter2\"",
+            "Password = \"hunter2\"",
+            "secret_key: 'abc'",
+            "private_key='xyz'",
+            "db url=https://user:pass@host/x key=sk-1234567890abcdefghijklmnop",
+            // 无需脱敏
+            "",
+            "你好世界",
+            "task-1234567890abcdefgh",
+            "secret_config_management_v2_2024",
+            "secret_ok",
+            "sk-x",
+            "a:b@c",
+            "user@host.com",
+            "帮我查一下今天的固废进厂车辆，密码是进厂凭证",
+            "password = \"abc\n后面还有内容\"继续",
+            "šřž非ASCII文本",
+        ];
+        for s in cases {
+            let redacted = sanitize_agent_payload(s);
+            let changed = redacted != s;
+            assert_eq!(
+                needs_redaction(s),
+                changed,
+                "不变量被破坏: needs_redaction({s:?})={} 但 sanitize 改写={} (输出 {redacted:?})",
+                needs_redaction(s),
+                changed
+            );
+        }
     }
 }
