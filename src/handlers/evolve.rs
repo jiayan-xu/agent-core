@@ -195,8 +195,25 @@ pub(crate) async fn handle_code_evolve(
 
         let mut consecutive = 0usize;
         let mut gens_run = 0usize;
+        // P0 四预算自治封套（借鉴 Prime Agent，方案 §2 注入点 A）：
+        // turns / tokens / wall-clock + 可选 gate_command；违约 → budget_break SSE +
+        // git_revert 干净基线（下方现有回退点已覆盖），绝不绕过隔离/鉴权/dry_run 双闸门。
+        let mut tracker = agent_core::autonomy_budget::BudgetTracker::new(ce.budget.clone());
         for gen in 1..=generations {
             gens_run += 1;
+            // ① 纯墙钟检查（每代顶部，不消耗 turn）
+            if let Err(b) = tracker.check_wall_clock() {
+                send(
+                    "budget_break",
+                    serde_json::json!({
+                        "reason": format!("{:?}", b),
+                        "gens_run": gens_run,
+                        "elapsed_secs": tracker.elapsed_secs(),
+                        "max_wall_clock_secs": ce.budget.max_wall_clock_secs,
+                    }),
+                );
+                break;
+            }
             let current = match std::fs::read_to_string(&target_p) {
                 Ok(c) => c,
                 Err(e) => {
@@ -220,6 +237,23 @@ pub(crate) async fn handle_code_evolve(
                 }
             };
             send("proposal", serde_json::json!({"gen": gen, "code": new_fn}));
+            // ② 记一轮 + token 记账（过渡期 chars/4 估算，方案 §6）；违约立即停 + 回退
+            if let Err(b) = tracker.record_turn(
+                agent_core::autonomy_budget::estimate_tokens(&new_fn),
+            ) {
+                let _ = git_revert(&repo, &target_p); // 硬红线：回到干净基线
+                send(
+                    "budget_break",
+                    serde_json::json!({
+                        "reason": format!("{:?}", b),
+                        "gens_run": gens_run,
+                        "turns": tracker.turns_used(),
+                        "tokens": tracker.tokens_used(),
+                        "elapsed_secs": tracker.elapsed_secs(),
+                    }),
+                );
+                break;
+            }
 
             // 2) 外科替换
             let new_src = match apply_patch(&current, &fn_name, &new_fn) {
@@ -299,6 +333,26 @@ pub(crate) async fn handle_code_evolve(
                 }
             }
         }
+        // ③ 循环结束后可选 pass/fail gate（Prime Agent 同款，方案 §2）
+        if let Some(cmd) = &ce.budget.gate_command {
+            if !cmd.trim().is_empty() {
+                let gate = tokio::process::Command::new("sh")
+                    .args(["-c", cmd])
+                    .current_dir(&repo)
+                    .output()
+                    .await;
+                let ok = gate.map(|o| o.status.success()).unwrap_or(false);
+                if !ok {
+                    let _ = git_revert(&repo, &target_p);
+                    // Gate 违约类型统一由 BudgetTracker 构造（ocr 2026-08-12 bug·high）
+                    let _breach = agent_core::autonomy_budget::BudgetTracker::gate_failed();
+                    send(
+                        "gate_failed",
+                        serde_json::json!({"command": cmd, "reason": "pass/fail gate 未通过，整体否决"}),
+                    );
+                }
+            }
+        }
         send(
             "done",
             serde_json::json!({"gens_run": gens_run, "best_ms": best, "applied": effective_apply}),
@@ -327,6 +381,22 @@ pub(crate) async fn handle_meta_evolution_run(
         .and_then(|Json(v)| v.get("namespace").and_then(|x| x.as_str()).map(|s| s.to_string()))
         .filter(|s| !s.is_empty())
         .unwrap_or(default_ns);
+    // ns 校验（ocr 2026-08-12 第十一轮 security·medium）：ns 是用户可控输入，且是
+    // evo_continuations map 的键——超长/畸形字符串会撑大 map（配合键数上限仍应
+    // 限制单键大小）并污染日志。允许字符集：字母数字 _ / : - . + @ 与空格。
+    let ns_valid = ns.len() <= 128
+        && ns
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-/:.+@ ".contains(c));
+    if !ns_valid {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "namespace 非法：长度须 ≤128 且仅含字母数字 _ - / : . + @ 空格"
+            })),
+        )
+            .into_response();
+    }
     let res = agent.run_meta_evolution(&ns).await;
     drop(agent_guard);
     Json(res).into_response()

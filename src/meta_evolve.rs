@@ -15,6 +15,7 @@ use rusqlite::{params, Connection};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::autonomy_budget::{AutonomyBudget, BudgetTracker};
 use crate::llm::{LlmClient, Message};
 use crate::mcp_client::McpClient;
 
@@ -97,6 +98,9 @@ pub struct MetaEvolutionConfig {
     /// 优化器模型（提示用，真实模型由 LlmClient 配置决定）
     #[serde(default = "default_optimizer_model")]
     pub optimizer_model: String,
+    /// 四预算自治封套（P0，借鉴 Prime Agent）。缺省全 0 = 不限制（向后兼容旧配置）。
+    #[serde(default)]
+    pub budget: AutonomyBudget,
 }
 
 fn default_window_days() -> i64 {
@@ -132,6 +136,7 @@ impl Default for MetaEvolutionConfig {
             max_rollback_rate: default_max_rollback(),
             cooldown_hours: default_cooldown(),
             optimizer_model: default_optimizer_model(),
+            budget: AutonomyBudget::default(),
         }
     }
 }
@@ -285,6 +290,25 @@ pub struct CandidatePrompt {
     pub hash: String,
 }
 
+/// optimize_prompt 错误：LLM 调用失败 or 预算违约（Budget 变体保持类型结构化，
+/// 供 run_once 传播为 RolloutResult::budget_breach，ocr 2026-08-12 bug·medium）
+#[derive(Debug)]
+pub enum OptimizeError {
+    Llm(String),
+    Budget(crate::autonomy_budget::BudgetBreach),
+}
+
+impl std::fmt::Display for OptimizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OptimizeError::Llm(e) => write!(f, "{}", e),
+            OptimizeError::Budget(b) => write!(f, "预算违约 {:?}", b),
+        }
+    }
+}
+
+impl std::error::Error for OptimizeError {}
+
 /// 评估结果
 #[derive(Debug, Clone)]
 pub struct EvalResult {
@@ -358,6 +382,21 @@ impl RolloutResult {
             attempted: true,
             status: "error".into(),
             reason: msg.into(),
+            baseline_rate: 0.0,
+            candidate_rate: 0.0,
+            passed: false,
+            rolled_out: false,
+            prompt_hash_before: String::new(),
+            prompt_hash_after: String::new(),
+            feedback_id: String::new(),
+        }
+    }
+    /// 四预算违约（方案 §5）：不 rollout、不变更提示词，reason 携带 breach 类型。
+    fn budget_breach(b: crate::autonomy_budget::BudgetBreach, at: &str) -> Self {
+        RolloutResult {
+            attempted: true,
+            status: "budget_breach".into(),
+            reason: format!("{:?} @ {}", b, at),
             baseline_rate: 0.0,
             candidate_rate: 0.0,
             passed: false,
@@ -733,12 +772,16 @@ impl MetaEvolver {
         Self::parse_negative_samples(&raw)
     }
 
-    /// LLM 精炼演化提示词 → 候选
+    /// LLM 精炼演化提示词 → 候选（传入 BudgetTracker 做 turns/tokens/wall-clock 记账）。
+    /// 错误类型带 BudgetBreach 变体：record_turn 违约可被 run_once 结构化传播为
+    /// RolloutResult::budget_breach（status="budget_breach"，审计可依状态键控，
+    /// ocr 2026-08-12 bug·medium：此前扁平为 String 走 error 状态，turns/tokens 违约被漏报）。
     pub async fn optimize_prompt(
         &self,
         samples: &[NegSample],
         model: &str,
-    ) -> Result<CandidatePrompt, String> {
+        tracker: &mut BudgetTracker,
+    ) -> Result<CandidatePrompt, OptimizeError> {
         let sample_txt: Vec<String> = samples
             .iter()
             .take(20)
@@ -766,10 +809,44 @@ impl MetaEvolver {
             tool_calls: None,
             tool_call_id: None,
         };
-        let reply = self.llm.chat(&[msg], &[]).await.map_err(|e| e.to_string())?;
+        // LLM 调用前预算检查：调用本身耗时不可控（长 prompt / 网络），且 turns 已满
+        // 时调用必违约——预判拒绝，避免超限请求仍发出（ocr 2026-08-12 第五/十一轮）。
+        // tokens 预判（第十二轮 bug·medium）：本次输入估算 + 已用 > 上限 → 提前拒绝。
+        if let Err(b) = tracker.check_pre_call() {
+            return Err(OptimizeError::Budget(b));
+        }
+        let input_est = crate::autonomy_budget::estimate_tokens(&msg.content.as_deref().unwrap_or(""));
+        if tracker.tokens_used().saturating_add(input_est) > tracker.budget().max_tokens
+            && tracker.budget().max_tokens > 0
+        {
+            return Err(OptimizeError::Budget(
+                crate::autonomy_budget::BudgetBreach::Tokens,
+            ));
+        }
+        let reply = match self.llm.chat(&[msg], &[]).await {
+            Ok(r) => r,
+            Err(e) => {
+                // 失败也消耗一次「轮次」：不记账可绕过 max_turns（共享 tracker 下
+                // 失败重试无限循环，ocr 2026-08-12 第九轮 bug·medium）。用 0 token
+                // 记账（失败无产出），turns 计数 +1；墙钟超限优先报告。
+                if let Err(b) = tracker.check_wall_clock() {
+                    return Err(OptimizeError::Budget(b));
+                }
+                if let Err(b) = tracker.record_turn(0) {
+                    return Err(OptimizeError::Budget(b));
+                }
+                return Err(OptimizeError::Llm(e.to_string()));
+            }
+        };
+        // 预算记账（过渡期 chars/4 估算，方案 §6）：turns/tokens/wall-clock 违约
+        // 必须显式传播——静默忽略会导致超限仍继续（ocr 2026-08-12 bug·high 修复）；
+        // 违约类型保持结构化（bug·medium：不扁平为 String）
+        tracker
+            .record_turn(crate::autonomy_budget::estimate_tokens(&reply.text))
+            .map_err(OptimizeError::Budget)?;
         let text = reply.text.trim().to_string();
         if text.is_empty() {
-            return Err("optimizer 返回空提示词".to_string());
+            return Err(OptimizeError::Llm("optimizer 返回空提示词".to_string()));
         }
         let hash = fnv1a(&text);
         Ok(CandidatePrompt {
@@ -830,9 +907,18 @@ impl MetaEvolver {
     }
 
     /// 一轮元进化（端到端）：采集 → 基线 → 优化 → rollout
-    pub async fn run_once(&self, mem_client: &McpClient, ns: &str) -> RolloutResult {
+    pub async fn run_once(
+        &self,
+        mem_client: &McpClient,
+        ns: &str,
+        tracker: &mut BudgetTracker,
+    ) -> RolloutResult {
         if !self.config.enabled {
             return RolloutResult::skipped("meta_evolution.enabled=false");
+        }
+        // 四预算封套：纯墙钟检查（循环顶部，不消耗 turn）
+        if let Err(b) = tracker.check_wall_clock() {
+            return RolloutResult::budget_breach(b, "run_once 顶部墙钟检查");
         }
         // cooldown 守卫：避免夜班 patrol / 手动 consolidate 高频反复跑 L2
         if self.config.cooldown_hours > 0 {
@@ -877,10 +963,21 @@ impl MetaEvolver {
             );
             return RolloutResult::guarded(baseline);
         }
-        let cand = match self.optimize_prompt(&samples, &self.config.optimizer_model).await {
+        let cand = match self
+            .optimize_prompt(&samples, &self.config.optimizer_model, tracker)
+            .await
+        {
             Ok(c) => c,
-            Err(e) => return RolloutResult::error(&e),
+            // 预算违约 → 结构化 budget_breach 状态（审计可依状态键控，非 error 混淆）
+            Err(OptimizeError::Budget(b)) => {
+                return RolloutResult::budget_breach(b, "optimize_prompt record_turn");
+            }
+            Err(OptimizeError::Llm(e)) => return RolloutResult::error(&e),
         };
+        // 预算违约（LLM 轮次后）：不 rollout、不变更提示词（方案 §5）
+        if let Err(b) = tracker.check_wall_clock() {
+            return RolloutResult::budget_breach(b, "optimize_prompt 后检查");
+        }
         let candidate_rate = self.estimate_candidate_rate(&cand.text, &samples, baseline);
         self.rollout_if_better(&cand, baseline, candidate_rate, &samples, ns)
             .await

@@ -284,11 +284,24 @@ pub(crate) struct MutationSnapshot {
 /// 超限时淘汰 seq 最旧的条目。
 const MUTATION_SNAPSHOT_MAX: usize = 64;
 
+/// 元进化 continuations 限流 map 全局键数上限（ocr 2026-08-12 第九轮 security·high）：
+/// ns 是用户可控输入，任意字符串可撑爆 map——上限使内存消耗有界（内存 DoS 防护）。
+const EVO_CONTINUATIONS_MAX_NS: usize = 256;
+
 /// 快照 map 复合键：长度前缀编码 `"{session_len}:{session}|{trace}"`——
 /// 分隔符歧义消除（session_id/trace_id 即使含 `|` 也不会碰撞，
 /// ocr 2026-08-12 第十二轮 bug·low）。
 fn snapshot_key(session_id: &str, trace_id: &str) -> String {
     format!("{}:{}|{}", session_id.len(), session_id, trace_id)
+}
+
+/// 元进化 continuations 限流裁决结果（配合 AgentCore::continuation_verdict）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationVerdict {
+    /// 允许触发：携带本次触发时刻（调用方负责入窗）
+    Admitted(std::time::Instant),
+    /// 窗口内已达上限：携带当前窗口内计数
+    Denied(usize),
 }
 
 /// Agent 核心
@@ -363,6 +376,10 @@ pub struct AgentCore {
     pub meta_evolver: crate::meta_evolve::MetaEvolver,
     /// PR5: 机制账本存储（evolution_feedback + meta_prompt），与 meta_evolver 共享
     pub meta_store: std::sync::Arc<tokio::sync::Mutex<crate::meta_evolve::MetaEvolutionStore>>,
+    /// P0 四预算封套：元进化 continuations 限流窗口（ns → 触发时刻列表）。
+    /// 由 run_meta_evolution 在 run_once 前做窗口限流（方案 §3 注入点 B）。
+    /// `pub(crate)`（第十三轮 security·low）：限流状态是安全控制，外部不得直接改写。
+    pub(crate) evo_continuations: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<std::time::Instant>>>>,
     /// HY3 1.3：技能库注册表（仅 features.skill_library=true 时 Some；否则 None=不注入）
     pub skill_registry: Option<Arc<dyn crate::skill_library::SkillRegistry + Send + Sync>>,
     /// HY3 1.3：LATS 控制器（仅 features.lats=true 时 Some；否则 None=原路径）
@@ -974,6 +991,8 @@ impl AgentCore {
             }
         };
         let meta_store = std::sync::Arc::new(tokio::sync::Mutex::new(meta_store));
+        let evo_continuations =
+            std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::<String, Vec<std::time::Instant>>::new()));
         let meta_evolver = crate::meta_evolve::MetaEvolver::new(
             config.meta_evolution.clone(),
             meta_store.clone(),
@@ -1094,6 +1113,7 @@ impl AgentCore {
             approval_gate,
             meta_evolver,
             meta_store,
+            evo_continuations,
             skill_registry,
             lats,
             multiagent,
@@ -10936,10 +10956,108 @@ impl AgentCore {
                 "reason": "meta_evolution.enabled=false（受控开启，需在 agent.toml 显式开启）"
             });
         }
+        // ns 自校验（第十二轮 security·medium）：ns 用作 evo_continuations 的键，
+        // 内存有界保证必须在**使用点**自洽，不依赖外部调用方校验（handler 层有
+        // 白名单校验，但此处兜底——任何调用路径超长 ns 直接拒绝）。
+        if ns.len() > 128 {
+            return serde_json::json!({
+                "status": "skipped",
+                "reason": "namespace 超长（>128 字符）",
+            });
+        }
+        // P0 四预算封套·continuations 限流（方案 §3 注入点 B）：窗口内触发次数超限 →
+        // 直接 skipped、不进入 run_once、零副作用。
+        // 安全护栏（ocr 2026-08-12 第九~十二轮）：ns 是用户可控输入——
+        // ① 全局键数上限 EVO_CONTINUATIONS_MAX_NS（内存 DoS 防护，配合 ns ≤128 自校验）；
+        // ② 过期空键删除（liveness DoS 防护：键永不删除会耗尽上限后永久拒绝新 ns）；
+        // ③ 新 ns 键超限时按 Denied 处理。
+        // ④ **每次触发全量 prune**：全量清理所有 ns 的过期空键（256 键 × retain 的
+        //    比较成本可忽略，无需间隔节流——第十二轮 bug·medium：间隔期内过期键
+        //    计入上限会误拒新 ns）。
+        // ⑤ 限流计费语义（第十三轮 bug·medium 文档化）：admission 时刻在 run_once
+        //    执行前记录——run_once 失败/被拒也计入窗口（触发即计费，防止「失败后
+        //    立即重试」刷窗口）；EVO_CONTINUATIONS_MAX_NS 为硬编码安全常量而非配置：
+        //    限流上限暴露为配置会削弱安全控制（调用方可调大），保持常量护栏。
+        let b = &self.config.meta_evolution.budget;
+        if b.max_continuations_per_window > 0 && b.continuation_window_secs > 0 {
+            let mut guard = self.evo_continuations.lock().await;
+            let now = std::time::Instant::now();
+            let window = std::time::Duration::from_secs(b.continuation_window_secs);
+            // 全量 sweep：删除所有过期空键，释放键位（每次触发，成本 O(键数)；
+            // 已覆盖当前 ns，无冗余 per-ns prune——第十三轮 maintainability·low）
+            guard.retain(|_, v| {
+                v.retain(|t| now.saturating_duration_since(*t) < window);
+                !v.is_empty()
+            });
+            // 键数上限：新 ns（prune 后仍不存在）且键数已满 → 拒绝（liveness DoS 缓解：
+            // 仅当 256 个**活跃**窗口同时存在时才拒绝，历史 ns 过期即释放）。
+            // 已知权衡（第十四轮 security·medium 文档化）：攻击者可用 256 个不同 ns
+            // 各触发一次撑满全局上限 → 新 ns 被拒（跨 ns availability DoS）；缓解 =
+            // 该端点有 auth_middleware 鉴权保护（需有效身份才可调用），且窗口过期即
+            // 释放键位；未来可按调用方/租户隔离键配额。
+            if !guard.contains_key(ns) && guard.len() >= EVO_CONTINUATIONS_MAX_NS {
+                return serde_json::json!({
+                    "status": "skipped",
+                    "reason": "continuation budget exceeded（ns 键数达上限）",
+                    "max_ns_keys": EVO_CONTINUATIONS_MAX_NS,
+                });
+            }
+            // 入窗：retain 后仍有条目（计数未满）→ Admitted；否则新建并入窗。
+            // 显式 reborrow（&mut *entry）：&mut Vec 传参的隐式 reborrow 虽可编译，
+            // 显式写法消除「move 后复用」疑虑（第十四轮 bug·critical 澄清）。
+            let entry = guard.entry(ns.to_string()).or_default();
+            match Self::continuation_verdict(
+                &mut *entry,
+                now,
+                b.max_continuations_per_window,
+                b.continuation_window_secs,
+            ) {
+                ContinuationVerdict::Admitted(t) => {
+                    entry.push(t);
+                }
+                ContinuationVerdict::Denied(count) => {
+                    return serde_json::json!({
+                        "status": "skipped",
+                        "reason": "continuation budget exceeded（四预算封套）",
+                        "window_secs": b.continuation_window_secs,
+                        "max_continuations_per_window": b.max_continuations_per_window,
+                        "current_in_window": count,
+                    });
+                }
+            }
+            drop(guard);
+        }
         // 与 consolidate 一致：admin/jarvis 身份与密钥配对
         let mem_client = memoria_maintenance_client(&self.config.memoria_url, &self.mcp);
-        let res = self.meta_evolver.run_once(&mem_client, ns).await;
+        let mut tracker = crate::autonomy_budget::BudgetTracker::new(b.clone());
+        let res = self
+            .meta_evolver
+            .run_once(&mem_client, ns, &mut tracker)
+            .await;
         res.to_json()
+    }
+
+    /// 元进化 continuations 窗口限流裁决（纯函数，独立可测——ocr 2026-08-12 第五轮
+    /// test·medium：此前内联在 run_meta_evolution 无法单测）。
+    /// 语义：窗口内 prune 过期条目 → 计数达标则 Denied（不入窗）→ 否则 Admitted(now)。
+    /// 注：admission 时刻在 run_once 执行前记录——若 run_once 耗时长，窗口语义为
+    /// 「触发时刻」近似而非「完成时刻」（bug·low 已文档化，限流近似可接受）。
+    pub fn continuation_verdict(
+        entry: &mut Vec<std::time::Instant>,
+        now: std::time::Instant,
+        max_per_window: u32,
+        window_secs: u64,
+    ) -> ContinuationVerdict {
+        // saturating_duration_since：单调钟极端回拨（now 早于存储时刻）不 panic，
+        // 按 0 处理（视为窗口内刚发生，ocr 2026-08-12 第七轮 bug·medium）
+        entry.retain(|t| {
+            now.saturating_duration_since(*t) < std::time::Duration::from_secs(window_secs)
+        });
+        if entry.len() >= max_per_window as usize {
+            ContinuationVerdict::Denied(entry.len())
+        } else {
+            ContinuationVerdict::Admitted(now)
+        }
     }
 
     /// PR5：元进化状态（供 /api/meta-evolution/status）
@@ -11210,6 +11328,81 @@ mod tool_fix_tests {
             assert_eq!(a.unwrap().trace_id, "t-a");
             assert_eq!(b.unwrap().trace_id, "t-b");
         });
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+
+    #[test]
+    fn continuation_verdict_admits_until_cap() {
+        // 窗口内最多 max_per_window 次：前 N 次 Admitted，第 N+1 次 Denied
+        let mut entry: Vec<std::time::Instant> = Vec::new();
+        let now = std::time::Instant::now();
+        for i in 0..3 {
+            match AgentCore::continuation_verdict(&mut entry, now, 3, 3600) {
+                ContinuationVerdict::Admitted(t) => entry.push(t),
+                ContinuationVerdict::Denied(c) => panic!("第 {} 次不应被拒（计数 {}）", i + 1, c),
+            }
+        }
+        assert!(matches!(
+            AgentCore::continuation_verdict(&mut entry, now, 3, 3600),
+            ContinuationVerdict::Denied(3)
+        ));
+    }
+
+    #[test]
+    fn continuation_verdict_prunes_expired() {
+        // 窗口外条目被 prune：旧时刻清空后重新计数。
+        // 不用真实 2h 前的 Instant（单调钟短时运行会 underflow 变 no-op，test·low）——
+        // 用「窗口 1s + 2s 前条目」等价构造，保证任何环境下都实际执行 prune。
+        let now = std::time::Instant::now();
+        // 2s 前（窗口 1s，必过期）。checked_sub 失败（单调钟运行 <2s）在测试环境不可能
+        // （cargo test 启动即需数秒）——expect 显式暴露而非静默回退（test·low）
+        let old = now.checked_sub(std::time::Duration::from_secs(2)).expect("单调钟运行不足 2s");
+        let mut entry = vec![old, old];
+        assert!(matches!(
+            AgentCore::continuation_verdict(&mut entry, now, 2, 1),
+            ContinuationVerdict::Admitted(_)
+        ), "过期条目应被 prune，重新放行");
+    }
+
+    #[test]
+    fn continuation_verdict_denied_reports_count() {
+        let now = std::time::Instant::now();
+        let mut entry: Vec<std::time::Instant> = vec![now; 5];
+        assert_eq!(
+            AgentCore::continuation_verdict(&mut entry, now, 3, 3600),
+            ContinuationVerdict::Denied(5)
+        );
+    }
+
+    #[test]
+    fn expired_ns_key_releases_slot() {
+        // 第十轮 bug·high 回归：过期空键必须释放键位（否则 256 个历史 ns 后
+        // 新 ns 永久 Denied = liveness DoS）。模拟 run_meta_evolution 的
+        // prune → 空则删 语义。
+        let mut map = std::collections::HashMap::<String, Vec<std::time::Instant>>::new();
+        let now = std::time::Instant::now();
+        // 2s 前（窗口 1s，必过期）。checked_sub 失败（单调钟运行 <2s）在测试环境不可能
+        // （cargo test 启动即需数秒）——expect 显式暴露而非静默回退（test·low）
+        let old = now.checked_sub(std::time::Duration::from_secs(2)).expect("单调钟运行不足 2s");
+        map.insert("stale_ns".to_string(), vec![old, old]);
+        // 模拟 prune：窗口 1s，条目全过期 → 空 → 删键
+        if let Some(entry) = map.get_mut("stale_ns") {
+            entry.retain(|t| {
+                now.saturating_duration_since(*t) < std::time::Duration::from_secs(1)
+            });
+            if entry.is_empty() {
+                map.remove("stale_ns");
+            }
+        }
+        assert!(
+            !map.contains_key("stale_ns"),
+            "过期空键必须删除（释放键位）"
+        );
+        assert!(map.is_empty());
     }
 }
 

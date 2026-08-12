@@ -7,6 +7,7 @@
 
 use std::sync::OnceLock;
 
+use agent_core::autonomy_budget::AutonomyBudget;
 use agent_core::dept_ops;
 use agent_core::llm::{LlmConfig, LlmProvider};
 use agent_core::meta_evolve::{MetaEvolutionConfig, SafetyConfig};
@@ -113,6 +114,9 @@ pub(crate) struct CodeEvolutionConfig {
     /// 提议用的专属 LLM 配置；缺省空 = 复用全局主 LlmClient。
     #[serde(default)]
     pub(crate) model: Option<LlmConfig>,
+    /// 四预算自治封套（P0，借鉴 Prime Agent）。缺省全 0 = 不限制（向后兼容旧配置）。
+    #[serde(default)]
+    pub(crate) budget: AutonomyBudget,
 }
 
 fn default_evo_gens() -> usize {
@@ -442,6 +446,18 @@ pub(crate) fn load_or_create_config() -> Config {
             // 存储态（AppState.config）始终保留占位符，save 时不会把 ${AGENT_API_KEY} 回写成明文。
             // 运行时展开交由 resolve_config_for_runtime（克隆后展开），见 build_agent 调用点。
             init_domain_and_org(&cfg);
+            // 预算配置一致性校验（第十二轮 bug·medium）：continuation 窗口/次数不配对
+            // 在启动时显式告警，而非运行期静默（validate 仅在测试调用过）
+            if let Some(me) = &cfg.meta_evolution {
+                if let Err(e) = me.budget.validate() {
+                    tracing::warn!(target: "agent.meta_evolve", "meta_evolution {}", e);
+                }
+            }
+            if let Some(ce) = &cfg.code_evolution {
+                if let Err(e) = ce.budget.validate() {
+                    tracing::warn!(target: "agent.code_evolve", "code_evolution {}", e);
+                }
+            }
             return cfg;
         }
     }
@@ -544,5 +560,79 @@ mod env_expand_tests {
             "pre/abc/mid/abc/post"
         );
         std::env::remove_var("HY3_EV_MIX");
+    }
+}
+
+#[cfg(test)]
+mod budget_serde_tests {
+    use super::*;
+
+    #[test]
+    fn code_evolution_config_missing_budget_parses() {
+        // 向后兼容：旧配置无 budget 字段仍可解析（默认全 0 = 不限制）。
+        // 注意：直接反序列化 CodeEvolutionConfig 时 TOML 键在顶层（无 [code_evolution] 前缀，
+        // 该前缀由 Config 顶层消费）。
+        let toml = r#"
+enabled = true
+generations = 4
+circuit_failures = 3
+dry_run_default = true
+allow_commit = false
+fn_name = "fib"
+"#;
+        let cfg: CodeEvolutionConfig = toml::from_str(toml).expect("缺 budget 字段应可解析");
+        assert!(cfg.budget.is_unset(), "缺省 budget 应为不限制");
+        assert_eq!(cfg.generations, 4);
+    }
+
+    #[test]
+    fn code_evolution_config_budget_parses() {
+        // 直接反序列化 CodeEvolutionConfig：budget 为嵌套子表 [budget]
+        let toml = r#"
+enabled = true
+[budget]
+max_turns = 8
+max_tokens = 200000
+max_wall_clock_secs = 300
+max_continuations_per_window = 0
+continuation_window_secs = 3600
+gate_command = "cargo test"
+"#;
+        let cfg: CodeEvolutionConfig = toml::from_str(toml).expect("嵌套 budget 应可解析");
+        assert_eq!(cfg.budget.max_turns, 8);
+        assert_eq!(cfg.budget.max_tokens, 200_000);
+        assert_eq!(cfg.budget.max_wall_clock_secs, 300);
+        assert_eq!(cfg.budget.gate_command.as_deref(), Some("cargo test"));
+        assert!(!cfg.budget.is_unset());
+    }
+
+    #[test]
+    fn config_top_level_with_nested_budget_parses() {
+        // 真实场景：agent.toml 顶层 [code_evolution.budget] 经 Config 解析后正确落到
+        // CodeEvolutionConfig.budget（验证完整链路，非仅孤立结构）
+        let toml = r#"
+agent_id = "test"
+[code_evolution]
+enabled = true
+[code_evolution.budget]
+max_turns = 8
+max_wall_clock_secs = 300
+"#;
+        let cfg: Config = toml::from_str(toml).expect("完整 Config 应可解析");
+        let ce = cfg.code_evolution.expect("code_evolution 应存在");
+        assert_eq!(ce.budget.max_turns, 8, "经 Config 嵌套解析后 max_turns 应为 8");
+        assert_eq!(ce.budget.max_wall_clock_secs, 300);
+    }
+
+    #[test]
+    fn meta_evolution_config_missing_budget_parses() {
+        let toml = r#"
+enabled = false
+window_days = 30
+min_samples = 20
+"#;
+        let cfg: MetaEvolutionConfig = toml::from_str(toml).expect("缺 budget 字段应可解析");
+        assert!(cfg.budget.is_unset());
+        assert_eq!(cfg.min_samples, 20);
     }
 }
