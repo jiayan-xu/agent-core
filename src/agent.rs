@@ -10990,7 +10990,11 @@ impl AgentCore {
                 !v.is_empty()
             });
             // 键数上限：新 ns（prune 后仍不存在）且键数已满 → 拒绝（liveness DoS 缓解：
-            // 仅当 256 个**活跃**窗口同时存在时才拒绝，历史 ns 过期即释放）
+            // 仅当 256 个**活跃**窗口同时存在时才拒绝，历史 ns 过期即释放）。
+            // 已知权衡（第十四轮 security·medium 文档化）：攻击者可用 256 个不同 ns
+            // 各触发一次撑满全局上限 → 新 ns 被拒（跨 ns availability DoS）；缓解 =
+            // 该端点有 auth_middleware 鉴权保护（需有效身份才可调用），且窗口过期即
+            // 释放键位；未来可按调用方/租户隔离键配额。
             if !guard.contains_key(ns) && guard.len() >= EVO_CONTINUATIONS_MAX_NS {
                 return serde_json::json!({
                     "status": "skipped",
@@ -10998,10 +11002,12 @@ impl AgentCore {
                     "max_ns_keys": EVO_CONTINUATIONS_MAX_NS,
                 });
             }
-            // 入窗：retain 后仍有条目（计数未满）→ Admitted；否则新建并入窗
+            // 入窗：retain 后仍有条目（计数未满）→ Admitted；否则新建并入窗。
+            // 显式 reborrow（&mut *entry）：&mut Vec 传参的隐式 reborrow 虽可编译，
+            // 显式写法消除「move 后复用」疑虑（第十四轮 bug·critical 澄清）。
             let entry = guard.entry(ns.to_string()).or_default();
             match Self::continuation_verdict(
-                entry,
+                &mut *entry,
                 now,
                 b.max_continuations_per_window,
                 b.continuation_window_secs,
