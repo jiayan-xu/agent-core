@@ -378,7 +378,8 @@ pub struct AgentCore {
     pub meta_store: std::sync::Arc<tokio::sync::Mutex<crate::meta_evolve::MetaEvolutionStore>>,
     /// P0 四预算封套：元进化 continuations 限流窗口（ns → 触发时刻列表）。
     /// 由 run_meta_evolution 在 run_once 前做窗口限流（方案 §3 注入点 B）。
-    pub evo_continuations: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<std::time::Instant>>>>,
+    /// `pub(crate)`（第十三轮 security·low）：限流状态是安全控制，外部不得直接改写。
+    pub(crate) evo_continuations: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<std::time::Instant>>>>,
     /// HY3 1.3：技能库注册表（仅 features.skill_library=true 时 Some；否则 None=不注入）
     pub skill_registry: Option<Arc<dyn crate::skill_library::SkillRegistry + Send + Sync>>,
     /// HY3 1.3：LATS 控制器（仅 features.lats=true 时 Some；否则 None=原路径）
@@ -10973,23 +10974,21 @@ impl AgentCore {
         // ④ **每次触发全量 prune**：全量清理所有 ns 的过期空键（256 键 × retain 的
         //    比较成本可忽略，无需间隔节流——第十二轮 bug·medium：间隔期内过期键
         //    计入上限会误拒新 ns）。
+        // ⑤ 限流计费语义（第十三轮 bug·medium 文档化）：admission 时刻在 run_once
+        //    执行前记录——run_once 失败/被拒也计入窗口（触发即计费，防止「失败后
+        //    立即重试」刷窗口）；EVO_CONTINUATIONS_MAX_NS 为硬编码安全常量而非配置：
+        //    限流上限暴露为配置会削弱安全控制（调用方可调大），保持常量护栏。
         let b = &self.config.meta_evolution.budget;
         if b.max_continuations_per_window > 0 && b.continuation_window_secs > 0 {
             let mut guard = self.evo_continuations.lock().await;
             let now = std::time::Instant::now();
             let window = std::time::Duration::from_secs(b.continuation_window_secs);
-            // 全量 sweep：删除所有过期空键，释放键位（每次触发，成本 O(键数)）
+            // 全量 sweep：删除所有过期空键，释放键位（每次触发，成本 O(键数)；
+            // 已覆盖当前 ns，无冗余 per-ns prune——第十三轮 maintainability·low）
             guard.retain(|_, v| {
                 v.retain(|t| now.saturating_duration_since(*t) < window);
                 !v.is_empty()
             });
-            // 当前 ns prune 兜底（sweep 已覆盖，但保语义清晰）
-            if let Some(entry) = guard.get_mut(ns) {
-                entry.retain(|t| now.saturating_duration_since(*t) < window);
-                if entry.is_empty() {
-                    guard.remove(ns);
-                }
-            }
             // 键数上限：新 ns（prune 后仍不存在）且键数已满 → 拒绝（liveness DoS 缓解：
             // 仅当 256 个**活跃**窗口同时存在时才拒绝，历史 ns 过期即释放）
             if !guard.contains_key(ns) && guard.len() >= EVO_CONTINUATIONS_MAX_NS {
