@@ -1,5 +1,16 @@
 # 演进日志 / CHANGELOG
 
+## 2026-08-12
+
+### v0.6.0 · main.rs 拆分重构（6720→100 行）+ Phase B 传输层脱敏三件套（新能力发版锚点）
+- **改动**：
+  - `src/main.rs` 6720 行单体按领域拆分为 15 个模块文件（config/state/auth/handlers×6/routes/bootstrap），main.rs 瘦身至 100 行仅保留入口；**零行为变更**（49 条路由表与拆分前逐条 diff 一致，cargo test 全绿）。
+  - Phase B 传输层三件套（对齐 GenOffice）：`sanitize.rs` 外发消息凭证脱敏（API key 前缀/URL userinfo/密钥赋值三类规则，字节版零分配检测器 + 不变量测试）；`llm.rs` 外发前 user 消息脱敏（Cow 零克隆快速路径）；`agent.rs` 字节预算 tool 输出截断（256KB 显式收敛循环）+ 变更前快照（按 session|trace 复合键，供回滚 UI/自进化 dry_run 复用）。
+  - ocr-review 门禁共修复 13 轮 40+ 条意见（含多个 security·high/bug·high：快照并发/Unicode 截断/JSON 键名脱敏/sk-proj_ 下划线/snake_case 判定等）；gitleaks 豁免 + GitHub Push Protection 适配。
+- **效果**：main.rs 从 6720 行可维护性重构为模块化结构，四预算自治封套落点（handlers/evolve.rs）就位；凭证在到达 LLM provider 前被脱敏，降低密钥误粘贴泄露面；变更前快照为回滚能力奠基。
+- **动机**：Phase B 属新能力+安全边界改动，按 `docs/RELEASING.md` 作为 `0.5.0 -> 0.6.0` 的 minor 发版锚点（v0.5.0 后积 42 commit）；版本号与 tag、CHANGELOG 三件套绑定同一次合并。
+- **关联**：`src/main.rs` / `src/{config,state,auth,bootstrap,routes}.rs` / `src/handlers/*` / `src/sanitize.rs` / `src/llm.rs` / `src/agent.rs` / `.gitleaks.toml` / `.github/workflows/ocr-review.yml`。
+
 ## 2026-08-10
 
 ### v0.5.0 · OfficeCLI 文档引擎接入 + office 源收窄为 fsutil 底座（安全边界发版锚点）
