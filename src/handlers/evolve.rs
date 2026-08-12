@@ -344,6 +344,8 @@ pub(crate) async fn handle_code_evolve(
                 let ok = gate.map(|o| o.status.success()).unwrap_or(false);
                 if !ok {
                     let _ = git_revert(&repo, &target_p);
+                    // Gate 违约类型统一由 BudgetTracker 构造（ocr 2026-08-12 bug·high）
+                    let _breach = agent_core::autonomy_budget::BudgetTracker::gate_failed();
                     send(
                         "gate_failed",
                         serde_json::json!({"command": cmd, "reason": "pass/fail gate 未通过，整体否决"}),

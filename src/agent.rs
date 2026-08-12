@@ -10960,6 +10960,10 @@ impl AgentCore {
                 });
             }
             entry.push(now);
+            // 淘汰过期后为空的 ns 键（防 map 无限增长，ocr 2026-08-12 perf·low）
+            if entry.is_empty() {
+                guard.remove(ns);
+            }
             drop(guard);
         }
         // 与 consolidate 一致：admin/jarvis 身份与密钥配对

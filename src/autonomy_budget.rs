@@ -47,11 +47,14 @@ impl Default for AutonomyBudget {
 
 impl AutonomyBudget {
     /// 是否完全未配置（全 0 / None）——用于「未开闸」判定与日志。
+    /// continuation_window_secs 与 max_continuations_per_window 成对：窗口非 0 而
+    /// 次数为 0 是「配了窗口但没限流」，仍视为未开闸（ocr 2026-08-12 bug·low 修复）。
     pub fn is_unset(&self) -> bool {
         self.max_turns == 0
             && self.max_tokens == 0
             && self.max_wall_clock_secs == 0
             && self.max_continuations_per_window == 0
+            && self.continuation_window_secs == 0
             && self.gate_command.is_none()
     }
 }
@@ -112,6 +115,14 @@ impl BudgetTracker {
         Ok(())
     }
 
+    /// 生成 `Gate` 违约（供调用方在 gate_command 非 0 退出时统一语义）。
+    /// gate 执行本身在调用方（handler 层需要 repo 上下文与异步进程），
+    /// 本方法保证违约类型从单一来源构造（ocr 2026-08-12 bug·high：此前
+    /// BudgetBreach::Gate 声明但无从构造，语义悬空）。
+    pub fn gate_failed() -> BudgetBreach {
+        BudgetBreach::Gate
+    }
+
     pub fn elapsed_secs(&self) -> u64 {
         self.start.elapsed().as_secs()
     }
@@ -126,6 +137,17 @@ impl BudgetTracker {
 
     pub fn budget(&self) -> &AutonomyBudget {
         &self.budget
+    }
+
+    /// 测试专用构造：可控 start 时刻（墙钟 breach 路径可测，ocr 2026-08-12 test·medium）
+    #[cfg(test)]
+    pub(crate) fn new_with_start(budget: AutonomyBudget, start: Instant) -> Self {
+        Self {
+            start,
+            turns: 0,
+            tokens: 0,
+            budget,
+        }
     }
 }
 
@@ -168,23 +190,25 @@ mod tests {
 
     #[test]
     fn wall_clock_breach() {
-        // 墙钟 1ms 级验证：max_wall_clock_secs 用 0 秒 + 显式等待不可行（整数秒），
-        // 改测「0=不限制」与 check_wall_clock 通过路径；真实超时由集成测覆盖。
-        let t = BudgetTracker::new(AutonomyBudget::default());
-        assert!(t.check_wall_clock().is_ok());
-        let t2 = BudgetTracker::new(AutonomyBudget {
-            max_wall_clock_secs: 1,
-            ..Default::default()
-        });
-        // 1 秒内不触发
-        assert!(t2.check_wall_clock().is_ok());
-        // 用已流逝时间伪造：直接构造一个 start 早已过去的 tracker 不可行（私有字段），
-        // 此处仅验证逻辑分支存在（record_turn 内也做墙钟检查）。
-        let mut t3 = BudgetTracker::new(AutonomyBudget {
-            max_wall_clock_secs: 0,
-            ..Default::default()
-        });
-        assert!(t3.record_turn(1).is_ok());
+        // 用可控 start 构造：start 早于 max_wall_clock_secs 对应时长 → 立即违约
+        let old_start = Instant::now() - Duration::from_secs(10);
+        let t = BudgetTracker::new_with_start(
+            AutonomyBudget {
+                max_wall_clock_secs: 1,
+                ..Default::default()
+            },
+            old_start,
+        );
+        assert_eq!(t.check_wall_clock(), Err(BudgetBreach::WallClock));
+        // record_turn 内也做墙钟检查
+        let mut t2 = BudgetTracker::new_with_start(
+            AutonomyBudget {
+                max_wall_clock_secs: 1,
+                ..Default::default()
+            },
+            old_start,
+        );
+        assert_eq!(t2.record_turn(1), Err(BudgetBreach::WallClock));
     }
 
     #[test]

@@ -788,8 +788,11 @@ impl MetaEvolver {
             tool_call_id: None,
         };
         let reply = self.llm.chat(&[msg], &[]).await.map_err(|e| e.to_string())?;
-        // 预算记账（过渡期 chars/4 估算，方案 §6）：超限即违约，调用方停止并回退
-        let _ = tracker.record_turn(crate::autonomy_budget::estimate_tokens(&reply.text));
+        // 预算记账（过渡期 chars/4 估算，方案 §6）：turns/tokens/wall-clock 违约
+        // 必须显式传播——静默忽略会导致超限仍继续（ocr 2026-08-12 bug·high 修复）
+        tracker
+            .record_turn(crate::autonomy_budget::estimate_tokens(&reply.text))
+            .map_err(|b| format!("预算违约 {:?}: 中止本轮元进化", b))?;
         let text = reply.text.trim().to_string();
         if text.is_empty() {
             return Err("optimizer 返回空提示词".to_string());
