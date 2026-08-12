@@ -11001,7 +11001,11 @@ impl AgentCore {
         max_per_window: u32,
         window_secs: u64,
     ) -> ContinuationVerdict {
-        entry.retain(|t| now.duration_since(*t) < std::time::Duration::from_secs(window_secs));
+        // saturating_duration_since：单调钟极端回拨（now 早于存储时刻）不 panic，
+        // 按 0 处理（视为窗口内刚发生，ocr 2026-08-12 第七轮 bug·medium）
+        entry.retain(|t| {
+            now.saturating_duration_since(*t) < std::time::Duration::from_secs(window_secs)
+        });
         if entry.len() >= max_per_window as usize {
             ContinuationVerdict::Denied(entry.len())
         } else {

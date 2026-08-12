@@ -98,9 +98,10 @@ impl BudgetTracker {
     /// 计数先增后检；`>` 语义（ocr 2026-08-12 第六轮 bug·low 复核后确认）：max_turns=N
     /// 允许**恰好 N 次**调用（第 N 次后 turns=N，N>N 为 false 放行；第 N+1 次违约）。
     /// 若用 `>=` 会在第 N 次就拒绝（只允许 N-1 次），反而偏离「上限 N」语义。
+    /// saturating_add：极端溢出不 panic（第七轮 bug·low）。
     pub fn record_turn(&mut self, tokens: u64) -> Result<(), BudgetBreach> {
-        self.turns += 1;
-        self.tokens += tokens;
+        self.turns = self.turns.saturating_add(1);
+        self.tokens = self.tokens.saturating_add(tokens);
         if self.budget.max_turns > 0 && self.turns > self.budget.max_turns {
             return Err(BudgetBreach::Turns);
         }
