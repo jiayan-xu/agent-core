@@ -60,13 +60,31 @@ pub fn needs_redaction(payload: &str) -> bool {
         }
         (j - start, has_underscore)
     };
+    // snake_case 段形态判定（第八轮 security·high 修正）：token 中每个 `_` 分隔段
+    // 均为「小写字母或数字、长度 ≤12」→ 判为 snake_case 标识符（误伤源，拒绝脱敏）。
+    // 任何段含大写字母或长度 >12（真实 key 的随机段特征）→ 放行。
+    let is_snake_case = |seg: &[u8]| -> bool {
+        let mut seg_start = 0usize;
+        let segs: Vec<&[u8]> = seg
+            .split(|&b| b == b'_')
+            .filter(|s| !s.is_empty())
+            .collect();
+        if segs.is_empty() {
+            return false;
+        }
+        let _ = seg_start;
+        segs.iter().all(|s| {
+            s.len() <= 12 && s.iter().all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+    };
     let mut i = 0usize;
     while i < n {
         // 规则 1：API key 前缀。覆盖常见真实格式（ocr 2026-08-12 第七轮 security·medium）：
         //   sk- / AIza / ghp_ / secret_ / sk_live_ / sk_test_ / hf_ / github_pat_ / AKIA…
-        // 下划线拒绝仅适用于「前缀本身不含 _」的匹配：sk- 后跟 snake_case 标识符
-        // （secret_config_management_v2_2024）为误伤源，而 sk_live_/hf_/github_pat_ 等
-        // 前缀自带 _，其 token 含 _ 属正常（Stripe/HF/GitHub 真实格式）。
+        // 下划线处理（第八轮 security·high 修正）：不再「含 _ 即拒」——sk-proj_xxx_yyy
+        // 等 OpenAI 新格式真实 key 含 _，直接拒绝会漏脱敏。改为 snake_case 形态判定：
+        // token 的 _ 分隔段全部为「小写字母/数字且 ≤12 字符」才判为 snake_case 标识符
+        // （secret_config_management_v2_2024）拒绝；任何含大写/长随机段的 token 放行。
         let prefix_matched = [
             "sk-", "aiza", "ghp_", "secret_", "sk_live_", "sk_test_", "hf_", "github_pat_", "akia",
         ]
@@ -74,8 +92,9 @@ pub fn needs_redaction(payload: &str) -> bool {
         .find(|p| at_word_boundary(i) && starts_with_ci(i, p));
         if let Some(p) = prefix_matched {
             let (token_len, has_underscore) = consume_token_bytes(i + p.len());
-            let underscore_ok = !has_underscore || p.trim_end_matches('_').contains('_');
-            if token_len >= 16 && underscore_ok {
+            let snake_case = has_underscore
+                && is_snake_case(&bytes[i + p.len()..i + p.len() + token_len]);
+            if token_len >= 16 && !snake_case {
                 return true;
             }
         }
@@ -180,8 +199,6 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
     };
 
     // 消费 [A-Za-z0-9_-]，返回消费掉的字符数；同时检测 token 内是否含下划线
-    // （真实 API key 不含 `_`；snake_case 标识符如 secret_config_management_v2_2024 含
-    //  `_` → 不视为 key，防误伤，ocr 2026-08-12）
     let consume_token_chars = |mut j: usize| -> (usize, bool) {
         let start = j;
         let mut has_underscore = false;
@@ -194,11 +211,21 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
         (j - start, has_underscore)
     };
 
+    // snake_case 段形态判定（与字节版 is_snake_case 同源，防两实现漂移）
+    let is_snake_case_chars = |seg: &[char]| -> bool {
+        seg.split(|&c| c == '_')
+            .filter(|s| !s.is_empty())
+            .all(|s| {
+                s.len() <= 12 && s.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            })
+    };
+
     while i < n {
         let c = chars[i];
         // 规则 1：API key 前缀（大小写不敏感 + 词边界）。覆盖 sk_live_/hf_/github_pat_/
-        // AKIA 等真实格式（第七轮 security·medium）；下划线拒绝仅对无 _ 前缀生效
-        // （snake_case 误伤防护，sk_live_ 等自带 _ 前缀的 token 含 _ 属正常）。
+        // AKIA 等真实格式（第七轮 security·medium）；下划线处理：仅 snake_case 段形态
+        // （全小写/数字、段长 ≤12）拒绝——sk-proj_xxx_yyy 等真实含 _ 的 key 放行
+        // （第八轮 security·high 修正，OpenAI 新格式 sk-proj_ 前有真实泄露案例）。
         let prefix_matched = [
             "sk-", "aiza", "ghp_", "secret_", "sk_live_", "sk_test_", "hf_", "github_pat_", "akia",
         ]
@@ -206,8 +233,9 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
         .find(|p| at_word_boundary(i) && starts_with_ci(i, p));
         if let Some(p) = prefix_matched {
             let (token_len, has_underscore) = consume_token_chars(i + p.len());
-            let underscore_ok = !has_underscore || p.trim_end_matches('_').contains('_');
-            if token_len >= 16 && underscore_ok {
+            let snake_case = has_underscore
+                && is_snake_case_chars(&chars[i + p.len()..i + p.len() + token_len]);
+            if token_len >= 16 && !snake_case {
                 out.push_str("[REDACTED_API_KEY]");
                 i += p.len() + token_len;
                 continue;
@@ -467,6 +495,27 @@ mod tests {
         assert!(needs_redaction("sk_live_51H-abcdefghijklmnopqrstuvwx"));
         assert!(needs_redaction("github_pat_-abcdefghijklmnopqrstuvwx"));
         assert!(needs_redaction("AKIA-ABCDEFGHIJKLMNOPQRSTUVWX"));
+    }
+
+    #[test]
+    fn sk_proj_underscore_key_redacted() {
+        // ocr 2026-08-12 第八轮 security·high：sk-proj_ 新格式含 `_`，此前被
+        // 「含 _ 即拒」误拒漏脱敏；snake_case 段形态判定（全小写/数字、段长 ≤12）
+        // 后，含大写随机段的真实 key 放行。
+        assert_eq!(
+            sanitize_agent_payload("sk-proj_AbCdEfGhIjKlMnOpQrStUvWxYz"),
+            "[REDACTED_API_KEY]"
+        );
+        assert_eq!(
+            sanitize_agent_payload("sk-proj_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c"),
+            "[REDACTED_API_KEY]"
+        );
+        assert!(needs_redaction("sk-proj_AbCdEfGhIjKlMnOpQrStUvWxYz"));
+        // snake_case 标识符仍不误伤
+        assert_eq!(
+            sanitize_agent_payload("secret_config_management_v2_2024"),
+            "secret_config_management_v2_2024"
+        );
     }
 
     #[test]
