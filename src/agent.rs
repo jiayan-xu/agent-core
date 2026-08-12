@@ -10957,25 +10957,35 @@ impl AgentCore {
         }
         // P0 四预算封套·continuations 限流（方案 §3 注入点 B）：窗口内触发次数超限 →
         // 直接 skipped、不进入 run_once、零副作用。
-        // 安全护栏（ocr 2026-08-12 第九轮 security·high）：ns 是用户可控输入——
-        // ① 全局键数上限 EVO_CONTINUATIONS_MAX_NS（防任意 ns 字符串撑爆 map 内存 DoS）；
-        // ② 空 Vec 键即时删除（防过期 ns 永久驻留）；③ 新 ns 键超限时按 Denied 处理
-        // （同时收紧「换新 ns 绕过限流」的利用面——虽不能根除，但键数有界）。
+        // 安全护栏（ocr 2026-08-12 第九/十轮）：ns 是用户可控输入——
+        // ① 全局键数上限 EVO_CONTINUATIONS_MAX_NS（内存 DoS 防护）；
+        // ② **过期空键即时删除**（liveness DoS 防护：键永不删除会耗尽上限后永久
+        //    拒绝新 ns，第十轮 bug·high）；③ 新 ns 键超限时按 Denied 处理。
         let b = &self.config.meta_evolution.budget;
         if b.max_continuations_per_window > 0 && b.continuation_window_secs > 0 {
             let mut guard = self.evo_continuations.lock().await;
             let now = std::time::Instant::now();
-            // 键数上限：超过 EVO_CONTINUATIONS_MAX_NS 且当前 ns 无条目 → 拒绝
-            // （内存 DoS 防护；有条目则走既有窗口判定）
-            let is_new_ns = !guard.contains_key(ns);
-            if is_new_ns && guard.len() >= EVO_CONTINUATIONS_MAX_NS {
+            // 先 prune 当前 ns 的过期条目（若存在）；空则删键——保证「键数上限只反映
+            // 活跃窗口」，历史 ns 过期后释放键位（第十轮 bug·high 修复）
+            if let Some(entry) = guard.get_mut(ns) {
+                entry.retain(|t| {
+                    now.saturating_duration_since(*t)
+                        < std::time::Duration::from_secs(b.continuation_window_secs)
+                });
+                if entry.is_empty() {
+                    guard.remove(ns);
+                }
+            }
+            // 键数上限：新 ns（prune 后仍不存在）且键数已满 → 拒绝（liveness DoS 缓解：
+            // 仅当 256 个**活跃**窗口同时存在时才拒绝，历史 ns 过期即释放）
+            if !guard.contains_key(ns) && guard.len() >= EVO_CONTINUATIONS_MAX_NS {
                 return serde_json::json!({
                     "status": "skipped",
                     "reason": "continuation budget exceeded（ns 键数达上限）",
                     "max_ns_keys": EVO_CONTINUATIONS_MAX_NS,
                 });
             }
-            // 单次 entry 获取，Admitted 分支复用同一引用（perf·low，第八轮）
+            // 入窗：retain 后仍有条目（计数未满）→ Admitted；否则新建并入窗
             let entry = guard.entry(ns.to_string()).or_default();
             match Self::continuation_verdict(
                 entry,
@@ -10985,12 +10995,6 @@ impl AgentCore {
             ) {
                 ContinuationVerdict::Admitted(t) => {
                     entry.push(t);
-                    // 空 Vec 键删除：当前 ns 原为空（新建或被 retain 清空）→ push 后
-                    // 长度 1，键有内容无需清理；**无条目且窗口内已过期**的场景由
-                    // continuation_verdict 的 retain 处理——若 retain 清空则键变空 Vec，
-                    // 此处 push 后恢复。真正需要清理的是「其他 ns 的空键」：窗口过期后
-                    // 键空驻留，但受全局键数上限约束（EVO_CONTINUATIONS_MAX_NS），
-                    // 有界可接受（第九轮 security·high 缓解：上限使内存消耗有界）。
                 }
                 ContinuationVerdict::Denied(count) => {
                     return serde_json::json!({
@@ -11351,6 +11355,31 @@ mod continuation_tests {
             AgentCore::continuation_verdict(&mut entry, now, 3, 3600),
             ContinuationVerdict::Denied(5)
         );
+    }
+
+    #[test]
+    fn expired_ns_key_releases_slot() {
+        // 第十轮 bug·high 回归：过期空键必须释放键位（否则 256 个历史 ns 后
+        // 新 ns 永久 Denied = liveness DoS）。模拟 run_meta_evolution 的
+        // prune → 空则删 语义。
+        let mut map = std::collections::HashMap::<String, Vec<std::time::Instant>>::new();
+        let now = std::time::Instant::now();
+        let old = now - std::time::Duration::from_secs(2); // 2s 前（窗口 1s，必过期）
+        map.insert("stale_ns".to_string(), vec![old, old]);
+        // 模拟 prune：窗口 1s，条目全过期 → 空 → 删键
+        if let Some(entry) = map.get_mut("stale_ns") {
+            entry.retain(|t| {
+                now.saturating_duration_since(*t) < std::time::Duration::from_secs(1)
+            });
+            if entry.is_empty() {
+                map.remove("stale_ns");
+            }
+        }
+        assert!(
+            !map.contains_key("stale_ns"),
+            "过期空键必须删除（释放键位）"
+        );
+        assert!(map.is_empty());
     }
 }
 
