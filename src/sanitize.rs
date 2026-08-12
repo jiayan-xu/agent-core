@@ -93,8 +93,13 @@ pub fn needs_redaction(payload: &str) -> bool {
         } else {
             0
         };
-        if key_len > 0 {
+        if key_len > 0 && at_word_boundary(i) {
             let mut j = i + key_len;
+            // JSON 风格键名（"password": "value"）：键名收尾引号后接 :，
+            // 当前逻辑漏脱敏（ocr 2026-08-12 第四轮 security·high），此处跳过一个收尾引号
+            if j < n && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                j += 1;
+            }
             while j < n && (bytes[j] == b' ' || bytes[j] == b'\t') {
                 j += 1;
             }
@@ -193,7 +198,7 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
                 }
             }
         }
-        // 规则 3：密钥赋值 key = "value" / key: "value"（key 大小写不敏感）
+        // 规则 3：密钥赋值 key = "value" / key: "value"（key 大小写不敏感 + 词边界防误伤）
         let key_len = if starts_with_ci(i, "secret_key") {
             10
         } else if starts_with_ci(i, "private_key") {
@@ -205,9 +210,14 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
         } else {
             0
         };
-        if key_len > 0 {
+        if key_len > 0 && at_word_boundary(i) {
             // 允许 key 后空格
             let mut j = i + key_len;
+            // JSON 风格键名（"password": "value"）：跳过一个收尾引号再找分隔符
+            // （ocr 2026-08-12 第四轮 security·high：{...} 配置粘贴时 password 值漏脱敏）
+            if j < n && (chars[j] == '"' || chars[j] == '\'') {
+                j += 1;
+            }
             while j < n && (chars[j] == ' ' || chars[j] == '\t') {
                 j += 1;
             }
@@ -460,6 +470,40 @@ mod tests {
             sanitize_agent_payload("password = \"abc\n后面还有内容\"继续"),
             "password = \"abc\n后面还有内容\"继续"
         );
+    }
+
+    #[test]
+    fn json_style_keys_redacted() {
+        // ocr 2026-08-12 第四轮 security·high：JSON 风格键名收尾引号后接 : 此前漏脱敏
+        assert_eq!(
+            sanitize_agent_payload("{\"password\": \"hunter2\"}"),
+            "{\"password\": \"[REDACTED_SECURE_TOKEN]\"}"
+        );
+        assert_eq!(
+            sanitize_agent_payload("{\"secret_key\":\"abc\"}"),
+            "{\"secret_key\":\"[REDACTED_SECURE_TOKEN]\"}"
+        );
+        assert_eq!(
+            sanitize_agent_payload("{\"api_key\": \"sk-abc1234567890abcdefgh\"}"),
+            "{\"api_key\": \"[REDACTED_API_KEY]\"}"
+        );
+        // 字节版检测器保持一致（不变量测试兜底）
+        assert!(needs_redaction("{\"password\": \"hunter2\"}"));
+        assert!(needs_redaction("{\"secret_key\":\"abc\"}"));
+    }
+
+    #[test]
+    fn keyword_suffix_not_redacted() {
+        // ocr 2026-08-12 第四轮 bug·medium：规则 3 此前无词边界，mypassword/resetpassword 误脱敏
+        assert_eq!(
+            sanitize_agent_payload("mypassword = \"abc\""),
+            "mypassword = \"abc\""
+        );
+        assert_eq!(
+            sanitize_agent_payload("resetpassword = \"x\""),
+            "resetpassword = \"x\""
+        );
+        assert!(!needs_redaction("mypassword = \"abc\""));
     }
 
     #[test]

@@ -27,12 +27,14 @@ regexes = [
   # 保证该文件未来若出现真实密钥仍会被 gitleaks 捕获）—— ocr-review 2026-08-12 建议。
   # 含大写变体：gitleaks 默认 OpenAI 规则大小写不敏感（(?i)\b(sk-...)），大写测试串
   # 在全库扫描下同样命中，必须一并豁免（ocr 2026-08-12 第二轮意见）。
-  '''sk-abc1234567890abcdefgh''',
-  '''AIzaSyA1234567890abcdefghijklmnopqrstuv''',
-  '''ghp_1234567890abcdefghijkl''',
-  '''sk-1234567890abcdefghijklmnop''',
-  '''secret_abcdefghijklmnopqrstuvwxyz1''',
-  '''SK-ABCDEFGHIJKLMNOPQRSTUVWX''',
-  '''GHP_ABCDEFGHIJKLMNOPQRSTUVWX''',
-  '''SECRET_ABCDEFGHIJKLMNOPQRSTUVWX''',
+  # 词边界包裹（\b...\b）：防未来真实 key 仅因「包含」mock 串前缀而被连带豁免
+  # （ocr 2026-08-12 第四轮 security·low）。
+  '''\bsk-abc1234567890abcdefgh\b''',
+  '''\bAIzaSyA1234567890abcdefghijklmnopqrstuv\b''',
+  '''\bghp_1234567890abcdefghijkl\b''',
+  '''\bsk-1234567890abcdefghijklmnop\b''',
+  '''\bsecret_abcdefghijklmnopqrstuvwxyz1\b''',
+  '''\bSK-ABCDEFGHIJKLMNOPQRSTUVWX\b''',
+  '''\bGHP_ABCDEFGHIJKLMNOPQRSTUVWX\b''',
+  '''\bSECRET_ABCDEFGHIJKLMNOPQRSTUVWX\b''',
 ]

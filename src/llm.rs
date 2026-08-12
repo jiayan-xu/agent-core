@@ -1183,9 +1183,16 @@ pub struct Message {
 /// 传输层脱敏：对 `role=user` 的正文做凭证脱敏
 /// （对齐 GenOffice sanitizeAgentPayload；只改外发副本，不改历史/存储）。
 /// 返回 `Cow`：**无任何脱敏发生时零克隆**（常见路径复用原 slice，检测走非分配
-/// `needs_redaction` 短路，ocr 2026-08-12 perf·medium 修复）；仅实际改写时才
-/// 分配新 Vec（chat_best_of_n 并发 fan-out 下收益最大化）。
-pub fn sanitize_messages(messages: &[Message]) -> Cow<'_, [Message]> {
+/// `needs_redaction` 短路）；仅实际改写时才分配新 Vec，且逐条 user 消息先用
+/// `needs_redaction` 门控，无敏感的单条消息跳过 sanitize 分配（ocr 2026-08-12
+/// 第四轮 perf·medium）。
+///
+/// 残余风险（已知边界，security·medium 文档化）：仅覆盖 `role=user` 的 `content`
+/// 字段；`role=tool`（MCP 输出，可能含连接串/命令回显）、`assistant`（回显粘贴的
+/// 密钥）以及 `tool_calls`/`tool_call_id` 字段仍原样上送。历史全量重发时上述向量
+/// 可持续泄漏——如需覆盖须扩展脱敏范围（当前设计有意限定 user 正文，避免误伤
+/// 工具语义输出）。
+pub(crate) fn sanitize_messages(messages: &[Message]) -> Cow<'_, [Message]> {
     let mut needs_redact = false;
     for m in messages.iter().filter(|m| m.role == "user") {
         if let Some(c) = &m.content {
@@ -1203,11 +1210,14 @@ pub fn sanitize_messages(messages: &[Message]) -> Cow<'_, [Message]> {
         .map(|m| {
             if m.role == "user" {
                 if let Some(c) = &m.content {
-                    let redacted = crate::sanitize::sanitize_agent_payload(c);
-                    if redacted != *c {
-                        let mut m2 = m.clone();
-                        m2.content = Some(redacted);
-                        return m2;
+                    // 逐条门控：无敏感的单条 user 消息不调用 sanitize（零分配跳过）
+                    if crate::sanitize::needs_redaction(c) {
+                        let redacted = crate::sanitize::sanitize_agent_payload(c);
+                        if redacted != *c {
+                            let mut m2 = m.clone();
+                            m2.content = Some(redacted);
+                            return m2;
+                        }
                     }
                 }
             }
