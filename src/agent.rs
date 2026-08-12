@@ -380,6 +380,14 @@ pub struct AgentCore {
     /// 由 run_meta_evolution 在 run_once 前做窗口限流（方案 §3 注入点 B）。
     /// `pub(crate)`（第十三轮 security·low）：限流状态是安全控制，外部不得直接改写。
     pub(crate) evo_continuations: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<std::time::Instant>>>>,
+    /// P1-B 递归持久子 agent：句柄注册表（含收件箱 + 状态），进程重启后从
+    /// `sub_agents.json` 恢复（断线续跑）。消息经既有 A2A（collab_send_raw）路由。
+    pub(crate) sub_agents: std::sync::Arc<tokio::sync::Mutex<crate::persistent_subagent::SubAgentRegistry>>,
+    /// 子 agent id 序列号（单调递增，spawn 时分配）
+    pub(crate) sub_agent_seq: std::sync::atomic::AtomicU64,
+    /// 子 agent 注册表持久化路径（构造时 cwd 固定，spawn/清理共用——避免
+    /// 运行时 current_dir 漂移导致读写不一致，ocr 2026-08-12 bug·medium）
+    pub(crate) sub_agents_file: String,
     /// HY3 1.3：技能库注册表（仅 features.skill_library=true 时 Some；否则 None=不注入）
     pub skill_registry: Option<Arc<dyn crate::skill_library::SkillRegistry + Send + Sync>>,
     /// HY3 1.3：LATS 控制器（仅 features.lats=true 时 Some；否则 None=原路径）
@@ -993,6 +1001,63 @@ impl AgentCore {
         let meta_store = std::sync::Arc::new(tokio::sync::Mutex::new(meta_store));
         let evo_continuations =
             std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::<String, Vec<std::time::Instant>>::new()));
+        // P1-B：子 agent 注册表（从 cwd/sub_agents.json 恢复，断线续跑）。
+        // seq 从恢复的注册表推断（max_seq+1），防重启后新 id 与旧 id 重复
+        // （ocr 2026-08-12 bug·high）。文件损坏时显式告警（other·medium：
+        // 不能静默当空注册表，否则丢全部子 agent 句柄）。
+        let sub_agents_path = cwd.join("sub_agents.json").to_string_lossy().to_string();
+        let (sub_agents_registry, load_status) =
+            crate::persistent_subagent::load(&sub_agents_path);
+        match load_status {
+            crate::persistent_subagent::LoadStatus::Corrupted => {
+                tracing::warn!(
+                    target: "agent.sub_agents",
+                    path = %sub_agents_path,
+                    "sub_agents.json 存在但解析失败（损坏）——已按空注册表启动，子 agent 句柄丢失"
+                );
+                // bug·medium（第七轮）：损坏文件不能坐等首次 save 原子覆盖（丢失
+                // 人工修复机会）——先备份为 sub_agents.json.corrupted.<ts>。
+                // （第八轮：与上方 warn 合并为单一分支，消除重复匹配）
+                if let Ok(meta) = std::fs::metadata(&sub_agents_path) {
+                    // 毫秒级时间戳（bug·low 第九轮：秒级在两次损坏启动时撞名覆盖）
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    let backup = format!("{}.corrupted.{}", sub_agents_path, ts);
+                    // 仅备份非空文件（空文件无价值）；copy 失败仅告警（other·low）
+                    if meta.len() > 0 {
+                        if let Err(e) = std::fs::copy(&sub_agents_path, &backup) {
+                            tracing::warn!(
+                                target: "agent.sub_agents",
+                                path = %sub_agents_path,
+                                "损坏文件备份失败: {}",
+                                e
+                            );
+                        } else {
+                            tracing::warn!(
+                                target: "agent.sub_agents",
+                                backup = %backup,
+                                "损坏的 sub_agents.json 已备份（供人工修复）"
+                            );
+                        }
+                    }
+                }
+            }
+            crate::persistent_subagent::LoadStatus::Unreadable => {
+                // bug·high 第五轮：读失败（权限/IO）不能当 Missing 静默
+                tracing::error!(
+                    target: "agent.sub_agents",
+                    path = %sub_agents_path,
+                    "sub_agents.json 存在但无法读取（权限/IO）——已按空注册表启动，断线续跑失效"
+                );
+            }
+            _ => {}
+        }
+        let restored_seq = sub_agents_registry.max_seq(&config.identity.agent_id);
+        let sub_agents = std::sync::Arc::new(tokio::sync::Mutex::new(sub_agents_registry));
+        let sub_agent_seq = std::sync::atomic::AtomicU64::new(restored_seq + 1);
+        let sub_agents_file = sub_agents_path;
         let meta_evolver = crate::meta_evolve::MetaEvolver::new(
             config.meta_evolution.clone(),
             meta_store.clone(),
@@ -1114,6 +1179,9 @@ impl AgentCore {
             meta_evolver,
             meta_store,
             evo_continuations,
+            sub_agents,
+            sub_agent_seq,
+            sub_agents_file,
             skill_registry,
             lats,
             multiagent,
@@ -5294,6 +5362,38 @@ impl AgentCore {
         // P1-1: 续跑——从已完成的步骤结果起步（崩溃恢复后 in_progress_step_results 已填充）
         let mut step_results: HashMap<u32, String> =
             self.in_progress_step_results.lock().await.clone();
+        // P1-C：checkpoint 缺失/过期的兜底——已执行步骤若本地无结果，尝试从
+        // memoria 外置召回（外置不能 write-only，读侧在续跑闭环补齐）。
+        // bug·high（第四轮）：**仅续跑时召回**——首跑（无 checkpoint、无外置）
+        // 对每个缺失步骤打 MCP 是纯浪费；续跑判定 = 本次恢复出非空 step_results
+        // （说明此前执行过，外置可能已有记录）。
+        let is_resume = !step_results.is_empty();
+        if is_resume {
+            let step_ns = allowed_ns
+                .first()
+                .cloned()
+                .unwrap_or_else(|| self.config.identity.ns());
+            for st in &plan.steps {
+                if !step_results.contains_key(&st.step_id) {
+                    if let Some(recalled) = crate::experience_memo::recall_plan_step(
+                        &self.mcp,
+                        session_id,
+                        st.step_id,
+                        &step_ns,
+                    )
+                    .await
+                    {
+                        step_results.insert(st.step_id, recalled);
+                        tracing::info!(
+                            target: "agent.composer",
+                            session = %session_id,
+                            step = st.step_id,
+                            "plan_step 从 Memoria 外置召回（续跑兜底）"
+                        );
+                    }
+                }
+            }
+        }
         let mut step_errors: Vec<String> = Vec::new();
         let mut executed: Vec<u32> = step_results.keys().cloned().collect();
         let total = plan.steps.len();
@@ -5408,6 +5508,27 @@ impl AgentCore {
             for (step_id, result) in results {
                 match result {
                     Ok(text) => {
+                        // P1-C（RLM 上下文外置）：大步骤结果外置到 memoria（外部变量）。
+                        // 语义澄清（bug·medium 第七轮）：step_results **仍保留完整**
+                        // 结果（本会话内正常使用），外置是**持久化冗余**——供崩溃
+                        // 恢复/跨会话续跑时 checkpoint 缺失兜底召回；上下文不膨胀
+                        // 由 summarize 的截断保证，外置解决的是「持久性」而非
+                        // 「体积」（体积问题见 summarize_composition 1500 截断）。
+                        // 先按引用判断长度，再 move 进 step_results（防借用冲突）。
+                        if text.chars().count() > 2000 {
+                            let step_ns = allowed_ns
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| self.config.identity.ns());
+                            crate::experience_memo::externalize_plan_step(
+                                &self.mcp,
+                                session_id,
+                                step_id,
+                                &text,
+                                &step_ns,
+                            )
+                            .await;
+                        }
                         step_results.insert(step_id, text);
                     }
                     Err(e) => {
@@ -5470,7 +5591,6 @@ impl AgentCore {
                 truncated
             ));
         }
-
         let prompt = format!(
             "你是固废监管系统的查询助手。用户用中文提问，系统已通过多个工具步骤查到了结果。\n\
              请基于下面的工具返回数据，用简洁的中文自然语言回答用户的原始问题。\n\
@@ -7707,6 +7827,20 @@ impl AgentCore {
                     {
                         text.push_str(&format!("\n\n💡 历史教训参考（情境召回）：{}", lesson));
                     }
+                    // P1-A（/refine 合成点）：失败教训结构化沉淀为 experience_memo，
+                    // 供 meta_evolution 第二样本源（解 min_samples=20 冷启动）。
+                    // best-effort：写失败仅告警，不阻断执行。
+                    let memo_ns = allowed_ns
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| self.config.identity.ns());
+                    crate::experience_memo::record_experience_memo(
+                        &self.mcp,
+                        &tc.name,
+                        &e,
+                        &memo_ns,
+                    )
+                    .await;
                     text
                 }
             };
@@ -7871,6 +8005,134 @@ impl AgentCore {
             )
             .await
             .map_err(|e| format!("a2a_send 失败: {}", e))
+    }
+
+    // ── P1-B 递归持久子 agent（句柄 + A2A 路由 + 断线续跑）──
+
+    /// 注册一个持久子 agent（句柄入注册表 + 落盘 sub_agents.json）。
+    /// 返回子 agent id；后续经 `sub_agent_send` 投递消息、`sub_agent_list` 查看状态。
+    /// save 失败返回 Err（other·low：不能返回成功 id 却未持久化——断线续跑承诺失效）。
+    pub(crate) async fn sub_agent_spawn(
+        &self,
+        task_desc: &str,
+        ns: &str,
+    ) -> Result<String, String> {
+        let seq = self
+            .sub_agent_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = format!("sub-{}-{}", self.config.identity.agent_id, seq);
+        let agent = crate::persistent_subagent::PersistentSubAgent::new(
+            id.clone(),
+            task_desc.to_string(),
+            ns.to_string(),
+        );
+        // 先持久化再入内存（bug·medium 第四轮：insert 先于 save，save 失败则
+        // 内存有磁盘无——重启丢句柄。改为：临时插入 → save → 失败回滚）。
+        {
+            let mut reg = self.sub_agents.lock().await;
+            reg.insert(agent);
+        }
+        // 统一用构造时固定路径（sub_agents_file），与 load 同一 cwd（bug·medium）
+        if let Err(e) = crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file).await {
+            tracing::warn!(target: "agent.sub_agents", "子 agent 注册表持久化失败: {}", e);
+            // 回滚内存插入（save 失败 = 断线续跑承诺失效，句柄不保留）
+            self.sub_agents.lock().await.remove(&id);
+            return Err(format!("子 agent 注册失败（未持久化）: {}", e));
+        }
+        Ok(id)
+    }
+
+    /// 向持久子 agent 投递消息（入其收件箱；未找到返回 Err，可回落 A2A 原生投递）。
+    /// 投递后落盘（bug·medium 第五轮：只改内存不 save 则重启丢消息——收件箱
+    /// 是断线续跑的核心状态，每条消息都必须持久化）。
+    /// save 失败返回 Err 并**回滚投递**（bug·high 第七轮：消息已入内存但 save 失败
+    /// 时返回 Err，调用方重试会重复投递——回滚刚投递的消息，保证「Err = 未投递」）。
+    pub(crate) async fn sub_agent_send(
+        &self,
+        to_sub_id: &str,
+        from: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        crate::persistent_subagent::deliver(&self.sub_agents, to_sub_id, from, content).await?;
+        if let Err(e) =
+            crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file).await
+        {
+            // 回滚：只移除**最后一条**匹配 from+content 的消息（bug·medium 第八轮：
+            // retain 全删会误删历史相同消息——相同内容可能此前投递过多次）。
+            {
+                let mut reg = self.sub_agents.lock().await;
+                if let Some(a) = reg.get_mut(to_sub_id) {
+                    if let Some(pos) = a
+                        .inbox
+                        .iter()
+                        .rposition(|m| m.from == from && m.content == content)
+                    {
+                        a.inbox.remove(pos);
+                    }
+                    a.last_active = crate::persistent_subagent::now_unix_pub();
+                }
+            }
+            tracing::error!(target: "agent.sub_agents", "投递后持久化失败，已回滚: {}", e);
+            return Err(format!("消息投递失败（未持久化，已回滚）: {}", e));
+        }
+        Ok(())
+    }
+
+    /// 列出全部持久子 agent（id / 状态 / 收件箱数），供管理接口展示。
+    /// 先收集快照再释放锁（perf·low：避免持锁期间做 JSON 构造）。
+    pub(crate) async fn sub_agent_list(&self) -> Vec<serde_json::Value> {
+        let snapshots: Vec<serde_json::Value> = {
+            let reg = self.sub_agents.lock().await;
+            reg.iter()
+                .map(|a| {
+                    serde_json::json!({
+                        "id": a.id,
+                        "state": format!("{:?}", a.state),
+                        "inbox": a.inbox.len(),
+                        "task_desc": a.task_desc,
+                        "created_at": a.created_at,
+                        "last_active": a.last_active,
+                    })
+                })
+                .collect()
+        };
+        snapshots
+    }
+
+    /// 取指定子 agent 收件箱并清空（消费语义；Done 后收件箱保留至清理）。
+    /// 返回 Option（bug·medium 第六轮）：None = 无消息可取——子 agent 不存在
+    /// **或**本次消费回滚（持久化失败）；Some(空) = 存在但当前无消息。调用方
+    /// 需结合 `sub_agent_list` 区分（第七轮：文档明确双关语义，不额外引入 Err
+    /// 以保持 API 简单；回滚是罕见故障路径，日志已记录）。
+    pub(crate) async fn sub_agent_take_inbox(
+        &self,
+        sub_id: &str,
+    ) -> Option<Vec<crate::persistent_subagent::SubAgentMessage>> {
+        let taken = {
+            let mut reg = self.sub_agents.lock().await;
+            reg.get_mut(sub_id)
+                .map(|a| std::mem::take(&mut a.inbox))
+        }?;
+        // 清空后落盘（bug·high：不清盘则重启后已消费消息重现 = 重复处理）。
+        // 事务化（bug·medium 第四轮）：save 失败则**回滚内存**（消息放回收件箱），
+        // 宁可本次消费失败，不让「已消费但未落盘」造成重启后重复处理。
+        // 回滚用 append 而非覆盖（bug·medium 第五轮：take 与 save 之间并发
+        // deliver 可能已追加新消息，直接 `inbox = taken` 会丢它们）。
+        if !taken.is_empty() {
+            if let Err(e) =
+                crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file).await
+            {
+                tracing::warn!(target: "agent.sub_agents", "消费收件箱后持久化失败，回滚: {}", e);
+                let mut reg = self.sub_agents.lock().await;
+                if let Some(a) = reg.get_mut(sub_id) {
+                    let mut restored = taken.clone();
+                    restored.append(&mut a.inbox); // 并发新消息在回滚消息之后
+                    a.inbox = restored;
+                }
+                return None; // 回滚后无消息可返回（调用方可重试）
+            }
+        }
+        Some(taken)
     }
 
     /// 取同组织已注册 Agent 通讯录（Memoria `agent_list`，需 admin）。
