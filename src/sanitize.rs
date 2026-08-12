@@ -68,24 +68,33 @@ pub fn needs_redaction(payload: &str) -> bool {
     // - `sk-proj_abcdefghijklmnop_qrstuvwxyz`（全小写随机段、无版本段）→ 脱敏 ✓
     // - 任何段含大写 / 字母数字混合（hex 随机段，如 9f8e7d6c）→ 脱敏 ✓
     let is_snake_case = |seg: &[u8]| -> bool {
-        let segs: Vec<&[u8]> = seg
-            .split(|&b| b == b'_')
-            .filter(|s| !s.is_empty())
-            .collect();
-        if segs.is_empty() {
+        // 零分配实现（第十三轮 perf·medium：此前 Vec<&[u8]> collect 违背 needs_redaction
+        // 零分配声称）：迭代器直接扫描段，不物化 Vec
+        let mut segs = seg.split(|&b| b == b'_').filter(|s| !s.is_empty());
+        let first = segs.next();
+        if first.is_none() {
             return false;
         }
         let mut has_version = false;
-        for s in &segs {
+        let mut check_seg = |s: &[u8], has_version: &mut bool| -> bool {
             if s.iter().all(|&b| b.is_ascii_lowercase()) {
-                // 纯小写字母单词段（长度不限：configuration=13 也是单词）
+                true // 纯小写字母单词段（长度不限：configuration=13 也是单词）
             } else if s.len() >= 2
                 && (s.iter().all(|&b| b.is_ascii_digit())
                     || (s[0] == b'v' && s[1..].iter().all(|&b| b.is_ascii_digit())))
             {
-                has_version = true; // 版本段：纯数字（如 2024）或 v+数字（如 v2）
+                *has_version = true; // 版本段：纯数字（如 2024）或 v+数字（如 v2）
+                true
             } else {
-                return false; // 含大写 / 字母数字混合（hex 随机段）→ 非标识符
+                false // 含大写 / 字母数字混合（hex 随机段）→ 非标识符
+            }
+        };
+        if !check_seg(first.unwrap(), &mut has_version) {
+            return false;
+        }
+        for s in segs {
+            if !check_seg(s, &mut has_version) {
+                return false;
             }
         }
         has_version
@@ -142,15 +151,22 @@ pub fn needs_redaction(payload: &str) -> bool {
                 }
             }
         }
-        // 规则 3：密钥赋值
+        // 规则 3：密钥赋值（第十三轮 security·medium：补 api_key/access_key/token 等
+        // 极常见配置键名——api_key = "..." 短值不走规则 1 前缀匹配，必须在此覆盖）
         let key_len = if starts_with_ci(i, "secret_key") {
             10
         } else if starts_with_ci(i, "private_key") {
             11
+        } else if starts_with_ci(i, "api_key") {
+            7
+        } else if starts_with_ci(i, "access_key") {
+            10
         } else if starts_with_ci(i, "password") {
             8
         } else if starts_with_ci(i, "passwd") {
             6
+        } else if starts_with_ci(i, "token") {
+            5
         } else {
             0
         };
@@ -231,24 +247,31 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
     // 段全部为「纯小写字母单词段」或「版本段（纯数字/v+数字）」且至少一个版本段
     //（第十轮 security·high：全小写随机段无版本号不得豁免，与字节版同构防分歧）。
     let is_snake_case_chars = |seg: &[char]| -> bool {
-        let segs: Vec<&[char]> = seg
-            .split(|&c| c == '_')
-            .filter(|s| !s.is_empty())
-            .collect();
-        if segs.is_empty() {
+        let mut segs = seg.split(|&c| c == '_').filter(|s| !s.is_empty());
+        let first = segs.next();
+        if first.is_none() {
             return false;
         }
         let mut has_version = false;
-        for s in &segs {
+        let mut check_seg = |s: &[char], has_version: &mut bool| -> bool {
             if s.iter().all(|&c| c.is_ascii_lowercase()) {
-                // 纯小写字母单词段（长度不限）
+                true // 纯小写字母单词段（长度不限）
             } else if s.len() >= 2
                 && (s.iter().all(|&c| c.is_ascii_digit())
                     || (s[0] == 'v' && s[1..].iter().all(|&c| c.is_ascii_digit())))
             {
-                has_version = true; // 版本段
+                *has_version = true; // 版本段
+                true
             } else {
-                return false; // 含大写 / 字母数字混合 → 非标识符
+                false // 含大写 / 字母数字混合 → 非标识符
+            }
+        };
+        if !check_seg(first.unwrap(), &mut has_version) {
+            return false;
+        }
+        for s in segs {
+            if !check_seg(s, &mut has_version) {
+                return false;
             }
         }
         has_version
@@ -310,15 +333,22 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
                 }
             }
         }
-        // 规则 3：密钥赋值 key = "value" / key: "value"（key 大小写不敏感 + 弱边界）
+        // 规则 3：密钥赋值 key = "value" / key: "value"（key 大小写不敏感 + 弱边界；
+        // 第十三轮补 api_key/access_key/token）
         let key_len = if starts_with_ci(i, "secret_key") {
             10
         } else if starts_with_ci(i, "private_key") {
             11
+        } else if starts_with_ci(i, "api_key") {
+            7
+        } else if starts_with_ci(i, "access_key") {
+            10
         } else if starts_with_ci(i, "password") {
             8
         } else if starts_with_ci(i, "passwd") {
             6
+        } else if starts_with_ci(i, "token") {
+            5
         } else {
             0
         };
@@ -684,13 +714,35 @@ mod tests {
             sanitize_agent_payload("{\"secret_key\":\"abc\"}"),
             "{\"secret_key\":\"[REDACTED_SECURE_TOKEN]\"}"
         );
+        // api_key 键名命中规则 3（第十三轮新增键名），整值打码 SECURE_TOKEN——
+        // 规则 1 的 sk- 前缀匹配不再单独触发（两种标记均安全脱敏）
         assert_eq!(
             sanitize_agent_payload("{\"api_key\": \"sk-abc1234567890abcdefgh\"}"),
-            "{\"api_key\": \"[REDACTED_API_KEY]\"}"
+            "{\"api_key\": \"[REDACTED_SECURE_TOKEN]\"}"
         );
         // 字节版检测器保持一致（不变量测试兜底）
         assert!(needs_redaction("{\"password\": \"hunter2\"}"));
         assert!(needs_redaction("{\"secret_key\":\"abc\"}"));
+    }
+
+    #[test]
+    fn api_key_assignment_redacted() {
+        // ocr 2026-08-12 第十三轮 security·medium：api_key/access_key/token 等常见
+        // 配置键名短值（不走规则 1 前缀匹配）此前漏脱敏
+        assert_eq!(
+            sanitize_agent_payload("api_key = \"hunter2\""),
+            "api_key = \"[REDACTED_SECURE_TOKEN]\""
+        );
+        assert_eq!(
+            sanitize_agent_payload("ACCESS_KEY: 'xyz'"),
+            "ACCESS_KEY: '[REDACTED_SECURE_TOKEN]'"
+        );
+        assert_eq!(
+            sanitize_agent_payload("token = \"abc123\""),
+            "token = \"[REDACTED_SECURE_TOKEN]\""
+        );
+        assert!(needs_redaction("api_key = \"hunter2\""));
+        assert!(needs_redaction("ACCESS_KEY: 'xyz'"));
     }
 
     #[test]
