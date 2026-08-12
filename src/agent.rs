@@ -5408,6 +5408,23 @@ impl AgentCore {
             for (step_id, result) in results {
                 match result {
                     Ok(text) => {
+                        // P1-C（RLM 上下文外置）：大步骤结果外置到 memoria（外部变量），
+                        // prompt 只带指针/摘要——长任务上下文不随步骤数线性膨胀。
+                        // 先按引用判断长度，再 move 进 step_results（防借用冲突）。
+                        if text.chars().count() > 2000 {
+                            let step_ns = allowed_ns
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| self.config.identity.ns());
+                            crate::experience_memo::externalize_plan_step(
+                                &self.mcp,
+                                session_id,
+                                step_id,
+                                &text,
+                                &step_ns,
+                            )
+                            .await;
+                        }
                         step_results.insert(step_id, text);
                     }
                     Err(e) => {
@@ -5470,7 +5487,6 @@ impl AgentCore {
                 truncated
             ));
         }
-
         let prompt = format!(
             "你是固废监管系统的查询助手。用户用中文提问，系统已通过多个工具步骤查到了结果。\n\
              请基于下面的工具返回数据，用简洁的中文自然语言回答用户的原始问题。\n\

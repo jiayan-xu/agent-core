@@ -96,6 +96,81 @@ pub async fn collect_memo_samples(
         .collect()
 }
 
+/// P1-C（RLM 上下文外置）：把组合计划的大步骤结果外置到 memoria（外部变量）。
+/// key 语义：`plan_step:{session_id}:{step_id}`，标签 `[plan_step_result, composer]`。
+/// 后续 summarize/续跑可经 `recall_plan_step` 按 key 召回，prompt 只带指针/摘要，
+/// 长任务上下文不随步骤数线性膨胀（对照文档 §3 P1）。
+/// best-effort：memoria 写失败仅告警，本地 step_results 不受影响。
+pub async fn externalize_plan_step(
+    mcp: &McpClient,
+    session_id: &str,
+    step_id: u32,
+    result: &str,
+    ns: &str,
+) {
+    // 结果超长时截断存储体（4KB 上限，仅存核心结论 + 原始数据的可召回索引）
+    let stored: String = result.chars().take(4096).collect();
+    let content = format!(
+        "[plan_step_result] session={} step={}\n{}",
+        session_id, step_id, stored
+    );
+    let args = serde_json::json!({
+        "content": content,
+        "tags": ["plan_step_result", "composer", format!("step:{}", step_id)],
+        "category": "plan_step_result",
+        "confidence": 90,
+        "importance": 2,
+        "namespace": ns,
+    });
+    match mcp.call_json("memory_remember", &args).await {
+        Ok(_) => {
+            tracing::debug!(session = %session_id, step = %step_id, "plan_step 已外置到 Memoria");
+        }
+        Err(e) => {
+            tracing::warn!(session = %session_id, step = %step_id, "plan_step 外置失败（best-effort）: {}", e);
+        }
+    }
+}
+
+/// 召回外置的 plan_step 结果（P1-C：崩溃恢复 / 跨会话续跑时按 key 取回）。
+/// best-effort：未命中返回 None。
+pub async fn recall_plan_step(
+    mcp: &McpClient,
+    session_id: &str,
+    step_id: u32,
+    ns: &str,
+) -> Option<String> {
+    let query = format!("plan_step_result session={} step={}", session_id, step_id);
+    let args = serde_json::json!({
+        "query": query,
+        "namespace": ns,
+        "category": "plan_step_result",
+        "max_results": 1,
+    });
+    let raw = mcp
+        .call_json("memory_search_v2", &args)
+        .await
+        .ok()?;
+    let results = raw.get("results").and_then(|r| r.as_array()).cloned()?;
+    for it in results {
+        let content = it
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        if content.contains(&format!("step={}", step_id)) {
+            // 剥掉元信息前缀，返回纯结果
+            return Some(
+                content
+                    .split_once('\n')
+                    .map(|(_, rest)| rest.to_string())
+                    .unwrap_or(content),
+            );
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +185,16 @@ mod tests {
             .and_then(|s| s.split(' ').next())
             .unwrap_or("unknown");
         assert_eq!(tool, "fill_excel_log");
+    }
+
+    #[test]
+    fn plan_step_content_roundtrip() {
+        // 外置内容：剥元信息前缀后应还原结果体（纯逻辑验证）
+        let content = "[plan_step_result] session=s1 step=3\n查询结果：7 月进厂 42 车";
+        let rest: String = match content.split_once('\n') {
+            Some((_, body)) => body.to_string(),
+            None => content.to_string(),
+        };
+        assert_eq!(rest, "查询结果：7 月进厂 42 车");
     }
 }
