@@ -1,11 +1,30 @@
 # 演进日志 / CHANGELOG
 
+## 2026-08-13
+
+### v0.8.0 · P1 三项落地（/refine 样本池 + 持久子 agent + RLM 上下文外置，新能力发版锚点）
+- **改动**：
+  - P1-A（/refine 合成点）：新增 `src/experience_memo.rs`，工具失败教训结构化沉淀
+    memoria（`record_experience_memo` 双写会话 ns + 根 ns）；`collect_negative_samples`
+    双源合并（evolution_log + experience_memo）解 min_samples=20 冷启动；baseline 分母
+    只计回滚类样本 + 证据门槛 ≥3。
+  - P1-C（RLM 上下文外置）：`externalize_plan_step`/`recall_plan_step` 大步骤结果外置
+    memoria（head+tail 截断），execute_plan 续跑召回兜底——长任务抗 context rot。
+  - P1-B（递归持久子 agent）：新增 `src/persistent_subagent.rs`（PersistentSubAgent
+    句柄 + SubAgentRegistry + save/load 断线续跑 + schema_version）；AgentCore 接线
+    sub_agent_spawn/send/list/take_inbox（收件箱全链路落盘 + 事务化回滚）。
+- **效果**：meta_evolution 冷启动门槛解除（运行经验也能喂样本池）；组合计划大结果
+  跨会话可恢复；子 agent 具备 spawn 后脱离终端、断线续跑、彼此消息能力（A2A Bridge
+  强化）；ocr-review 11 轮 60+ 条意见全修（含 bug·high×5/security·medium×2）。
+- **动机**：对照文档 §3 P1 借鉴裁决（/refine memo、rlm() 持久子 agent、RLM 上下文外置）。
+
 ## 2026-08-12
 
 ### v0.7.0 · 四预算自治封套落地（P0，借鉴 Prime Agent，新能力发版锚点）
 - **改动**：新增 `src/autonomy_budget.rs`（`AutonomyBudget` 六维预算 + `BudgetTracker` + `BudgetBreach` + 过渡期 token 估算）；注入点 A `handle_code_evolve`（循环顶部墙钟/提议后记账/gate_command 通过后整体否决）、注入点 B `run_meta_evolution`（continuations 窗口限流 + `run_once` 内记账）；`CodeEvolutionConfig`/`MetaEvolutionConfig` 各 +budget 字段（serde 全 default 向后兼容）；agent.toml 增补 `[*.budget]` 段。
 - **效果**：code/meta 进化引擎获得统一运行时封套（turns/tokens/wall-clock/continuations + 可选 pass/fail gate），违约即停 + 回退 + 审计；预算为**加法护栏**，不削弱 x-evolve-key/隔离仓库/dry_run 双闸门任一既有门禁；ocr-review 14 轮 30+ 条意见全修（含 security·high×4/bug·high×3/security·medium×5）。
 - **动机**：借鉴 Prime Agent 四独立预算自治封套（对照文档 §3-P0），补「长时自主 agent 统一 4 维封顶」；与「定时自动化必须带超时」硬规矩一脉相承。
+
 - **关联**：`src/autonomy_budget.rs` / `src/handlers/evolve.rs` / `src/meta_evolve.rs` / `src/agent.rs` / `src/config.rs` / `agent.toml`。
 
 ### v0.6.0 · main.rs 拆分重构（6720→100 行）+ Phase B 传输层脱敏三件套（新能力发版锚点）
