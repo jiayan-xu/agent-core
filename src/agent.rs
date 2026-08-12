@@ -10952,9 +10952,6 @@ impl AgentCore {
                 let entry = guard.entry(ns.to_string()).or_default();
                 entry.retain(|t| now.duration_since(*t) < std::time::Duration::from_secs(b.continuation_window_secs));
                 if entry.len() >= b.max_continuations_per_window as usize {
-                    // Continuations 违约统一由 BudgetBreach 构造（ocr 2026-08-12 第二轮
-                    // maintainability·medium：此前变体声明但无从构造）
-                    let _breach = crate::autonomy_budget::BudgetBreach::Continuations;
                     return serde_json::json!({
                         "status": "skipped",
                         "reason": "continuation budget exceeded（四预算封套）",

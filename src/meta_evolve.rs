@@ -292,6 +292,7 @@ pub struct CandidatePrompt {
 
 /// optimize_prompt 错误：LLM 调用失败 or 预算违约（Budget 变体保持类型结构化，
 /// 供 run_once 传播为 RolloutResult::budget_breach，ocr 2026-08-12 bug·medium）
+#[derive(Debug)]
 pub enum OptimizeError {
     Llm(String),
     Budget(crate::autonomy_budget::BudgetBreach),
@@ -806,6 +807,11 @@ impl MetaEvolver {
             tool_calls: None,
             tool_call_id: None,
         };
+        // LLM 调用前墙钟检查：调用本身耗时不可控（长 prompt / 网络），
+        // 仅依赖调用后 record_turn 的检查会让超限请求仍发出（ocr 2026-08-12 bug·medium）
+        if let Err(b) = tracker.check_wall_clock() {
+            return Err(OptimizeError::Budget(b));
+        }
         let reply = self.llm.chat(&[msg], &[]).await.map_err(OptimizeError::Llm)?;
         // 预算记账（过渡期 chars/4 估算，方案 §6）：turns/tokens/wall-clock 违约
         // 必须显式传播——静默忽略会导致超限仍继续（ocr 2026-08-12 bug·high 修复）；

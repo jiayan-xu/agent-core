@@ -50,8 +50,9 @@ impl Default for AutonomyBudget {
 
 impl AutonomyBudget {
     /// 是否完全未配置（全 0 / None）——用于「未开闸」判定与日志。
-    /// continuation_window_secs 与 max_continuations_per_window 成对：窗口非 0 而
-    /// 次数为 0 是「配了窗口但没限流」，仍视为未开闸（ocr 2026-08-12 bug·low 修复）。
+    /// **全部** 6 项均为默认值才判未开闸（含成对的 continuation_window_secs——
+    /// 窗口非 0 而次数为 0 仍是「配了窗口但无限流」的异常组合，不视为未开闸；
+    /// ocr 2026-08-12 bug·low/bug·medium：doc 与实现对齐）。
     pub fn is_unset(&self) -> bool {
         self.max_turns == 0
             && self.max_tokens == 0
@@ -187,7 +188,7 @@ mod tests {
             ..Default::default()
         });
         assert!(t.record_turn(60).is_ok());
-        assert_eq!(t.record_turn(50).is_ok(), false); // 60+50=110 > 100 → 违约
+        assert_eq!(t.record_turn(50), Err(BudgetBreach::Tokens)); // 60+50=110 > 100 → 违约
         assert_eq!(t.record_turn(1), Err(BudgetBreach::Tokens));
     }
 
@@ -235,6 +236,17 @@ mod tests {
         assert_eq!(estimate_tokens("abcd"), 1);
         // 中文 4 chars → 1 token
         assert_eq!(estimate_tokens("固废监管"), 1);
+    }
+
+    #[test]
+    fn misspelled_key_rejected() {
+        // 安全红线：budget 表内拼错键名（max_turn 缺 s）必须解析失败，
+        // 防「拼错 → 静默 0 → 封套失效」（ocr 2026-08-12 bug·medium）
+        let toml = r#"
+max_turn = 8
+"#;
+        let r: Result<AutonomyBudget, _> = toml::from_str(toml);
+        assert!(r.is_err(), "拼错键名必须拒绝解析: {:?}", r);
     }
 }
 
