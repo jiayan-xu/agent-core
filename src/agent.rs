@@ -10948,26 +10948,22 @@ impl AgentCore {
         if b.max_continuations_per_window > 0 && b.continuation_window_secs > 0 {
             let mut guard = self.evo_continuations.lock().await;
             let now = std::time::Instant::now();
-            {
-                let entry = guard.entry(ns.to_string()).or_default();
-                entry.retain(|t| now.duration_since(*t) < std::time::Duration::from_secs(b.continuation_window_secs));
-                if entry.len() >= b.max_continuations_per_window as usize {
-                    return serde_json::json!({
-                        "status": "skipped",
-                        "reason": "continuation budget exceeded（四预算封套）",
-                        "window_secs": b.continuation_window_secs,
-                        "max_continuations_per_window": b.max_continuations_per_window,
-                        "current_in_window": entry.len(),
-                    });
-                }
+            let entry = guard.entry(ns.to_string()).or_default();
+            entry.retain(|t| now.duration_since(*t) < std::time::Duration::from_secs(b.continuation_window_secs));
+            if entry.len() >= b.max_continuations_per_window as usize {
+                return serde_json::json!({
+                    "status": "skipped",
+                    "reason": "continuation budget exceeded（四预算封套）",
+                    "window_secs": b.continuation_window_secs,
+                    "max_continuations_per_window": b.max_continuations_per_window,
+                    "current_in_window": entry.len(),
+                });
             }
-            // 全过期（窗口内无条目）→ 删键重建，防 ns 键无限驻留
-            // （ocr 2026-08-12 perf·low：retain 清空后键仍留 map；push 后再判 is_empty 恒假）
-            if guard.get(ns).map(|v| v.is_empty()).unwrap_or(false) {
-                guard.remove(ns);
-            }
-            guard.entry(ns.to_string()).or_default().push(now);
+            entry.push(now);
             drop(guard);
+            // 注：ns 键在 retain 清空后仍驻留 map——ns 是业务命名空间（数量有限），
+            // 空 Vec 驻留内存可忽略，无需键淘汰（ocr 2026-08-12 第四轮确认此前清理块
+            // 对新键是白删再建，已移除）。
         }
         // 与 consolidate 一致：admin/jarvis 身份与密钥配对
         let mem_client = memoria_maintenance_client(&self.config.memoria_url, &self.mcp);

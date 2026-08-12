@@ -72,6 +72,9 @@ pub struct BudgetTracker {
 }
 
 /// 违约类型。调用方须立即停止并按 §5 违约语义处理（回退 + 审计）。
+/// 说明（ocr 2026-08-12 第四轮 maintainability·medium）：`Continuations` 由
+/// 触发器层（run_meta_evolution 的窗口限流）直接判定并以 JSON skipped 返回，
+/// 不经 BudgetTracker（tracker 只管 turns/tokens/wall-clock/gate 四项）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetBreach {
     Turns,
@@ -194,8 +197,12 @@ mod tests {
 
     #[test]
     fn wall_clock_breach() {
-        // 用可控 start 构造：start 早于 max_wall_clock_secs 对应时长 → 立即违约
-        let old_start = Instant::now() - Duration::from_secs(10);
+        // 用可控 start 构造：start 早于 max_wall_clock_secs 对应时长 → 立即违约。
+        // checked_sub 防单调钟刚启动（elapsed < 10s）时 underflow panic（ocr 第四轮 test·low）
+        let old_start = match Instant::now().checked_sub(Duration::from_secs(10)) {
+            Some(s) => s,
+            None => return, // 单调钟运行不足 10s（极罕见），跳过
+        };
         let t = BudgetTracker::new_with_start(
             AutonomyBudget {
                 max_wall_clock_secs: 1,
@@ -227,7 +234,8 @@ mod tests {
         }
         assert_eq!(t.turns_used(), 3);
         assert_eq!(t.tokens_used(), 300);
-        assert!(t.elapsed_secs() >= 0);
+        // 墙钟合理性：3 次 record_turn 应在秒级内完成（防 elapsed 语义回归，ocr 第四轮 test·low）
+        assert!(t.elapsed_secs() < 60, "elapsed_secs 异常: {}", t.elapsed_secs());
     }
 
     #[test]

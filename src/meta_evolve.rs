@@ -307,6 +307,8 @@ impl std::fmt::Display for OptimizeError {
     }
 }
 
+impl std::error::Error for OptimizeError {}
+
 /// 评估结果
 #[derive(Debug, Clone)]
 pub struct EvalResult {
