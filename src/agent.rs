@@ -259,6 +259,38 @@ pub enum MembershipVerdict {
     Unknown,
 }
 
+/// 首个变更（非只读）工具执行前的会话快照（Phase B，GenOffice snapshotBefore 借鉴）。
+/// 供回滚 UI / 自进化 dry_run 复用；每个 run 首个写工具前捕获一次（run 起始不删除，
+/// 跨 run 残留由下次写工具按 trace_id 覆盖、容量淘汰清理——第七轮 doc 与生命周期对齐）。
+/// 保真度权衡（ocr 2026-08-12 第三轮 perf·low）：`messages_before` 捕获于首个写工具
+/// 执行前（execute_tool_calls 内），此时历史中较早轮次的超长 tool 输出可能已被
+/// `squash_stale_tool_outputs` 截断（含 `(truncated)` 标记）——即快照非「写前完整
+/// 历史」，回滚消费方应按需从历史重新加载完整消息。
+#[derive(Debug, Clone)]
+pub(crate) struct MutationSnapshot {
+    /// 触发快照的写工具名
+    pub(crate) tool_name: String,
+    /// 捕获时该 run 的消息列表（含系统 prompt 与已执行工具结果）
+    pub(crate) messages_before: Vec<crate::llm::Message>,
+    pub(crate) session_id: String,
+    pub(crate) trace_id: String,
+    pub(crate) captured_at_ms: u64,
+    /// 单调递增序号（淘汰排序用，不依赖可回拨的墙钟；ocr 2026-08-12 第三轮 bug·medium）
+    pub(crate) seq: u64,
+}
+
+/// 变更前快照 map 容量上限（ocr 2026-08-12 第二轮 perf·medium）：
+/// 防「写了工具后不再 run」的会话累积深克隆快照 → 无界内存增长 + 敏感历史滞留。
+/// 超限时淘汰 seq 最旧的条目。
+const MUTATION_SNAPSHOT_MAX: usize = 64;
+
+/// 快照 map 复合键：长度前缀编码 `"{session_len}:{session}|{trace}"`——
+/// 分隔符歧义消除（session_id/trace_id 即使含 `|` 也不会碰撞，
+/// ocr 2026-08-12 第十二轮 bug·low）。
+fn snapshot_key(session_id: &str, trace_id: &str) -> String {
+    format!("{}:{}|{}", session_id.len(), session_id, trace_id)
+}
+
 /// Agent 核心
 pub struct AgentCore {
     pub config: AgentConfig,
@@ -294,6 +326,15 @@ pub struct AgentCore {
     /// P1-1: 会话历史摘要缓存（session_id → (已摘要条数, 摘要文本, 已摘要区间指纹)）——滑动窗口+摘要层。
     /// 指纹防「外部历史替换但条数不变」场景返回过期摘要（P1 审查#3）。
     history_summary_cache: tokio::sync::Mutex<HashMap<String, (usize, String, u64)>>,
+    /// Phase B（GenOffice snapshotBefore 借鉴）：本次 run 首个非只读工具执行前的消息快照，
+    /// 供回滚 UI / 自进化 dry_run 复用。map 键 = "session_id|trace_id" 复合键：
+    /// 同 session 并发 run 各自独立，互不覆盖、互不误取（第八轮 bug·medium 修复）；
+    /// run 起始不删、首个写工具执行前捕获一次（单锁原子）。
+    /// `pub(crate)`：外部只能经 take_mutation_snapshot 读取，不能直接改写 map
+    /// （防绕过 seq 分配与容量淘汰不变量，ocr 2026-08-12 第六轮 maintainability·low）。
+    pub(crate) mutation_snapshot: tokio::sync::Mutex<HashMap<String, MutationSnapshot>>,
+    /// 快照捕获单调序号（淘汰排序用，替代可回拨的墙钟，ocr 2026-08-12 第三轮）
+    pub(crate) snapshot_seq: std::sync::atomic::AtomicU64,
     /// P2-1: 命名空间级配额与成本（tool 轮次 / 日 token 预算 / 并发会话）
     pub quota: Arc<std::sync::Mutex<NsQuotaStore>>,
     /// 白龙马 A3: Focus Stack → Thread 模型 —— 已归档话题（episode）软隐藏索引
@@ -1001,6 +1042,8 @@ impl AgentCore {
             inbox_cache: tokio::sync::Mutex::new(InboxCache::new()),
             session_manager: SessionManager::new(),
             history_summary_cache: tokio::sync::Mutex::new(HashMap::new()),
+            mutation_snapshot: tokio::sync::Mutex::new(HashMap::new()),
+            snapshot_seq: std::sync::atomic::AtomicU64::new(1),
             audit_logger: AuditLogger::new(mcp_for_audit),
             tool_route_cache: tokio::sync::Mutex::new(HashMap::new()),
             namespace_registry: std::sync::Mutex::new(NamespaceRegistry::new()),
@@ -6597,6 +6640,11 @@ impl AgentCore {
         // 反复重试 6-7 轮 → 70s+）。Hard 任务保持 20 轮（固废多步推理）。
         let max_rounds = if is_easy_query { 3u32 } else { self.config.max_tool_rounds };
 
+        // Phase B：快照由捕获点管理（见 execute_tool_calls），run 起始**不**删除——
+        // 否则同 session 并发 run 会互相删掉对方刚捕获的快照（ocr 2026-08-12
+        // 第五轮 bug·medium）。捕获点通过 trace_id 区分「本 run 已捕获」与「旧 run
+        // 残留」，旧残留会在首次写工具时被覆盖。
+
         for _round in 0..max_rounds {
             // P2-1: 日 token 预算预估（请求上下文体量），超限硬拒
             let ctx_chars: usize = ctx
@@ -6775,6 +6823,8 @@ impl AgentCore {
                 ToolExecOutcome::Abort(reply) => return reply,
                 ToolExecOutcome::Executed(any) => ctx.did_work |= any,
             }
+            // Phase B：每轮工具执行后按字节预算截断陈旧 tool 输出（防跨轮载荷越滚越大）
+            Self::squash_stale_tool_outputs(&mut ctx.messages);
         }
 
         // 轮数耗尽，最后让 LLM 总结
@@ -7202,6 +7252,92 @@ impl AgentCore {
         out
     }
 
+    /// 运行中超预算时截断**陈旧** tool 输出（对齐 GenOffice loop.ts squashStaleToolOutputs）：
+    /// 保留结构（tool 消息成对完整）、保最近 N 条原文，更早的只截内容并加截断标记。
+    /// 避免多轮工具循环里历史 tool 结果越滚越大、每轮重发超大载荷。
+    fn squash_stale_tool_outputs(messages: &mut Vec<Message>) {
+        const BUDGET_BYTES: usize = 256 * 1024;
+        const KEEP_RECENT: usize = 2;
+        const OUTPUT_MAX_BYTES: usize = 2_000;
+        const TRUNC_MARKER: &str = "…(output truncated: too long)";
+        const SHORT_MARKER: &str = "(truncated)";
+        let tool_msgs: Vec<usize> = (0..messages.len())
+            .filter(|&i| messages[i].role == "tool")
+            .collect();
+        let total: usize = tool_msgs
+            .iter()
+            .map(|&i| messages[i].content.as_ref().map(|c| c.len()).unwrap_or(0))
+            .sum();
+        if total <= BUDGET_BYTES {
+            return;
+        }
+        // 显式循环：从最旧的 tool 消息开始处理，直到总字节降到预算内（ocr 2026-08-12
+        // bug·medium：原先仅对单条超限消息截断，多条小输出合计超预算时永不收敛；
+        // bug·high：字节/字符单位不匹配，多字节内容截断无效）。
+        // 最近 KEEP_RECENT 条 tool 消息豁免（保留 LLM 刚看到的上下文）。
+        let mut remaining = total;
+        let mut truncated_any = false;
+        let head_bytes = OUTPUT_MAX_BYTES.saturating_sub(TRUNC_MARKER.len());
+        for (idx, &i) in tool_msgs.iter().enumerate() {
+            if remaining <= BUDGET_BYTES {
+                break;
+            }
+            // tool_msgs 升序（旧→新）；最后 KEEP_RECENT 条豁免（保留 LLM 刚看到的
+            // 上下文——这是软上限：末两轮产出超大 tool 输出时，本轮 payload 可能
+            // 仍超预算，下一轮起该消息移出豁免窗口后被截断，ocr 2026-08-12 第六轮
+            // bug·medium 已如实文档化此设计权衡）。
+            if tool_msgs.len() - idx <= KEEP_RECENT {
+                continue;
+            }
+            let Some(c) = messages[i].content.as_ref() else {
+                continue;
+            };
+            // 长消息：字节级截断 + 字符边界安全切片（多字节内容不撕裂字符）
+            if c.len() > head_bytes + TRUNC_MARKER.len() {
+                let head: String = c
+                    .char_indices()
+                    // 预留 4 字节给可能的 UTF-8 边界字符，保证 head+marker 严格短于原文
+                    // （ocr 2026-08-12 第二轮 bug·low：bi < head_bytes 时多字节字符可能
+                    // 使 squashed ≥ 原文，saved=0 导致预算循环空转）
+                    .take_while(|&(bi, _)| bi + 4 <= head_bytes)
+                    .map(|(_, ch)| ch)
+                    .collect();
+                let squashed = format!("{}{}", head, TRUNC_MARKER);
+                let saved = c.len().saturating_sub(squashed.len());
+                messages[i].content = Some(squashed);
+                remaining = remaining.saturating_sub(saved);
+                truncated_any = true;
+            } else if c.len() > SHORT_MARKER.len() {
+                // 短消息：截断反而变长（marker 比原文大）→ 整条替换为短标记
+                let saved = c.len() - SHORT_MARKER.len();
+                messages[i].content = Some(SHORT_MARKER.to_string());
+                remaining = remaining.saturating_sub(saved);
+                truncated_any = true;
+            }
+        }
+        if truncated_any {
+            tracing::debug!("squash_stale_tool_outputs: 已按字节预算截断旧 tool 输出");
+        }
+    }
+
+    /// 取走指定会话**当前 run**（trace_id 匹配）的变更前快照（首个非只读工具执行前
+    /// 的消息列表），供回滚 UI / 自进化 dry_run 复用。
+    /// None = 该会话本次 run 尚未执行写工具。
+    /// map 键为 "session_id|trace_id" 复合键：并发同 session 不同 run 各自独立，
+    /// 旧 run 残留不会污染当前 run 的读取（第八轮 bug·medium 修复；第七轮
+    /// documentation·medium 的 doc 与生命周期对齐）。
+    /// 只克隆取出、**不删除条目**：条目兼作「本 run 已捕获」标记，消费方在 run
+    /// 进行中取走快照后，后续写工具不得重新捕获（否则快照反映变更后状态，破坏
+    /// 「首个写工具前」不变量，第五轮 bug·medium）。
+    pub(crate) async fn take_mutation_snapshot(
+        &self,
+        session_id: &str,
+        trace_id: &str,
+    ) -> Option<MutationSnapshot> {
+        let snap_key = snapshot_key(session_id, trace_id);
+        self.mutation_snapshot.lock().await.get(&snap_key).cloned()
+    }
+
     /// 执行 LLM 返回的工具调用（重构 L 阶段：Agents SDK turn 语义——校验→审批→执行→回灌）。
     /// 返回 ToolExecOutcome：Executed(是否执行了工具) 或 Abort(提前终止文案，llm_loop 直接返回)。
     async fn execute_tool_calls(
@@ -7484,6 +7620,51 @@ impl AgentCore {
                         tool_call_id: None,
                     });
                     continue;
+                }
+            }
+
+            // Phase B：首个非只读（写）工具执行前捕获变更前快照（GenOffice snapshotBefore 借鉴），
+            // 供回滚 UI / 自进化 dry_run 复用。map 键 = "session_id|trace_id" 复合键：
+            // 同 session 并发 run（不同 trace）各自独立快照，互不覆盖、互不误取
+            // （第八轮 bug·medium：此前仅按 session 键控，并发双 run 后写覆盖先写，
+            // 丢失「首个写工具前」语义）。
+            // 捕获语义：无本 run 键 → 捕获；已有本 run 键 → 已捕获跳过。
+            // 旧 run 残留（不同 trace 键）自然共存，由容量淘汰按 seq 清理。
+            if !crate::boundary::is_read_only_tool(&tc.name) {
+                let snap_key = snapshot_key(session_id, trace_id);
+                let mut m = self.mutation_snapshot.lock().await;
+                if !m.contains_key(&snap_key) {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let seq = self
+                        .snapshot_seq
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let snap = MutationSnapshot {
+                        tool_name: tc.name.clone(),
+                        messages_before: messages.clone(),
+                        session_id: session_id.to_string(),
+                        trace_id: trace_id.to_string(),
+                        captured_at_ms: now_ms,
+                        seq,
+                    };
+                    // 容量上限：防「写了工具后不再 run 的会话」累积深克隆快照导致
+                    // 无界内存增长与敏感历史滞留（ocr 2026-08-12 第二轮 perf·medium）。
+                    // 超限时淘汰 seq 最旧条目（排除本键）；活跃 run 被误淘汰的固有
+                    // 妥协已文档化（第七轮 bug·medium 缓解）。
+                    if m.len() >= MUTATION_SNAPSHOT_MAX {
+                        let oldest = m
+                            .iter()
+                            .filter(|(k, _)| k.as_str() != snap_key)
+                            .min_by_key(|(_, s)| s.seq)
+                            .map(|(k, _)| k.clone());
+                        if let Some(k) = oldest {
+                            m.remove(&k);
+                        }
+                    }
+                    m.insert(snap_key, snap);
+                    tracing::info!(tool = %tc.name, session = %session_id, "mutation_snapshot_captured");
                 }
             }
 
@@ -10862,6 +11043,173 @@ mod tool_fix_tests {
         // 无候选返回 None
         let empty: Vec<&String> = vec![];
         assert!(fuzzy_closest(&empty, "anything").is_none());
+    }
+
+    // ── Phase B 单测（ocr 2026-08-12 test·low：快照生命周期 + 字节预算截断）──
+
+    #[test]
+    fn squash_stale_tool_outputs_multibyte_byte_cap() {
+        // 多字节内容：中文 50000 字符 = 150000 字节，且总预算超限才进入截断。
+        // 修复前 guard 用 c.len()（字节）而截断用 chars().take()（字符）→ 多字节内容
+        // 截断无效且 payload 反增；修复后按字节截断 + 字符边界安全切片，总长度必须收缩。
+        let big_cn = "固废".repeat(50_000); // 100000 字符 / 300000 字节（单条已超 256KB 预算）
+        let mut msgs = vec![
+            Message {
+                role: "tool".into(),
+                content: Some(big_cn.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "tool".into(),
+                content: Some("x".repeat(1000)), // 补刀，确保 total > 预算
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "tool".into(),
+                content: Some("recent-ok".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        AgentCore::squash_stale_tool_outputs(&mut msgs);
+        let squashed = msgs[0].content.as_ref().unwrap();
+        assert!(
+            squashed.len() < big_cn.len(),
+            "截断后必须比原文短: {} vs {}",
+            squashed.len(),
+            big_cn.len()
+        );
+        assert!(
+            squashed.ends_with("(output truncated: too long)"),
+            "应带截断标记: {}",
+            squashed
+        );
+        // 字符边界：截断处不得撕裂 UTF-8 序列（无 replacement char）
+        assert!(!squashed.contains('\u{FFFD}'), "不得含替换字符: {squashed}");
+        // 最近 KEEP_RECENT=2 条豁免
+        assert_eq!(msgs[1].content.as_ref().unwrap(), &"x".repeat(1000));
+        assert_eq!(msgs[2].content.as_ref().unwrap(), "recent-ok");
+    }
+
+    #[test]
+    fn squash_stale_tool_outputs_many_small_outputs() {
+        // 多条小输出合计超预算：修复前每条 ≤ OUTPUT_MAX 永不截断 → payload 持续增长；
+        // 修复后从最旧开始截断直到总字节降到预算内。
+        let mut msgs: Vec<Message> = (0..300)
+            .map(|_| Message {
+                role: "tool".into(),
+                content: Some("x".repeat(1000)), // 300KB 总计 > 256KB 预算
+                tool_calls: None,
+                tool_call_id: None,
+            })
+            .collect();
+        AgentCore::squash_stale_tool_outputs(&mut msgs);
+        let total: usize = msgs
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
+            .sum();
+        assert!(
+            total <= 256 * 1024,
+            "截断后总字节必须 ≤ 预算, got {total}"
+        );
+        // 最后两条保留原样（KEEP_RECENT）
+        assert_eq!(msgs[298].content.as_ref().unwrap().len(), 1000);
+        assert_eq!(msgs[299].content.as_ref().unwrap().len(), 1000);
+    }
+
+    // ── 快照生命周期（ocr 2026-08-12 第六/七轮 test·low：补 capture 语义单测）──
+
+    fn mock_snapshot(trace: &str, seq: u64) -> MutationSnapshot {
+        MutationSnapshot {
+            tool_name: "cw_write".into(),
+            messages_before: vec![],
+            session_id: "s1".into(),
+            trace_id: trace.into(),
+            captured_at_ms: seq,
+            seq,
+        }
+    }
+
+    // 用最小桩验证 take_mutation_snapshot 语义（复合键 "session|trace" + 不删条目）
+    struct SnapshotStoreStub(tokio::sync::Mutex<HashMap<String, MutationSnapshot>>);
+    impl SnapshotStoreStub {
+        async fn take(&self, session_id: &str, trace_id: &str) -> Option<MutationSnapshot> {
+            let key = snapshot_key(session_id, trace_id);
+            self.0.lock().await.get(&key).cloned()
+        }
+        async fn insert(&self, snap: MutationSnapshot) {
+            let key = snapshot_key(&snap.session_id, &snap.trace_id);
+            self.0.lock().await.insert(key, snap);
+        }
+        async fn keys(&self) -> Vec<String> {
+            self.0.lock().await.keys().cloned().collect()
+        }
+    }
+
+    #[test]
+    fn snapshot_take_does_not_clear_capture_flag() {
+        // take 只克隆取出、不删除条目：消费方取走后「已捕获」标记仍在，
+        // 同 run 后续写工具不会重新捕获变更后状态（第五轮 bug·medium 修复验证）。
+        let store = SnapshotStoreStub(tokio::sync::Mutex::new(HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            store.insert(mock_snapshot("t1", 1)).await;
+            let taken = store.take("s1", "t1").await;
+            assert!(taken.is_some(), "trace 匹配应能取走快照");
+            assert_eq!(store.keys().await.len(), 1, "take 不得清除已捕获标记");
+            let again = store.take("s1", "t1").await;
+            assert!(again.is_some(), "重复取走应仍返回快照");
+        });
+    }
+
+    #[test]
+    fn snapshot_take_filters_by_trace_id() {
+        // 第七轮 doc·medium：跨 run 残留（旧 trace_id）不得被误当作当前 run 快照返回
+        let store = SnapshotStoreStub(tokio::sync::Mutex::new(HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            store.insert(mock_snapshot("t-old", 1)).await; // 旧 run 残留
+            let stale = store.take("s1", "t-new").await;
+            assert!(
+                stale.is_none(),
+                "旧 run 残留不得被当作当前 run 快照返回"
+            );
+            // 当前 run 捕获后即可取
+            store.insert(mock_snapshot("t-new", 2)).await;
+            let cur = store.take("s1", "t-new").await;
+            assert!(cur.is_some(), "当前 run 快照应可取");
+            assert_eq!(cur.unwrap().trace_id, "t-new");
+        });
+    }
+
+    #[test]
+    fn snapshot_concurrent_runs_do_not_clobber() {
+        // 第八轮 bug·medium：同 session 并发双 run（不同 trace）各自独立快照，
+        // 互不覆盖——复合键 "session|trace" 验证。
+        let store = SnapshotStoreStub(tokio::sync::Mutex::new(HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            store.insert(mock_snapshot("t-a", 1)).await; // run A 先捕获
+            store.insert(mock_snapshot("t-b", 2)).await; // run B 后捕获（同 session）
+            assert_eq!(store.keys().await.len(), 2, "双 run 快照应共存");
+            let a = store.take("s1", "t-a").await;
+            let b = store.take("s1", "t-b").await;
+            assert!(a.is_some() && b.is_some(), "各自取回自己的快照");
+            assert_eq!(a.unwrap().trace_id, "t-a");
+            assert_eq!(b.unwrap().trace_id, "t-b");
+        });
     }
 }
 

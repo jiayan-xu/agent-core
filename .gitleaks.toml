@@ -23,4 +23,18 @@ regexes = [
   # 但因存于公开历史（c043779/81e12c6）gitleaks 全库/PR 扫描会命中 → 阻塞所有 PR。
   # 已确认当前 agent.toml api_key=""（env 注入），该 key 无价值，豁免避免 PR 全阻塞。
   '''sk-e64d9f088c0f4e099124419477002e2d''',
+  # src/sanitize.rs 传输层脱敏单测的模拟密钥（精确字符串豁免，不做整文件路径豁免，
+  # 保证该文件未来若出现真实密钥仍会被 gitleaks 捕获）—— ocr-review 2026-08-12 建议。
+  # 含大写变体：gitleaks 默认 OpenAI 规则大小写不敏感（(?i)\b(sk-...)），大写测试串
+  # 在全库扫描下同样命中，必须一并豁免（ocr 2026-08-12 第二轮意见）。
+  # 词边界包裹（\b...\b）：防未来真实 key 仅因「包含」mock 串前缀而被连带豁免
+  # （ocr 2026-08-12 第四轮 security·low）。
+  '''\bsk-abc1234567890abcdefgh\b''',
+  '''\bAIzaSyA1234567890abcdefghijklmnopqrstuv\b''',
+  '''\bghp_1234567890abcdefghijkl\b''',
+  '''\bsk-1234567890abcdefghijklmnop\b''',
+  '''\bsecret_abcdefghijklmnopqrstuvwxyz1\b''',
+  '''\bSK-ABCDEFGHIJKLMNOPQRSTUVWX\b''',
+  '''\bGHP_ABCDEFGHIJKLMNOPQRSTUVWX\b''',
+  '''\bSECRET_ABCDEFGHIJKLMNOPQRSTUVWX\b''',
 ]

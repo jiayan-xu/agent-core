@@ -1,5 +1,6 @@
 //! LLM 客户端 — 兼容 DeepSeek / OpenAI API（支持流式）
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -1179,6 +1180,60 @@ pub struct Message {
     pub tool_call_id: Option<String>,
 }
 
+/// 传输层脱敏：对 `role=user` 的正文做凭证脱敏
+/// （对齐 GenOffice sanitizeAgentPayload；只改外发副本，不改历史/存储）。
+/// 返回 `Cow`：**无任何脱敏发生时零克隆**（常见路径复用原 slice，检测走非分配
+/// `needs_redaction` 短路）；仅实际改写时才分配新 Vec，且逐条 user 消息先用
+/// `needs_redaction` 门控，无敏感的单条消息跳过 sanitize 分配（ocr 2026-08-12
+/// 第四轮 perf·medium）。
+///
+/// 残余风险（已知边界，security·medium 文档化）：仅覆盖 `role=user` 的 `content`
+/// 字段；`role=tool`（MCP 输出，可能含连接串/命令回显）、`assistant`（回显粘贴的
+/// 密钥）以及 `tool_calls`/`tool_call_id` 字段仍原样上送。历史全量重发时上述向量
+/// 可持续泄漏——如需覆盖须扩展脱敏范围（当前设计有意限定 user 正文，避免误伤
+/// 工具语义输出）。
+pub(crate) fn sanitize_messages(messages: &[Message]) -> Cow<'_, [Message]> {
+    let mut needs_redact = false;
+    for m in messages.iter().filter(|m| m.role == "user") {
+        if let Some(c) = &m.content {
+            if crate::sanitize::needs_redaction(c) {
+                needs_redact = true;
+                break;
+            }
+        }
+    }
+    if !needs_redact {
+        return Cow::Borrowed(messages);
+    }
+    let out: Vec<Message> = messages
+        .iter()
+        .map(|m| {
+            if m.role == "user" {
+                if let Some(c) = &m.content {
+                    // 逐条门控：无敏感的单条 user 消息不调用 sanitize（零分配跳过）
+                    if crate::sanitize::needs_redaction(c) {
+                        let redacted = crate::sanitize::sanitize_agent_payload(c);
+                        if redacted != *c {
+                            let mut m2 = m.clone();
+                            m2.content = Some(redacted);
+                            return m2;
+                        }
+                        // gate/sanitizer 分歧：needs_redaction=true 但 sanitize 未改写——
+                        // 属两实现漂移（不变量测试兜底但此处显式告警，防静默明文外发，
+                        // ocr 2026-08-12 第九轮 security·low）
+                        tracing::warn!(
+                            "sanitize 漂移：needs_redaction=true 但 payload 未改写，len={}",
+                            c.len()
+                        );
+                    }
+                }
+            }
+            m.clone()
+        })
+        .collect();
+    Cow::Owned(out)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolCallJson {
     pub id: String,
@@ -1257,6 +1312,9 @@ impl LlmClient {
         messages: &[Message],
         tools: &[ToolDef],
     ) -> Result<LlmResponse, String> {
+        // 传输层脱敏：user 消息凭证打码后再上送（不改历史/存储）
+        let sanitized = sanitize_messages(messages);
+        let messages: &[Message] = &sanitized;
         // 主 Provider + 备用 Provider 列表
         let mut providers: Vec<LlmProvider> = Vec::new();
         providers.push(LlmProvider {
@@ -1415,6 +1473,9 @@ impl LlmClient {
         tools: &[ToolDef],
         sender: mpsc::UnboundedSender<SseEvent>,
     ) -> Result<String, String> {
+        // 传输层脱敏：user 消息凭证打码后再上送（不改历史/存储）
+        let sanitized = sanitize_messages(messages);
+        let messages: &[Message] = &sanitized;
         // P2-6: 主 Provider 失败时尝试备用 Provider
         let mut providers: Vec<LlmProvider> = Vec::new();
         providers.push(LlmProvider {
@@ -1921,5 +1982,88 @@ mod quick_difficulty_tests {
             tool_call_id: None,
         }];
         assert_eq!(classify_heuristic(&m), TaskDifficulty::Hard);
+    }
+}
+
+#[cfg(test)]
+mod sanitize_messages_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_fast_path_when_no_redaction() {
+        // 无敏感内容：常见路径应零克隆（Cow::Borrowed）
+        let msgs = vec![
+            Message {
+                role: "system".into(),
+                content: Some("你是助手".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "user".into(),
+                content: Some("帮我查一下今天的固废进厂车辆".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "assistant".into(),
+                content: Some("好的".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        let out = sanitize_messages(&msgs);
+        assert!(matches!(out, Cow::Borrowed(_)), "无敏感内容应走 Borrowed 快速路径");
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn owned_path_redacts_only_user_content() {
+        // 说明（ocr 2026-08-12 第六轮 maintainability·low）：Cow::Owned 路径为重建
+        // Vec 会克隆全部消息（含 system/assistant/tool）；实际优化是「无敏感单条
+        // user 消息经 needs_redaction 门控跳过 String 分配」——测试名如实表述。
+        let msgs = vec![
+            Message {
+                role: "system".into(),
+                content: Some("你是助手".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "user".into(),
+                content: Some("我的 key 是 sk-abc1234567890abcdefgh".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "assistant".into(),
+                content: Some("收到".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        let out = sanitize_messages(&msgs);
+        assert!(matches!(out, Cow::Owned(_)), "有敏感内容应走 Owned 路径");
+        assert_eq!(out[0].content, msgs[0].content, "system 消息应原样保留");
+        assert_eq!(out[2].content, msgs[2].content, "assistant 消息应原样保留");
+        assert_ne!(out[1].content, msgs[1].content, "user 消息应被脱敏");
+        assert!(out[1].content.as_ref().unwrap().contains("[REDACTED_API_KEY]"));
+        // tool_calls/tool_call_id 字段不被触碰（只改 content）
+        assert!(out[1].tool_calls.is_none() && msgs[1].tool_calls.is_none());
+        assert_eq!(out[1].tool_call_id, msgs[1].tool_call_id);
+    }
+
+    #[test]
+    fn tool_message_untouched() {
+        // tool 消息含类似 key 的文本也不应脱敏（只处理 role=user）
+        let msgs = vec![Message {
+            role: "tool".into(),
+            content: Some("result sk-abc1234567890abcdefgh".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let out = sanitize_messages(&msgs);
+        assert!(matches!(out, Cow::Borrowed(_)), "tool 消息不在脱敏范围，应走 Borrowed");
+        assert_eq!(out[0].content.as_ref().unwrap(), "result sk-abc1234567890abcdefgh");
     }
 }
