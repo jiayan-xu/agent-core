@@ -810,9 +810,18 @@ impl MetaEvolver {
             tool_call_id: None,
         };
         // LLM 调用前预算检查：调用本身耗时不可控（长 prompt / 网络），且 turns 已满
-        // 时调用必违约——预判拒绝，避免超限请求仍发出（ocr 2026-08-12 第五/十一轮）
+        // 时调用必违约——预判拒绝，避免超限请求仍发出（ocr 2026-08-12 第五/十一轮）。
+        // tokens 预判（第十二轮 bug·medium）：本次输入估算 + 已用 > 上限 → 提前拒绝。
         if let Err(b) = tracker.check_pre_call() {
             return Err(OptimizeError::Budget(b));
+        }
+        let input_est = crate::autonomy_budget::estimate_tokens(&msg.content.as_deref().unwrap_or(""));
+        if tracker.tokens_used().saturating_add(input_est) > tracker.budget().max_tokens
+            && tracker.budget().max_tokens > 0
+        {
+            return Err(OptimizeError::Budget(
+                crate::autonomy_budget::BudgetBreach::Tokens,
+            ));
         }
         let reply = match self.llm.chat(&[msg], &[]).await {
             Ok(r) => r,

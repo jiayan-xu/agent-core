@@ -446,6 +446,18 @@ pub(crate) fn load_or_create_config() -> Config {
             // 存储态（AppState.config）始终保留占位符，save 时不会把 ${AGENT_API_KEY} 回写成明文。
             // 运行时展开交由 resolve_config_for_runtime（克隆后展开），见 build_agent 调用点。
             init_domain_and_org(&cfg);
+            // 预算配置一致性校验（第十二轮 bug·medium）：continuation 窗口/次数不配对
+            // 在启动时显式告警，而非运行期静默（validate 仅在测试调用过）
+            if let Some(me) = &cfg.meta_evolution {
+                if let Err(e) = me.budget.validate() {
+                    tracing::warn!(target: "agent.meta_evolve", "meta_evolution {}", e);
+                }
+            }
+            if let Some(ce) = &cfg.code_evolution {
+                if let Err(e) = ce.budget.validate() {
+                    tracing::warn!(target: "agent.code_evolve", "code_evolution {}", e);
+                }
+            }
             return cfg;
         }
     }

@@ -288,9 +288,6 @@ const MUTATION_SNAPSHOT_MAX: usize = 64;
 /// ns 是用户可控输入，任意字符串可撑爆 map——上限使内存消耗有界（内存 DoS 防护）。
 const EVO_CONTINUATIONS_MAX_NS: usize = 256;
 
-/// 全量过期键 sweep 间隔（次触发）：每 N 次触发做一次全量清理，摊销 O(键数) 成本。
-const EVO_CONTINUATIONS_SWEEP_INTERVAL: u64 = 64;
-
 /// 快照 map 复合键：长度前缀编码 `"{session_len}:{session}|{trace}"`——
 /// 分隔符歧义消除（session_id/trace_id 即使含 `|` 也不会碰撞，
 /// ocr 2026-08-12 第十二轮 bug·low）。
@@ -382,9 +379,6 @@ pub struct AgentCore {
     /// P0 四预算封套：元进化 continuations 限流窗口（ns → 触发时刻列表）。
     /// 由 run_meta_evolution 在 run_once 前做窗口限流（方案 §3 注入点 B）。
     pub evo_continuations: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<std::time::Instant>>>>,
-    /// 全量 sweep 节流计数器（每 EVO_CONTINUATIONS_SWEEP_INTERVAL 次触发做一次全量
-    /// 过期键清理，摊销 O(键数)，第十一轮 security·high）
-    pub evo_sweep_counter: std::sync::atomic::AtomicU64,
     /// HY3 1.3：技能库注册表（仅 features.skill_library=true 时 Some；否则 None=不注入）
     pub skill_registry: Option<Arc<dyn crate::skill_library::SkillRegistry + Send + Sync>>,
     /// HY3 1.3：LATS 控制器（仅 features.lats=true 时 Some；否则 None=原路径）
@@ -998,7 +992,6 @@ impl AgentCore {
         let meta_store = std::sync::Arc::new(tokio::sync::Mutex::new(meta_store));
         let evo_continuations =
             std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::<String, Vec<std::time::Instant>>::new()));
-        let evo_sweep_counter = std::sync::atomic::AtomicU64::new(0);
         let meta_evolver = crate::meta_evolve::MetaEvolver::new(
             config.meta_evolution.clone(),
             meta_store.clone(),
@@ -1120,7 +1113,6 @@ impl AgentCore {
             meta_evolver,
             meta_store,
             evo_continuations,
-            evo_sweep_counter,
             skill_registry,
             lats,
             multiagent,
@@ -10963,38 +10955,37 @@ impl AgentCore {
                 "reason": "meta_evolution.enabled=false（受控开启，需在 agent.toml 显式开启）"
             });
         }
+        // ns 自校验（第十二轮 security·medium）：ns 用作 evo_continuations 的键，
+        // 内存有界保证必须在**使用点**自洽，不依赖外部调用方校验（handler 层有
+        // 白名单校验，但此处兜底——任何调用路径超长 ns 直接拒绝）。
+        if ns.len() > 128 {
+            return serde_json::json!({
+                "status": "skipped",
+                "reason": "namespace 超长（>128 字符）",
+            });
+        }
         // P0 四预算封套·continuations 限流（方案 §3 注入点 B）：窗口内触发次数超限 →
         // 直接 skipped、不进入 run_once、零副作用。
-        // 安全护栏（ocr 2026-08-12 第九/十/十一轮）：ns 是用户可控输入——
-        // ① 全局键数上限 EVO_CONTINUATIONS_MAX_NS（内存 DoS 防护）；
+        // 安全护栏（ocr 2026-08-12 第九~十二轮）：ns 是用户可控输入——
+        // ① 全局键数上限 EVO_CONTINUATIONS_MAX_NS（内存 DoS 防护，配合 ns ≤128 自校验）；
         // ② 过期空键删除（liveness DoS 防护：键永不删除会耗尽上限后永久拒绝新 ns）；
         // ③ 新 ns 键超限时按 Denied 处理。
-        // ④ **全局过期键清理**：仅 prune 当前 ns 会让其他 ns 的空键长期驻留，达到
-        //    上限后仍可能拒绝新 ns（security·high，第十一轮）——每 EVO_CONTINUATIONS_SWEEP_INTERVAL
-        //    次触发做一次全量 sweep，摊销成本 O(键数)。
+        // ④ **每次触发全量 prune**：全量清理所有 ns 的过期空键（256 键 × retain 的
+        //    比较成本可忽略，无需间隔节流——第十二轮 bug·medium：间隔期内过期键
+        //    计入上限会误拒新 ns）。
         let b = &self.config.meta_evolution.budget;
         if b.max_continuations_per_window > 0 && b.continuation_window_secs > 0 {
             let mut guard = self.evo_continuations.lock().await;
             let now = std::time::Instant::now();
-            // 全量 sweep（每 N 次触发执行一次）：删除所有过期空键，释放键位
-            let do_sweep = {
-                let c = self.evo_sweep_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                c % EVO_CONTINUATIONS_SWEEP_INTERVAL == 0
-            };
-            if do_sweep {
-                let window = std::time::Duration::from_secs(b.continuation_window_secs);
-                guard.retain(|_, v| {
-                    v.retain(|t| now.saturating_duration_since(*t) < window);
-                    !v.is_empty()
-                });
-            }
-            // 先 prune 当前 ns 的过期条目（若存在）；空则删键——保证「键数上限只反映
-            // 活跃窗口」，历史 ns 过期后释放键位（第十轮 bug·high 修复）
+            let window = std::time::Duration::from_secs(b.continuation_window_secs);
+            // 全量 sweep：删除所有过期空键，释放键位（每次触发，成本 O(键数)）
+            guard.retain(|_, v| {
+                v.retain(|t| now.saturating_duration_since(*t) < window);
+                !v.is_empty()
+            });
+            // 当前 ns prune 兜底（sweep 已覆盖，但保语义清晰）
             if let Some(entry) = guard.get_mut(ns) {
-                entry.retain(|t| {
-                    now.saturating_duration_since(*t)
-                        < std::time::Duration::from_secs(b.continuation_window_secs)
-                });
+                entry.retain(|t| now.saturating_duration_since(*t) < window);
                 if entry.is_empty() {
                     guard.remove(ns);
                 }
@@ -11362,7 +11353,9 @@ mod continuation_tests {
         // 不用真实 2h 前的 Instant（单调钟短时运行会 underflow 变 no-op，test·low）——
         // 用「窗口 1s + 2s 前条目」等价构造，保证任何环境下都实际执行 prune。
         let now = std::time::Instant::now();
-        let old = now.checked_sub(std::time::Duration::from_secs(2)).unwrap_or(now); // 2s 前（窗口 1s，必过期）; 单调钟不足 2s 时回退 now 仍过期
+        // 2s 前（窗口 1s，必过期）。checked_sub 失败（单调钟运行 <2s）在测试环境不可能
+        // （cargo test 启动即需数秒）——expect 显式暴露而非静默回退（test·low）
+        let old = now.checked_sub(std::time::Duration::from_secs(2)).expect("单调钟运行不足 2s");
         let mut entry = vec![old, old];
         assert!(matches!(
             AgentCore::continuation_verdict(&mut entry, now, 2, 1),
@@ -11387,7 +11380,9 @@ mod continuation_tests {
         // prune → 空则删 语义。
         let mut map = std::collections::HashMap::<String, Vec<std::time::Instant>>::new();
         let now = std::time::Instant::now();
-        let old = now.checked_sub(std::time::Duration::from_secs(2)).unwrap_or(now); // 2s 前（窗口 1s，必过期）; 单调钟不足 2s 时回退 now 仍过期
+        // 2s 前（窗口 1s，必过期）。checked_sub 失败（单调钟运行 <2s）在测试环境不可能
+        // （cargo test 启动即需数秒）——expect 显式暴露而非静默回退（test·low）
+        let old = now.checked_sub(std::time::Duration::from_secs(2)).expect("单调钟运行不足 2s");
         map.insert("stale_ns".to_string(), vec![old, old]);
         // 模拟 prune：窗口 1s，条目全过期 → 空 → 删键
         if let Some(entry) = map.get_mut("stale_ns") {
