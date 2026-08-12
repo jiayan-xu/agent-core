@@ -2,6 +2,12 @@
 
 ## 2026-08-12
 
+### v0.7.0 · 四预算自治封套落地（P0，借鉴 Prime Agent，新能力发版锚点）
+- **改动**：新增 `src/autonomy_budget.rs`（`AutonomyBudget` 六维预算 + `BudgetTracker` + `BudgetBreach` + 过渡期 token 估算）；注入点 A `handle_code_evolve`（循环顶部墙钟/提议后记账/gate_command 通过后整体否决）、注入点 B `run_meta_evolution`（continuations 窗口限流 + `run_once` 内记账）；`CodeEvolutionConfig`/`MetaEvolutionConfig` 各 +budget 字段（serde 全 default 向后兼容）；agent.toml 增补 `[*.budget]` 段。
+- **效果**：code/meta 进化引擎获得统一运行时封套（turns/tokens/wall-clock/continuations + 可选 pass/fail gate），违约即停 + 回退 + 审计；预算为**加法护栏**，不削弱 x-evolve-key/隔离仓库/dry_run 双闸门任一既有门禁；ocr-review 14 轮 30+ 条意见全修（含 security·high×4/bug·high×3/security·medium×5）。
+- **动机**：借鉴 Prime Agent 四独立预算自治封套（对照文档 §3-P0），补「长时自主 agent 统一 4 维封顶」；与「定时自动化必须带超时」硬规矩一脉相承。
+- **关联**：`src/autonomy_budget.rs` / `src/handlers/evolve.rs` / `src/meta_evolve.rs` / `src/agent.rs` / `src/config.rs` / `agent.toml`。
+
 ### v0.6.0 · main.rs 拆分重构（6720→100 行）+ Phase B 传输层脱敏三件套（新能力发版锚点）
 - **改动**：
   - `src/main.rs` 6720 行单体按领域拆分为 15 个模块文件（config/state/auth/handlers×6/routes/bootstrap），main.rs 瘦身至 100 行仅保留入口；**零行为变更**（49 条路由表与拆分前逐条 diff 一致，cargo test 全绿）。
