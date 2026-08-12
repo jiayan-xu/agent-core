@@ -13,7 +13,7 @@ use axum::Json;
 use agent_core::llm::LlmConfig;
 
 use crate::auth::authenticate;
-use crate::is_admin;
+use crate::handlers::approval::is_admin;
 use crate::state::{record_dream_health, AppState};
 
 pub(crate) async fn handle_admin_consolidate(

@@ -13,7 +13,7 @@ use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
 use tokio::sync::broadcast;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 
 use agent_core::agent::{AgentCore, EventKind, MeetingEvent};
 
@@ -946,3 +946,257 @@ pub(crate) async fn handle_meeting_heartbeat(
 }
 
 
+
+/// 圆桌会议（/api/roundtable）：建会 + SSE 收敛 + 共识落库（从 src/main.rs 迁入，P7 重构）
+pub(crate) async fn handle_panel_discuss(
+    headers: axum::http::HeaderMap,
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> axum::response::Response {
+    let (caller, caller_ns) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let admin = is_admin(&headers, &st).await;
+    let v = match body {
+        Some(Json(v)) => v,
+        None => return (axum::http::StatusCode::BAD_REQUEST, "missing body").into_response(),
+    };
+    let topic = match v.get("topic").and_then(|x| x.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return (axum::http::StatusCode::BAD_REQUEST, "topic required").into_response(),
+    };
+    let chair = v.get("chair").and_then(|x| x.as_str()).map(|s| s.to_string());
+    let session_id = v.get("session_id").and_then(|x| x.as_str()).unwrap_or("");
+    // 可选 personas 筛选：前端分身多选生效。空/缺省则全部参与。
+    let selected_ids: Option<Vec<String>> = v
+        .get("personas")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty());
+    // 圆桌默认私有（仅拥有者 / admin 可见）；显式 visibility=public 才公开
+    let is_private = !(v
+        .get("visibility")
+        .and_then(|x| x.as_str())
+        .map(|s| s == "public")
+        .unwrap_or(false));
+    // 会议升级 Step1：层级范围（dept:<id> / org:<company>）。
+    // 提供时按 scope 过滤分身；缺省走全部（兼容旧客户端）。
+    let scope: Option<String> = v
+        .get("scope")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+
+    // 会议升级 Step1：发起者只能创建自己所属 scope 的会议（非 admin 时），
+    // 防止越权创建他人 scope 的部门/公司会议。
+    if let Some(ref sc) = scope {
+        if !admin && !agent_core::agent::scope_matches_caller(sc, &caller_ns) {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                format!("无权发起该 scope 的会议：{}", sc),
+            )
+                .into_response();
+        }
+    }
+
+    // 会议升级 Step2：真人 A2A 参会者（agent_id 列表）。
+    // 前端「真人参会」多选产生；每人以 `agent/<id>` 收件箱接收会议开播通知。
+    let participant_agents: Vec<String> = v
+        .get("participants")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let participant_agents_c = participant_agents.clone();
+
+    // 计算实际参与者（用于会议记录），并预建会议记录（status=running）
+    let g0 = st.agent.lock().await;
+    let has_agent = g0.is_some();
+    let mut participants: Vec<String> = Vec::new();
+    if let Some(ref agent) = *g0 {
+        let mut personas = agent.list_personas_scoped(scope.as_deref());
+        personas.sort_by(|a, b| a.persona_id.cmp(&b.persona_id));
+        if let Some(ids) = &selected_ids {
+            personas.retain(|p| ids.contains(&p.persona_id));
+        }
+        participants = personas.iter().map(|p| p.persona_id.clone()).collect();
+    }
+    drop(g0);
+    if !has_agent {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+    }
+    let (meeting_id, create_arc) = {
+        let g = st.agent.lock().await;
+        match &*g {
+            Some(ref agent) => {
+                let arc = agent.clone();
+                let id = agent.create_meeting(
+                    &topic,
+                    &caller,
+                    participants.clone(),
+                    participant_agents,
+                    is_private,
+                    scope.clone(),
+                );
+                (id, Some(arc))
+            }
+            None => (String::new(), None),
+        }
+    };
+    // 【round-17 #2】create_meeting 已不再内部落盘：在全局 st.agent 锁释放后、于锁外用
+    // spawn_blocking 持久化新建会议，避免同步 fsync 阻塞 tokio worker / 全局锁。
+    if let Some(arc) = &create_arc {
+        let _ = persist_meetings_for(arc, |e| {
+            // reviewer round-21 #2 maintainability·low：日志标签用实际 handler——本路径由
+            // `handle_panel_discuss`（/api/roundtable）创建会议，非「handle_meetings_create」，
+            // 错误标签会误导排障者定位错误 handler。
+            tracing::error!(error = %e, meeting = %meeting_id, "roundtable: 会议已创建但落盘失败（可能进程崩溃丢失，请排查磁盘）");
+        }).await;
+    }
+
+    let st_clone = st.clone();
+    let (tx, rx): (
+        tokio::sync::mpsc::UnboundedSender<Result<SseEvent, Infallible>>,
+        tokio::sync::mpsc::UnboundedReceiver<Result<SseEvent, Infallible>>,
+    ) = tokio::sync::mpsc::unbounded_channel();
+
+    let topic_c = topic.clone();
+    let chair_c = chair.clone();
+    let session_c = session_id.to_string();
+    let sel_c = selected_ids;
+    let scope_c = scope;
+    let meeting_id_c = meeting_id.clone();
+    let owner_c = caller.clone();
+    tokio::spawn(async move {
+        // 仅取 Arc<AgentCore> 克隆后立即释放全局 agent 锁：
+        // 收敛过程含 LLM 调用 / A2A 投递，绝不能在整个 SSE 任务期间持全局锁
+        // （reviewer round-11 F2：原 `let Some(ref agent) = *g` 让 guard 活到任务结束，
+        // 嵌套 agent→meeting_tx 广播且阻塞所有并发 agent 操作）。
+        // 克隆出的 Arc 全程持有，所有 agent 方法经 &AgentCore 调用，不再依赖全局锁。
+        let agent_arc: std::sync::Arc<AgentCore> = {
+            let g = st_clone.agent.lock().await;
+            match g.as_ref() {
+                Some(a) => a.clone(),
+                None => {
+                    let _ = tx.send(Ok(SseEvent::default().event("done").data("")));
+                    return;
+                }
+            }
+        };
+        let agent = agent_arc.as_ref();
+        let ns = agent.caller_ns(&session_c);
+        // 会议升级 Step2：开场即 A2A 通知真人参与者（agent/<id> 收件箱）
+        if !meeting_id_c.is_empty() && !participant_agents_c.is_empty() {
+            let notice = serde_json::json!({
+                "type": "meeting",
+                "subject": format!("会议「{}」已开始，等待你的参会意见", topic_c),
+                "meeting": meeting_id_c,
+                "from": owner_c,
+                "content": format!("会议「{}」已由 {} 发起并开始，会议 ID={}。请通过 /api/meetings/{}/message 提交你的意见。", topic_c, owner_c, meeting_id_c, meeting_id_c),
+                "kind": "meeting-notice",
+            });
+            for t in &participant_agents_c {
+                if let Err(e) = agent.collab_send_raw(t, &notice).await {
+                    tracing::warn!(target = %t, "会议开播通知 A2A 投递失败: {}", e);
+                }
+            }
+        }
+        let mut personas = agent.list_personas_scoped(scope_c.as_deref());
+        personas.sort_by(|a, b| a.persona_id.cmp(&b.persona_id));
+        if let Some(ids) = &sel_c {
+            personas.retain(|p| ids.contains(&p.persona_id));
+        }
+        let pool = agent.llm_pool();
+        let mut stances: Vec<(String, String)> = Vec::new();
+        for (i, p) in personas.iter().enumerate() {
+            let (id, stance, prov) = agent.persona_stance(p, &topic_c, i, &pool).await;
+            let payload = serde_json::json!({
+                "persona_id": id,
+                "display_name": p.display_name,
+                "stance": stance,
+                "provider": prov,
+            });
+            let _ = tx.send(Ok(SseEvent::default().event("stance").data(payload.to_string())));
+            stances.push((id, stance));
+        }
+        let consensus = agent.chair_consensus(&topic_c, &stances, chair_c.as_deref()).await;
+        let _ = tx.send(Ok(SseEvent::default().event("consensus").data(
+            serde_json::json!({ "consensus": consensus }).to_string(),
+        )));
+        // 回填会议记录（共识 + 状态机跃迁），并把收敛结果实时广播给订阅端：
+        // - 终态（status=done / phase=Done）→ ended，关闭订阅流；
+        // - 非终态（真人待接手）→ state，订阅端更新 phase（ai_speaking → awaiting_humans）。
+        // 否则订阅者永远看不到本次跃迁，停留在陈旧状态。
+        if !meeting_id_c.is_empty() {
+            if let Some((status, phase)) = agent.finish_meeting(&meeting_id_c, &consensus) {
+                // 【reviewer round-24 #2 performance·medium】**先广播实时事件 + 清理 presence，
+                // 再后台持久化**——与 handle_meeting_message（round-21 #1）的原则一致。persist 是
+                // spawn_blocking 全文件序列化 + fsync 且被 persist_lock 串行化，若 await 它再广播，
+                // 磁盘延迟会排在实时 phase 转换（ai_speaking → awaiting_humans，正是真人订阅者等待
+                // 的信号）之前，并发写时订阅者要多等一次 fsync。持久化是 best-effort（失败仅 error
+                // 日志、会议已在内存、后续 save 会带上），故把实时广播/清理放最前。
+                // 【round-20 #5】终态判定用 meeting_state 的 terminal flag（单一来源，覆盖 phase_raw）：
+                // finish_meeting 内部已保证 status/phase 已知，但统一走权威谓词避免未来新增终态漏改。
+                let terminal = agent
+                    .meeting_state(&meeting_id_c)
+                    .map_or(true, |(_, _, _, term)| term);
+                if terminal {
+                    broadcast_meeting_event(
+                        &st,
+                        &meeting_id_c,
+                        EventKind::Ended,
+                        serde_json::json!({ "status": status, "phase": phase, "terminal": true }),
+                    ).await;
+                    // 【round-20 #6】纯 AI 圆桌收敛到终态时，与 handle_meeting_end / delete 一致
+                    // 移除 presence 条目，避免该会议已终态、无人再心跳而滞留（sweeper 仍兜底）。
+                    st.meeting_presence.lock().await.remove(&meeting_id_c);
+                } else {
+                    broadcast_meeting_event(
+                        &st,
+                        &meeting_id_c,
+                        EventKind::State,
+                        serde_json::json!({ "status": status, "phase": phase }),
+                    ).await;
+                }
+                // 【round-17 #5 + round-24 #2】收敛状态持久化移到广播**之后**：spawn_blocking 迁移
+                // 写盘到阻塞线程池，避免同步 fsync 阻塞 tokio worker / 挡住实时广播。
+                let _ = persist_meetings_for(&agent_arc, |e| {
+                    tracing::error!(error = %e, meeting = %meeting_id_c, "roundtable: 共识已回填但落盘失败（可能进程崩溃丢失，请排查磁盘）");
+                }).await;
+            }
+        }
+        // 最佳努力写入 Memoria（调用者自身 ns）
+        let stances_text = stances
+            .iter()
+            .map(|(id, s)| format!("【{}】{}", id, s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = format!(
+            "[roundtable] topic={}\nconsensus={}\n---\n{}",
+            topic_c, consensus, stances_text
+        );
+        // Profile/dynamic 主源读 memories(category=decision)；勿再写 category=roundtable
+        let args = serde_json::json!({
+            "content": content,
+            "tags": ["decision", "roundtable"],
+            "category": "decision",
+            "confidence": 80,
+            "importance": 5,
+            "namespace": ns,
+        });
+        if agent.mcp.call_json("memory_remember", &args).await.is_ok() {
+            tracing::info!(ns = %ns, "roundtable 共识已写入 Memoria(category=decision)");
+        }
+        let _ = tx.send(Ok(SseEvent::default().event("done").data("")));
+    });
+
+    Sse::new(UnboundedReceiverStream::new(rx)).into_response()
+}
