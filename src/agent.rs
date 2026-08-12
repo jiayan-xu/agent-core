@@ -380,6 +380,11 @@ pub struct AgentCore {
     /// 由 run_meta_evolution 在 run_once 前做窗口限流（方案 §3 注入点 B）。
     /// `pub(crate)`（第十三轮 security·low）：限流状态是安全控制，外部不得直接改写。
     pub(crate) evo_continuations: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<std::time::Instant>>>>,
+    /// P1-B 递归持久子 agent：句柄注册表（含收件箱 + 状态），进程重启后从
+    /// `sub_agents.json` 恢复（断线续跑）。消息经既有 A2A（collab_send_raw）路由。
+    pub(crate) sub_agents: std::sync::Arc<tokio::sync::Mutex<crate::persistent_subagent::SubAgentRegistry>>,
+    /// 子 agent id 序列号（单调递增，spawn 时分配）
+    pub(crate) sub_agent_seq: std::sync::atomic::AtomicU64,
     /// HY3 1.3：技能库注册表（仅 features.skill_library=true 时 Some；否则 None=不注入）
     pub skill_registry: Option<Arc<dyn crate::skill_library::SkillRegistry + Send + Sync>>,
     /// HY3 1.3：LATS 控制器（仅 features.lats=true 时 Some；否则 None=原路径）
@@ -993,6 +998,12 @@ impl AgentCore {
         let meta_store = std::sync::Arc::new(tokio::sync::Mutex::new(meta_store));
         let evo_continuations =
             std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::<String, Vec<std::time::Instant>>::new()));
+        // P1-B：子 agent 注册表（从 cwd/sub_agents.json 恢复，断线续跑）
+        let sub_agents_path = cwd.join("sub_agents.json").to_string_lossy().to_string();
+        let sub_agents = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::persistent_subagent::load(&sub_agents_path),
+        ));
+        let sub_agent_seq = std::sync::atomic::AtomicU64::new(1);
         let meta_evolver = crate::meta_evolve::MetaEvolver::new(
             config.meta_evolution.clone(),
             meta_store.clone(),
@@ -1114,6 +1125,8 @@ impl AgentCore {
             meta_evolver,
             meta_store,
             evo_continuations,
+            sub_agents,
+            sub_agent_seq,
             skill_registry,
             lats,
             multiagent,
@@ -7901,6 +7914,72 @@ impl AgentCore {
             )
             .await
             .map_err(|e| format!("a2a_send 失败: {}", e))
+    }
+
+    // ── P1-B 递归持久子 agent（句柄 + A2A 路由 + 断线续跑）──
+
+    /// 注册一个持久子 agent（句柄入注册表 + 落盘 sub_agents.json）。
+    /// 返回子 agent id；后续经 `sub_agent_send` 投递消息、`sub_agent_list` 查看状态。
+    pub(crate) async fn sub_agent_spawn(
+        &self,
+        task_desc: &str,
+        ns: &str,
+    ) -> String {
+        let seq = self
+            .sub_agent_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = format!("sub-{}-{}", self.config.identity.agent_id, seq);
+        let agent = crate::persistent_subagent::PersistentSubAgent::new(
+            id.clone(),
+            task_desc.to_string(),
+            ns.to_string(),
+        );
+        self.sub_agents.lock().await.insert(agent);
+        let path = std::env::current_dir()
+            .unwrap_or_default()
+            .join("sub_agents.json")
+            .to_string_lossy()
+            .to_string();
+        let _ = crate::persistent_subagent::save(&self.sub_agents, &path).await;
+        id
+    }
+
+    /// 向持久子 agent 投递消息（入其收件箱；未找到返回 Err，可回落 A2A 原生投递）。
+    pub(crate) async fn sub_agent_send(
+        &self,
+        to_sub_id: &str,
+        from: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        crate::persistent_subagent::deliver(&self.sub_agents, to_sub_id, from, content).await
+    }
+
+    /// 列出全部持久子 agent（id / 状态 / 收件箱数），供管理接口展示。
+    pub(crate) async fn sub_agent_list(&self) -> Vec<serde_json::Value> {
+        let reg = self.sub_agents.lock().await;
+        reg.iter()
+            .map(|a| {
+                serde_json::json!({
+                    "id": a.id,
+                    "state": format!("{:?}", a.state),
+                    "inbox": a.inbox.len(),
+                    "task_desc": a.task_desc,
+                    "created_at": a.created_at,
+                    "last_active": a.last_active,
+                })
+            })
+            .collect()
+    }
+
+    /// 取指定子 agent 收件箱并清空（消费语义；Done 后收件箱保留至清理）。
+    pub(crate) async fn sub_agent_take_inbox(
+        &self,
+        sub_id: &str,
+    ) -> Vec<crate::persistent_subagent::SubAgentMessage> {
+        let mut reg = self.sub_agents.lock().await;
+        reg.get_mut(sub_id)
+            .map(|a| std::mem::take(&mut a.inbox))
+            .unwrap_or_default()
     }
 
     /// 取同组织已注册 Agent 通讯录（Memoria `agent_list`，需 admin）。
