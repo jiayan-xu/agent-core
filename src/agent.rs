@@ -11303,10 +11303,12 @@ mod continuation_tests {
 
     #[test]
     fn continuation_verdict_prunes_expired() {
-        // 窗口外条目被 prune：旧时刻清空后重新计数
-        let old = std::time::Instant::now() - std::time::Duration::from_secs(7200); // 2h 前（窗口 1h）
-        let mut entry = vec![old, old];
+        // 窗口外条目被 prune：旧时刻清空后重新计数（checked_sub 防单调钟 underflow）
         let now = std::time::Instant::now();
+        let Some(old) = now.checked_sub(std::time::Duration::from_secs(7200)) else {
+            return; // 单调钟运行不足 2h（极罕见），跳过
+        };
+        let mut entry = vec![old, old];
         assert!(matches!(
             AgentCore::continuation_verdict(&mut entry, now, 2, 3600),
             ContinuationVerdict::Admitted(_)

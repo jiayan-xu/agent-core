@@ -95,6 +95,9 @@ impl BudgetTracker {
     }
 
     /// 每次 LLM 轮次后调用；返回 Err 即违约，调用方须立即停止并回退。
+    /// 计数先增后检；`>` 语义（ocr 2026-08-12 第六轮 bug·low 复核后确认）：max_turns=N
+    /// 允许**恰好 N 次**调用（第 N 次后 turns=N，N>N 为 false 放行；第 N+1 次违约）。
+    /// 若用 `>=` 会在第 N 次就拒绝（只允许 N-1 次），反而偏离「上限 N」语义。
     pub fn record_turn(&mut self, tokens: u64) -> Result<(), BudgetBreach> {
         self.turns += 1;
         self.tokens += tokens;
@@ -112,7 +115,7 @@ impl BudgetTracker {
         Ok(())
     }
 
-    /// 仅在循环顶部做纯墙钟检查（不消耗 turn）。
+    /// 仅在循环顶部做纯墙钟检查（不消耗 turn）。同 record_turn 的 `>` 语义。
     pub fn check_wall_clock(&self) -> Result<(), BudgetBreach> {
         if self.budget.max_wall_clock_secs > 0
             && self.start.elapsed() > Duration::from_secs(self.budget.max_wall_clock_secs)
@@ -159,9 +162,10 @@ impl BudgetTracker {
 }
 
 /// 过渡期 token 估算（方案 §6）：真实 usage 未打通前用 chars/4 近似。
-/// 仅用于预算记账，不参与任何协议字段。
+/// 下限 1：1-3 字符的短文本不得估为 0（否则小预算下无限次短调用绕过封套，
+/// ocr 2026-08-12 第六轮 bug·low）。仅用于预算记账，不参与任何协议字段。
 pub fn estimate_tokens(text: &str) -> u64 {
-    (text.chars().count() / 4) as u64
+    ((text.chars().count() / 4) as u64).max(1)
 }
 
 #[cfg(test)]
