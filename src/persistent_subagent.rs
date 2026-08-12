@@ -185,12 +185,12 @@ pub async fn deliver(
 /// 受控写：临时文件 + rename（避免半写损坏）。
 /// tmp 唯一后缀（bug·medium 第三轮）：并发 save 共用 `{path}.tmp` 会互相覆盖/
 /// rename 竞态——用 pid+计数唯一后缀，写完后 rename 到目标。
+/// 持锁范围（bug·high 第六轮）：序列化到 rename **全程持锁**——锁外写文件期间
+/// 其它线程改注册表会写入旧快照（lost-update）。小文件写微秒级，持锁成本可忽略。
 pub async fn save(registry: &Arc<Mutex<SubAgentRegistry>>, path: &str) -> Result<(), String> {
-    let json = {
-        let reg = registry.lock().await;
-        serde_json::to_string_pretty(&reg.agents)
-            .map_err(|e| format!("序列化子 agent 注册表失败: {}", e))?
-    };
+    let mut reg = registry.lock().await;
+    let json = serde_json::to_string_pretty(&reg.agents)
+        .map_err(|e| format!("序列化子 agent 注册表失败: {}", e))?;
     static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = format!("{}.tmp.{}.{}", path, std::process::id(), seq);
@@ -226,7 +226,16 @@ pub fn load(path: &str) -> (SubAgentRegistry, LoadStatus) {
         Err(_) => return (reg, LoadStatus::Unreadable),
     };
     match serde_json::from_str::<HashMap<String, PersistentSubAgent>>(&text) {
-        Ok(map) => {
+        Ok(mut map) => {
+            // 崩溃恢复（bug·medium 第六轮）：Running 状态是进程内存态，重启后
+            // 执行上下文已丢失——统一复位 Idle（由调用方按收件箱/任务重新驱动），
+            // 否则永远卡 Running（无法推进/老化）。
+            for a in map.values_mut() {
+                if a.state == SubAgentState::Running {
+                    a.state = SubAgentState::Idle;
+                }
+                a.notify = None; // 通知通道是内存态，重启后无接收方
+            }
             reg.agents = map;
             (reg, LoadStatus::Loaded)
         }
@@ -308,7 +317,8 @@ mod tests {
         assert_eq!(status, LoadStatus::Loaded);
         assert_eq!(restored.len(), 1);
         let a = restored.get("sub-x").unwrap();
-        assert_eq!(a.state, SubAgentState::Running);
+        // 崩溃恢复语义：Running 复位 Idle（第六轮 bug·medium）
+        assert_eq!(a.state, SubAgentState::Idle);
         assert_eq!(a.inbox.len(), 1);
         assert_eq!(a.inbox[0].from, "sub-y");
         let _ = std::fs::remove_file(&path);

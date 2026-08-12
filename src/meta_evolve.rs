@@ -649,14 +649,22 @@ impl MetaEvolver {
 
     /// 基线回滚率：rolled_back 样本占比
     pub fn baseline_rollback_rate(&self, samples: &[NegSample]) -> f64 {
-        if samples.is_empty() {
+        // bug·medium（第六轮）：样本池现含两类（rolled_back/corrected 回滚 +
+        // tool_failure 经验 memo）——baseline 语义是「回滚率」，分母必须只计
+        // 回滚类样本，否则 memo 样本稀释基线（tool_failure 数大时基线被压到
+        // 接近 0，熔断/改进判定失真）。
+        let rb_class: Vec<&NegSample> = samples
+            .iter()
+            .filter(|s| s.change_type == "rolled_back" || s.change_type == "corrected")
+            .collect();
+        if rb_class.is_empty() {
             return 0.0;
         }
-        let rb = samples
+        let rb = rb_class
             .iter()
             .filter(|s| s.change_type == "rolled_back")
             .count() as f64;
-        rb / samples.len() as f64
+        rb / rb_class.len() as f64
     }
 
     /// 估计候选提示词的回滚率：基线 × (1 − 失败模式覆盖率)

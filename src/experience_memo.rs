@@ -16,6 +16,9 @@ use crate::mcp_client::McpClient;
 /// 写入一条会话经验 memo（工具失败教训）。best-effort：失败仅告警不阻断。
 /// 结构：content 含 工具名 / 错误摘要 / 触发上下文；tag 便于按工具召回；
 /// 与 evolution_log 样本共走 `min_samples` 门槛（两源合并计数）。
+/// **双写**（bug·medium 第六轮）：会话 ns（隔离粒度，`agent/{id}/{caller}`）+ 根 ns
+/// （`agent/{id}`，collect 的检索源）各写一份——否则第二样本源永远取不到
+/// （写会话 ns、读根 ns 的缺口）。
 pub async fn record_experience_memo(
     mcp: &McpClient,
     tool: &str,
@@ -27,20 +30,38 @@ pub async fn record_experience_memo(
         "[experience_memo] 工具 {} 执行失败：{}",
         tool, err_preview
     );
-    let args = serde_json::json!({
-        "content": content,
-        "tags": ["experience_memo", "lesson", tool],
-        "category": "experience_memo",
-        "confidence": 70,
-        "importance": 3,
-        "namespace": ns,
-    });
-    match mcp.call_json("memory_remember", &args).await {
-        Ok(_) => {
-            tracing::debug!(tool = %tool, ns = %ns, "experience_memo 已写入");
+    // 从会话 ns 推导根 ns：`agent/{id}/{caller}` → `agent/{id}`；非该形态则
+    // 只写原 ns（不猜测）。
+    let root_ns: Option<String> = {
+        let parts: Vec<&str> = ns.split('/').collect();
+        if parts.len() >= 2 && parts[0] == "agent" && !parts[1].is_empty() {
+            Some(format!("agent/{}", parts[1]))
+        } else {
+            None
         }
-        Err(e) => {
-            tracing::warn!(tool = %tool, "experience_memo 写入失败（best-effort）: {}", e);
+    };
+    let mut targets = vec![ns.to_string()];
+    if let Some(rn) = &root_ns {
+        if rn != ns {
+            targets.push(rn.clone());
+        }
+    }
+    for target in &targets {
+        let args = serde_json::json!({
+            "content": content,
+            "tags": ["experience_memo", "lesson", tool],
+            "category": "experience_memo",
+            "confidence": 70,
+            "importance": 3,
+            "namespace": target,
+        });
+        match mcp.call_json("memory_remember", &args).await {
+            Ok(_) => {
+                tracing::debug!(tool = %tool, ns = %target, "experience_memo 已写入");
+            }
+            Err(e) => {
+                tracing::warn!(tool = %tool, ns = %target, "experience_memo 写入失败（best-effort）: {}", e);
+            }
         }
     }
 }

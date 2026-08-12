@@ -8013,6 +8013,8 @@ impl AgentCore {
     /// 向持久子 agent 投递消息（入其收件箱；未找到返回 Err，可回落 A2A 原生投递）。
     /// 投递后落盘（bug·medium 第五轮：只改内存不 save 则重启丢消息——收件箱
     /// 是断线续跑的核心状态，每条消息都必须持久化）。
+    /// save 失败返回 Err（bug·high 第六轮：不能 warn 后仍 Ok——调用方会以为
+    /// 投递成功，实际重启即丢；返回 Err 让调用方可重试/告警）。
     pub(crate) async fn sub_agent_send(
         &self,
         to_sub_id: &str,
@@ -8020,10 +8022,12 @@ impl AgentCore {
         content: &str,
     ) -> Result<(), String> {
         crate::persistent_subagent::deliver(&self.sub_agents, to_sub_id, from, content).await?;
-        if let Err(e) = crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file).await
-        {
-            tracing::warn!(target: "agent.sub_agents", "投递后持久化失败: {}", e);
-        }
+        crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file)
+            .await
+            .map_err(|e| {
+                tracing::error!(target: "agent.sub_agents", "投递后持久化失败: {}", e);
+                format!("消息已入内存收件箱但持久化失败（重启将丢失）: {}", e)
+            })?;
         Ok(())
     }
 
@@ -8049,16 +8053,18 @@ impl AgentCore {
     }
 
     /// 取指定子 agent 收件箱并清空（消费语义；Done 后收件箱保留至清理）。
+    /// 取指定子 agent 收件箱并清空（消费语义；Done 后收件箱保留至清理）。
+    /// 返回 Option（bug·medium 第六轮）：None = 子 agent 不存在，Some(空) = 存在
+    /// 但当前无消息——调用方可区分「查无此 agent」与「无新消息」。
     pub(crate) async fn sub_agent_take_inbox(
         &self,
         sub_id: &str,
-    ) -> Vec<crate::persistent_subagent::SubAgentMessage> {
+    ) -> Option<Vec<crate::persistent_subagent::SubAgentMessage>> {
         let taken = {
             let mut reg = self.sub_agents.lock().await;
             reg.get_mut(sub_id)
                 .map(|a| std::mem::take(&mut a.inbox))
-                .unwrap_or_default()
-        };
+        }?;
         // 清空后落盘（bug·high：不清盘则重启后已消费消息重现 = 重复处理）。
         // 事务化（bug·medium 第四轮）：save 失败则**回滚内存**（消息放回收件箱），
         // 宁可本次消费失败，不让「已消费但未落盘」造成重启后重复处理。
@@ -8075,10 +8081,10 @@ impl AgentCore {
                     restored.append(&mut a.inbox); // 并发新消息在回滚消息之后
                     a.inbox = restored;
                 }
-                return Vec::new();
+                return None; // 回滚后无消息可返回（调用方可重试）
             }
         }
-        taken
+        Some(taken)
     }
 
     /// 取同组织已注册 Agent 通讯录（Memoria `agent_list`，需 admin）。
