@@ -195,8 +195,25 @@ pub(crate) async fn handle_code_evolve(
 
         let mut consecutive = 0usize;
         let mut gens_run = 0usize;
+        // P0 四预算自治封套（借鉴 Prime Agent，方案 §2 注入点 A）：
+        // turns / tokens / wall-clock + 可选 gate_command；违约 → budget_break SSE +
+        // git_revert 干净基线（下方现有回退点已覆盖），绝不绕过隔离/鉴权/dry_run 双闸门。
+        let mut tracker = agent_core::autonomy_budget::BudgetTracker::new(ce.budget.clone());
         for gen in 1..=generations {
             gens_run += 1;
+            // ① 纯墙钟检查（每代顶部，不消耗 turn）
+            if let Err(b) = tracker.check_wall_clock() {
+                send(
+                    "budget_break",
+                    serde_json::json!({
+                        "reason": format!("{:?}", b),
+                        "gens_run": gens_run,
+                        "elapsed_secs": tracker.elapsed_secs(),
+                        "max_wall_clock_secs": ce.budget.max_wall_clock_secs,
+                    }),
+                );
+                break;
+            }
             let current = match std::fs::read_to_string(&target_p) {
                 Ok(c) => c,
                 Err(e) => {
@@ -220,6 +237,23 @@ pub(crate) async fn handle_code_evolve(
                 }
             };
             send("proposal", serde_json::json!({"gen": gen, "code": new_fn}));
+            // ② 记一轮 + token 记账（过渡期 chars/4 估算，方案 §6）；违约立即停 + 回退
+            if let Err(b) = tracker.record_turn(
+                agent_core::autonomy_budget::estimate_tokens(&new_fn),
+            ) {
+                let _ = git_revert(&repo, &target_p); // 硬红线：回到干净基线
+                send(
+                    "budget_break",
+                    serde_json::json!({
+                        "reason": format!("{:?}", b),
+                        "gens_run": gens_run,
+                        "turns": tracker.turns_used(),
+                        "tokens": tracker.tokens_used(),
+                        "elapsed_secs": tracker.elapsed_secs(),
+                    }),
+                );
+                break;
+            }
 
             // 2) 外科替换
             let new_src = match apply_patch(&current, &fn_name, &new_fn) {
@@ -296,6 +330,24 @@ pub(crate) async fn handle_code_evolve(
                 if consecutive >= circuit {
                     send("circuit_break", serde_json::json!({"reason": "连续无进展达上限"}));
                     break;
+                }
+            }
+        }
+        // ③ 循环结束后可选 pass/fail gate（Prime Agent 同款，方案 §2）
+        if let Some(cmd) = &ce.budget.gate_command {
+            if !cmd.trim().is_empty() {
+                let gate = tokio::process::Command::new("sh")
+                    .args(["-c", cmd])
+                    .current_dir(&repo)
+                    .output()
+                    .await;
+                let ok = gate.map(|o| o.status.success()).unwrap_or(false);
+                if !ok {
+                    let _ = git_revert(&repo, &target_p);
+                    send(
+                        "gate_failed",
+                        serde_json::json!({"command": cmd, "reason": "pass/fail gate 未通过，整体否决"}),
+                    );
                 }
             }
         }

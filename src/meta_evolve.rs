@@ -15,6 +15,7 @@ use rusqlite::{params, Connection};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::autonomy_budget::{AutonomyBudget, BudgetTracker};
 use crate::llm::{LlmClient, Message};
 use crate::mcp_client::McpClient;
 
@@ -97,6 +98,9 @@ pub struct MetaEvolutionConfig {
     /// 优化器模型（提示用，真实模型由 LlmClient 配置决定）
     #[serde(default = "default_optimizer_model")]
     pub optimizer_model: String,
+    /// 四预算自治封套（P0，借鉴 Prime Agent）。缺省全 0 = 不限制（向后兼容旧配置）。
+    #[serde(default)]
+    pub budget: AutonomyBudget,
 }
 
 fn default_window_days() -> i64 {
@@ -132,6 +136,7 @@ impl Default for MetaEvolutionConfig {
             max_rollback_rate: default_max_rollback(),
             cooldown_hours: default_cooldown(),
             optimizer_model: default_optimizer_model(),
+            budget: AutonomyBudget::default(),
         }
     }
 }
@@ -358,6 +363,21 @@ impl RolloutResult {
             attempted: true,
             status: "error".into(),
             reason: msg.into(),
+            baseline_rate: 0.0,
+            candidate_rate: 0.0,
+            passed: false,
+            rolled_out: false,
+            prompt_hash_before: String::new(),
+            prompt_hash_after: String::new(),
+            feedback_id: String::new(),
+        }
+    }
+    /// 四预算违约（方案 §5）：不 rollout、不变更提示词，reason 携带 breach 类型。
+    fn budget_breach(b: crate::autonomy_budget::BudgetBreach, at: &str) -> Self {
+        RolloutResult {
+            attempted: true,
+            status: "budget_breach".into(),
+            reason: format!("{:?} @ {}", b, at),
             baseline_rate: 0.0,
             candidate_rate: 0.0,
             passed: false,
@@ -733,11 +753,12 @@ impl MetaEvolver {
         Self::parse_negative_samples(&raw)
     }
 
-    /// LLM 精炼演化提示词 → 候选
+    /// LLM 精炼演化提示词 → 候选（传入 BudgetTracker 做 turns/tokens/wall-clock 记账）
     pub async fn optimize_prompt(
         &self,
         samples: &[NegSample],
         model: &str,
+        tracker: &mut BudgetTracker,
     ) -> Result<CandidatePrompt, String> {
         let sample_txt: Vec<String> = samples
             .iter()
@@ -767,6 +788,8 @@ impl MetaEvolver {
             tool_call_id: None,
         };
         let reply = self.llm.chat(&[msg], &[]).await.map_err(|e| e.to_string())?;
+        // 预算记账（过渡期 chars/4 估算，方案 §6）：超限即违约，调用方停止并回退
+        let _ = tracker.record_turn(crate::autonomy_budget::estimate_tokens(&reply.text));
         let text = reply.text.trim().to_string();
         if text.is_empty() {
             return Err("optimizer 返回空提示词".to_string());
@@ -830,9 +853,18 @@ impl MetaEvolver {
     }
 
     /// 一轮元进化（端到端）：采集 → 基线 → 优化 → rollout
-    pub async fn run_once(&self, mem_client: &McpClient, ns: &str) -> RolloutResult {
+    pub async fn run_once(
+        &self,
+        mem_client: &McpClient,
+        ns: &str,
+        tracker: &mut BudgetTracker,
+    ) -> RolloutResult {
         if !self.config.enabled {
             return RolloutResult::skipped("meta_evolution.enabled=false");
+        }
+        // 四预算封套：纯墙钟检查（循环顶部，不消耗 turn）
+        if let Err(b) = tracker.check_wall_clock() {
+            return RolloutResult::budget_breach(b, "run_once 顶部墙钟检查");
         }
         // cooldown 守卫：避免夜班 patrol / 手动 consolidate 高频反复跑 L2
         if self.config.cooldown_hours > 0 {
@@ -877,10 +909,17 @@ impl MetaEvolver {
             );
             return RolloutResult::guarded(baseline);
         }
-        let cand = match self.optimize_prompt(&samples, &self.config.optimizer_model).await {
+        let cand = match self
+            .optimize_prompt(&samples, &self.config.optimizer_model, tracker)
+            .await
+        {
             Ok(c) => c,
             Err(e) => return RolloutResult::error(&e),
         };
+        // 预算违约（LLM 轮次后）：不 rollout、不变更提示词（方案 §5）
+        if let Err(b) = tracker.check_wall_clock() {
+            return RolloutResult::budget_breach(b, "optimize_prompt 后检查");
+        }
         let candidate_rate = self.estimate_candidate_rate(&cand.text, &samples, baseline);
         self.rollout_if_better(&cand, baseline, candidate_rate, &samples, ns)
             .await

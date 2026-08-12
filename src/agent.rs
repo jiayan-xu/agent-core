@@ -363,6 +363,9 @@ pub struct AgentCore {
     pub meta_evolver: crate::meta_evolve::MetaEvolver,
     /// PR5: 机制账本存储（evolution_feedback + meta_prompt），与 meta_evolver 共享
     pub meta_store: std::sync::Arc<tokio::sync::Mutex<crate::meta_evolve::MetaEvolutionStore>>,
+    /// P0 四预算封套：元进化 continuations 限流窗口（ns → 触发时刻列表）。
+    /// 由 run_meta_evolution 在 run_once 前做窗口限流（方案 §3 注入点 B）。
+    pub evo_continuations: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Vec<std::time::Instant>>>>,
     /// HY3 1.3：技能库注册表（仅 features.skill_library=true 时 Some；否则 None=不注入）
     pub skill_registry: Option<Arc<dyn crate::skill_library::SkillRegistry + Send + Sync>>,
     /// HY3 1.3：LATS 控制器（仅 features.lats=true 时 Some；否则 None=原路径）
@@ -974,6 +977,8 @@ impl AgentCore {
             }
         };
         let meta_store = std::sync::Arc::new(tokio::sync::Mutex::new(meta_store));
+        let evo_continuations =
+            std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::<String, Vec<std::time::Instant>>::new()));
         let meta_evolver = crate::meta_evolve::MetaEvolver::new(
             config.meta_evolution.clone(),
             meta_store.clone(),
@@ -1094,6 +1099,7 @@ impl AgentCore {
             approval_gate,
             meta_evolver,
             meta_store,
+            evo_continuations,
             skill_registry,
             lats,
             multiagent,
@@ -10936,9 +10942,33 @@ impl AgentCore {
                 "reason": "meta_evolution.enabled=false（受控开启，需在 agent.toml 显式开启）"
             });
         }
+        // P0 四预算封套·continuations 限流（方案 §3 注入点 B）：窗口内触发次数超限 →
+        // 直接 skipped、不进入 run_once、零副作用。
+        let b = &self.config.meta_evolution.budget;
+        if b.max_continuations_per_window > 0 && b.continuation_window_secs > 0 {
+            let mut guard = self.evo_continuations.lock().await;
+            let now = std::time::Instant::now();
+            let entry = guard.entry(ns.to_string()).or_default();
+            entry.retain(|t| now.duration_since(*t) < std::time::Duration::from_secs(b.continuation_window_secs));
+            if entry.len() >= b.max_continuations_per_window as usize {
+                return serde_json::json!({
+                    "status": "skipped",
+                    "reason": "continuation budget exceeded（四预算封套）",
+                    "window_secs": b.continuation_window_secs,
+                    "max_continuations_per_window": b.max_continuations_per_window,
+                    "current_in_window": entry.len(),
+                });
+            }
+            entry.push(now);
+            drop(guard);
+        }
         // 与 consolidate 一致：admin/jarvis 身份与密钥配对
         let mem_client = memoria_maintenance_client(&self.config.memoria_url, &self.mcp);
-        let res = self.meta_evolver.run_once(&mem_client, ns).await;
+        let mut tracker = crate::autonomy_budget::BudgetTracker::new(b.clone());
+        let res = self
+            .meta_evolver
+            .run_once(&mem_client, ns, &mut tracker)
+            .await;
         res.to_json()
     }
 

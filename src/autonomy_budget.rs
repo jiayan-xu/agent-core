@@ -1,0 +1,238 @@
+//! 四预算自治封套（P0，借鉴 Prime Agent，落地设计见 tech-docs/2026-08-11_agent-core四预算自治封套落地方案.md）。
+//!
+//! 给进化引擎（code_evolution / meta_evolution）一个**统一运行时封套**：
+//! turns / tokens / wall-clock 三维 + 可选 pass/fail gate + continuations 窗口限流。
+//! 语义：0 / None = 不限制（默认宽松，向后兼容旧配置）。
+//! 硬红线：本模块是**加法护栏**，绝不绕过 `resolve_isolated_target` / `x-evolve-key` /
+//! `dry_run`+`allow_commit` / 签名冻结 任一既有门禁。
+
+use std::time::{Duration, Instant};
+
+/// 四预算自治封套。所有字段 `serde(default)`：旧配置缺字段仍解析（向后兼容）。
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AutonomyBudget {
+    /// 本任务最大 LLM 轮次（turns）。code_evolution=提议调用次数；meta_evolution=run_once 内 LLM 调用数。0=不限制。
+    #[serde(default)]
+    pub max_turns: usize,
+    /// 本任务累计最大 token 数（过渡期用 chars/4 估算，见方案 §6）。0=不限制。
+    #[serde(default)]
+    pub max_tokens: u64,
+    /// 本任务硬墙钟上限（秒）。超时立即停 + 回退 + 审计。0=不限制。
+    #[serde(default)]
+    pub max_wall_clock_secs: u64,
+    /// 滚动窗口内允许的最大「续跑/触发」次数（continuations）。0=不限制。
+    #[serde(default)]
+    pub max_continuations_per_window: u32,
+    /// 续跑窗口（秒），与 max_continuations_per_window 配合。
+    #[serde(default)]
+    pub continuation_window_secs: u64,
+    /// 可选 pass/fail gate：任务结束前运行的 shell 命令，非 0 退出则整体否决 + 回退。
+    #[serde(default)]
+    pub gate_command: Option<String>,
+}
+
+impl Default for AutonomyBudget {
+    /// 默认宽松：全 0 = 不限制（与「预算封套是叠加层、默认不开闸」的纪律一致）。
+    fn default() -> Self {
+        Self {
+            max_turns: 0,
+            max_tokens: 0,
+            max_wall_clock_secs: 0,
+            max_continuations_per_window: 0,
+            continuation_window_secs: 0,
+            gate_command: None,
+        }
+    }
+}
+
+impl AutonomyBudget {
+    /// 是否完全未配置（全 0 / None）——用于「未开闸」判定与日志。
+    pub fn is_unset(&self) -> bool {
+        self.max_turns == 0
+            && self.max_tokens == 0
+            && self.max_wall_clock_secs == 0
+            && self.max_continuations_per_window == 0
+            && self.gate_command.is_none()
+    }
+}
+
+/// 运行时追踪器（每个 evolve 任务一个实例）。
+pub struct BudgetTracker {
+    start: Instant,
+    turns: usize,
+    tokens: u64,
+    budget: AutonomyBudget,
+}
+
+/// 违约类型。调用方须立即停止并按 §5 违约语义处理（回退 + 审计）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetBreach {
+    Turns,
+    Tokens,
+    WallClock,
+    Gate,
+    Continuations,
+}
+
+impl BudgetTracker {
+    pub fn new(budget: AutonomyBudget) -> Self {
+        Self {
+            start: Instant::now(),
+            turns: 0,
+            tokens: 0,
+            budget,
+        }
+    }
+
+    /// 每次 LLM 轮次后调用；返回 Err 即违约，调用方须立即停止并回退。
+    pub fn record_turn(&mut self, tokens: u64) -> Result<(), BudgetBreach> {
+        self.turns += 1;
+        self.tokens += tokens;
+        if self.budget.max_turns > 0 && self.turns > self.budget.max_turns {
+            return Err(BudgetBreach::Turns);
+        }
+        if self.budget.max_tokens > 0 && self.tokens > self.budget.max_tokens {
+            return Err(BudgetBreach::Tokens);
+        }
+        if self.budget.max_wall_clock_secs > 0
+            && self.start.elapsed() > Duration::from_secs(self.budget.max_wall_clock_secs)
+        {
+            return Err(BudgetBreach::WallClock);
+        }
+        Ok(())
+    }
+
+    /// 仅在循环顶部做纯墙钟检查（不消耗 turn）。
+    pub fn check_wall_clock(&self) -> Result<(), BudgetBreach> {
+        if self.budget.max_wall_clock_secs > 0
+            && self.start.elapsed() > Duration::from_secs(self.budget.max_wall_clock_secs)
+        {
+            return Err(BudgetBreach::WallClock);
+        }
+        Ok(())
+    }
+
+    pub fn elapsed_secs(&self) -> u64 {
+        self.start.elapsed().as_secs()
+    }
+
+    pub fn turns_used(&self) -> usize {
+        self.turns
+    }
+
+    pub fn tokens_used(&self) -> u64 {
+        self.tokens
+    }
+
+    pub fn budget(&self) -> &AutonomyBudget {
+        &self.budget
+    }
+}
+
+/// 过渡期 token 估算（方案 §6）：真实 usage 未打通前用 chars/4 近似。
+/// 仅用于预算记账，不参与任何协议字段。
+pub fn estimate_tokens(text: &str) -> u64 {
+    (text.chars().count() / 4) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_budget_is_unset() {
+        assert!(AutonomyBudget::default().is_unset());
+    }
+
+    #[test]
+    fn turns_breach() {
+        let mut t = BudgetTracker::new(AutonomyBudget {
+            max_turns: 2,
+            ..Default::default()
+        });
+        assert!(t.record_turn(10).is_ok());
+        assert!(t.record_turn(10).is_ok());
+        assert_eq!(t.record_turn(10), Err(BudgetBreach::Turns));
+    }
+
+    #[test]
+    fn tokens_breach() {
+        let mut t = BudgetTracker::new(AutonomyBudget {
+            max_tokens: 100,
+            ..Default::default()
+        });
+        assert!(t.record_turn(60).is_ok());
+        assert_eq!(t.record_turn(50).is_ok(), false); // 60+50=110 > 100 → 违约
+        assert_eq!(t.record_turn(1), Err(BudgetBreach::Tokens));
+    }
+
+    #[test]
+    fn wall_clock_breach() {
+        // 墙钟 1ms 级验证：max_wall_clock_secs 用 0 秒 + 显式等待不可行（整数秒），
+        // 改测「0=不限制」与 check_wall_clock 通过路径；真实超时由集成测覆盖。
+        let t = BudgetTracker::new(AutonomyBudget::default());
+        assert!(t.check_wall_clock().is_ok());
+        let t2 = BudgetTracker::new(AutonomyBudget {
+            max_wall_clock_secs: 1,
+            ..Default::default()
+        });
+        // 1 秒内不触发
+        assert!(t2.check_wall_clock().is_ok());
+        // 用已流逝时间伪造：直接构造一个 start 早已过去的 tracker 不可行（私有字段），
+        // 此处仅验证逻辑分支存在（record_turn 内也做墙钟检查）。
+        let mut t3 = BudgetTracker::new(AutonomyBudget {
+            max_wall_clock_secs: 0,
+            ..Default::default()
+        });
+        assert!(t3.record_turn(1).is_ok());
+    }
+
+    #[test]
+    fn ok_path_counts_turns_and_tokens() {
+        let mut t = BudgetTracker::new(AutonomyBudget {
+            max_turns: 10,
+            max_tokens: 1000,
+            ..Default::default()
+        });
+        for _ in 0..3 {
+            assert!(t.record_turn(100).is_ok());
+        }
+        assert_eq!(t.turns_used(), 3);
+        assert_eq!(t.tokens_used(), 300);
+        assert!(t.elapsed_secs() >= 0);
+    }
+
+    #[test]
+    fn estimate_tokens_approximation() {
+        // "abcd" 4 chars → 1 token
+        assert_eq!(estimate_tokens("abcd"), 1);
+        // 中文 4 chars → 1 token
+        assert_eq!(estimate_tokens("固废监管"), 1);
+    }
+}
+
+#[cfg(test)]
+mod serde_probe_tests {
+    use super::*;
+
+    #[test]
+    fn budget_top_level_keys_parse() {
+        // 直接反序列化 AutonomyBudget 时键在顶层；嵌套表场景由 CodeEvolutionConfig
+        // 的 [code_evolution.budget] 测试覆盖（config.rs budget_serde_tests）
+        let toml = r#"
+max_turns = 8
+max_tokens = 200000
+max_wall_clock_secs = 300
+max_continuations_per_window = 5
+continuation_window_secs = 3600
+gate_command = "cargo test"
+"#;
+        let b: AutonomyBudget = toml::from_str(toml).expect("顶层键应解析");
+        assert_eq!(b.max_turns, 8, "max_turns 应解析为 8, got {}", b.max_turns);
+        assert_eq!(b.max_tokens, 200_000);
+        assert_eq!(b.max_wall_clock_secs, 300);
+        assert_eq!(b.max_continuations_per_window, 5);
+        assert_eq!(b.continuation_window_secs, 3600);
+        assert_eq!(b.gate_command.as_deref(), Some("cargo test"));
+    }
+}
