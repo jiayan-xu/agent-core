@@ -65,7 +65,7 @@ impl PersistentSubAgent {
             state: SubAgentState::Idle,
             inbox: Vec::new(),
             created_at: now_iso(),
-            last_active: now_unix(),
+            last_active: now_unix_pub(),
             notify: None,
         }
     }
@@ -75,7 +75,7 @@ impl PersistentSubAgent {
     }
 }
 
-fn now_unix() -> u64 {
+pub fn now_unix_pub() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -172,7 +172,7 @@ pub async fn deliver(
             .get_mut(to_sub_id)
             .ok_or_else(|| format!("子 agent {} 不存在", to_sub_id))?;
         agent.inbox.push(msg.clone());
-        agent.last_active = now_unix();
+        agent.last_active = now_unix_pub();
         agent.notify.clone()
     };
     if let Some(sender) = notify_sender {

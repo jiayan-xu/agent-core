@@ -1024,6 +1024,27 @@ impl AgentCore {
                     "sub_agents.json 存在但无法读取（权限/IO）——已按空注册表启动，断线续跑失效"
                 );
             }
+            crate::persistent_subagent::LoadStatus::Corrupted => {
+                // bug·medium（第七轮）：损坏文件不能坐等首次 save 原子覆盖（丢失
+                // 人工修复机会）——先备份为 sub_agents.json.corrupted.<ts>。
+                if let Ok(meta) = std::fs::metadata(&sub_agents_path) {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let backup = format!("{}.corrupted.{}", sub_agents_path, ts);
+                    // 仅备份非空文件（空文件无价值）
+                    if meta.len() > 0 {
+                        let _ = std::fs::copy(&sub_agents_path, &backup);
+                        tracing::warn!(
+                            target: "agent.sub_agents",
+                            path = %sub_agents_path,
+                            backup = %backup,
+                            "损坏的 sub_agents.json 已备份（供人工修复）"
+                        );
+                    }
+                }
+            }
             _ => {}
         }
         let restored_seq = sub_agents_registry.max_seq(&config.identity.agent_id);
@@ -5480,8 +5501,12 @@ impl AgentCore {
             for (step_id, result) in results {
                 match result {
                     Ok(text) => {
-                        // P1-C（RLM 上下文外置）：大步骤结果外置到 memoria（外部变量），
-                        // prompt 只带指针/摘要——长任务上下文不随步骤数线性膨胀。
+                        // P1-C（RLM 上下文外置）：大步骤结果外置到 memoria（外部变量）。
+                        // 语义澄清（bug·medium 第七轮）：step_results **仍保留完整**
+                        // 结果（本会话内正常使用），外置是**持久化冗余**——供崩溃
+                        // 恢复/跨会话续跑时 checkpoint 缺失兜底召回；上下文不膨胀
+                        // 由 summarize 的截断保证，外置解决的是「持久性」而非
+                        // 「体积」（体积问题见 summarize_composition 1500 截断）。
                         // 先按引用判断长度，再 move 进 step_results（防借用冲突）。
                         if text.chars().count() > 2000 {
                             let step_ns = allowed_ns
@@ -7998,7 +8023,7 @@ impl AgentCore {
         // 内存有磁盘无——重启丢句柄。改为：临时插入 → save → 失败回滚）。
         {
             let mut reg = self.sub_agents.lock().await;
-            reg.insert(agent.clone());
+            reg.insert(agent);
         }
         // 统一用构造时固定路径（sub_agents_file），与 load 同一 cwd（bug·medium）
         if let Err(e) = crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file).await {
@@ -8013,8 +8038,8 @@ impl AgentCore {
     /// 向持久子 agent 投递消息（入其收件箱；未找到返回 Err，可回落 A2A 原生投递）。
     /// 投递后落盘（bug·medium 第五轮：只改内存不 save 则重启丢消息——收件箱
     /// 是断线续跑的核心状态，每条消息都必须持久化）。
-    /// save 失败返回 Err（bug·high 第六轮：不能 warn 后仍 Ok——调用方会以为
-    /// 投递成功，实际重启即丢；返回 Err 让调用方可重试/告警）。
+    /// save 失败返回 Err 并**回滚投递**（bug·high 第七轮：消息已入内存但 save 失败
+    /// 时返回 Err，调用方重试会重复投递——回滚刚投递的消息，保证「Err = 未投递」）。
     pub(crate) async fn sub_agent_send(
         &self,
         to_sub_id: &str,
@@ -8022,12 +8047,20 @@ impl AgentCore {
         content: &str,
     ) -> Result<(), String> {
         crate::persistent_subagent::deliver(&self.sub_agents, to_sub_id, from, content).await?;
-        crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file)
-            .await
-            .map_err(|e| {
-                tracing::error!(target: "agent.sub_agents", "投递后持久化失败: {}", e);
-                format!("消息已入内存收件箱但持久化失败（重启将丢失）: {}", e)
-            })?;
+        if let Err(e) =
+            crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file).await
+        {
+            // 回滚：移除刚投递的消息（匹配 from+content+时间最近的条目）
+            {
+                let mut reg = self.sub_agents.lock().await;
+                if let Some(a) = reg.get_mut(to_sub_id) {
+                    a.inbox.retain(|m| !(m.from == from && m.content == content));
+                    a.last_active = crate::persistent_subagent::now_unix_pub();
+                }
+            }
+            tracing::error!(target: "agent.sub_agents", "投递后持久化失败，已回滚: {}", e);
+            return Err(format!("消息投递失败（未持久化，已回滚）: {}", e));
+        }
         Ok(())
     }
 
@@ -8054,8 +8087,10 @@ impl AgentCore {
 
     /// 取指定子 agent 收件箱并清空（消费语义；Done 后收件箱保留至清理）。
     /// 取指定子 agent 收件箱并清空（消费语义；Done 后收件箱保留至清理）。
-    /// 返回 Option（bug·medium 第六轮）：None = 子 agent 不存在，Some(空) = 存在
-    /// 但当前无消息——调用方可区分「查无此 agent」与「无新消息」。
+    /// 返回 Option（bug·medium 第六轮）：None = 无消息可取——子 agent 不存在
+    /// **或**本次消费回滚（持久化失败）；Some(空) = 存在但当前无消息。调用方
+    /// 需结合 `sub_agent_list` 区分（第七轮：文档明确双关语义，不额外引入 Err
+    /// 以保持 API 简单；回滚是罕见故障路径，日志已记录）。
     pub(crate) async fn sub_agent_take_inbox(
         &self,
         sub_id: &str,

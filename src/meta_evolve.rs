@@ -989,6 +989,26 @@ impl MetaEvolver {
                 feedback_id: String::new(),
             };
         }
+        // bug·medium（第七轮）：样本池可被 memo 纯撑满 min_samples，但**无回滚
+        // 证据链**（rolled_back/corrected=0）时优化方向不成立（baseline=0，候选
+        // 无从评估改进）——跳过本轮，避免基于工具失败经验乱改演化提示词。
+        let has_rb_evidence = samples
+            .iter()
+            .any(|s| s.change_type == "rolled_back" || s.change_type == "corrected");
+        if !has_rb_evidence {
+            return RolloutResult {
+                attempted: false,
+                status: "insufficient_samples".into(),
+                reason: "仅有 experience_memo 样本，无回滚证据链（rolled_back/corrected=0），跳过优化".into(),
+                baseline_rate: 0.0,
+                candidate_rate: 0.0,
+                passed: false,
+                rolled_out: false,
+                prompt_hash_before: String::new(),
+                prompt_hash_after: String::new(),
+                feedback_id: String::new(),
+            };
+        }
         let baseline = self.baseline_rollback_rate(&samples);
         // 熔断（P-E lite）：基线超阈值 → 暂停 L2，不影响 L1
         if baseline > self.config.max_rollback_rate {
