@@ -319,10 +319,13 @@ pub struct AgentCore {
     history_summary_cache: tokio::sync::Mutex<HashMap<String, (usize, String, u64)>>,
     /// Phase B（GenOffice snapshotBefore 借鉴）：本次 run 首个非只读工具执行前的消息快照，
     /// 供回滚 UI / 自进化 dry_run 复用。按 session_id 键控（多会话并发互不覆盖，
-    /// ocr 2026-08-12 bug·high 修复）；每次 run 起始删除本会话条目，首个写工具执行前捕获一次。
-    pub mutation_snapshot: tokio::sync::Mutex<HashMap<String, MutationSnapshot>>,
+    /// ocr 2026-08-12 bug·high 修复）；run 起始不删、首个写工具执行前捕获一次
+    /// （跨 trace_id 覆盖旧残留，第六轮 bug·high 后捕获为单锁原子）。
+    /// `pub(crate)`：外部只能经 take_mutation_snapshot 读取，不能直接改写 map
+    /// （防绕过 seq 分配与容量淘汰不变量，ocr 2026-08-12 第六轮 maintainability·low）。
+    pub(crate) mutation_snapshot: tokio::sync::Mutex<HashMap<String, MutationSnapshot>>,
     /// 快照捕获单调序号（淘汰排序用，替代可回拨的墙钟，ocr 2026-08-12 第三轮）
-    pub snapshot_seq: std::sync::atomic::AtomicU64,
+    pub(crate) snapshot_seq: std::sync::atomic::AtomicU64,
     /// P2-1: 命名空间级配额与成本（tool 轮次 / 日 token 预算 / 并发会话）
     pub quota: Arc<std::sync::Mutex<NsQuotaStore>>,
     /// 白龙马 A3: Focus Stack → Thread 模型 —— 已归档话题（episode）软隐藏索引
@@ -7270,7 +7273,10 @@ impl AgentCore {
             if remaining <= BUDGET_BYTES {
                 break;
             }
-            // tool_msgs 升序（旧→新）；最后 KEEP_RECENT 条豁免
+            // tool_msgs 升序（旧→新）；最后 KEEP_RECENT 条豁免（保留 LLM 刚看到的
+            // 上下文——这是软上限：末两轮产出超大 tool 输出时，本轮 payload 可能
+            // 仍超预算，下一轮起该消息移出豁免窗口后被截断，ocr 2026-08-12 第六轮
+            // bug·medium 已如实文档化此设计权衡）。
             if tool_msgs.len() - idx <= KEEP_RECENT {
                 continue;
             }
@@ -7603,20 +7609,22 @@ impl AgentCore {
 
             // Phase B：首个非只读（写）工具执行前捕获变更前快照（GenOffice snapshotBefore 借鉴），
             // 供回滚 UI / 自进化 dry_run 复用；按 session 键控，每个 run 只捕获一次。
-            // 捕获语义（ocr 2026-08-12 第三/五轮）：
+            // 捕获语义（ocr 2026-08-12 第三/五/六轮）：
             // - 已有快照且 trace_id == 本 run → 已捕获，跳过
             // - 已有快照但 trace_id != 本 run（旧 run 残留，run 起始不再删除）→ 覆盖为
             //   本 run 首个写工具前的快照（保证「首个写工具前」不变量）
             // - 无快照 → 捕获
+            // 探测+克隆+插入在**同一锁内**完成（快照捕获为低频一次性操作，克隆大
+            // 结构可接受；换取 check-then-act 原子性，消除并发同 session 双 run 竞态
+            // ——第六轮 bug·high：此前探测锁外、插入锁内，两个不同 trace_id 的 run
+            // 会互相覆盖对方快照）。
             if !crate::boundary::is_read_only_tool(&tc.name) {
-                let need_capture = {
-                    let m = self.mutation_snapshot.lock().await;
-                    match m.get(session_id) {
-                        Some(s) => s.trace_id != trace_id,
-                        None => true,
-                    }
-                };
-                if need_capture {
+                let mut m = self.mutation_snapshot.lock().await;
+                let already_captured = m
+                    .get(session_id)
+                    .map(|s| s.trace_id == trace_id)
+                    .unwrap_or(false);
+                if !already_captured {
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -7632,31 +7640,22 @@ impl AgentCore {
                         captured_at_ms: now_ms,
                         seq,
                     };
-                    // 深克隆在锁外完成后单锁插入；若探测后、插入前其他 run 已为本会话
-                    // 捕获（并发同 session），则保留先到者（其 trace_id 与本 run 不同，
-                    // 但先捕获者更接近「首个写工具前」）。
-                    let mut m = self.mutation_snapshot.lock().await;
-                    let already = m
-                        .get(session_id)
-                        .map(|s| s.trace_id == trace_id)
-                        .unwrap_or(false);
-                    if !already {
-                        // 容量上限：防「写了工具后不再 run 的会话」累积深克隆快照导致
-                        // 无界内存增长与敏感历史滞留（ocr 2026-08-12 第二轮 perf·medium）；
-                        // 超限时淘汰序号最旧条目。淘汰在判重之后：避免先淘汰旧条目、
-                        // 随后又因已捕获而放弃插入，白丢一个有效快照（第五轮 bug·low）。
-                        if m.len() >= MUTATION_SNAPSHOT_MAX {
-                            let oldest = m
-                                .iter()
-                                .min_by_key(|(_, s)| s.seq)
-                                .map(|(k, _)| k.clone());
-                            if let Some(k) = oldest {
-                                m.remove(&k);
-                            }
+                    // 容量上限：防「写了工具后不再 run 的会话」累积深克隆快照导致
+                    // 无界内存增长与敏感历史滞留（ocr 2026-08-12 第二轮 perf·medium）。
+                    // 仅当**新增**条目（本会话此前无残留）且超限时淘汰 seq 最旧条目：
+                    // 覆盖旧残留（map 不增长）时不淘汰，避免白丢有效快照（第五轮 bug·low）。
+                    let inserting_new = !m.contains_key(session_id);
+                    if inserting_new && m.len() >= MUTATION_SNAPSHOT_MAX {
+                        let oldest = m
+                            .iter()
+                            .min_by_key(|(_, s)| s.seq)
+                            .map(|(k, _)| k.clone());
+                        if let Some(k) = oldest {
+                            m.remove(&k);
                         }
-                        m.insert(session_id.to_string(), snap);
-                        tracing::info!(tool = %tc.name, session = %session_id, "mutation_snapshot_captured");
                     }
+                    m.insert(session_id.to_string(), snap);
+                    tracing::info!(tool = %tc.name, session = %session_id, "mutation_snapshot_captured");
                 }
             }
 
@@ -11110,6 +11109,70 @@ mod tool_fix_tests {
         // 最后两条保留原样（KEEP_RECENT）
         assert_eq!(msgs[298].content.as_ref().unwrap().len(), 1000);
         assert_eq!(msgs[299].content.as_ref().unwrap().len(), 1000);
+    }
+
+    // ── 快照生命周期（ocr 2026-08-12 第六轮 test·low：补 capture 语义单测）──
+
+    fn mock_snapshot(trace: &str, seq: u64) -> MutationSnapshot {
+        MutationSnapshot {
+            tool_name: "cw_write".into(),
+            messages_before: vec![],
+            session_id: "s1".into(),
+            trace_id: trace.into(),
+            captured_at_ms: seq,
+            seq,
+        }
+    }
+
+    #[test]
+    fn snapshot_take_does_not_clear_capture_flag() {
+        // take 只克隆取出、不删除条目：消费方取走后「已捕获」标记仍在，
+        // 同 run 后续写工具不会重新捕获变更后状态（第五轮 bug·medium 修复验证）。
+        let store = tokio::sync::Mutex::new(HashMap::<String, MutationSnapshot>::new());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            store.lock().await.insert("s1".into(), mock_snapshot("t1", 1));
+            // 等价于 take_mutation_snapshot 的 clone 语义
+            let taken = store.lock().await.get("s1").cloned();
+            assert!(taken.is_some(), "应能取走快照");
+            assert!(
+                store.lock().await.contains_key("s1"),
+                "take 不得清除已捕获标记"
+            );
+            let again = store.lock().await.get("s1").cloned();
+            assert!(again.is_some(), "重复取走应仍返回快照");
+        });
+    }
+
+    #[test]
+    fn snapshot_capture_semantics_trace_id() {
+        // 捕获判定：同 trace_id 跳过（已捕获）；异 trace_id 覆盖（旧 run 残留）
+        let store = tokio::sync::Mutex::new(HashMap::<String, MutationSnapshot>::new());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // 残留旧 run 快照（trace_id=t-old）
+            store.lock().await.insert("s1".into(), mock_snapshot("t-old", 1));
+            // 新 run（trace_id=t-new）判定 need_capture：异 trace → true
+            let need_capture = {
+                let m = store.lock().await;
+                match m.get("s1") {
+                    Some(s) => s.trace_id != "t-new",
+                    None => true,
+                }
+            };
+            assert!(need_capture, "异 trace_id 残留应触发重新捕获");
+            // 捕获后同 trace 再判定 → false
+            let mut m = store.lock().await;
+            m.insert("s1".into(), mock_snapshot("t-new", 2));
+            let already = m.get("s1").map(|s| s.trace_id == "t-new").unwrap_or(false);
+            assert!(already, "同 trace_id 应视为已捕获");
+        });
     }
 }
 

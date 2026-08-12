@@ -87,9 +87,15 @@ pub fn needs_redaction(payload: &str) -> bool {
                 scheme_start -= 1;
             }
             let scheme_len = i - scheme_start;
-            // 首字符必须是字母（RFC 3986 scheme 约束），防「数字:」被误认
+            // 首字符必须是字母（RFC 3986 scheme 约束），防「数字:」被误认；
+            // scheme 起点前要求非 scheme 字符（词边界，ocr 2026-08-12 第六轮 security·low）
             let first_alpha = bytes[scheme_start].is_ascii_alphabetic();
-            if first_alpha && (1..=32).contains(&scheme_len) {
+            let boundary_ok = scheme_start == 0
+                || !(bytes[scheme_start - 1].is_ascii_alphanumeric()
+                    || bytes[scheme_start - 1] == b'+'
+                    || bytes[scheme_start - 1] == b'-'
+                    || bytes[scheme_start - 1] == b'.');
+            if first_alpha && boundary_ok && (1..=32).contains(&scheme_len) {
                 if let Some(at) = find_userinfo_at_bytes(bytes, i) {
                     if find_userinfo_colon_bytes(bytes, i, at).is_some() {
                         return true;
@@ -214,9 +220,16 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
                 scheme_start -= 1;
             }
             let scheme_len = i - scheme_start;
-            // 首字符必须是字母（RFC 3986 scheme 约束），防「数字:」被误认
+            // 首字符必须是字母（RFC 3986 scheme 约束），防「数字:」被误认；
+            // scheme 起点前要求非 scheme 字符（词边界），防把 "abc-https://..." 中
+            // 的 - 误并入 scheme（ocr 2026-08-12 第六轮 security·low）
             let first_alpha = chars[scheme_start].is_ascii_alphabetic();
-            if first_alpha && (1..=32).contains(&scheme_len) {
+            let boundary_ok = scheme_start == 0
+                || !(chars[scheme_start - 1].is_ascii_alphanumeric()
+                    || chars[scheme_start - 1] == '+'
+                    || chars[scheme_start - 1] == '-'
+                    || chars[scheme_start - 1] == '.');
+            if first_alpha && boundary_ok && (1..=32).contains(&scheme_len) {
                 if let Some(at) = find_userinfo_at(&chars, i) {
                     if let Some(colon_rel) = find_userinfo_colon(&chars, i, at) {
                         // 保留 "://" 与 "user:"，仅遮蔽密码

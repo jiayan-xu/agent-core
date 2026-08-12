@@ -2011,7 +2011,10 @@ mod sanitize_messages_tests {
     }
 
     #[test]
-    fn owned_path_only_clones_affected_user_message() {
+    fn owned_path_redacts_only_user_content() {
+        // 说明（ocr 2026-08-12 第六轮 maintainability·low）：Cow::Owned 路径为重建
+        // Vec 会克隆全部消息（含 system/assistant/tool）；实际优化是「无敏感单条
+        // user 消息经 needs_redaction 门控跳过 String 分配」——测试名如实表述。
         let msgs = vec![
             Message {
                 role: "system".into(),
@@ -2038,6 +2041,9 @@ mod sanitize_messages_tests {
         assert_eq!(out[2].content, msgs[2].content, "assistant 消息应原样保留");
         assert_ne!(out[1].content, msgs[1].content, "user 消息应被脱敏");
         assert!(out[1].content.as_ref().unwrap().contains("[REDACTED_API_KEY]"));
+        // tool_calls/tool_call_id 字段不被触碰（只改 content）
+        assert!(out[1].tool_calls.is_none() && msgs[1].tool_calls.is_none());
+        assert_eq!(out[1].tool_call_id, msgs[1].tool_call_id);
     }
 
     #[test]
