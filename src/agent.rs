@@ -7707,6 +7707,20 @@ impl AgentCore {
                     {
                         text.push_str(&format!("\n\n💡 历史教训参考（情境召回）：{}", lesson));
                     }
+                    // P1-A（/refine 合成点）：失败教训结构化沉淀为 experience_memo，
+                    // 供 meta_evolution 第二样本源（解 min_samples=20 冷启动）。
+                    // best-effort：写失败仅告警，不阻断执行。
+                    let memo_ns = allowed_ns
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| self.config.identity.ns());
+                    crate::experience_memo::record_experience_memo(
+                        &self.mcp,
+                        &tc.name,
+                        &e,
+                        &memo_ns,
+                    )
+                    .await;
                     text
                 }
             };

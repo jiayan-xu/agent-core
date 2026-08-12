@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod autonomy_budget; // P0 四预算自治封套（turns/tokens/wall-clock/continuations + gate）
+pub mod experience_memo; // P1-A /refine 合成点：会话经验 memo（meta_evolution 第二样本源）
 pub mod approval;
 pub mod clarify; // P2-3：澄清工具（Request clarification 对标）
 pub mod reply_polish; // PFAiX 回复净化：检测 JSON/代码块泄漏

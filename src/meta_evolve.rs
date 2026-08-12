@@ -747,7 +747,11 @@ impl MetaEvolver {
 
     // ── 异步：触网（LLM / memoria） ─────────────────────
 
-    /// 采集负样本（经 memoria `evolution_log_query`）
+    /// 采集负样本：**双源合并**（P1-A /refine 合成点）——
+    /// ① memoria `evolution_log_query`（rolled_back/corrected 回滚日志，传统源）；
+    /// ② `experience_memo` 会话经验 memo（运行时工具失败教训，主动积累源）。
+    /// 合并解 `min_samples=20` 冷启动：回滚日志稀少时，持续运行的工具失败经验
+    /// 也能凑够样本；memo 样本的 change_type=tool_failure:<tool> 供元优化器学习禁忌。
     pub async fn collect_negative_samples(
         &self,
         mem_client: &McpClient,
@@ -769,7 +773,21 @@ impl MetaEvolver {
             )
             .await
             .unwrap_or_default();
-        Self::parse_negative_samples(&raw)
+        let mut samples = Self::parse_negative_samples(&raw);
+        // P1-A：追加 experience_memo 样本（第二源；检索 agent 根 ns `agent/{id}`，
+        // 与 agent.rs identity.ns() 一致；best-effort）
+        let root_ns = format!("agent/{}", self.agent_id);
+        let memos = crate::experience_memo::collect_memo_samples(mem_client, &root_ns, limit).await;
+        let mut known: std::collections::HashSet<String> = samples
+            .iter()
+            .map(|s| s.old_value.clone())
+            .collect();
+        for m in memos {
+            if known.insert(m.old_value.clone()) {
+                samples.push(m);
+            }
+        }
+        samples
     }
 
     /// LLM 精炼演化提示词 → 候选（传入 BudgetTracker 做 turns/tokens/wall-clock 记账）。
