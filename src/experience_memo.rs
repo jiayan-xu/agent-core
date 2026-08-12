@@ -83,7 +83,10 @@ pub async fn collect_memo_samples(
             if content.is_empty() || !content.contains("experience_memo") {
                 return None;
             }
-            // 从 content 提取工具名（"[experience_memo] 工具 X 执行失败：..."）
+            // 从 content 提取工具名（"[experience_memo] 工具 X 执行失败：..."）。
+            // 约定：record_experience_memo 固定写入该格式；若工具名含空格（极罕见），
+            // 只取首段作为近似标签（maintainability·low 已文档化；解析失败回落
+            // "unknown" 不阻断采样）。
             let tool = content
                 .split("工具 ")
                 .nth(1)
@@ -112,7 +115,8 @@ pub async fn externalize_plan_step(
     result: &str,
     ns: &str,
 ) {
-    // 结果超长时截断存储体（4KB 上限，仅存核心结论 + 原始数据的可召回索引）
+    // 结果超长时截断存储体（4096 **字符**上限，非字节——bug·low 注释修正；
+    // 仅存核心结论 + 原始数据的可召回索引）
     let stored: String = result.chars().take(4096).collect();
     let content = format!(
         "[plan_step_result] session={} step={}\n{}",
@@ -149,7 +153,9 @@ pub async fn recall_plan_step(
         "query": query,
         "namespace": ns,
         "category": "plan_step_result",
-        "max_results": 1,
+        // bug·medium（第三轮）：语义搜索 top1 可能不是目标 step（语义相近的其它
+        // 步骤结果更靠前）——取 5 个候选，靠下方的精确 session+step 过滤命中。
+        "max_results": 5,
     });
     let raw = mcp
         .call_json("memory_search_v2", &args)
@@ -168,20 +174,23 @@ pub async fn recall_plan_step(
             .unwrap_or("")
             .to_string();
         // 精确 step 匹配（ocr 2026-08-12 bug·high）：`step=3` 不得误配 `step=30`——
-        // 要求匹配位置后不是数字；同时校验 session 前缀防跨会话误取。
+        // 要求匹配位置后不是数字；**session 同样精确匹配**（bug·high 第三轮：
+        // `session=1` 不得误配 `session=10`）。
         let step_pat = format!("step={}", step_id);
-        let session_ok = content.contains(&format!("session={}", session_id));
-        let step_ok = content
-            .find(&step_pat)
-            .map(|pos| {
-                let after = content[pos + step_pat.len()..]
+        let session_pat = format!("session={}", session_id);
+        let exact_match = |content: &str, pat: &str| -> bool {
+            content.find(pat).map(|pos| {
+                let before = content[..pos].chars().next_back().map(|c| !c.is_ascii_alphanumeric()).unwrap_or(true);
+                let after = content[pos + pat.len()..]
                     .chars()
                     .next()
                     .map(|c| !c.is_ascii_digit())
                     .unwrap_or(true);
-                after
-            })
-            .unwrap_or(false);
+                before && after
+            }).unwrap_or(false)
+        };
+        let session_ok = exact_match(&content, &session_pat);
+        let step_ok = exact_match(&content, &step_pat);
         if session_ok && step_ok {
             // 剥掉元信息前缀，返回纯结果
             return Some(

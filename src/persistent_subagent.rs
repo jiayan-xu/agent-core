@@ -43,14 +43,17 @@ pub struct PersistentSubAgent {
     /// 所属命名空间（A2A 收件箱定位）
     pub ns: String,
     pub state: SubAgentState,
-    /// 收件箱（跨会话累积；Done 后清空）
+    /// 收件箱（跨会话累积；消费经 sub_agent_take_inbox 显式清空，完成态子 agent
+    /// 由老化 sweep 整体回收——不在 Done 时自动清，保留审计痕迹）
     pub inbox: Vec<SubAgentMessage>,
     pub created_at: String,
     /// 最近一次活动（Unix 秒，用于老化清理）
     pub last_active: u64,
-    /// 通知通道（内存态；持久化后重建）
+    /// 通知通道（内存态；持久化后重建）。
+    /// 直接存 UnboundedSender（Clone+Send+Sync，send 取 &self）——无需 Mutex 包裹
+    /// （bug·medium 第三轮：Arc<Mutex<Sender>> 是过度设计，且引入锁序问题）。
     #[serde(skip)]
-    pub notify: Option<Arc<Mutex<mpsc::UnboundedSender<SubAgentMessage>>>>,
+    pub notify: Option<mpsc::UnboundedSender<SubAgentMessage>>,
 }
 
 impl PersistentSubAgent {
@@ -146,10 +149,9 @@ impl SubAgentRegistry {
 
 /// 消息投递：入收件箱 + 通知（若子 agent 已注册 notify 通道）。
 /// 未找到目标子 agent 返回 Err（调用方可用 A2A 原生投递兜底）。
-/// 锁序修复（ocr 2026-08-12 bug·high）：先把 notify 的 sender **克隆出来**
-/// （UnboundedSender 是 Clone 的），在 registry 锁内只做收件箱写入，
-/// 锁外再 send——避免 registry 锁跨 `ntf.lock().await`（防与其它
-/// notify 持锁路径形成锁序环 / 长时间阻塞其它注册表操作）。
+/// 锁序修复（ocr 2026-08-12 bug·high/第三轮）：notify 直接存 UnboundedSender
+/// （send 取 &self 且线程安全）——registry 锁内只写收件箱，锁外再 send，
+/// 不持有任何跨 await 的锁。
 pub async fn deliver(
     registry: &Arc<Mutex<SubAgentRegistry>>,
     to_sub_id: &str,
@@ -168,12 +170,7 @@ pub async fn deliver(
             .ok_or_else(|| format!("子 agent {} 不存在", to_sub_id))?;
         agent.inbox.push(msg.clone());
         agent.last_active = now_unix();
-        // UnboundedSender: Clone 后可在锁外安全 send（不发则丢弃）。
-        // try_lock：notify 锁被占用时跳过通知（不阻塞收件箱写入）。
-        match &agent.notify {
-            Some(ntf) => ntf.try_lock().ok().map(|g| g.clone()),
-            None => None,
-        }
+        agent.notify.clone()
     };
     if let Some(sender) = notify_sender {
         let _ = sender.send(msg);
@@ -183,16 +180,22 @@ pub async fn deliver(
 
 /// 持久化注册表到 JSON 文件（断线续跑：重启后 `load` 恢复）。
 /// 受控写：临时文件 + rename（避免半写损坏）。
+/// tmp 唯一后缀（bug·medium 第三轮）：并发 save 共用 `{path}.tmp` 会互相覆盖/
+/// rename 竞态——用 pid+计数唯一后缀，写完后 rename 到目标。
 pub async fn save(registry: &Arc<Mutex<SubAgentRegistry>>, path: &str) -> Result<(), String> {
     let json = {
         let reg = registry.lock().await;
         serde_json::to_string_pretty(&reg.agents)
             .map_err(|e| format!("序列化子 agent 注册表失败: {}", e))?
     };
-    let tmp = format!("{}.tmp", path);
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = format!("{}.tmp.{}.{}", path, std::process::id(), seq);
     tokio::fs::write(&tmp, json.as_bytes())
         .await
         .map_err(|e| format!("写子 agent 注册表临时文件失败: {}", e))?;
+    // rename 阻塞（perf·medium 已文档化）：同盘 rename 为元数据操作，小文件
+    // 微秒级；跨盘场景罕见（path 固定在工作目录），可接受。
     std::fs::rename(&tmp, path).map_err(|e| format!("原子替换子 agent 注册表失败: {}", e))
 }
 
