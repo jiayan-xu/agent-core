@@ -8,8 +8,11 @@
 
 use std::time::{Duration, Instant};
 
-/// 四预算自治封套。所有字段 `serde(default)`：旧配置缺字段仍解析（向后兼容）。
+/// 四预算自治封套。所有字段 `serde(default)`：旧配置缺整个 budget 表仍解析（向后兼容）。
+/// `deny_unknown_fields`：budget 表**内**拼错键名（如 max_turn）立即报错——
+/// 防「拼错 → 静默 0 → 封套失效 = 无界 LLM 消耗」（安全红线，ocr 2026-08-12 bug·medium）。
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AutonomyBudget {
     /// 本任务最大 LLM 轮次（turns）。code_evolution=提议调用次数；meta_evolution=run_once 内 LLM 调用数。0=不限制。
     #[serde(default)]

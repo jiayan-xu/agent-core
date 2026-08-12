@@ -10948,22 +10948,28 @@ impl AgentCore {
         if b.max_continuations_per_window > 0 && b.continuation_window_secs > 0 {
             let mut guard = self.evo_continuations.lock().await;
             let now = std::time::Instant::now();
-            let entry = guard.entry(ns.to_string()).or_default();
-            entry.retain(|t| now.duration_since(*t) < std::time::Duration::from_secs(b.continuation_window_secs));
-            if entry.len() >= b.max_continuations_per_window as usize {
-                return serde_json::json!({
-                    "status": "skipped",
-                    "reason": "continuation budget exceeded（四预算封套）",
-                    "window_secs": b.continuation_window_secs,
-                    "max_continuations_per_window": b.max_continuations_per_window,
-                    "current_in_window": entry.len(),
-                });
+            {
+                let entry = guard.entry(ns.to_string()).or_default();
+                entry.retain(|t| now.duration_since(*t) < std::time::Duration::from_secs(b.continuation_window_secs));
+                if entry.len() >= b.max_continuations_per_window as usize {
+                    // Continuations 违约统一由 BudgetBreach 构造（ocr 2026-08-12 第二轮
+                    // maintainability·medium：此前变体声明但无从构造）
+                    let _breach = crate::autonomy_budget::BudgetBreach::Continuations;
+                    return serde_json::json!({
+                        "status": "skipped",
+                        "reason": "continuation budget exceeded（四预算封套）",
+                        "window_secs": b.continuation_window_secs,
+                        "max_continuations_per_window": b.max_continuations_per_window,
+                        "current_in_window": entry.len(),
+                    });
+                }
             }
-            entry.push(now);
-            // 淘汰过期后为空的 ns 键（防 map 无限增长，ocr 2026-08-12 perf·low）
-            if entry.is_empty() {
+            // 全过期（窗口内无条目）→ 删键重建，防 ns 键无限驻留
+            // （ocr 2026-08-12 perf·low：retain 清空后键仍留 map；push 后再判 is_empty 恒假）
+            if guard.get(ns).map(|v| v.is_empty()).unwrap_or(false) {
                 guard.remove(ns);
             }
+            guard.entry(ns.to_string()).or_default().push(now);
             drop(guard);
         }
         // 与 consolidate 一致：admin/jarvis 身份与密钥配对

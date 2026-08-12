@@ -290,6 +290,22 @@ pub struct CandidatePrompt {
     pub hash: String,
 }
 
+/// optimize_prompt 错误：LLM 调用失败 or 预算违约（Budget 变体保持类型结构化，
+/// 供 run_once 传播为 RolloutResult::budget_breach，ocr 2026-08-12 bug·medium）
+pub enum OptimizeError {
+    Llm(String),
+    Budget(crate::autonomy_budget::BudgetBreach),
+}
+
+impl std::fmt::Display for OptimizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OptimizeError::Llm(e) => write!(f, "{}", e),
+            OptimizeError::Budget(b) => write!(f, "预算违约 {:?}", b),
+        }
+    }
+}
+
 /// 评估结果
 #[derive(Debug, Clone)]
 pub struct EvalResult {
@@ -753,13 +769,16 @@ impl MetaEvolver {
         Self::parse_negative_samples(&raw)
     }
 
-    /// LLM 精炼演化提示词 → 候选（传入 BudgetTracker 做 turns/tokens/wall-clock 记账）
+    /// LLM 精炼演化提示词 → 候选（传入 BudgetTracker 做 turns/tokens/wall-clock 记账）。
+    /// 错误类型带 BudgetBreach 变体：record_turn 违约可被 run_once 结构化传播为
+    /// RolloutResult::budget_breach（status="budget_breach"，审计可依状态键控，
+    /// ocr 2026-08-12 bug·medium：此前扁平为 String 走 error 状态，turns/tokens 违约被漏报）。
     pub async fn optimize_prompt(
         &self,
         samples: &[NegSample],
         model: &str,
         tracker: &mut BudgetTracker,
-    ) -> Result<CandidatePrompt, String> {
+    ) -> Result<CandidatePrompt, OptimizeError> {
         let sample_txt: Vec<String> = samples
             .iter()
             .take(20)
@@ -787,15 +806,16 @@ impl MetaEvolver {
             tool_calls: None,
             tool_call_id: None,
         };
-        let reply = self.llm.chat(&[msg], &[]).await.map_err(|e| e.to_string())?;
+        let reply = self.llm.chat(&[msg], &[]).await.map_err(OptimizeError::Llm)?;
         // 预算记账（过渡期 chars/4 估算，方案 §6）：turns/tokens/wall-clock 违约
-        // 必须显式传播——静默忽略会导致超限仍继续（ocr 2026-08-12 bug·high 修复）
+        // 必须显式传播——静默忽略会导致超限仍继续（ocr 2026-08-12 bug·high 修复）；
+        // 违约类型保持结构化（bug·medium：不扁平为 String）
         tracker
             .record_turn(crate::autonomy_budget::estimate_tokens(&reply.text))
-            .map_err(|b| format!("预算违约 {:?}: 中止本轮元进化", b))?;
+            .map_err(OptimizeError::Budget)?;
         let text = reply.text.trim().to_string();
         if text.is_empty() {
-            return Err("optimizer 返回空提示词".to_string());
+            return Err(OptimizeError::Llm("optimizer 返回空提示词".to_string()));
         }
         let hash = fnv1a(&text);
         Ok(CandidatePrompt {
@@ -917,7 +937,11 @@ impl MetaEvolver {
             .await
         {
             Ok(c) => c,
-            Err(e) => return RolloutResult::error(&e),
+            // 预算违约 → 结构化 budget_breach 状态（审计可依状态键控，非 error 混淆）
+            Err(OptimizeError::Budget(b)) => {
+                return RolloutResult::budget_breach(b, "optimize_prompt record_turn");
+            }
+            Err(OptimizeError::Llm(e)) => return RolloutResult::error(&e),
         };
         // 预算违约（LLM 轮次后）：不 rollout、不变更提示词（方案 §5）
         if let Err(b) = tracker.check_wall_clock() {
