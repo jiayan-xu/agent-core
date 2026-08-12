@@ -107,7 +107,10 @@ pub fn needs_redaction(payload: &str) -> bool {
             let (token_len, has_underscore) = consume_token_bytes(i + p.len());
             let snake_case = has_underscore
                 && is_snake_case(&bytes[i + p.len()..i + p.len() + token_len]);
-            if token_len >= 16 && !snake_case {
+            // `sk-` 前缀（含 sk-proj_）为强密钥信号：无论后续段形态一律脱敏——
+            // sk-proj_abcdefghijklmnop_1234（全小写+数字段）不得被 snake_case 豁免
+            // 泄漏（ocr 2026-08-12 第十一轮 security·high）
+            if token_len >= 16 && (!snake_case || *p == "sk-") {
                 return true;
             }
         }
@@ -266,7 +269,8 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
             let (token_len, has_underscore) = consume_token_chars(i + p.len());
             let snake_case = has_underscore
                 && is_snake_case_chars(&chars[i + p.len()..i + p.len() + token_len]);
-            if token_len >= 16 && !snake_case {
+            // `sk-` 前缀（含 sk-proj_）为强密钥信号：一律脱敏（第十一轮 security·high）
+            if token_len >= 16 && (!snake_case || *p == "sk-") {
                 out.push_str("[REDACTED_API_KEY]");
                 i += p.len() + token_len;
                 continue;
@@ -552,6 +556,12 @@ mod tests {
             sanitize_agent_payload("sk-proj_abcdefghijklmnop_qrstuvwxyz"),
             "[REDACTED_API_KEY]"
         );
+        // 第十一轮泄漏回归：sk- 前缀为强密钥信号，带数字段也不得被 snake_case 豁免
+        assert_eq!(
+            sanitize_agent_payload("sk-proj_abcdefghijklmnop_1234"),
+            "[REDACTED_API_KEY]"
+        );
+        assert!(needs_redaction("sk-proj_abcdefghijklmnop_1234"));
         assert!(needs_redaction("sk-proj_AbCdEfGhIjKlMnOpQrStUvWxYz"));
         assert!(needs_redaction("sk-proj_9f8e7d6c_5b4a3f2e_1d0c9b8a_7f6e5d4c"));
         assert!(needs_redaction("sk-proj_abcdefghijklmnop_qrstuvwxyz"));

@@ -7322,7 +7322,7 @@ impl AgentCore {
     /// 只克隆取出、**不删除条目**：条目兼作「本 run 已捕获」标记，消费方在 run
     /// 进行中取走快照后，后续写工具不得重新捕获（否则快照反映变更后状态，破坏
     /// 「首个写工具前」不变量，第五轮 bug·medium）。
-    pub async fn take_mutation_snapshot(
+    pub(crate) async fn take_mutation_snapshot(
         &self,
         session_id: &str,
         trace_id: &str,
