@@ -272,6 +272,11 @@ pub struct MutationSnapshot {
     pub captured_at_ms: u64,
 }
 
+/// 变更前快照 map 容量上限（ocr 2026-08-12 第二轮 perf·medium）：
+/// 防「写了工具后不再 run」的会话累积深克隆快照 → 无界内存增长 + 敏感历史滞留。
+/// 超限时淘汰 captured_at_ms 最旧的条目（淘汰在锁外 drop）。
+const MUTATION_SNAPSHOT_MAX: usize = 64;
+
 /// Agent 核心
 pub struct AgentCore {
     pub config: AgentConfig,
@@ -6617,7 +6622,8 @@ impl AgentCore {
 
         // Phase B：每次 run 起始重置本会话的变更前快照（首个写工具执行时重新捕获；
         // 按 session 键控，不影响其他并发会话的快照）
-        self.mutation_snapshot.lock().await.remove(session_id);
+        let stale = self.mutation_snapshot.lock().await.remove(session_id);
+        drop(stale); // 锁外 drop 大结构（深克隆消息列表，ocr 2026-08-12 第二轮 perf·low）
 
         for _round in 0..max_rounds {
             // P2-1: 日 token 预算预估（请求上下文体量），超限硬拒
@@ -7267,7 +7273,10 @@ impl AgentCore {
             if c.len() > head_bytes + TRUNC_MARKER.len() {
                 let head: String = c
                     .char_indices()
-                    .take_while(|&(bi, _)| bi < head_bytes)
+                    // 预留 4 字节给可能的 UTF-8 边界字符，保证 head+marker 严格短于原文
+                    // （ocr 2026-08-12 第二轮 bug·low：bi < head_bytes 时多字节字符可能
+                    // 使 squashed ≥ 原文，saved=0 导致预算循环空转）
+                    .take_while(|&(bi, _)| bi + 4 <= head_bytes)
                     .map(|(_, ch)| ch)
                     .collect();
                 let squashed = format!("{}{}", head, TRUNC_MARKER);
@@ -7600,10 +7609,28 @@ impl AgentCore {
                         trace_id: trace_id.to_string(),
                         captured_at_ms: now_ms,
                     };
-                    self.mutation_snapshot
-                        .lock()
-                        .await
-                        .insert(session_id.to_string(), snap);
+                    // 容量上限：防「写了工具后不再 run 的会话」累积深克隆快照导致无界内存
+                    // 增长与敏感历史滞留（ocr 2026-08-12 第二轮 perf·medium）；超限时淘汰
+                    // 最旧条目。drop 留在锁外执行。
+                    let evicted = {
+                        let mut m = self.mutation_snapshot.lock().await;
+                        if m.len() >= MUTATION_SNAPSHOT_MAX {
+                            let oldest = m
+                                .iter()
+                                .min_by_key(|(_, s)| s.captured_at_ms)
+                                .map(|(k, _)| k.clone());
+                            if let Some(k) = oldest {
+                                m.remove(&k)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    drop(evicted); // 锁外 drop 大结构
+                    let mut m = self.mutation_snapshot.lock().await;
+                    m.insert(session_id.to_string(), snap);
                     tracing::info!(tool = %tc.name, session = %session_id, "mutation_snapshot_captured");
                 }
             }

@@ -1182,14 +1182,14 @@ pub struct Message {
 
 /// 传输层脱敏：对 `role=user` 的正文做凭证脱敏
 /// （对齐 GenOffice sanitizeAgentPayload；只改外发副本，不改历史/存储）。
-/// 返回 `Cow`：**无任何脱敏发生时零克隆**（常见路径复用原 slice），
-/// 仅实际改写时才分配新 Vec（ocr 2026-08-12 perf·low 修复——原实现无条件
-/// 克隆整个消息列表，chat_best_of_n 并发 fan-out 时被放大）。
+/// 返回 `Cow`：**无任何脱敏发生时零克隆**（常见路径复用原 slice，检测走非分配
+/// `needs_redaction` 短路，ocr 2026-08-12 perf·medium 修复）；仅实际改写时才
+/// 分配新 Vec（chat_best_of_n 并发 fan-out 下收益最大化）。
 pub fn sanitize_messages(messages: &[Message]) -> Cow<'_, [Message]> {
     let mut needs_redact = false;
     for m in messages.iter().filter(|m| m.role == "user") {
         if let Some(c) = &m.content {
-            if crate::sanitize::sanitize_agent_payload(c) != *c {
+            if crate::sanitize::needs_redaction(c) {
                 needs_redact = true;
                 break;
             }

@@ -25,9 +25,14 @@ regexes = [
   '''sk-e64d9f088c0f4e099124419477002e2d''',
   # src/sanitize.rs 传输层脱敏单测的模拟密钥（精确字符串豁免，不做整文件路径豁免，
   # 保证该文件未来若出现真实密钥仍会被 gitleaks 捕获）—— ocr-review 2026-08-12 建议。
+  # 含大写变体：gitleaks 默认 OpenAI 规则大小写不敏感（(?i)\b(sk-...)），大写测试串
+  # 在全库扫描下同样命中，必须一并豁免（ocr 2026-08-12 第二轮意见）。
   '''sk-abc1234567890abcdefgh''',
   '''AIzaSyA1234567890abcdefghijklmnopqrstuv''',
   '''ghp_1234567890abcdefghijkl''',
   '''sk-1234567890abcdefghijklmnop''',
   '''secret_abcdefghijklmnopqrstuvwxyz1''',
+  '''SK-ABCDEFGHIJKLMNOPQRSTUVWX''',
+  '''GHP_ABCDEFGHIJKLMNOPQRSTUVWX''',
+  '''SECRET_ABCDEFGHIJKLMNOPQRSTUVWX''',
 ]

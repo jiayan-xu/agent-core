@@ -10,6 +10,99 @@
 //!   3. `password|passwd|secret_key|private_key` 赋值（`=`/`:` 后引号包裹值）→ `[REDACTED_SECURE_TOKEN]`
 //!      （收尾引号扫描跳过 `\` 转义序列、遇换行即止，防跨行/转义引号导致漏脱敏或过度脱敏）
 
+/// 快速判定文本是否**需要**脱敏（非分配实现，供调用方在常见无敏感路径上零成本短路；
+/// ocr 2026-08-12 第二轮 perf·medium：sanitize_messages 的检测 pass 不得再整段分配）。
+/// 检测：规则 1/2/3 任一触发模式存在即返回 true。逻辑与 `sanitize_agent_payload`
+/// 保持同源（触发条件一致，只做存在性判断，不重建输出）。
+pub fn needs_redaction(payload: &str) -> bool {
+    let chars: Vec<char> = payload.chars().collect();
+    let n = chars.len();
+    let starts_with_ci = |i: usize, pat: &str| -> bool {
+        let pb = pat.as_bytes();
+        if i + pb.len() > n {
+            return false;
+        }
+        pb.iter()
+            .enumerate()
+            .all(|(k, &b)| chars[i + k].to_ascii_lowercase() as u8 == b)
+    };
+    let at_word_boundary = |i: usize| -> bool {
+        i == 0
+            || !(chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_' || chars[i - 1] == '-')
+    };
+    let consume_token_chars = |mut j: usize| -> (usize, bool) {
+        let start = j;
+        let mut has_underscore = false;
+        while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '_' || chars[j] == '-') {
+            if chars[j] == '_' {
+                has_underscore = true;
+            }
+            j += 1;
+        }
+        (j - start, has_underscore)
+    };
+    let mut i = 0usize;
+    while i < n {
+        // 规则 1：API key 前缀
+        let prefix_matched = ["sk-", "aiza", "ghp_", "secret_"]
+            .iter()
+            .find(|p| at_word_boundary(i) && starts_with_ci(i, p));
+        if let Some(p) = prefix_matched {
+            let (token_len, has_underscore) = consume_token_chars(i + p.len());
+            if token_len >= 16 && !has_underscore {
+                return true;
+            }
+        }
+        // 规则 2：URL userinfo（scheme://...:...@...）
+        if chars[i] == ':' && starts_with_ci(i, "://") {
+            let mut scheme_start = i;
+            while scheme_start > 0 && chars[scheme_start - 1].is_ascii_alphabetic() {
+                scheme_start -= 1;
+            }
+            let scheme_len = i - scheme_start;
+            if (1..=32).contains(&scheme_len) {
+                if let Some(at) = find_userinfo_at(&chars, i) {
+                    if find_userinfo_colon(&chars, i, at).is_some() {
+                        return true;
+                    }
+                }
+            }
+        }
+        // 规则 3：密钥赋值
+        let key_len = if starts_with_ci(i, "secret_key") {
+            10
+        } else if starts_with_ci(i, "private_key") {
+            11
+        } else if starts_with_ci(i, "password") {
+            8
+        } else if starts_with_ci(i, "passwd") {
+            6
+        } else {
+            0
+        };
+        if key_len > 0 {
+            let mut j = i + key_len;
+            while j < n && (chars[j] == ' ' || chars[j] == '\t') {
+                j += 1;
+            }
+            if j < n && (chars[j] == '=' || chars[j] == ':') {
+                let mut k = j + 1;
+                while k < n && (chars[k] == ' ' || chars[k] == '\t') {
+                    k += 1;
+                }
+                if k < n && (chars[k] == '"' || chars[k] == '\'') {
+                    let quote = chars[k];
+                    if find_closing_quote(&chars, k + 1, quote).is_some() {
+                        return true;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// 对一段文本做脱敏。普通对话（含 "a:b@c" 这类无 scheme 的写法）不会被改写。
 pub fn sanitize_agent_payload(payload: &str) -> String {
     let mut out = String::with_capacity(payload.len());
