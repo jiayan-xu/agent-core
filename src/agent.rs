@@ -308,8 +308,9 @@ pub struct AgentCore {
     /// 指纹防「外部历史替换但条数不变」场景返回过期摘要（P1 审查#3）。
     history_summary_cache: tokio::sync::Mutex<HashMap<String, (usize, String, u64)>>,
     /// Phase B（GenOffice snapshotBefore 借鉴）：本次 run 首个非只读工具执行前的消息快照，
-    /// 供回滚 UI / 自进化 dry_run 复用。每次 run 起始重置，首个写工具执行前捕获一次。
-    pub mutation_snapshot: tokio::sync::Mutex<Option<MutationSnapshot>>,
+    /// 供回滚 UI / 自进化 dry_run 复用。按 session_id 键控（多会话并发互不覆盖，
+    /// ocr 2026-08-12 bug·high 修复）；每次 run 起始删除本会话条目，首个写工具执行前捕获一次。
+    pub mutation_snapshot: tokio::sync::Mutex<HashMap<String, MutationSnapshot>>,
     /// P2-1: 命名空间级配额与成本（tool 轮次 / 日 token 预算 / 并发会话）
     pub quota: Arc<std::sync::Mutex<NsQuotaStore>>,
     /// 白龙马 A3: Focus Stack → Thread 模型 —— 已归档话题（episode）软隐藏索引
@@ -1017,7 +1018,7 @@ impl AgentCore {
             inbox_cache: tokio::sync::Mutex::new(InboxCache::new()),
             session_manager: SessionManager::new(),
             history_summary_cache: tokio::sync::Mutex::new(HashMap::new()),
-            mutation_snapshot: tokio::sync::Mutex::new(None),
+            mutation_snapshot: tokio::sync::Mutex::new(HashMap::new()),
             audit_logger: AuditLogger::new(mcp_for_audit),
             tool_route_cache: tokio::sync::Mutex::new(HashMap::new()),
             namespace_registry: std::sync::Mutex::new(NamespaceRegistry::new()),
@@ -6614,8 +6615,9 @@ impl AgentCore {
         // 反复重试 6-7 轮 → 70s+）。Hard 任务保持 20 轮（固废多步推理）。
         let max_rounds = if is_easy_query { 3u32 } else { self.config.max_tool_rounds };
 
-        // Phase B：每次 run 起始重置变更前快照（首个写工具执行时重新捕获）
-        *self.mutation_snapshot.lock().await = None;
+        // Phase B：每次 run 起始重置本会话的变更前快照（首个写工具执行时重新捕获；
+        // 按 session 键控，不影响其他并发会话的快照）
+        self.mutation_snapshot.lock().await.remove(session_id);
 
         for _round in 0..max_rounds {
             // P2-1: 日 token 预算预估（请求上下文体量），超限硬拒
@@ -7230,37 +7232,67 @@ impl AgentCore {
     fn squash_stale_tool_outputs(messages: &mut Vec<Message>) {
         const BUDGET_BYTES: usize = 256 * 1024;
         const KEEP_RECENT: usize = 2;
-        const OUTPUT_MAX: usize = 2_000;
-        let total: usize = messages
+        const OUTPUT_MAX_BYTES: usize = 2_000;
+        const TRUNC_MARKER: &str = "…(output truncated: too long)";
+        const SHORT_MARKER: &str = "(truncated)";
+        let tool_msgs: Vec<usize> = (0..messages.len())
+            .filter(|&i| messages[i].role == "tool")
+            .collect();
+        let total: usize = tool_msgs
             .iter()
-            .filter(|m| m.role == "tool")
-            .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
+            .map(|&i| messages[i].content.as_ref().map(|c| c.len()).unwrap_or(0))
             .sum();
         if total <= BUDGET_BYTES {
             return;
         }
-        let mut recent = 0;
-        for m in messages.iter_mut().rev() {
-            if m.role != "tool" {
+        // 显式循环：从最旧的 tool 消息开始处理，直到总字节降到预算内（ocr 2026-08-12
+        // bug·medium：原先仅对单条超限消息截断，多条小输出合计超预算时永不收敛；
+        // bug·high：字节/字符单位不匹配，多字节内容截断无效）。
+        // 最近 KEEP_RECENT 条 tool 消息豁免（保留 LLM 刚看到的上下文）。
+        let mut remaining = total;
+        let mut truncated_any = false;
+        let head_bytes = OUTPUT_MAX_BYTES.saturating_sub(TRUNC_MARKER.len());
+        for (idx, &i) in tool_msgs.iter().enumerate() {
+            if remaining <= BUDGET_BYTES {
+                break;
+            }
+            // tool_msgs 升序（旧→新）；最后 KEEP_RECENT 条豁免
+            if tool_msgs.len() - idx <= KEEP_RECENT {
                 continue;
             }
-            recent += 1;
-            if recent <= KEEP_RECENT {
+            let Some(c) = messages[i].content.as_ref() else {
                 continue;
+            };
+            // 长消息：字节级截断 + 字符边界安全切片（多字节内容不撕裂字符）
+            if c.len() > head_bytes + TRUNC_MARKER.len() {
+                let head: String = c
+                    .char_indices()
+                    .take_while(|&(bi, _)| bi < head_bytes)
+                    .map(|(_, ch)| ch)
+                    .collect();
+                let squashed = format!("{}{}", head, TRUNC_MARKER);
+                let saved = c.len().saturating_sub(squashed.len());
+                messages[i].content = Some(squashed);
+                remaining = remaining.saturating_sub(saved);
+                truncated_any = true;
+            } else if c.len() > SHORT_MARKER.len() {
+                // 短消息：截断反而变长（marker 比原文大）→ 整条替换为短标记
+                let saved = c.len() - SHORT_MARKER.len();
+                messages[i].content = Some(SHORT_MARKER.to_string());
+                remaining = remaining.saturating_sub(saved);
+                truncated_any = true;
             }
-            if let Some(c) = &m.content {
-                if c.len() > OUTPUT_MAX {
-                    let head: String = c.chars().take(OUTPUT_MAX).collect();
-                    m.content = Some(format!("{}…(output truncated: too long)", head));
-                }
-            }
+        }
+        if truncated_any {
+            tracing::debug!("squash_stale_tool_outputs: 已按字节预算截断旧 tool 输出");
         }
     }
 
-    /// 取走本次 run 的变更前快照（首个非只读工具执行前的消息列表），
-    /// 供回滚 UI / 自进化 dry_run 复用；None = 本次 run 无写工具执行。
-    pub async fn take_mutation_snapshot(&self) -> Option<MutationSnapshot> {
-        self.mutation_snapshot.lock().await.take()
+    /// 取走指定会话本次 run 的变更前快照（首个非只读工具执行前的消息列表），
+    /// 供回滚 UI / 自进化 dry_run 复用；None = 该会话本次 run 无写工具执行。
+    /// 按 session_id 键控：并发会话各自取走自己的快照，互不串扰（ocr 2026-08-12 bug·high 修复）。
+    pub async fn take_mutation_snapshot(&self, session_id: &str) -> Option<MutationSnapshot> {
+        self.mutation_snapshot.lock().await.remove(session_id)
     }
 
     /// 执行 LLM 返回的工具调用（重构 L 阶段：Agents SDK turn 语义——校验→审批→执行→回灌）。
@@ -7549,21 +7581,29 @@ impl AgentCore {
             }
 
             // Phase B：首个非只读（写）工具执行前捕获变更前快照（GenOffice snapshotBefore 借鉴），
-            // 供回滚 UI / 自进化 dry_run 复用；每次 run 只捕获一次（run 起始已重置）。
+            // 供回滚 UI / 自进化 dry_run 复用；按 session 键控，每次 run 只捕获一次（run 起始已删除本会话条目）。
+            // 深克隆移到锁外（先短锁查 None 再克隆，缩短临界区，ocr 2026-08-12 perf·low 修复）。
             if !crate::boundary::is_read_only_tool(&tc.name) {
-                let mut snap = self.mutation_snapshot.lock().await;
-                if snap.is_none() {
+                let need_capture = {
+                    let m = self.mutation_snapshot.lock().await;
+                    !m.contains_key(session_id)
+                };
+                if need_capture {
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
-                    *snap = Some(MutationSnapshot {
+                    let snap = MutationSnapshot {
                         tool_name: tc.name.clone(),
                         messages_before: messages.clone(),
                         session_id: session_id.to_string(),
                         trace_id: trace_id.to_string(),
                         captured_at_ms: now_ms,
-                    });
+                    };
+                    self.mutation_snapshot
+                        .lock()
+                        .await
+                        .insert(session_id.to_string(), snap);
                     tracing::info!(tool = %tc.name, session = %session_id, "mutation_snapshot_captured");
                 }
             }
@@ -10943,6 +10983,81 @@ mod tool_fix_tests {
         // 无候选返回 None
         let empty: Vec<&String> = vec![];
         assert!(fuzzy_closest(&empty, "anything").is_none());
+    }
+
+    // ── Phase B 单测（ocr 2026-08-12 test·low：快照生命周期 + 字节预算截断）──
+
+    #[test]
+    fn squash_stale_tool_outputs_multibyte_byte_cap() {
+        // 多字节内容：中文 50000 字符 = 150000 字节，且总预算超限才进入截断。
+        // 修复前 guard 用 c.len()（字节）而截断用 chars().take()（字符）→ 多字节内容
+        // 截断无效且 payload 反增；修复后按字节截断 + 字符边界安全切片，总长度必须收缩。
+        let big_cn = "固废".repeat(50_000); // 100000 字符 / 300000 字节（单条已超 256KB 预算）
+        let mut msgs = vec![
+            Message {
+                role: "tool".into(),
+                content: Some(big_cn.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "tool".into(),
+                content: Some("x".repeat(1000)), // 补刀，确保 total > 预算
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "tool".into(),
+                content: Some("recent-ok".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        AgentCore::squash_stale_tool_outputs(&mut msgs);
+        let squashed = msgs[0].content.as_ref().unwrap();
+        assert!(
+            squashed.len() < big_cn.len(),
+            "截断后必须比原文短: {} vs {}",
+            squashed.len(),
+            big_cn.len()
+        );
+        assert!(
+            squashed.ends_with("(output truncated: too long)"),
+            "应带截断标记: {}",
+            squashed
+        );
+        // 字符边界：截断处不得撕裂 UTF-8 序列（无 replacement char）
+        assert!(!squashed.contains('\u{FFFD}'), "不得含替换字符: {squashed}");
+        // 最近 KEEP_RECENT=2 条豁免
+        assert_eq!(msgs[1].content.as_ref().unwrap(), &"x".repeat(1000));
+        assert_eq!(msgs[2].content.as_ref().unwrap(), "recent-ok");
+    }
+
+    #[test]
+    fn squash_stale_tool_outputs_many_small_outputs() {
+        // 多条小输出合计超预算：修复前每条 ≤ OUTPUT_MAX 永不截断 → payload 持续增长；
+        // 修复后从最旧开始截断直到总字节降到预算内。
+        let mut msgs: Vec<Message> = (0..300)
+            .map(|_| Message {
+                role: "tool".into(),
+                content: Some("x".repeat(1000)), // 300KB 总计 > 256KB 预算
+                tool_calls: None,
+                tool_call_id: None,
+            })
+            .collect();
+        AgentCore::squash_stale_tool_outputs(&mut msgs);
+        let total: usize = msgs
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
+            .sum();
+        assert!(
+            total <= 256 * 1024,
+            "截断后总字节必须 ≤ 预算, got {total}"
+        );
+        // 最后两条保留原样（KEEP_RECENT）
+        assert_eq!(msgs[298].content.as_ref().unwrap().len(), 1000);
+        assert_eq!(msgs[299].content.as_ref().unwrap().len(), 1000);
     }
 }
 

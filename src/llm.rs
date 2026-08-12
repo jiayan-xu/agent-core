@@ -1,5 +1,6 @@
 //! LLM 客户端 — 兼容 DeepSeek / OpenAI API（支持流式）
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -1179,10 +1180,25 @@ pub struct Message {
     pub tool_call_id: Option<String>,
 }
 
-/// 传输层脱敏：克隆消息列表，对 `role=user` 的正文做凭证脱敏
+/// 传输层脱敏：对 `role=user` 的正文做凭证脱敏
 /// （对齐 GenOffice sanitizeAgentPayload；只改外发副本，不改历史/存储）。
-pub fn sanitize_messages(messages: &[Message]) -> Vec<Message> {
-    messages
+/// 返回 `Cow`：**无任何脱敏发生时零克隆**（常见路径复用原 slice），
+/// 仅实际改写时才分配新 Vec（ocr 2026-08-12 perf·low 修复——原实现无条件
+/// 克隆整个消息列表，chat_best_of_n 并发 fan-out 时被放大）。
+pub fn sanitize_messages(messages: &[Message]) -> Cow<'_, [Message]> {
+    let mut needs_redact = false;
+    for m in messages.iter().filter(|m| m.role == "user") {
+        if let Some(c) = &m.content {
+            if crate::sanitize::sanitize_agent_payload(c) != *c {
+                needs_redact = true;
+                break;
+            }
+        }
+    }
+    if !needs_redact {
+        return Cow::Borrowed(messages);
+    }
+    let out: Vec<Message> = messages
         .iter()
         .map(|m| {
             if m.role == "user" {
@@ -1197,7 +1213,8 @@ pub fn sanitize_messages(messages: &[Message]) -> Vec<Message> {
             }
             m.clone()
         })
-        .collect()
+        .collect();
+    Cow::Owned(out)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1280,7 +1297,7 @@ impl LlmClient {
     ) -> Result<LlmResponse, String> {
         // 传输层脱敏：user 消息凭证打码后再上送（不改历史/存储）
         let sanitized = sanitize_messages(messages);
-        let messages = sanitized.as_slice();
+        let messages: &[Message] = &sanitized;
         // 主 Provider + 备用 Provider 列表
         let mut providers: Vec<LlmProvider> = Vec::new();
         providers.push(LlmProvider {
@@ -1441,7 +1458,7 @@ impl LlmClient {
     ) -> Result<String, String> {
         // 传输层脱敏：user 消息凭证打码后再上送（不改历史/存储）
         let sanitized = sanitize_messages(messages);
-        let messages = sanitized.as_slice();
+        let messages: &[Message] = &sanitized;
         // P2-6: 主 Provider 失败时尝试备用 Provider
         let mut providers: Vec<LlmProvider> = Vec::new();
         providers.push(LlmProvider {
