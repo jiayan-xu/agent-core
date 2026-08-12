@@ -814,7 +814,18 @@ impl MetaEvolver {
         if let Err(b) = tracker.check_wall_clock() {
             return Err(OptimizeError::Budget(b));
         }
-        let reply = self.llm.chat(&[msg], &[]).await.map_err(OptimizeError::Llm)?;
+        let reply = match self.llm.chat(&[msg], &[]).await {
+            Ok(r) => r,
+            Err(e) => {
+                // LLM 失败路径也检查墙钟：调用可能挂起很久，失败返回时若已超限
+                // 仍应报告 budget_breach（防「失败后继续下一轮」绕过封套，
+                // ocr 2026-08-12 第五轮 bug·medium）
+                if let Err(b) = tracker.check_wall_clock() {
+                    return Err(OptimizeError::Budget(b));
+                }
+                return Err(OptimizeError::Llm(e.to_string()));
+            }
+        };
         // 预算记账（过渡期 chars/4 估算，方案 §6）：turns/tokens/wall-clock 违约
         // 必须显式传播——静默忽略会导致超限仍继续（ocr 2026-08-12 bug·high 修复）；
         // 违约类型保持结构化（bug·medium：不扁平为 String）

@@ -291,6 +291,15 @@ fn snapshot_key(session_id: &str, trace_id: &str) -> String {
     format!("{}:{}|{}", session_id.len(), session_id, trace_id)
 }
 
+/// 元进化 continuations 限流裁决结果（配合 AgentCore::continuation_verdict）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationVerdict {
+    /// 允许触发：携带本次触发时刻（调用方负责入窗）
+    Admitted(std::time::Instant),
+    /// 窗口内已达上限：携带当前窗口内计数
+    Denied(usize),
+}
+
 /// Agent 核心
 pub struct AgentCore {
     pub config: AgentConfig,
@@ -10948,22 +10957,28 @@ impl AgentCore {
         if b.max_continuations_per_window > 0 && b.continuation_window_secs > 0 {
             let mut guard = self.evo_continuations.lock().await;
             let now = std::time::Instant::now();
-            let entry = guard.entry(ns.to_string()).or_default();
-            entry.retain(|t| now.duration_since(*t) < std::time::Duration::from_secs(b.continuation_window_secs));
-            if entry.len() >= b.max_continuations_per_window as usize {
-                return serde_json::json!({
-                    "status": "skipped",
-                    "reason": "continuation budget exceeded（四预算封套）",
-                    "window_secs": b.continuation_window_secs,
-                    "max_continuations_per_window": b.max_continuations_per_window,
-                    "current_in_window": entry.len(),
-                });
+            match Self::continuation_verdict(
+                guard.entry(ns.to_string()).or_default(),
+                now,
+                b.max_continuations_per_window,
+                b.continuation_window_secs,
+            ) {
+                ContinuationVerdict::Admitted(t) => {
+                    guard.entry(ns.to_string()).or_default().push(t);
+                    // 注：ns 键在 retain 清空后仍驻留 map——ns 是业务命名空间（数量有限），
+                    // 空 Vec 驻留内存可忽略，无需键淘汰（ocr 2026-08-12 第四轮确认）。
+                }
+                ContinuationVerdict::Denied(count) => {
+                    return serde_json::json!({
+                        "status": "skipped",
+                        "reason": "continuation budget exceeded（四预算封套）",
+                        "window_secs": b.continuation_window_secs,
+                        "max_continuations_per_window": b.max_continuations_per_window,
+                        "current_in_window": count,
+                    });
+                }
             }
-            entry.push(now);
             drop(guard);
-            // 注：ns 键在 retain 清空后仍驻留 map——ns 是业务命名空间（数量有限），
-            // 空 Vec 驻留内存可忽略，无需键淘汰（ocr 2026-08-12 第四轮确认此前清理块
-            // 对新键是白删再建，已移除）。
         }
         // 与 consolidate 一致：admin/jarvis 身份与密钥配对
         let mem_client = memoria_maintenance_client(&self.config.memoria_url, &self.mcp);
@@ -10973,6 +10988,25 @@ impl AgentCore {
             .run_once(&mem_client, ns, &mut tracker)
             .await;
         res.to_json()
+    }
+
+    /// 元进化 continuations 窗口限流裁决（纯函数，独立可测——ocr 2026-08-12 第五轮
+    /// test·medium：此前内联在 run_meta_evolution 无法单测）。
+    /// 语义：窗口内 prune 过期条目 → 计数达标则 Denied（不入窗）→ 否则 Admitted(now)。
+    /// 注：admission 时刻在 run_once 执行前记录——若 run_once 耗时长，窗口语义为
+    /// 「触发时刻」近似而非「完成时刻」（bug·low 已文档化，限流近似可接受）。
+    pub fn continuation_verdict(
+        entry: &mut Vec<std::time::Instant>,
+        now: std::time::Instant,
+        max_per_window: u32,
+        window_secs: u64,
+    ) -> ContinuationVerdict {
+        entry.retain(|t| now.duration_since(*t) < std::time::Duration::from_secs(window_secs));
+        if entry.len() >= max_per_window as usize {
+            ContinuationVerdict::Denied(entry.len())
+        } else {
+            ContinuationVerdict::Admitted(now)
+        }
     }
 
     /// PR5：元进化状态（供 /api/meta-evolution/status）
@@ -11243,6 +11277,50 @@ mod tool_fix_tests {
             assert_eq!(a.unwrap().trace_id, "t-a");
             assert_eq!(b.unwrap().trace_id, "t-b");
         });
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+
+    #[test]
+    fn continuation_verdict_admits_until_cap() {
+        // 窗口内最多 max_per_window 次：前 N 次 Admitted，第 N+1 次 Denied
+        let mut entry: Vec<std::time::Instant> = Vec::new();
+        let now = std::time::Instant::now();
+        for i in 0..3 {
+            match AgentCore::continuation_verdict(&mut entry, now, 3, 3600) {
+                ContinuationVerdict::Admitted(t) => entry.push(t),
+                ContinuationVerdict::Denied(c) => panic!("第 {} 次不应被拒（计数 {}）", i + 1, c),
+            }
+        }
+        assert!(matches!(
+            AgentCore::continuation_verdict(&mut entry, now, 3, 3600),
+            ContinuationVerdict::Denied(3)
+        ));
+    }
+
+    #[test]
+    fn continuation_verdict_prunes_expired() {
+        // 窗口外条目被 prune：旧时刻清空后重新计数
+        let old = std::time::Instant::now() - std::time::Duration::from_secs(7200); // 2h 前（窗口 1h）
+        let mut entry = vec![old, old];
+        let now = std::time::Instant::now();
+        assert!(matches!(
+            AgentCore::continuation_verdict(&mut entry, now, 2, 3600),
+            ContinuationVerdict::Admitted(_)
+        ), "过期条目应被 prune，重新放行");
+    }
+
+    #[test]
+    fn continuation_verdict_denied_reports_count() {
+        let now = std::time::Instant::now();
+        let mut entry: Vec<std::time::Instant> = vec![now; 5];
+        assert_eq!(
+            AgentCore::continuation_verdict(&mut entry, now, 3, 3600),
+            ContinuationVerdict::Denied(5)
+        );
     }
 }
 
