@@ -62,7 +62,11 @@ pub async fn collect_memo_samples(
     let raw = mcp
         .call_json("memory_search_v2", &args)
         .await
-        .unwrap_or_else(|_| serde_json::json!({}));
+        .unwrap_or_else(|e| {
+            // other·medium：MCP 错误不能静默变空结果（否则样本源故障无迹可查）
+            tracing::warn!(target: "agent.meta_evolve", ns = %ns, "experience_memo 召回失败: {}", e);
+            serde_json::json!({})
+        });
     let results = raw
         .get("results")
         .and_then(|r| r.as_array())
@@ -150,6 +154,11 @@ pub async fn recall_plan_step(
     let raw = mcp
         .call_json("memory_search_v2", &args)
         .await
+        .map_err(|e| {
+            // other·medium：后端失败与未命中必须可区分（补日志）
+            tracing::warn!(target: "agent.composer", ns = %ns, "plan_step 召回失败: {}", e);
+            e
+        })
         .ok()?;
     let results = raw.get("results").and_then(|r| r.as_array()).cloned()?;
     for it in results {
@@ -158,7 +167,22 @@ pub async fn recall_plan_step(
             .and_then(|c| c.as_str())
             .unwrap_or("")
             .to_string();
-        if content.contains(&format!("step={}", step_id)) {
+        // 精确 step 匹配（ocr 2026-08-12 bug·high）：`step=3` 不得误配 `step=30`——
+        // 要求匹配位置后不是数字；同时校验 session 前缀防跨会话误取。
+        let step_pat = format!("step={}", step_id);
+        let session_ok = content.contains(&format!("session={}", session_id));
+        let step_ok = content
+            .find(&step_pat)
+            .map(|pos| {
+                let after = content[pos + step_pat.len()..]
+                    .chars()
+                    .next()
+                    .map(|c| !c.is_ascii_digit())
+                    .unwrap_or(true);
+                after
+            })
+            .unwrap_or(false);
+        if session_ok && step_ok {
             // 剥掉元信息前缀，返回纯结果
             return Some(
                 content

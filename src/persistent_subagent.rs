@@ -131,6 +131,17 @@ impl SubAgentRegistry {
         });
         before - self.agents.len()
     }
+
+    /// 从现有 id 推断最大 seq（id 形如 `sub-<agent_id>-<seq>`）——重启后
+    /// seq 恢复用，防新 id 与恢复的旧 id 重复（ocr 2026-08-12 bug·high）。
+    /// 无子 agent 时返回 0（调用方从 1 起）。
+    pub fn max_seq(&self) -> u64 {
+        self.agents
+            .keys()
+            .filter_map(|id| id.rsplit('-').next().and_then(|s| s.parse::<u64>().ok()))
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// 消息投递：入收件箱 + 通知（若子 agent 已注册 notify 通道）。
@@ -173,16 +184,31 @@ pub async fn save(registry: &Arc<Mutex<SubAgentRegistry>>, path: &str) -> Result
     std::fs::rename(&tmp, path).map_err(|e| format!("原子替换子 agent 注册表失败: {}", e))
 }
 
+/// 加载结果状态（区分「文件缺失」与「文件损坏」——other·medium：
+/// 损坏是配置/落盘 bug，应告警而非静默当空注册表）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadStatus {
+    Loaded,
+    Missing,
+    Corrupted,
+}
+
 /// 从 JSON 文件恢复注册表（重启续跑入口）。文件不存在/损坏 → 空注册表（不阻断启动）。
+/// 返回状态供调用方区分处理（损坏时告警）。
 /// 同步实现：供 AgentCore::new（非 async）启动恢复调用。
-pub fn load(path: &str) -> SubAgentRegistry {
+pub fn load(path: &str) -> (SubAgentRegistry, LoadStatus) {
     let mut reg = SubAgentRegistry::new();
-    if let Ok(text) = std::fs::read_to_string(path) {
-        if let Ok(map) = serde_json::from_str::<HashMap<String, PersistentSubAgent>>(&text) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return (reg, LoadStatus::Missing),
+    };
+    match serde_json::from_str::<HashMap<String, PersistentSubAgent>>(&text) {
+        Ok(map) => {
             reg.agents = map;
+            (reg, LoadStatus::Loaded)
         }
+        Err(_) => (reg, LoadStatus::Corrupted),
     }
-    reg
 }
 
 #[cfg(test)]
@@ -255,7 +281,8 @@ mod tests {
         let tmp = std::env::temp_dir().join("sub_agent_test.json");
         let path = tmp.to_string_lossy().to_string();
         save(&reg, &path).await.unwrap();
-        let restored = load(&path);
+        let (restored, status) = load(&path);
+        assert_eq!(status, LoadStatus::Loaded);
         assert_eq!(restored.len(), 1);
         let a = restored.get("sub-x").unwrap();
         assert_eq!(a.state, SubAgentState::Running);

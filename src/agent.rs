@@ -385,6 +385,9 @@ pub struct AgentCore {
     pub(crate) sub_agents: std::sync::Arc<tokio::sync::Mutex<crate::persistent_subagent::SubAgentRegistry>>,
     /// 子 agent id 序列号（单调递增，spawn 时分配）
     pub(crate) sub_agent_seq: std::sync::atomic::AtomicU64,
+    /// 子 agent 注册表持久化路径（构造时 cwd 固定，spawn/清理共用——避免
+    /// 运行时 current_dir 漂移导致读写不一致，ocr 2026-08-12 bug·medium）
+    pub(crate) sub_agents_file: String,
     /// HY3 1.3：技能库注册表（仅 features.skill_library=true 时 Some；否则 None=不注入）
     pub skill_registry: Option<Arc<dyn crate::skill_library::SkillRegistry + Send + Sync>>,
     /// HY3 1.3：LATS 控制器（仅 features.lats=true 时 Some；否则 None=原路径）
@@ -998,12 +1001,24 @@ impl AgentCore {
         let meta_store = std::sync::Arc::new(tokio::sync::Mutex::new(meta_store));
         let evo_continuations =
             std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::<String, Vec<std::time::Instant>>::new()));
-        // P1-B：子 agent 注册表（从 cwd/sub_agents.json 恢复，断线续跑）
+        // P1-B：子 agent 注册表（从 cwd/sub_agents.json 恢复，断线续跑）。
+        // seq 从恢复的注册表推断（max_seq+1），防重启后新 id 与旧 id 重复
+        // （ocr 2026-08-12 bug·high）。文件损坏时显式告警（other·medium：
+        // 不能静默当空注册表，否则丢全部子 agent 句柄）。
         let sub_agents_path = cwd.join("sub_agents.json").to_string_lossy().to_string();
-        let sub_agents = std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::persistent_subagent::load(&sub_agents_path),
-        ));
-        let sub_agent_seq = std::sync::atomic::AtomicU64::new(1);
+        let (sub_agents_registry, load_status) =
+            crate::persistent_subagent::load(&sub_agents_path);
+        if load_status == crate::persistent_subagent::LoadStatus::Corrupted {
+            tracing::warn!(
+                target: "agent.sub_agents",
+                path = %sub_agents_path,
+                "sub_agents.json 存在但解析失败（损坏）——已按空注册表启动，子 agent 句柄丢失"
+            );
+        }
+        let restored_seq = sub_agents_registry.max_seq();
+        let sub_agents = std::sync::Arc::new(tokio::sync::Mutex::new(sub_agents_registry));
+        let sub_agent_seq = std::sync::atomic::AtomicU64::new(restored_seq + 1);
+        let sub_agents_file = sub_agents_path;
         let meta_evolver = crate::meta_evolve::MetaEvolver::new(
             config.meta_evolution.clone(),
             meta_store.clone(),
@@ -1127,6 +1142,7 @@ impl AgentCore {
             evo_continuations,
             sub_agents,
             sub_agent_seq,
+            sub_agents_file,
             skill_registry,
             lats,
             multiagent,
@@ -5307,6 +5323,35 @@ impl AgentCore {
         // P1-1: 续跑——从已完成的步骤结果起步（崩溃恢复后 in_progress_step_results 已填充）
         let mut step_results: HashMap<u32, String> =
             self.in_progress_step_results.lock().await.clone();
+        // P1-C：checkpoint 缺失/过期的兜底——已执行步骤若本地无结果，尝试从
+        // memoria 外置召回（perf·medium：外置不能 write-only，读侧在续跑闭环
+        // 补齐；仅对缺失步骤召回，避免无谓 MCP 调用）。
+        if !step_results.is_empty() {
+            let step_ns = allowed_ns
+                .first()
+                .cloned()
+                .unwrap_or_else(|| self.config.identity.ns());
+            for st in &plan.steps {
+                if !step_results.contains_key(&st.step_id) {
+                    if let Some(recalled) = crate::experience_memo::recall_plan_step(
+                        &self.mcp,
+                        session_id,
+                        st.step_id,
+                        &step_ns,
+                    )
+                    .await
+                    {
+                        step_results.insert(st.step_id, recalled);
+                        tracing::info!(
+                            target: "agent.composer",
+                            session = %session_id,
+                            step = st.step_id,
+                            "plan_step 从 Memoria 外置召回（续跑兜底）"
+                        );
+                    }
+                }
+            }
+        }
         let mut step_errors: Vec<String> = Vec::new();
         let mut executed: Vec<u32> = step_results.keys().cloned().collect();
         let total = plan.steps.len();
@@ -7935,12 +7980,10 @@ impl AgentCore {
             ns.to_string(),
         );
         self.sub_agents.lock().await.insert(agent);
-        let path = std::env::current_dir()
-            .unwrap_or_default()
-            .join("sub_agents.json")
-            .to_string_lossy()
-            .to_string();
-        let _ = crate::persistent_subagent::save(&self.sub_agents, &path).await;
+        // 统一用构造时固定路径（sub_agents_file），与 load 同一 cwd（bug·medium）
+        if let Err(e) = crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file).await {
+            tracing::warn!(target: "agent.sub_agents", "子 agent 注册表持久化失败: {}", e);
+        }
         id
     }
 
@@ -7955,20 +7998,24 @@ impl AgentCore {
     }
 
     /// 列出全部持久子 agent（id / 状态 / 收件箱数），供管理接口展示。
+    /// 先收集快照再释放锁（perf·low：避免持锁期间做 JSON 构造）。
     pub(crate) async fn sub_agent_list(&self) -> Vec<serde_json::Value> {
-        let reg = self.sub_agents.lock().await;
-        reg.iter()
-            .map(|a| {
-                serde_json::json!({
-                    "id": a.id,
-                    "state": format!("{:?}", a.state),
-                    "inbox": a.inbox.len(),
-                    "task_desc": a.task_desc,
-                    "created_at": a.created_at,
-                    "last_active": a.last_active,
+        let snapshots: Vec<serde_json::Value> = {
+            let reg = self.sub_agents.lock().await;
+            reg.iter()
+                .map(|a| {
+                    serde_json::json!({
+                        "id": a.id,
+                        "state": format!("{:?}", a.state),
+                        "inbox": a.inbox.len(),
+                        "task_desc": a.task_desc,
+                        "created_at": a.created_at,
+                        "last_active": a.last_active,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        };
+        snapshots
     }
 
     /// 取指定子 agent 收件箱并清空（消费语义；Done 后收件箱保留至清理）。

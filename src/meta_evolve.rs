@@ -774,16 +774,21 @@ impl MetaEvolver {
             .await
             .unwrap_or_default();
         let mut samples = Self::parse_negative_samples(&raw);
-        // P1-A：追加 experience_memo 样本（第二源；检索 agent 根 ns `agent/{id}`，
-        // 与 agent.rs identity.ns() 一致；best-effort）
+        // P1-A：追加 experience_memo 样本（第二源；best-effort）。
+        // 检索 agent **根 ns** `agent/{id}`（非 identity.ns() 的完整路径
+        // `agent/{id}/{path}`）——经验 memo 面向跨会话全局经验，故在根 ns 检索
+        // （与 recall_failure_lesson 的 root_ns 用法一致；ocr 2026-08-12 bug·medium
+        // 修正注释：此前「与 identity.ns() 一致」表述不准，实为根 ns 约定）。
         let root_ns = format!("agent/{}", self.agent_id);
         let memos = crate::experience_memo::collect_memo_samples(mem_client, &root_ns, limit).await;
-        let mut known: std::collections::HashSet<String> = samples
+        // 去重键：change_type + old_value 复合（仅 old_value 会误并不同样本，
+        // bug·low——同错误文本可能来自不同工具/场景，change_type 承载工具名）
+        let mut known: std::collections::HashSet<(String, String)> = samples
             .iter()
-            .map(|s| s.old_value.clone())
+            .map(|s| (s.change_type.clone(), s.old_value.clone()))
             .collect();
         for m in memos {
-            if known.insert(m.old_value.clone()) {
+            if known.insert((m.change_type.clone(), m.old_value.clone())) {
                 samples.push(m);
             }
         }
