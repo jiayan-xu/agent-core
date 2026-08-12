@@ -1019,9 +1019,10 @@ impl AgentCore {
                 // 人工修复机会）——先备份为 sub_agents.json.corrupted.<ts>。
                 // （第八轮：与上方 warn 合并为单一分支，消除重复匹配）
                 if let Ok(meta) = std::fs::metadata(&sub_agents_path) {
+                    // 毫秒级时间戳（bug·low 第九轮：秒级在两次损坏启动时撞名覆盖）
                     let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
+                        .map(|d| d.as_millis())
                         .unwrap_or(0);
                     let backup = format!("{}.corrupted.{}", sub_agents_path, ts);
                     // 仅备份非空文件（空文件无价值）；copy 失败仅告警（other·low）
@@ -8098,7 +8099,6 @@ impl AgentCore {
         snapshots
     }
 
-    /// 取指定子 agent 收件箱并清空（消费语义；Done 后收件箱保留至清理）。
     /// 取指定子 agent 收件箱并清空（消费语义；Done 后收件箱保留至清理）。
     /// 返回 Option（bug·medium 第六轮）：None = 无消息可取——子 agent 不存在
     /// **或**本次消费回滚（持久化失败）；Some(空) = 存在但当前无消息。调用方

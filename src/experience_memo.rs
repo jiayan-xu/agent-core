@@ -66,6 +66,19 @@ pub async fn record_experience_memo(
     }
 }
 
+/// 从 memo content 提取工具名（"[experience_memo] 工具 X 执行失败：..."）。
+/// 纯函数（test·medium 第九轮：测试调用真实实现而非内联复制）。
+/// 约定：record_experience_memo 固定写入该格式；工具名含空格时取首段近似；
+/// 解析失败回落 "unknown"。
+pub fn parse_tool_from_memo(content: &str) -> String {
+    content
+        .split("工具 ")
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 /// 召回经验 memo 样本（第二样本源）：按标签 `experience_memo` + `lesson` 检索，
 /// 取窗口内最近 `limit` 条，映射为 `NegSample`（change_type 语义：
 /// 用工具名近似「易错操作」，old/new 承载错误上下文，供元优化器学习禁忌）。
@@ -108,12 +121,7 @@ pub async fn collect_memo_samples(
             // 约定：record_experience_memo 固定写入该格式；若工具名含空格（极罕见），
             // 只取首段作为近似标签（maintainability·low 已文档化；解析失败回落
             // "unknown" 不阻断采样）。
-            let tool = content
-                .split("工具 ")
-                .nth(1)
-                .and_then(|s| s.split(' ').next())
-                .unwrap_or("unknown")
-                .to_string();
+            let tool = parse_tool_from_memo(&content);
             Some(crate::meta_evolve::NegSample {
                 change_type: format!("tool_failure:{}", tool),
                 old_value: content.clone(),
@@ -201,15 +209,16 @@ pub async fn recall_plan_step(
             .and_then(|c| c.as_str())
             .unwrap_or("")
             .to_string();
-        // 精确 step 匹配（ocr 2026-08-12 bug·high）：`step=3` 不得误配 `step=30`——
-        // 要求匹配位置后不是数字；**session 同样精确匹配**（bug·high 第三轮：
-        // `session=1` 不得误配 `session=10`）。
+        // 精确 step/session 匹配（bug·medium 第九轮修正）：**只匹配元信息前缀行**
+        // （首行 `[plan_step_result] session=.. step=..`）——结果体可能含
+        // "session=.."/"step=.." 字样（如查询内容），全段扫描会误配。
+        let header = content.lines().next().unwrap_or("");
         let step_pat = format!("step={}", step_id);
         let session_pat = format!("session={}", session_id);
-        let exact_match = |content: &str, pat: &str| -> bool {
-            content.find(pat).map(|pos| {
-                let before = content[..pos].chars().next_back().map(|c| !c.is_ascii_alphanumeric()).unwrap_or(true);
-                let after = content[pos + pat.len()..]
+        let exact_match = |line: &str, pat: &str| -> bool {
+            line.find(pat).map(|pos| {
+                let before = line[..pos].chars().next_back().map(|c| !c.is_ascii_alphanumeric()).unwrap_or(true);
+                let after = line[pos + pat.len()..]
                     .chars()
                     .next()
                     .map(|c| !c.is_ascii_digit())
@@ -217,8 +226,8 @@ pub async fn recall_plan_step(
                 before && after
             }).unwrap_or(false)
         };
-        let session_ok = exact_match(&content, &session_pat);
-        let step_ok = exact_match(&content, &step_pat);
+        let session_ok = exact_match(header, &session_pat);
+        let step_ok = exact_match(header, &step_pat);
         if session_ok && step_ok {
             // 剥掉元信息前缀，返回纯结果
             return Some(
@@ -238,14 +247,11 @@ mod tests {
 
     #[test]
     fn memo_content_parses_tool_name() {
-        // 解析 content 提取工具名的纯逻辑验证
+        // test·medium（第九轮）：调用真实实现 parse_tool_from_memo，不内联复制
         let content = "[experience_memo] 工具 fill_excel_log 执行失败：写入被拒";
-        let tool = content
-            .split("工具 ")
-            .nth(1)
-            .and_then(|s| s.split(' ').next())
-            .unwrap_or("unknown");
-        assert_eq!(tool, "fill_excel_log");
+        assert_eq!(parse_tool_from_memo(content), "fill_excel_log");
+        // 无工具名格式 → unknown 回落
+        assert_eq!(parse_tool_from_memo("随便一段文本"), "unknown");
     }
 
     #[test]
