@@ -13,9 +13,6 @@ paths = [
   '''.*/tests/.*''',
   '''.*/test_.*\.rs''',
   '''.*_test\.rs''',
-  # src/sanitize.rs 传输层脱敏单测：故意用格式合法的模拟密钥
-  # （sk-/AIza/ghp_ 前缀假 key）验证脱敏逻辑，非真实密钥。
-  '''src/sanitize\.rs''',
 ]
 regexes = [
   # 单元测试用的 deadbeef 占位 admin key
@@ -26,4 +23,11 @@ regexes = [
   # 但因存于公开历史（c043779/81e12c6）gitleaks 全库/PR 扫描会命中 → 阻塞所有 PR。
   # 已确认当前 agent.toml api_key=""（env 注入），该 key 无价值，豁免避免 PR 全阻塞。
   '''sk-e64d9f088c0f4e099124419477002e2d''',
+  # src/sanitize.rs 传输层脱敏单测的模拟密钥（精确字符串豁免，不做整文件路径豁免，
+  # 保证该文件未来若出现真实密钥仍会被 gitleaks 捕获）—— ocr-review 2026-08-12 建议。
+  '''sk-abc1234567890abcdefgh''',
+  '''AIzaSyA1234567890abcdefghijklmnopqrstuv''',
+  '''ghp_1234567890abcdefghijkl''',
+  '''sk-1234567890abcdefghijklmnop''',
+  '''secret_abcdefghijklmnopqrstuvwxyz1''',
 ]
