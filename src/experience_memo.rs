@@ -71,12 +71,12 @@ pub async fn record_experience_memo(
 /// 约定：record_experience_memo 固定写入该格式；工具名含空格时取首段近似；
 /// 解析失败回落 "unknown"。
 pub fn parse_tool_from_memo(content: &str) -> String {
-    content
-        .split("工具 ")
-        .nth(1)
-        .and_then(|s| s.split(' ').next())
-        .unwrap_or("unknown")
-        .to_string()
+    // bug·low（第十一轮）：空工具名（"工具  " 后无内容）也会命中 split，需
+    // 显式判空回落 unknown。
+    match content.split("工具 ").nth(1).and_then(|s| s.split(' ').next()) {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => "unknown".to_string(),
+    }
 }
 
 /// 召回经验 memo 样本（第二样本源）：按标签 `experience_memo` + `lesson` 检索，
@@ -218,10 +218,12 @@ pub async fn recall_plan_step(
         let exact_match = |line: &str, pat: &str| -> bool {
             line.find(pat).map(|pos| {
                 let before = line[..pos].chars().next_back().map(|c| !c.is_ascii_alphanumeric()).unwrap_or(true);
+                // after 边界拒字母数字（bug·low 第十一轮）：`step=3x` 与 `step=3`
+                // 是不同 token，仅拒数字会误配（step=3 匹配 step=3a 之类）
                 let after = line[pos + pat.len()..]
                     .chars()
                     .next()
-                    .map(|c| !c.is_ascii_digit())
+                    .map(|c| !c.is_ascii_alphanumeric())
                     .unwrap_or(true);
                 before && after
             }).unwrap_or(false)

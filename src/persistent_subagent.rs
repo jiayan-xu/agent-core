@@ -49,11 +49,19 @@ pub struct PersistentSubAgent {
     pub created_at: String,
     /// 最近一次活动（Unix 秒，用于老化清理）
     pub last_active: u64,
+    /// 持久化 schema 版本（maintainability·medium 第十一轮：sub_agents.json 直读
+    /// 无版本号，未来字段迁移无锚点——serde default 向后兼容旧文件）
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     /// 通知通道（内存态；持久化后重建）。
     /// 直接存 UnboundedSender（Clone+Send+Sync，send 取 &self）——无需 Mutex 包裹
     /// （bug·medium 第三轮：Arc<Mutex<Sender>> 是过度设计，且引入锁序问题）。
     #[serde(skip)]
     pub notify: Option<mpsc::UnboundedSender<SubAgentMessage>>,
+}
+
+fn default_schema_version() -> u32 {
+    1
 }
 
 impl PersistentSubAgent {
@@ -66,6 +74,7 @@ impl PersistentSubAgent {
             inbox: Vec::new(),
             created_at: now_iso(),
             last_active: now_unix_pub(),
+            schema_version: default_schema_version(),
             notify: None,
         }
     }
