@@ -647,6 +647,12 @@ impl MetaEvolver {
 
     // ── 纯函数：可单测，不触网 ──────────────────────────
 
+    /// 是否回滚类样本（rolled_back/corrected）——统一判断点，避免三处字符串
+    /// 字面量漂移（maintainability·low 第十轮）。
+    pub fn is_rollback_class(change_type: &str) -> bool {
+        change_type == "rolled_back" || change_type == "corrected"
+    }
+
     /// 基线回滚率：rolled_back 样本占比
     pub fn baseline_rollback_rate(&self, samples: &[NegSample]) -> f64 {
         // bug·medium（第六轮）：样本池现含两类（rolled_back/corrected 回滚 +
@@ -655,7 +661,7 @@ impl MetaEvolver {
         // 接近 0，熔断/改进判定失真）。
         let rb_class: Vec<&NegSample> = samples
             .iter()
-            .filter(|s| s.change_type == "rolled_back" || s.change_type == "corrected")
+            .filter(|s| Self::is_rollback_class(&s.change_type))
             .collect();
         if rb_class.is_empty() {
             return 0.0;
@@ -665,6 +671,17 @@ impl MetaEvolver {
             .filter(|s| s.change_type == "rolled_back")
             .count() as f64;
         rb / rb_class.len() as f64
+    }
+
+    /// 回滚类样本是否足以支撑优化（bug·medium 第十轮：rb_class 太小（1-2 条）
+    /// 时 baseline 噪声大，优化方向不可靠——至少 MIN_RB_SAMPLES 条才优化）。
+    pub fn has_enough_rollback_evidence(samples: &[NegSample]) -> bool {
+        const MIN_RB_SAMPLES: usize = 3;
+        samples
+            .iter()
+            .filter(|s| Self::is_rollback_class(&s.change_type))
+            .count()
+            >= MIN_RB_SAMPLES
     }
 
     /// 估计候选提示词的回滚率：基线 × (1 − 失败模式覆盖率)
@@ -993,16 +1010,14 @@ impl MetaEvolver {
             };
         }
         // bug·medium（第七轮）：样本池可被 memo 纯撑满 min_samples，但**无回滚
-        // 证据链**（rolled_back/corrected=0）时优化方向不成立（baseline=0，候选
-        // 无从评估改进）——跳过本轮，避免基于工具失败经验乱改演化提示词。
-        let has_rb_evidence = samples
-            .iter()
-            .any(|s| s.change_type == "rolled_back" || s.change_type == "corrected");
-        if !has_rb_evidence {
+        // 证据链**（rolled_back/corrected 不足）时优化方向不成立（baseline 噪声大，
+        // 候选无从评估改进）——跳过本轮，避免基于工具失败经验乱改演化提示词。
+        // 第十轮：门槛从 ≥1 提升为 ≥3（1-2 条回滚样本的 baseline 不可靠）。
+        if !Self::has_enough_rollback_evidence(&samples) {
             return RolloutResult {
                 attempted: false,
                 status: "insufficient_samples".into(),
-                reason: "仅有 experience_memo 样本，无回滚证据链（rolled_back/corrected=0），跳过优化".into(),
+                reason: "回滚证据不足（rolled_back/corrected < 3），跳过优化".into(),
                 baseline_rate: 0.0,
                 candidate_rate: 0.0,
                 passed: false,

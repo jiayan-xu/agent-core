@@ -206,19 +206,25 @@ pub async fn save(registry: &Arc<Mutex<SubAgentRegistry>>, path: &str) -> Result
         let mut f = tokio::fs::File::create(&tmp)
             .await
             .map_err(|e| format!("创建临时文件失败: {}", e))?;
-        f.write_all(json.as_bytes())
-            .await
-            .map_err(|e| format!("写临时文件失败: {}", e))?;
-        f.flush()
-            .await
-            .map_err(|e| format!("flush 临时文件失败: {}", e))?;
-        f.sync_all()
-            .await
-            .map_err(|e| format!("fsync 临时文件失败: {}", e))?;
+        if let Err(e) = async {
+            f.write_all(json.as_bytes()).await?;
+            f.flush().await?;
+            f.sync_all().await?;
+            Ok::<(), std::io::Error>(())
+        }
+        .await
+        {
+            let _ = std::fs::remove_file(&tmp); // 清理残留 tmp（maintainability·low）
+            return Err(format!("写临时文件失败: {}", e));
+        }
     }
     // rename 阻塞（perf·medium 已文档化）：同盘 rename 为元数据操作，小文件
     // 微秒级；跨盘场景罕见（path 固定在工作目录），可接受。
-    std::fs::rename(&tmp, path).map_err(|e| format!("原子替换子 agent 注册表失败: {}", e))
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("原子替换子 agent 注册表失败: {}", e));
+    }
+    Ok(())
 }
 
 /// 加载结果状态（区分「文件缺失」与「文件损坏」——other·medium：
@@ -249,9 +255,14 @@ pub fn load(path: &str) -> (SubAgentRegistry, LoadStatus) {
             // 崩溃恢复（bug·medium 第六轮）：Running 状态是进程内存态，重启后
             // 执行上下文已丢失——统一复位 Idle（由调用方按收件箱/任务重新驱动），
             // 否则永远卡 Running（无法推进/老化）。
+            // 刷新 last_active（bug·high 第十轮）：崩溃前的 Running agent 的
+            // last_active 可能很旧（崩溃时未更新）——复位 Idle 后若不刷新，
+            // 首次 sweep 就按老化删除，直接破坏断线续跑。
+            let now = now_unix_pub();
             for a in map.values_mut() {
                 if a.state == SubAgentState::Running {
                     a.state = SubAgentState::Idle;
+                    a.last_active = now;
                 }
                 a.notify = None; // 通知通道是内存态，重启后无接收方
             }
