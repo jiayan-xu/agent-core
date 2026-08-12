@@ -260,7 +260,8 @@ pub enum MembershipVerdict {
 }
 
 /// 首个变更（非只读）工具执行前的会话快照（Phase B，GenOffice snapshotBefore 借鉴）。
-/// 供回滚 UI / 自进化 dry_run 复用；每次 run 起始重置，首个写工具前捕获一次。
+/// 供回滚 UI / 自进化 dry_run 复用；每个 run 首个写工具前捕获一次（run 起始不删除，
+/// 跨 run 残留由下次写工具按 trace_id 覆盖、容量淘汰清理——第七轮 doc 与生命周期对齐）。
 /// 保真度权衡（ocr 2026-08-12 第三轮 perf·low）：`messages_before` 捕获于每轮末尾
 /// `squash_stale_tool_outputs` 之后，超长 tool 输出可能已含 `(truncated)` 标记，
 /// 即快照非「写前完整历史」——回滚消费方应按需从历史重新加载完整消息。
@@ -7311,15 +7312,23 @@ impl AgentCore {
         }
     }
 
-    /// 取走指定会话本次 run 的变更前快照（首个非只读工具执行前的消息列表），
-    /// 供回滚 UI / 自进化 dry_run 复用；None = 该会话本次 run 无写工具执行。
-    /// 按 session_id 键控：并发会话各自取走自己的快照，互不串扰（ocr 2026-08-12 bug·high 修复）。
-    /// 只克隆取出、**不删除条目**：条目兼作「本次 run 已捕获」标记（contains_key），
-    /// 消费方在 run 进行中取走快照后，后续写工具不得重新捕获（否则快照反映变更后状态，
-    /// 破坏「首个写工具前」不变量，ocr 2026-08-12 第五轮 bug·medium）；条目由
-    /// run 起始的 remove 与容量淘汰清理。
-    pub async fn take_mutation_snapshot(&self, session_id: &str) -> Option<MutationSnapshot> {
-        self.mutation_snapshot.lock().await.get(session_id).cloned()
+    /// 取走指定会话**当前 run**（trace_id 匹配）的变更前快照（首个非只读工具执行前
+    /// 的消息列表），供回滚 UI / 自进化 dry_run 复用。
+    /// None = 该会话本次 run 尚未执行写工具，或仅有旧 run 残留（跨 run 残留由
+    /// 下次写工具覆盖、容量淘汰清理，**不会**被误当作本次 run 的快照返回——
+    /// ocr 2026-08-12 第七轮 documentation·medium：doc 与生命周期对齐）。
+    /// 只克隆取出、**不删除条目**：条目兼作「本次 run 已捕获」标记，消费方在 run
+    /// 进行中取走快照后，后续写工具不得重新捕获（否则快照反映变更后状态，破坏
+    /// 「首个写工具前」不变量，第五轮 bug·medium）。
+    pub async fn take_mutation_snapshot(
+        &self,
+        session_id: &str,
+        trace_id: &str,
+    ) -> Option<MutationSnapshot> {
+        let m = self.mutation_snapshot.lock().await;
+        m.get(session_id)
+            .filter(|s| s.trace_id == trace_id)
+            .cloned()
     }
 
     /// 执行 LLM 返回的工具调用（重构 L 阶段：Agents SDK turn 语义——校验→审批→执行→回灌）。
@@ -7644,10 +7653,15 @@ impl AgentCore {
                     // 无界内存增长与敏感历史滞留（ocr 2026-08-12 第二轮 perf·medium）。
                     // 仅当**新增**条目（本会话此前无残留）且超限时淘汰 seq 最旧条目：
                     // 覆盖旧残留（map 不增长）时不淘汰，避免白丢有效快照（第五轮 bug·low）。
+                    // 淘汰**排除当前会话自身**（正在插入新快照，淘汰自己无意义且会丢
+                    // 本 run 刚捕获的数据）；其他会话的「活跃 run」快照可能被误淘汰
+                    // ——下次写工具会重新捕获（含先前变更的状态），这是容量上限的
+                    // 固有妥协，已文档化（第七轮 bug·medium 缓解）。
                     let inserting_new = !m.contains_key(session_id);
                     if inserting_new && m.len() >= MUTATION_SNAPSHOT_MAX {
                         let oldest = m
                             .iter()
+                            .filter(|(k, _)| k.as_str() != session_id)
                             .min_by_key(|(_, s)| s.seq)
                             .map(|(k, _)| k.clone());
                         if let Some(k) = oldest {
@@ -11111,7 +11125,7 @@ mod tool_fix_tests {
         assert_eq!(msgs[299].content.as_ref().unwrap().len(), 1000);
     }
 
-    // ── 快照生命周期（ocr 2026-08-12 第六轮 test·low：补 capture 语义单测）──
+    // ── 快照生命周期（ocr 2026-08-12 第六/七轮 test·low：补 capture 语义单测）──
 
     fn mock_snapshot(trace: &str, seq: u64) -> MutationSnapshot {
         MutationSnapshot {
@@ -11124,53 +11138,91 @@ mod tool_fix_tests {
         }
     }
 
+    // 用最小 AgentCore 桩验证 take_mutation_snapshot 语义（trace_id 过滤 + 不删条目）
+    struct SnapshotStoreStub(tokio::sync::Mutex<HashMap<String, MutationSnapshot>>);
+    impl SnapshotStoreStub {
+        async fn take(&self, session_id: &str, trace_id: &str) -> Option<MutationSnapshot> {
+            let m = self.0.lock().await;
+            m.get(session_id).filter(|s| s.trace_id == trace_id).cloned()
+        }
+        async fn insert(&self, snap: MutationSnapshot) {
+            self.0.lock().await.insert(snap.session_id.clone(), snap);
+        }
+    }
+
     #[test]
     fn snapshot_take_does_not_clear_capture_flag() {
         // take 只克隆取出、不删除条目：消费方取走后「已捕获」标记仍在，
         // 同 run 后续写工具不会重新捕获变更后状态（第五轮 bug·medium 修复验证）。
-        let store = tokio::sync::Mutex::new(HashMap::<String, MutationSnapshot>::new());
+        let store = SnapshotStoreStub(tokio::sync::Mutex::new(HashMap::new()));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
-            store.lock().await.insert("s1".into(), mock_snapshot("t1", 1));
-            // 等价于 take_mutation_snapshot 的 clone 语义
-            let taken = store.lock().await.get("s1").cloned();
-            assert!(taken.is_some(), "应能取走快照");
+            store.insert(mock_snapshot("t1", 1)).await;
+            let taken = store.take("s1", "t1").await;
+            assert!(taken.is_some(), "trace 匹配应能取走快照");
             assert!(
-                store.lock().await.contains_key("s1"),
+                store.0.lock().await.contains_key("s1"),
                 "take 不得清除已捕获标记"
             );
-            let again = store.lock().await.get("s1").cloned();
+            let again = store.take("s1", "t1").await;
             assert!(again.is_some(), "重复取走应仍返回快照");
         });
     }
 
     #[test]
+    fn snapshot_take_filters_by_trace_id() {
+        // 第七轮 doc·medium：跨 run 残留（旧 trace_id）不得被误当作当前 run 快照返回
+        let store = SnapshotStoreStub(tokio::sync::Mutex::new(HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            store.insert(mock_snapshot("t-old", 1)).await; // 旧 run 残留
+            let stale = store.take("s1", "t-new").await;
+            assert!(
+                stale.is_none(),
+                "旧 run 残留不得被当作当前 run 快照返回"
+            );
+            // 当前 run 捕获后即可取
+            store.insert(mock_snapshot("t-new", 2)).await;
+            let cur = store.take("s1", "t-new").await;
+            assert!(cur.is_some(), "当前 run 快照应可取");
+            assert_eq!(cur.unwrap().trace_id, "t-new");
+        });
+    }
+
+    #[test]
     fn snapshot_capture_semantics_trace_id() {
-        // 捕获判定：同 trace_id 跳过（已捕获）；异 trace_id 覆盖（旧 run 残留）
-        let store = tokio::sync::Mutex::new(HashMap::<String, MutationSnapshot>::new());
+        // 捕获判定语义：同 trace_id 跳过（已捕获）；异 trace_id 覆盖（旧 run 残留）
+        // ——与 execute_tool_calls 内 need_capture 判定一致（第七轮 test·low：
+        // 此处用桩验证判定逻辑本身）。
+        let store = SnapshotStoreStub(tokio::sync::Mutex::new(HashMap::new()));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
             // 残留旧 run 快照（trace_id=t-old）
-            store.lock().await.insert("s1".into(), mock_snapshot("t-old", 1));
-            // 新 run（trace_id=t-new）判定 need_capture：异 trace → true
+            store.insert(mock_snapshot("t-old", 1)).await;
+            // 新 run（trace_id=t-new）判定 need_capture：异 trace → true（需覆盖）
             let need_capture = {
-                let m = store.lock().await;
+                let m = store.0.lock().await;
                 match m.get("s1") {
                     Some(s) => s.trace_id != "t-new",
                     None => true,
                 }
             };
             assert!(need_capture, "异 trace_id 残留应触发重新捕获");
-            // 捕获后同 trace 再判定 → false
-            let mut m = store.lock().await;
-            m.insert("s1".into(), mock_snapshot("t-new", 2));
-            let already = m.get("s1").map(|s| s.trace_id == "t-new").unwrap_or(false);
+            // 捕获后同 trace 再判定 → false（已捕获，跳过）
+            store.insert(mock_snapshot("t-new", 2)).await;
+            let already = {
+                let m = store.0.lock().await;
+                m.get("s1").map(|s| s.trace_id == "t-new").unwrap_or(false)
+            };
             assert!(already, "同 trace_id 应视为已捕获");
         });
     }

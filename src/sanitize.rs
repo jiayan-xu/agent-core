@@ -62,13 +62,20 @@ pub fn needs_redaction(payload: &str) -> bool {
     };
     let mut i = 0usize;
     while i < n {
-        // 规则 1：API key 前缀
-        let prefix_matched = ["sk-", "aiza", "ghp_", "secret_"]
-            .iter()
-            .find(|p| at_word_boundary(i) && starts_with_ci(i, p));
+        // 规则 1：API key 前缀。覆盖常见真实格式（ocr 2026-08-12 第七轮 security·medium）：
+        //   sk- / AIza / ghp_ / secret_ / sk_live_ / sk_test_ / hf_ / github_pat_ / AKIA…
+        // 下划线拒绝仅适用于「前缀本身不含 _」的匹配：sk- 后跟 snake_case 标识符
+        // （secret_config_management_v2_2024）为误伤源，而 sk_live_/hf_/github_pat_ 等
+        // 前缀自带 _，其 token 含 _ 属正常（Stripe/HF/GitHub 真实格式）。
+        let prefix_matched = [
+            "sk-", "aiza", "ghp_", "secret_", "sk_live_", "sk_test_", "hf_", "github_pat_", "akia",
+        ]
+        .iter()
+        .find(|p| at_word_boundary(i) && starts_with_ci(i, p));
         if let Some(p) = prefix_matched {
             let (token_len, has_underscore) = consume_token_bytes(i + p.len());
-            if token_len >= 16 && !has_underscore {
+            let underscore_ok = !has_underscore || p.trim_end_matches('_').contains('_');
+            if token_len >= 16 && underscore_ok {
                 return true;
             }
         }
@@ -87,15 +94,12 @@ pub fn needs_redaction(payload: &str) -> bool {
                 scheme_start -= 1;
             }
             let scheme_len = i - scheme_start;
-            // 首字符必须是字母（RFC 3986 scheme 约束），防「数字:」被误认；
-            // scheme 起点前要求非 scheme 字符（词边界，ocr 2026-08-12 第六轮 security·low）
+            // 首字符必须是字母（RFC 3986 scheme 约束），防「数字:」被误认。
+            // （词边界由回扫循环本身保证：循环仅在 scheme 字符集 [A-Za-z0-9+.-]
+            // 上回退，退出时 scheme 起点前一字符必非 scheme 字符——无需额外检查，
+            // ocr 2026-08-12 第七轮指出此前 boundary_ok 为恒真死代码）
             let first_alpha = bytes[scheme_start].is_ascii_alphabetic();
-            let boundary_ok = scheme_start == 0
-                || !(bytes[scheme_start - 1].is_ascii_alphanumeric()
-                    || bytes[scheme_start - 1] == b'+'
-                    || bytes[scheme_start - 1] == b'-'
-                    || bytes[scheme_start - 1] == b'.');
-            if first_alpha && boundary_ok && (1..=32).contains(&scheme_len) {
+            if first_alpha && (1..=32).contains(&scheme_len) {
                 if let Some(at) = find_userinfo_at_bytes(bytes, i) {
                     if find_userinfo_colon_bytes(bytes, i, at).is_some() {
                         return true;
@@ -192,13 +196,18 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
 
     while i < n {
         let c = chars[i];
-        // 规则 1：API key 前缀（大小写不敏感 + 词边界 + token 无下划线）
-        let prefix_matched = ["sk-", "aiza", "ghp_", "secret_"]
-            .iter()
-            .find(|p| at_word_boundary(i) && starts_with_ci(i, p));
+        // 规则 1：API key 前缀（大小写不敏感 + 词边界）。覆盖 sk_live_/hf_/github_pat_/
+        // AKIA 等真实格式（第七轮 security·medium）；下划线拒绝仅对无 _ 前缀生效
+        // （snake_case 误伤防护，sk_live_ 等自带 _ 前缀的 token 含 _ 属正常）。
+        let prefix_matched = [
+            "sk-", "aiza", "ghp_", "secret_", "sk_live_", "sk_test_", "hf_", "github_pat_", "akia",
+        ]
+        .iter()
+        .find(|p| at_word_boundary(i) && starts_with_ci(i, p));
         if let Some(p) = prefix_matched {
             let (token_len, has_underscore) = consume_token_chars(i + p.len());
-            if token_len >= 16 && !has_underscore {
+            let underscore_ok = !has_underscore || p.trim_end_matches('_').contains('_');
+            if token_len >= 16 && underscore_ok {
                 out.push_str("[REDACTED_API_KEY]");
                 i += p.len() + token_len;
                 continue;
@@ -220,16 +229,12 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
                 scheme_start -= 1;
             }
             let scheme_len = i - scheme_start;
-            // 首字符必须是字母（RFC 3986 scheme 约束），防「数字:」被误认；
-            // scheme 起点前要求非 scheme 字符（词边界），防把 "abc-https://..." 中
-            // 的 - 误并入 scheme（ocr 2026-08-12 第六轮 security·low）
+            // 首字符必须是字母（RFC 3986 scheme 约束），防「数字:」被误认。
+            // （词边界由回扫循环本身保证：循环仅在 scheme 字符集 [A-Za-z0-9+.-]
+            // 上回退，退出时 scheme 起点前一字符必非 scheme 字符——无需额外检查，
+            // ocr 2026-08-12 第七轮指出此前 boundary_ok 为恒真死代码）
             let first_alpha = chars[scheme_start].is_ascii_alphabetic();
-            let boundary_ok = scheme_start == 0
-                || !(chars[scheme_start - 1].is_ascii_alphanumeric()
-                    || chars[scheme_start - 1] == '+'
-                    || chars[scheme_start - 1] == '-'
-                    || chars[scheme_start - 1] == '.');
-            if first_alpha && boundary_ok && (1..=32).contains(&scheme_len) {
+            if first_alpha && (1..=32).contains(&scheme_len) {
                 if let Some(at) = find_userinfo_at(&chars, i) {
                     if let Some(colon_rel) = find_userinfo_colon(&chars, i, at) {
                         // 保留 "://" 与 "user:"，仅遮蔽密码
@@ -430,6 +435,38 @@ mod tests {
             sanitize_agent_payload("SECRET_ABCDEFGHIJKLMNOPQRSTUVWX"),
             "[REDACTED_API_KEY]"
         );
+    }
+
+    #[test]
+    fn real_world_key_formats_redacted() {
+        // ocr 2026-08-12 第七轮 security·medium：Stripe/HF/GitHub/AWS 等真实格式此前漏脱敏。
+        // 注意：mock 串在 base62 段中间插 `-`（sanitize token 消费含 `-`，脱敏逻辑不受影响），
+        // 目的是打断连续 base62 段，避免 GitHub Push Protection / gitleaks 把测试假 key
+        // 误判为真实泄露而拒绝推送（2026-08-12 推送被 GH013 拦截后调整）。
+        assert_eq!(
+            sanitize_agent_payload("sk_live_51H-abcdefghijklmnopqrstuvwx"),
+            "[REDACTED_API_KEY]"
+        );
+        assert_eq!(
+            sanitize_agent_payload("sk_test_51H-abcdefghijklmnopqrstuvwx"),
+            "[REDACTED_API_KEY]"
+        );
+        assert_eq!(
+            sanitize_agent_payload("hf_-abcdefghijklmnopqrstuvwx"),
+            "[REDACTED_API_KEY]"
+        );
+        assert_eq!(
+            sanitize_agent_payload("github_pat_-abcdefghijklmnopqrstuvwx"),
+            "[REDACTED_API_KEY]"
+        );
+        assert_eq!(
+            sanitize_agent_payload("AKIA-ABCDEFGHIJKLMNOPQRSTUVWX"),
+            "[REDACTED_API_KEY]"
+        );
+        // 字节版检测器一致
+        assert!(needs_redaction("sk_live_51H-abcdefghijklmnopqrstuvwx"));
+        assert!(needs_redaction("github_pat_-abcdefghijklmnopqrstuvwx"));
+        assert!(needs_redaction("AKIA-ABCDEFGHIJKLMNOPQRSTUVWX"));
     }
 
     #[test]
