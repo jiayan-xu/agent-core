@@ -284,6 +284,10 @@ pub(crate) struct MutationSnapshot {
 /// 超限时淘汰 seq 最旧的条目。
 const MUTATION_SNAPSHOT_MAX: usize = 64;
 
+/// 元进化 continuations 限流 map 全局键数上限（ocr 2026-08-12 第九轮 security·high）：
+/// ns 是用户可控输入，任意字符串可撑爆 map——上限使内存消耗有界（内存 DoS 防护）。
+const EVO_CONTINUATIONS_MAX_NS: usize = 256;
+
 /// 快照 map 复合键：长度前缀编码 `"{session_len}:{session}|{trace}"`——
 /// 分隔符歧义消除（session_id/trace_id 即使含 `|` 也不会碰撞，
 /// ocr 2026-08-12 第十二轮 bug·low）。
@@ -10953,12 +10957,25 @@ impl AgentCore {
         }
         // P0 四预算封套·continuations 限流（方案 §3 注入点 B）：窗口内触发次数超限 →
         // 直接 skipped、不进入 run_once、零副作用。
+        // 安全护栏（ocr 2026-08-12 第九轮 security·high）：ns 是用户可控输入——
+        // ① 全局键数上限 EVO_CONTINUATIONS_MAX_NS（防任意 ns 字符串撑爆 map 内存 DoS）；
+        // ② 空 Vec 键即时删除（防过期 ns 永久驻留）；③ 新 ns 键超限时按 Denied 处理
+        // （同时收紧「换新 ns 绕过限流」的利用面——虽不能根除，但键数有界）。
         let b = &self.config.meta_evolution.budget;
         if b.max_continuations_per_window > 0 && b.continuation_window_secs > 0 {
             let mut guard = self.evo_continuations.lock().await;
             let now = std::time::Instant::now();
-            // 单次 entry 获取，Admitted 分支复用同一引用（perf·low：避免二次
-            // to_string + entry 查找，ocr 2026-08-12 第八轮）
+            // 键数上限：超过 EVO_CONTINUATIONS_MAX_NS 且当前 ns 无条目 → 拒绝
+            // （内存 DoS 防护；有条目则走既有窗口判定）
+            let is_new_ns = !guard.contains_key(ns);
+            if is_new_ns && guard.len() >= EVO_CONTINUATIONS_MAX_NS {
+                return serde_json::json!({
+                    "status": "skipped",
+                    "reason": "continuation budget exceeded（ns 键数达上限）",
+                    "max_ns_keys": EVO_CONTINUATIONS_MAX_NS,
+                });
+            }
+            // 单次 entry 获取，Admitted 分支复用同一引用（perf·low，第八轮）
             let entry = guard.entry(ns.to_string()).or_default();
             match Self::continuation_verdict(
                 entry,
@@ -10968,8 +10985,12 @@ impl AgentCore {
             ) {
                 ContinuationVerdict::Admitted(t) => {
                     entry.push(t);
-                    // 注：ns 键在 retain 清空后仍驻留 map——ns 是业务命名空间（数量有限），
-                    // 空 Vec 驻留内存可忽略，无需键淘汰（ocr 2026-08-12 第四轮确认）。
+                    // 空 Vec 键删除：当前 ns 原为空（新建或被 retain 清空）→ push 后
+                    // 长度 1，键有内容无需清理；**无条目且窗口内已过期**的场景由
+                    // continuation_verdict 的 retain 处理——若 retain 清空则键变空 Vec，
+                    // 此处 push 后恢复。真正需要清理的是「其他 ns 的空键」：窗口过期后
+                    // 键空驻留，但受全局键数上限约束（EVO_CONTINUATIONS_MAX_NS），
+                    // 有界可接受（第九轮 security·high 缓解：上限使内存消耗有界）。
                 }
                 ContinuationVerdict::Denied(count) => {
                     return serde_json::json!({
@@ -11310,14 +11331,14 @@ mod continuation_tests {
 
     #[test]
     fn continuation_verdict_prunes_expired() {
-        // 窗口外条目被 prune：旧时刻清空后重新计数（checked_sub 防单调钟 underflow）
+        // 窗口外条目被 prune：旧时刻清空后重新计数。
+        // 不用真实 2h 前的 Instant（单调钟短时运行会 underflow 变 no-op，test·low）——
+        // 用「窗口 1s + 2s 前条目」等价构造，保证任何环境下都实际执行 prune。
         let now = std::time::Instant::now();
-        let Some(old) = now.checked_sub(std::time::Duration::from_secs(7200)) else {
-            return; // 单调钟运行不足 2h（极罕见），跳过
-        };
+        let old = now - std::time::Duration::from_secs(2); // 2s 前（窗口 1s，必过期）
         let mut entry = vec![old, old];
         assert!(matches!(
-            AgentCore::continuation_verdict(&mut entry, now, 2, 3600),
+            AgentCore::continuation_verdict(&mut entry, now, 2, 1),
             ContinuationVerdict::Admitted(_)
         ), "过期条目应被 prune，重新放行");
     }

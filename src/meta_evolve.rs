@@ -817,10 +817,13 @@ impl MetaEvolver {
         let reply = match self.llm.chat(&[msg], &[]).await {
             Ok(r) => r,
             Err(e) => {
-                // LLM 失败路径也检查墙钟：调用可能挂起很久，失败返回时若已超限
-                // 仍应报告 budget_breach（防「失败后继续下一轮」绕过封套，
-                // ocr 2026-08-12 第五轮 bug·medium）
+                // 失败也消耗一次「轮次」：不记账可绕过 max_turns（共享 tracker 下
+                // 失败重试无限循环，ocr 2026-08-12 第九轮 bug·medium）。用 0 token
+                // 记账（失败无产出），turns 计数 +1；墙钟超限优先报告。
                 if let Err(b) = tracker.check_wall_clock() {
+                    return Err(OptimizeError::Budget(b));
+                }
+                if let Err(b) = tracker.record_turn(0) {
                     return Err(OptimizeError::Budget(b));
                 }
                 return Err(OptimizeError::Llm(e.to_string()));
