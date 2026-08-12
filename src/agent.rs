@@ -284,6 +284,13 @@ pub(crate) struct MutationSnapshot {
 /// 超限时淘汰 seq 最旧的条目。
 const MUTATION_SNAPSHOT_MAX: usize = 64;
 
+/// 快照 map 复合键：长度前缀编码 `"{session_len}:{session}|{trace}"`——
+/// 分隔符歧义消除（session_id/trace_id 即使含 `|` 也不会碰撞，
+/// ocr 2026-08-12 第十二轮 bug·low）。
+fn snapshot_key(session_id: &str, trace_id: &str) -> String {
+    format!("{}:{}|{}", session_id.len(), session_id, trace_id)
+}
+
 /// Agent 核心
 pub struct AgentCore {
     pub config: AgentConfig,
@@ -7327,7 +7334,7 @@ impl AgentCore {
         session_id: &str,
         trace_id: &str,
     ) -> Option<MutationSnapshot> {
-        let snap_key = format!("{}|{}", session_id, trace_id);
+        let snap_key = snapshot_key(session_id, trace_id);
         self.mutation_snapshot.lock().await.get(&snap_key).cloned()
     }
 
@@ -7624,7 +7631,7 @@ impl AgentCore {
             // 捕获语义：无本 run 键 → 捕获；已有本 run 键 → 已捕获跳过。
             // 旧 run 残留（不同 trace 键）自然共存，由容量淘汰按 seq 清理。
             if !crate::boundary::is_read_only_tool(&tc.name) {
-                let snap_key = format!("{}|{}", session_id, trace_id);
+                let snap_key = snapshot_key(session_id, trace_id);
                 let mut m = self.mutation_snapshot.lock().await;
                 if !m.contains_key(&snap_key) {
                     let now_ms = std::time::SystemTime::now()
@@ -11130,11 +11137,11 @@ mod tool_fix_tests {
     struct SnapshotStoreStub(tokio::sync::Mutex<HashMap<String, MutationSnapshot>>);
     impl SnapshotStoreStub {
         async fn take(&self, session_id: &str, trace_id: &str) -> Option<MutationSnapshot> {
-            let key = format!("{}|{}", session_id, trace_id);
+            let key = snapshot_key(session_id, trace_id);
             self.0.lock().await.get(&key).cloned()
         }
         async fn insert(&self, snap: MutationSnapshot) {
-            let key = format!("{}|{}", snap.session_id, snap.trace_id);
+            let key = snapshot_key(&snap.session_id, &snap.trace_id);
             self.0.lock().await.insert(key, snap);
         }
         async fn keys(&self) -> Vec<String> {
