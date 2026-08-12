@@ -809,9 +809,9 @@ impl MetaEvolver {
             tool_calls: None,
             tool_call_id: None,
         };
-        // LLM 调用前墙钟检查：调用本身耗时不可控（长 prompt / 网络），
-        // 仅依赖调用后 record_turn 的检查会让超限请求仍发出（ocr 2026-08-12 bug·medium）
-        if let Err(b) = tracker.check_wall_clock() {
+        // LLM 调用前预算检查：调用本身耗时不可控（长 prompt / 网络），且 turns 已满
+        // 时调用必违约——预判拒绝，避免超限请求仍发出（ocr 2026-08-12 第五/十一轮）
+        if let Err(b) = tracker.check_pre_call() {
             return Err(OptimizeError::Budget(b));
         }
         let reply = match self.llm.chat(&[msg], &[]).await {

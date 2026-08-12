@@ -381,6 +381,22 @@ pub(crate) async fn handle_meta_evolution_run(
         .and_then(|Json(v)| v.get("namespace").and_then(|x| x.as_str()).map(|s| s.to_string()))
         .filter(|s| !s.is_empty())
         .unwrap_or(default_ns);
+    // ns 校验（ocr 2026-08-12 第十一轮 security·medium）：ns 是用户可控输入，且是
+    // evo_continuations map 的键——超长/畸形字符串会撑大 map（配合键数上限仍应
+    // 限制单键大小）并污染日志。允许字符集：字母数字 _ / : - . + @ 与空格。
+    let ns_valid = ns.len() <= 128
+        && ns
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-/:.+@ ".contains(c));
+    if !ns_valid {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "namespace 非法：长度须 ≤128 且仅含字母数字 _ - / : . + @ 空格"
+            })),
+        )
+            .into_response();
+    }
     let res = agent.run_meta_evolution(&ns).await;
     drop(agent_guard);
     Json(res).into_response()

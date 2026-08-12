@@ -61,6 +61,20 @@ impl AutonomyBudget {
             && self.continuation_window_secs == 0
             && self.gate_command.is_none()
     }
+
+    /// 配置一致性校验（第十一轮 bug·medium）：continuation 两字段必须成对——
+    /// 窗口非 0 而次数为 0（或反之）是配错。返回 Err 时调用方应拒绝加载/告警。
+    pub fn validate(&self) -> Result<(), String> {
+        let window_only = self.continuation_window_secs > 0 && self.max_continuations_per_window == 0;
+        let count_only = self.continuation_window_secs == 0 && self.max_continuations_per_window > 0;
+        if window_only || count_only {
+            return Err(format!(
+                "budget.continuation 配置不配对: window_secs={} max_per_window={}（须同时为 0 或同时 >0）",
+                self.continuation_window_secs, self.max_continuations_per_window
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// 运行时追踪器（每个 evolve 任务一个实例）。
@@ -126,6 +140,17 @@ impl BudgetTracker {
         Ok(())
     }
 
+    /// LLM 调用**前**检查（第十一轮 bug·medium：record_turn 是调用后记账，超限请求
+    /// 已发出才被拦截）。预判：若 turns 已用满（下一次调用必违约）→ 提前拒绝。
+    /// 语义：turns 已用 `max_turns` 次时返回 Turns 违约（`>` 下第 N+1 次必违约）。
+    pub fn check_pre_call(&self) -> Result<(), BudgetBreach> {
+        self.check_wall_clock()?;
+        if self.budget.max_turns > 0 && self.turns >= self.budget.max_turns {
+            return Err(BudgetBreach::Turns);
+        }
+        Ok(())
+    }
+
     /// 生成 `Gate` 违约（供调用方在 gate_command 非 0 退出时统一语义）。
     /// gate 执行本身在调用方（handler 层需要 repo 上下文与异步进程），
     /// 本方法保证违约类型从单一来源构造（ocr 2026-08-12 bug·high：此前
@@ -164,7 +189,11 @@ impl BudgetTracker {
 
 /// 过渡期 token 估算（方案 §6）：真实 usage 未打通前用 chars/4 近似。
 /// 下限 1：1-3 字符的短文本不得估为 0（否则小预算下无限次短调用绕过封套，
-/// ocr 2026-08-12 第六轮 bug·low）。仅用于预算记账，不参与任何协议字段。
+/// ocr 2026-08-12 第六轮 bug·low）。
+/// ⚠️ 已知偏差（第十一轮 bug·low 文档化）：CJK 文本被低估（中文约 1-2 chars/token，
+/// 4 chars/token 的假设偏高）——对中文为主的任务，max_tokens 预算按「估值的 2 倍」
+/// 配置可部分补偿；精确记账待 LlmClient usage 打通（方案 §6 前置子任务）。
+/// 仅用于预算记账，不参与任何协议字段。
 pub fn estimate_tokens(text: &str) -> u64 {
     ((text.chars().count() / 4) as u64).max(1)
 }
@@ -176,6 +205,29 @@ mod tests {
     #[test]
     fn default_budget_is_unset() {
         assert!(AutonomyBudget::default().is_unset());
+    }
+
+    #[test]
+    fn continuation_pair_validation() {
+        // 窗口/次数必须成对（第十一轮 bug·medium）
+        let ok = AutonomyBudget {
+            max_continuations_per_window: 5,
+            continuation_window_secs: 3600,
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
+        let window_only = AutonomyBudget {
+            continuation_window_secs: 3600,
+            ..Default::default()
+        };
+        assert!(window_only.validate().is_err());
+        let count_only = AutonomyBudget {
+            max_continuations_per_window: 5,
+            ..Default::default()
+        };
+        assert!(count_only.validate().is_err());
+        // 全默认合法
+        assert!(AutonomyBudget::default().validate().is_ok());
     }
 
     #[test]
