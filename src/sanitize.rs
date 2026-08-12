@@ -60,11 +60,12 @@ pub fn needs_redaction(payload: &str) -> bool {
         }
         (j - start, has_underscore)
     };
-    // snake_case 段形态判定（第八轮 security·high 修正）：token 中每个 `_` 分隔段
-    // 均为「小写字母或数字、长度 ≤12」→ 判为 snake_case 标识符（误伤源，拒绝脱敏）。
-    // 任何段含大写字母或长度 >12（真实 key 的随机段特征）→ 放行。
+    // snake_case 标识符判定（第九轮 security·high 修正）：仅当 token 的 `_` 分隔段
+    // 全部为「纯小写字母单词段」或「版本段（纯数字 / v+数字）」且至少含一个单词段
+    // 时，才判为 snake_case 标识符（误伤源，拒绝脱敏）。
+    // 任何段含大写字母、或字母数字混合（hex 随机段特征，如 sk-proj_9f8e7d6c_...）
+    // → 判为真实 key，放行脱敏。此判定同时覆盖泄漏与误伤两个方向。
     let is_snake_case = |seg: &[u8]| -> bool {
-        let mut seg_start = 0usize;
         let segs: Vec<&[u8]> = seg
             .split(|&b| b == b'_')
             .filter(|s| !s.is_empty())
@@ -72,10 +73,20 @@ pub fn needs_redaction(payload: &str) -> bool {
         if segs.is_empty() {
             return false;
         }
-        let _ = seg_start;
-        segs.iter().all(|s| {
-            s.len() <= 12 && s.iter().all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit())
-        })
+        let mut has_word = false;
+        for s in &segs {
+            if s.iter().all(|&b| b.is_ascii_lowercase()) {
+                has_word = true; // 纯小写字母单词段
+            } else if s.len() >= 2
+                && (s.iter().all(|&b| b.is_ascii_digit())
+                    || (s[0] == b'v' && s[1..].iter().all(|&b| b.is_ascii_digit())))
+            {
+                // 版本段：纯数字（如 2024）或 v+数字（如 v2）
+            } else {
+                return false; // 含大写 / 字母数字混合（hex 随机段）→ 非标识符
+            }
+        }
+        has_word
     };
     let mut i = 0usize;
     while i < n {
@@ -211,13 +222,30 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
         (j - start, has_underscore)
     };
 
-    // snake_case 段形态判定（与字节版 is_snake_case 同源，防两实现漂移）
+    // snake_case 标识符判定（与字节版 is_snake_case 同构，第九轮 bug·medium 防分歧）：
+    // 段全部为「纯小写字母单词段」或「版本段（纯数字/v+数字）」且至少一个单词段。
     let is_snake_case_chars = |seg: &[char]| -> bool {
-        seg.split(|&c| c == '_')
+        let segs: Vec<&[char]> = seg
+            .split(|&c| c == '_')
             .filter(|s| !s.is_empty())
-            .all(|s| {
-                s.len() <= 12 && s.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit())
-            })
+            .collect();
+        if segs.is_empty() {
+            return false;
+        }
+        let mut has_word = false;
+        for s in &segs {
+            if s.iter().all(|&c| c.is_ascii_lowercase()) {
+                has_word = true;
+            } else if s.len() >= 2
+                && (s.iter().all(|&c| c.is_ascii_digit())
+                    || (s[0] == 'v' && s[1..].iter().all(|&c| c.is_ascii_digit())))
+            {
+                // 版本段
+            } else {
+                return false; // 含大写 / 字母数字混合 → 非标识符
+            }
+        }
+        has_word
     };
 
     while i < n {
@@ -499,9 +527,9 @@ mod tests {
 
     #[test]
     fn sk_proj_underscore_key_redacted() {
-        // ocr 2026-08-12 第八轮 security·high：sk-proj_ 新格式含 `_`，此前被
-        // 「含 _ 即拒」误拒漏脱敏；snake_case 段形态判定（全小写/数字、段长 ≤12）
-        // 后，含大写随机段的真实 key 放行。
+        // ocr 2026-08-12 第八/九轮 security·high：sk-proj_ 新格式含 `_`，此前被
+        // 「含 _ 即拒」误拒漏脱敏；第九轮起 snake_case 判定收窄——hex 分段
+        // （sk-proj_9f8e7d6c_...）字母数字混合段视为真实 key 放行脱敏。
         assert_eq!(
             sanitize_agent_payload("sk-proj_AbCdEfGhIjKlMnOpQrStUvWxYz"),
             "[REDACTED_API_KEY]"
@@ -510,12 +538,24 @@ mod tests {
             sanitize_agent_payload("sk-proj_9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c"),
             "[REDACTED_API_KEY]"
         );
+        // 第九轮泄漏回归：hex 分段（全小写/数字段）不得被误判为 snake_case 豁免
+        assert_eq!(
+            sanitize_agent_payload("sk-proj_9f8e7d6c_5b4a3f2e_1d0c9b8a_7f6e5d4c"),
+            "[REDACTED_API_KEY]"
+        );
         assert!(needs_redaction("sk-proj_AbCdEfGhIjKlMnOpQrStUvWxYz"));
-        // snake_case 标识符仍不误伤
+        assert!(needs_redaction("sk-proj_9f8e7d6c_5b4a3f2e_1d0c9b8a_7f6e5d4c"));
+        // snake_case 标识符仍不误伤（单词段+版本段）
         assert_eq!(
             sanitize_agent_payload("secret_config_management_v2_2024"),
             "secret_config_management_v2_2024"
         );
+        // 第九轮误伤回归：13 字符单词段（configuration）仍是标识符，不得脱敏
+        assert_eq!(
+            sanitize_agent_payload("secret_configuration_management_v2_2024"),
+            "secret_configuration_management_v2_2024"
+        );
+        assert!(!needs_redaction("secret_configuration_management_v2_2024"));
     }
 
     #[test]

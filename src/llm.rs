@@ -1218,6 +1218,13 @@ pub(crate) fn sanitize_messages(messages: &[Message]) -> Cow<'_, [Message]> {
                             m2.content = Some(redacted);
                             return m2;
                         }
+                        // gate/sanitizer 分歧：needs_redaction=true 但 sanitize 未改写——
+                        // 属两实现漂移（不变量测试兜底但此处显式告警，防静默明文外发，
+                        // ocr 2026-08-12 第九轮 security·low）
+                        tracing::warn!(
+                            "sanitize 漂移：needs_redaction=true 但 payload 未改写，len={}",
+                            c.len()
+                        );
                     }
                 }
             }
