@@ -1179,6 +1179,27 @@ pub struct Message {
     pub tool_call_id: Option<String>,
 }
 
+/// 传输层脱敏：克隆消息列表，对 `role=user` 的正文做凭证脱敏
+/// （对齐 GenOffice sanitizeAgentPayload；只改外发副本，不改历史/存储）。
+pub fn sanitize_messages(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|m| {
+            if m.role == "user" {
+                if let Some(c) = &m.content {
+                    let redacted = crate::sanitize::sanitize_agent_payload(c);
+                    if redacted != *c {
+                        let mut m2 = m.clone();
+                        m2.content = Some(redacted);
+                        return m2;
+                    }
+                }
+            }
+            m.clone()
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolCallJson {
     pub id: String,
@@ -1257,6 +1278,9 @@ impl LlmClient {
         messages: &[Message],
         tools: &[ToolDef],
     ) -> Result<LlmResponse, String> {
+        // 传输层脱敏：user 消息凭证打码后再上送（不改历史/存储）
+        let sanitized = sanitize_messages(messages);
+        let messages = sanitized.as_slice();
         // 主 Provider + 备用 Provider 列表
         let mut providers: Vec<LlmProvider> = Vec::new();
         providers.push(LlmProvider {
@@ -1415,6 +1439,9 @@ impl LlmClient {
         tools: &[ToolDef],
         sender: mpsc::UnboundedSender<SseEvent>,
     ) -> Result<String, String> {
+        // 传输层脱敏：user 消息凭证打码后再上送（不改历史/存储）
+        let sanitized = sanitize_messages(messages);
+        let messages = sanitized.as_slice();
         // P2-6: 主 Provider 失败时尝试备用 Provider
         let mut providers: Vec<LlmProvider> = Vec::new();
         providers.push(LlmProvider {

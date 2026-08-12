@@ -43,3 +43,4 @@ pub mod controlled_write; // 受控写「写后回读」协议骨架
 pub mod local_fs; // 本仓沙箱读写文件铁轨（不依赖 dashboard MCP）
 pub mod db_write; // 双轨·轨一：受控改库扳手（cw_select / cw_write）
 pub mod repo_ws; // 双轨·轨二：本机白名单仓库编辑（repo_ws_*）
+pub mod sanitize; // 外发消息凭证脱敏（传输层，对齐 GenOffice sanitizeAgentPayload）
