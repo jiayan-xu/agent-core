@@ -1015,6 +1015,33 @@ impl AgentCore {
                     path = %sub_agents_path,
                     "sub_agents.json 存在但解析失败（损坏）——已按空注册表启动，子 agent 句柄丢失"
                 );
+                // bug·medium（第七轮）：损坏文件不能坐等首次 save 原子覆盖（丢失
+                // 人工修复机会）——先备份为 sub_agents.json.corrupted.<ts>。
+                // （第八轮：与上方 warn 合并为单一分支，消除重复匹配）
+                if let Ok(meta) = std::fs::metadata(&sub_agents_path) {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let backup = format!("{}.corrupted.{}", sub_agents_path, ts);
+                    // 仅备份非空文件（空文件无价值）；copy 失败仅告警（other·low）
+                    if meta.len() > 0 {
+                        if let Err(e) = std::fs::copy(&sub_agents_path, &backup) {
+                            tracing::warn!(
+                                target: "agent.sub_agents",
+                                path = %sub_agents_path,
+                                "损坏文件备份失败: {}",
+                                e
+                            );
+                        } else {
+                            tracing::warn!(
+                                target: "agent.sub_agents",
+                                backup = %backup,
+                                "损坏的 sub_agents.json 已备份（供人工修复）"
+                            );
+                        }
+                    }
+                }
             }
             crate::persistent_subagent::LoadStatus::Unreadable => {
                 // bug·high 第五轮：读失败（权限/IO）不能当 Missing 静默
@@ -1023,27 +1050,6 @@ impl AgentCore {
                     path = %sub_agents_path,
                     "sub_agents.json 存在但无法读取（权限/IO）——已按空注册表启动，断线续跑失效"
                 );
-            }
-            crate::persistent_subagent::LoadStatus::Corrupted => {
-                // bug·medium（第七轮）：损坏文件不能坐等首次 save 原子覆盖（丢失
-                // 人工修复机会）——先备份为 sub_agents.json.corrupted.<ts>。
-                if let Ok(meta) = std::fs::metadata(&sub_agents_path) {
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let backup = format!("{}.corrupted.{}", sub_agents_path, ts);
-                    // 仅备份非空文件（空文件无价值）
-                    if meta.len() > 0 {
-                        let _ = std::fs::copy(&sub_agents_path, &backup);
-                        tracing::warn!(
-                            target: "agent.sub_agents",
-                            path = %sub_agents_path,
-                            backup = %backup,
-                            "损坏的 sub_agents.json 已备份（供人工修复）"
-                        );
-                    }
-                }
             }
             _ => {}
         }
@@ -8050,11 +8056,18 @@ impl AgentCore {
         if let Err(e) =
             crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file).await
         {
-            // 回滚：移除刚投递的消息（匹配 from+content+时间最近的条目）
+            // 回滚：只移除**最后一条**匹配 from+content 的消息（bug·medium 第八轮：
+            // retain 全删会误删历史相同消息——相同内容可能此前投递过多次）。
             {
                 let mut reg = self.sub_agents.lock().await;
                 if let Some(a) = reg.get_mut(to_sub_id) {
-                    a.inbox.retain(|m| !(m.from == from && m.content == content));
+                    if let Some(pos) = a
+                        .inbox
+                        .iter()
+                        .rposition(|m| m.from == from && m.content == content)
+                    {
+                        a.inbox.remove(pos);
+                    }
                     a.last_active = crate::persistent_subagent::now_unix_pub();
                 }
             }

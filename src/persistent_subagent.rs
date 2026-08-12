@@ -126,11 +126,16 @@ impl SubAgentRegistry {
         self.agents.values()
     }
 
-    /// 老化清理：超过 `max_idle_secs` 无活动的已完成/失败子 agent 移除。
+    /// 老化清理（maintainability·medium 第八轮）：超过 `max_idle_secs` 无活动的
+    /// Done/Failed 子 agent 移除；**Idle 长期无活动也移除**（spawn 后从未被驱动
+    /// 的僵尸句柄）；Running 保留（执行中，last_active 应持续更新）。
     pub fn sweep(&mut self, now_unix: u64, max_idle_secs: u64) -> usize {
         let before = self.agents.len();
         self.agents.retain(|_, a| {
-            !a.is_finished() || now_unix.saturating_sub(a.last_active) < max_idle_secs
+            if a.state == SubAgentState::Running {
+                return true;
+            }
+            now_unix.saturating_sub(a.last_active) < max_idle_secs
         });
         before - self.agents.len()
     }
@@ -194,9 +199,23 @@ pub async fn save(registry: &Arc<Mutex<SubAgentRegistry>>, path: &str) -> Result
     static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = format!("{}.tmp.{}.{}", path, std::process::id(), seq);
-    tokio::fs::write(&tmp, json.as_bytes())
-        .await
-        .map_err(|e| format!("写子 agent 注册表临时文件失败: {}", e))?;
+    // 写 + fsync（bug·medium 第八轮）：无 fsync 则断电/崩溃时 rename 成功但数据
+    // 未落盘（页缓存丢失）——注册表是断线续跑核心状态，落盘可靠性优先。
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut f = tokio::fs::File::create(&tmp)
+            .await
+            .map_err(|e| format!("创建临时文件失败: {}", e))?;
+        f.write_all(json.as_bytes())
+            .await
+            .map_err(|e| format!("写临时文件失败: {}", e))?;
+        f.flush()
+            .await
+            .map_err(|e| format!("flush 临时文件失败: {}", e))?;
+        f.sync_all()
+            .await
+            .map_err(|e| format!("fsync 临时文件失败: {}", e))?;
+    }
     // rename 阻塞（perf·medium 已文档化）：同盘 rename 为元数据操作，小文件
     // 微秒级；跨盘场景罕见（path 固定在工作目录），可接受。
     std::fs::rename(&tmp, path).map_err(|e| format!("原子替换子 agent 注册表失败: {}", e))
@@ -265,17 +284,28 @@ mod tests {
         assert_eq!(reg.len(), 1);
         assert!(reg.get("sub-1").is_some());
 
-        // 未完成的不被 sweep
-        let removed = reg.sweep(now() + 9999, 60);
+        // 活跃 Idle（last_active=now，未超时）不被 sweep
+        let removed = reg.sweep(now(), 60);
         assert_eq!(removed, 0);
         assert_eq!(reg.len(), 1);
 
-        // 完成后老化可清
-        reg.get_mut("sub-1").unwrap().state = SubAgentState::Done;
+        // Idle 长期无活动 → 可清（maintainability·medium 第八轮新语义）
         reg.get_mut("sub-1").unwrap().last_active = now() - 120;
         let removed = reg.sweep(now(), 60);
         assert_eq!(removed, 1);
         assert!(reg.is_empty());
+
+        // Running 永不因老化清除（执行中）
+        let mut running = PersistentSubAgent::new(
+            "sub-2".into(),
+            "长任务".into(),
+            "agent/xujiayan".into(),
+        );
+        running.state = SubAgentState::Running;
+        running.last_active = now() - 99999;
+        reg.insert(running);
+        assert_eq!(reg.sweep(now(), 60), 0);
+        assert_eq!(reg.len(), 1);
     }
 
     #[tokio::test]
