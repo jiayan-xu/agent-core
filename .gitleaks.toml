@@ -13,6 +13,9 @@ paths = [
   '''.*/tests/.*''',
   '''.*/test_.*\.rs''',
   '''.*_test\.rs''',
+  # src/sanitize.rs 传输层脱敏单测：故意用格式合法的模拟密钥
+  # （sk-/AIza/ghp_ 前缀假 key）验证脱敏逻辑，非真实密钥。
+  '''src/sanitize\.rs''',
 ]
 regexes = [
   # 单元测试用的 deadbeef 占位 admin key
