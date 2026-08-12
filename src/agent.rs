@@ -10957,14 +10957,17 @@ impl AgentCore {
         if b.max_continuations_per_window > 0 && b.continuation_window_secs > 0 {
             let mut guard = self.evo_continuations.lock().await;
             let now = std::time::Instant::now();
+            // 单次 entry 获取，Admitted 分支复用同一引用（perf·low：避免二次
+            // to_string + entry 查找，ocr 2026-08-12 第八轮）
+            let entry = guard.entry(ns.to_string()).or_default();
             match Self::continuation_verdict(
-                guard.entry(ns.to_string()).or_default(),
+                entry,
                 now,
                 b.max_continuations_per_window,
                 b.continuation_window_secs,
             ) {
                 ContinuationVerdict::Admitted(t) => {
-                    guard.entry(ns.to_string()).or_default().push(t);
+                    entry.push(t);
                     // 注：ns 键在 retain 清空后仍驻留 map——ns 是业务命名空间（数量有限），
                     // 空 Vec 驻留内存可忽略，无需键淘汰（ocr 2026-08-12 第四轮确认）。
                 }
