@@ -60,11 +60,13 @@ pub fn needs_redaction(payload: &str) -> bool {
         }
         (j - start, has_underscore)
     };
-    // snake_case 标识符判定（第九轮 security·high 修正）：仅当 token 的 `_` 分隔段
-    // 全部为「纯小写字母单词段」或「版本段（纯数字 / v+数字）」且至少含一个单词段
-    // 时，才判为 snake_case 标识符（误伤源，拒绝脱敏）。
-    // 任何段含大写字母、或字母数字混合（hex 随机段特征，如 sk-proj_9f8e7d6c_...）
-    // → 判为真实 key，放行脱敏。此判定同时覆盖泄漏与误伤两个方向。
+    // snake_case 标识符判定（第九/十轮 security·high 修正）：仅当 token 的 `_` 分隔段
+    // **全部**为「纯小写字母单词段」或「版本段（纯数字 / v+数字）」**且至少含一个
+    // 版本段**时，才判为 snake_case 标识符（误伤源，拒绝脱敏）。
+    // 版本段是标识符的强特征（真实 API key 几乎不带 `_v2_`/`_2024` 版本号）：
+    // - `secret_configuration_management_v2_2024`：单词段 + v2/2024 版本段 → 豁免 ✓
+    // - `sk-proj_abcdefghijklmnop_qrstuvwxyz`（全小写随机段、无版本段）→ 脱敏 ✓
+    // - 任何段含大写 / 字母数字混合（hex 随机段，如 9f8e7d6c）→ 脱敏 ✓
     let is_snake_case = |seg: &[u8]| -> bool {
         let segs: Vec<&[u8]> = seg
             .split(|&b| b == b'_')
@@ -73,20 +75,20 @@ pub fn needs_redaction(payload: &str) -> bool {
         if segs.is_empty() {
             return false;
         }
-        let mut has_word = false;
+        let mut has_version = false;
         for s in &segs {
             if s.iter().all(|&b| b.is_ascii_lowercase()) {
-                has_word = true; // 纯小写字母单词段
+                // 纯小写字母单词段（长度不限：configuration=13 也是单词）
             } else if s.len() >= 2
                 && (s.iter().all(|&b| b.is_ascii_digit())
                     || (s[0] == b'v' && s[1..].iter().all(|&b| b.is_ascii_digit())))
             {
-                // 版本段：纯数字（如 2024）或 v+数字（如 v2）
+                has_version = true; // 版本段：纯数字（如 2024）或 v+数字（如 v2）
             } else {
                 return false; // 含大写 / 字母数字混合（hex 随机段）→ 非标识符
             }
         }
-        has_word
+        has_version
     };
     let mut i = 0usize;
     while i < n {
@@ -223,7 +225,8 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
     };
 
     // snake_case 标识符判定（与字节版 is_snake_case 同构，第九轮 bug·medium 防分歧）：
-    // 段全部为「纯小写字母单词段」或「版本段（纯数字/v+数字）」且至少一个单词段。
+    // 段全部为「纯小写字母单词段」或「版本段（纯数字/v+数字）」且至少一个版本段
+    //（第十轮 security·high：全小写随机段无版本号不得豁免，与字节版同构防分歧）。
     let is_snake_case_chars = |seg: &[char]| -> bool {
         let segs: Vec<&[char]> = seg
             .split(|&c| c == '_')
@@ -232,20 +235,20 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
         if segs.is_empty() {
             return false;
         }
-        let mut has_word = false;
+        let mut has_version = false;
         for s in &segs {
             if s.iter().all(|&c| c.is_ascii_lowercase()) {
-                has_word = true;
+                // 纯小写字母单词段（长度不限）
             } else if s.len() >= 2
                 && (s.iter().all(|&c| c.is_ascii_digit())
                     || (s[0] == 'v' && s[1..].iter().all(|&c| c.is_ascii_digit())))
             {
-                // 版本段
+                has_version = true; // 版本段
             } else {
                 return false; // 含大写 / 字母数字混合 → 非标识符
             }
         }
-        has_word
+        has_version
     };
 
     while i < n {
@@ -543,8 +546,15 @@ mod tests {
             sanitize_agent_payload("sk-proj_9f8e7d6c_5b4a3f2e_1d0c9b8a_7f6e5d4c"),
             "[REDACTED_API_KEY]"
         );
+        // 第十轮泄漏回归：全小写随机段（无版本段）不得豁免——sk-proj_ 后跟
+        // 纯小写长段（abcdefghijklmnop 16 字符）无版本号，判为真实 key
+        assert_eq!(
+            sanitize_agent_payload("sk-proj_abcdefghijklmnop_qrstuvwxyz"),
+            "[REDACTED_API_KEY]"
+        );
         assert!(needs_redaction("sk-proj_AbCdEfGhIjKlMnOpQrStUvWxYz"));
         assert!(needs_redaction("sk-proj_9f8e7d6c_5b4a3f2e_1d0c9b8a_7f6e5d4c"));
+        assert!(needs_redaction("sk-proj_abcdefghijklmnop_qrstuvwxyz"));
         // snake_case 标识符仍不误伤（单词段+版本段）
         assert_eq!(
             sanitize_agent_payload("secret_config_management_v2_2024"),

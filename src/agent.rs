@@ -262,20 +262,21 @@ pub enum MembershipVerdict {
 /// 首个变更（非只读）工具执行前的会话快照（Phase B，GenOffice snapshotBefore 借鉴）。
 /// 供回滚 UI / 自进化 dry_run 复用；每个 run 首个写工具前捕获一次（run 起始不删除，
 /// 跨 run 残留由下次写工具按 trace_id 覆盖、容量淘汰清理——第七轮 doc 与生命周期对齐）。
-/// 保真度权衡（ocr 2026-08-12 第三轮 perf·low）：`messages_before` 捕获于每轮末尾
-/// `squash_stale_tool_outputs` 之后，超长 tool 输出可能已含 `(truncated)` 标记，
-/// 即快照非「写前完整历史」——回滚消费方应按需从历史重新加载完整消息。
+/// 保真度权衡（ocr 2026-08-12 第三轮 perf·low）：`messages_before` 捕获于首个写工具
+/// 执行前（execute_tool_calls 内），此时历史中较早轮次的超长 tool 输出可能已被
+/// `squash_stale_tool_outputs` 截断（含 `(truncated)` 标记）——即快照非「写前完整
+/// 历史」，回滚消费方应按需从历史重新加载完整消息。
 #[derive(Debug, Clone)]
-pub struct MutationSnapshot {
+pub(crate) struct MutationSnapshot {
     /// 触发快照的写工具名
-    pub tool_name: String,
+    pub(crate) tool_name: String,
     /// 捕获时该 run 的消息列表（含系统 prompt 与已执行工具结果）
-    pub messages_before: Vec<crate::llm::Message>,
-    pub session_id: String,
-    pub trace_id: String,
-    pub captured_at_ms: u64,
+    pub(crate) messages_before: Vec<crate::llm::Message>,
+    pub(crate) session_id: String,
+    pub(crate) trace_id: String,
+    pub(crate) captured_at_ms: u64,
     /// 单调递增序号（淘汰排序用，不依赖可回拨的墙钟；ocr 2026-08-12 第三轮 bug·medium）
-    pub seq: u64,
+    pub(crate) seq: u64,
 }
 
 /// 变更前快照 map 容量上限（ocr 2026-08-12 第二轮 perf·medium）：
