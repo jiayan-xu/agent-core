@@ -33,12 +33,18 @@ pub fn needs_redaction(payload: &str) -> bool {
             .enumerate()
             .all(|(k, &b)| bytes[i + k].to_ascii_lowercase() == b)
     };
-    // 词边界：i 之前必须是「非 token 字节」（防 task-123... 里的 sk- 误命中）
+    // 词边界（规则 1 用）：i 之前必须是「非 token 字节」（防 task-123... 里的 sk- 误命中）
     let at_word_boundary = |i: usize| -> bool {
         i == 0
             || !(bytes[i - 1].is_ascii_alphanumeric()
                 || bytes[i - 1] == b'_'
                 || bytes[i - 1] == b'-')
+    };
+    // 弱边界（规则 3 用）：i 之前仅要求「非字母数字」——允许 `_`/`-` 前缀，
+    // 覆盖 DB_PASSWORD= / api_secret_key= 等常见 env/JSON 键名（ocr 2026-08-12
+    // 第五轮 security·medium），同时仍挡 mypassword/resetpassword（前邻字母）。
+    let at_weak_boundary = |i: usize| -> bool {
+        i == 0 || !bytes[i - 1].is_ascii_alphanumeric()
     };
     // 消费 [A-Za-z0-9_-]，返回消费掉的字节数；同时检测 token 内是否含下划线
     let consume_token_bytes = |mut j: usize| -> (usize, bool) {
@@ -68,12 +74,22 @@ pub fn needs_redaction(payload: &str) -> bool {
         }
         // 规则 2：URL userinfo（scheme://...:...@...）
         if bytes[i] == b':' && starts_with_ci(i, "://") {
+            // RFC 3986 scheme = 字母开头 + [A-Za-z0-9+.-]*：s3://、git+ssh:// 等
+            // 含数字/符号的 scheme 也要识别（ocr 2026-08-12 第五轮 security·medium；
+            // 原实现仅回扫字母，s3:// 的 scheme_len 会算成 0 而漏脱敏）
             let mut scheme_start = i;
-            while scheme_start > 0 && bytes[scheme_start - 1].is_ascii_alphabetic() {
+            while scheme_start > 0
+                && (bytes[scheme_start - 1].is_ascii_alphanumeric()
+                    || bytes[scheme_start - 1] == b'+'
+                    || bytes[scheme_start - 1] == b'-'
+                    || bytes[scheme_start - 1] == b'.')
+            {
                 scheme_start -= 1;
             }
             let scheme_len = i - scheme_start;
-            if (1..=32).contains(&scheme_len) {
+            // 首字符必须是字母（RFC 3986 scheme 约束），防「数字:」被误认
+            let first_alpha = bytes[scheme_start].is_ascii_alphabetic();
+            if first_alpha && (1..=32).contains(&scheme_len) {
                 if let Some(at) = find_userinfo_at_bytes(bytes, i) {
                     if find_userinfo_colon_bytes(bytes, i, at).is_some() {
                         return true;
@@ -93,7 +109,8 @@ pub fn needs_redaction(payload: &str) -> bool {
         } else {
             0
         };
-        if key_len > 0 && at_word_boundary(i) {
+        // 规则 3：密钥赋值 key = "value" / key: "value"（key 大小写不敏感 + 弱边界）
+        if key_len > 0 && at_weak_boundary(i) {
             let mut j = i + key_len;
             // JSON 风格键名（"password": "value"）：键名收尾引号后接 :，
             // 当前逻辑漏脱敏（ocr 2026-08-12 第四轮 security·high），此处跳过一个收尾引号
@@ -140,10 +157,16 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
         })
     };
 
-    // 词边界：i 之前必须是「非 token 字符」（防 task-123... 里的 sk- 误命中）
+    // 词边界（规则 1 用）：i 之前必须是「非 token 字符」（防 task-123... 里的 sk- 误命中）
     let at_word_boundary = |i: usize| -> bool {
         i == 0
             || !(chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_' || chars[i - 1] == '-')
+    };
+
+    // 弱边界（规则 3 用）：仅要求前邻非字母数字，允许 `_`/`-` 前缀（DB_PASSWORD= 等，
+    // ocr 2026-08-12 第五轮 security·medium）
+    let at_weak_boundary = |i: usize| -> bool {
+        i == 0 || !chars[i - 1].is_ascii_alphanumeric()
     };
 
     // 消费 [A-Za-z0-9_-]，返回消费掉的字符数；同时检测 token 内是否含下划线
@@ -179,13 +202,21 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
         // 触发点 = ':' 位置；scheme 字符（如 https 的 h..s）已在此前按原样输出，
         // 因此只需补 "://" + user: + 遮蔽密码。
         if c == ':' && starts_with_ci(i, "://") {
-            // 回找 scheme 起点（连续 ASCII 字母，大小写均可；RFC 3986 scheme 大小写不敏感）
+            // RFC 3986 scheme = 字母开头 + [A-Za-z0-9+.-]*：s3://、git+ssh:// 等
+            // 含数字/符号的 scheme 也要识别（ocr 2026-08-12 第五轮 security·medium）
             let mut scheme_start = i;
-            while scheme_start > 0 && chars[scheme_start - 1].is_ascii_alphabetic() {
+            while scheme_start > 0
+                && (chars[scheme_start - 1].is_ascii_alphanumeric()
+                    || chars[scheme_start - 1] == '+'
+                    || chars[scheme_start - 1] == '-'
+                    || chars[scheme_start - 1] == '.')
+            {
                 scheme_start -= 1;
             }
             let scheme_len = i - scheme_start;
-            if (1..=32).contains(&scheme_len) {
+            // 首字符必须是字母（RFC 3986 scheme 约束），防「数字:」被误认
+            let first_alpha = chars[scheme_start].is_ascii_alphabetic();
+            if first_alpha && (1..=32).contains(&scheme_len) {
                 if let Some(at) = find_userinfo_at(&chars, i) {
                     if let Some(colon_rel) = find_userinfo_colon(&chars, i, at) {
                         // 保留 "://" 与 "user:"，仅遮蔽密码
@@ -198,7 +229,7 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
                 }
             }
         }
-        // 规则 3：密钥赋值 key = "value" / key: "value"（key 大小写不敏感 + 词边界防误伤）
+        // 规则 3：密钥赋值 key = "value" / key: "value"（key 大小写不敏感 + 弱边界）
         let key_len = if starts_with_ci(i, "secret_key") {
             10
         } else if starts_with_ci(i, "private_key") {
@@ -210,7 +241,7 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
         } else {
             0
         };
-        if key_len > 0 && at_word_boundary(i) {
+        if key_len > 0 && at_weak_boundary(i) {
             // 允许 key 后空格
             let mut j = i + key_len;
             // JSON 风格键名（"password": "value"）：跳过一个收尾引号再找分隔符
@@ -247,13 +278,19 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
 }
 
 /// 从 `start` 起寻找与 `quote` 匹配的收尾引号：
-/// - 遇 `\` 跳过下一字符（转义引号不算收尾）
+/// - 遇 `\` 跳过下一字符（转义引号不算收尾）；若下一字符是换行则返回 None（行尾
+///   反斜杠不得跨行匹配，ocr 2026-08-12 第五轮 bug·low）
 /// - 遇 `\n`/`\r` 返回 None（不跨行）
 fn find_closing_quote(chars: &[char], start: usize, quote: char) -> Option<usize> {
     let mut j = start;
     while j < chars.len() {
         match chars[j] {
-            '\\' => j += 2, // 跳过转义序列（含 \" 本身）
+            '\\' => {
+                if j + 1 < chars.len() && (chars[j + 1] == '\n' || chars[j + 1] == '\r') {
+                    return None;
+                }
+                j += 2; // 跳过转义序列（含 \" 本身）
+            }
             '\n' | '\r' => return None,
             q if q == quote => return Some(j - start),
             _ => j += 1,
@@ -267,7 +304,12 @@ fn find_closing_quote_bytes(bytes: &[u8], start: usize, quote: char) -> Option<u
     let mut j = start;
     while j < bytes.len() {
         match bytes[j] {
-            b'\\' => j += 2, // 跳过转义序列（含 \" 本身）
+            b'\\' => {
+                if j + 1 < bytes.len() && (bytes[j + 1] == b'\n' || bytes[j + 1] == b'\r') {
+                    return None;
+                }
+                j += 2; // 跳过转义序列（含 \" 本身）
+            }
             b'\n' | b'\r' => return None,
             q if q as char == quote => return Some(j - start),
             _ => j += 1,
@@ -504,6 +546,56 @@ mod tests {
             "resetpassword = \"x\""
         );
         assert!(!needs_redaction("mypassword = \"abc\""));
+    }
+
+    #[test]
+    fn env_style_keys_redacted() {
+        // ocr 2026-08-12 第五轮 security·medium：弱边界允许 `_`/`-` 前缀，
+        // DB_PASSWORD= / api_secret_key= 等 env/JSON 键名必须脱敏
+        assert_eq!(
+            sanitize_agent_payload("DB_PASSWORD=\"postgres\""),
+            "DB_PASSWORD=\"[REDACTED_SECURE_TOKEN]\""
+        );
+        assert_eq!(
+            sanitize_agent_payload("RDS_PASSWORD=\"hunter2\""),
+            "RDS_PASSWORD=\"[REDACTED_SECURE_TOKEN]\""
+        );
+        assert_eq!(
+            sanitize_agent_payload("api_secret_key=\"abc\""),
+            "api_secret_key=\"[REDACTED_SECURE_TOKEN]\""
+        );
+        assert_eq!(
+            sanitize_agent_payload("{\"db_password\": \"x\"}"),
+            "{\"db_password\": \"[REDACTED_SECURE_TOKEN]\"}"
+        );
+        // 字节版检测器保持一致
+        assert!(needs_redaction("DB_PASSWORD=\"postgres\""));
+        assert!(needs_redaction("api_secret_key=\"abc\""));
+    }
+
+    #[test]
+    fn compound_scheme_redacted() {
+        // ocr 2026-08-12 第五轮 security·medium：RFC 3986 scheme 含数字/符号
+        // （s3://、git+ssh:// 等），原实现仅回扫字母会漏脱敏
+        assert_eq!(
+            sanitize_agent_payload("s3://admin:hunter2@bucket.example/x"),
+            "s3://admin:[REDACTED_CREDENTIALS]@bucket.example/x"
+        );
+        assert_eq!(
+            sanitize_agent_payload("git+ssh://user:pass@host/repo"),
+            "git+ssh://user:[REDACTED_CREDENTIALS]@host/repo"
+        );
+        assert!(needs_redaction("s3://admin:hunter2@bucket.example/x"));
+    }
+
+    #[test]
+    fn trailing_backslash_does_not_cross_line() {
+        // ocr 2026-08-12 第五轮 bug·low：行尾反斜杠跳过换行继续匹配引号 → 跨行过度脱敏
+        assert_eq!(
+            sanitize_agent_payload("password = \"abc\\\n\"def\""),
+            "password = \"abc\\\n\"def\""
+        );
+        assert!(!needs_redaction("password = \"abc\\\n\"def\""));
     }
 
     #[test]

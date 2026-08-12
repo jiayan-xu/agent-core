@@ -6628,10 +6628,10 @@ impl AgentCore {
         // 反复重试 6-7 轮 → 70s+）。Hard 任务保持 20 轮（固废多步推理）。
         let max_rounds = if is_easy_query { 3u32 } else { self.config.max_tool_rounds };
 
-        // Phase B：每次 run 起始重置本会话的变更前快照（首个写工具执行时重新捕获；
-        // 按 session 键控，不影响其他并发会话的快照）
-        let stale = self.mutation_snapshot.lock().await.remove(session_id);
-        drop(stale); // 锁外 drop 大结构（深克隆消息列表，ocr 2026-08-12 第二轮 perf·low）
+        // Phase B：快照由捕获点管理（见 execute_tool_calls），run 起始**不**删除——
+        // 否则同 session 并发 run 会互相删掉对方刚捕获的快照（ocr 2026-08-12
+        // 第五轮 bug·medium）。捕获点通过 trace_id 区分「本 run 已捕获」与「旧 run
+        // 残留」，旧残留会在首次写工具时被覆盖。
 
         for _round in 0..max_rounds {
             // P2-1: 日 token 预算预估（请求上下文体量），超限硬拒
@@ -7308,8 +7308,12 @@ impl AgentCore {
     /// 取走指定会话本次 run 的变更前快照（首个非只读工具执行前的消息列表），
     /// 供回滚 UI / 自进化 dry_run 复用；None = 该会话本次 run 无写工具执行。
     /// 按 session_id 键控：并发会话各自取走自己的快照，互不串扰（ocr 2026-08-12 bug·high 修复）。
+    /// 只克隆取出、**不删除条目**：条目兼作「本次 run 已捕获」标记（contains_key），
+    /// 消费方在 run 进行中取走快照后，后续写工具不得重新捕获（否则快照反映变更后状态，
+    /// 破坏「首个写工具前」不变量，ocr 2026-08-12 第五轮 bug·medium）；条目由
+    /// run 起始的 remove 与容量淘汰清理。
     pub async fn take_mutation_snapshot(&self, session_id: &str) -> Option<MutationSnapshot> {
-        self.mutation_snapshot.lock().await.remove(session_id)
+        self.mutation_snapshot.lock().await.get(session_id).cloned()
     }
 
     /// 执行 LLM 返回的工具调用（重构 L 阶段：Agents SDK turn 语义——校验→审批→执行→回灌）。
@@ -7598,21 +7602,21 @@ impl AgentCore {
             }
 
             // Phase B：首个非只读（写）工具执行前捕获变更前快照（GenOffice snapshotBefore 借鉴），
-            // 供回滚 UI / 自进化 dry_run 复用；按 session 键控，每次 run 只捕获一次（run 起始已删除本会话条目）。
-            // 深克隆移到锁外（先短锁查 None 再克隆，缩短临界区，ocr 2026-08-12 perf·low 修复）。
+            // 供回滚 UI / 自进化 dry_run 复用；按 session 键控，每个 run 只捕获一次。
+            // 捕获语义（ocr 2026-08-12 第三/五轮）：
+            // - 已有快照且 trace_id == 本 run → 已捕获，跳过
+            // - 已有快照但 trace_id != 本 run（旧 run 残留，run 起始不再删除）→ 覆盖为
+            //   本 run 首个写工具前的快照（保证「首个写工具前」不变量）
+            // - 无快照 → 捕获
             if !crate::boundary::is_read_only_tool(&tc.name) {
-                // 单锁原子 check-then-act：contains_key 检查与 insert 在同一临界区内完成，
-                // 消除「两 run 并发同 session 双双通过检查、后插覆盖先插」的竞态
-                // （ocr 2026-08-12 第三轮 bug·medium）。深克隆仍在锁外执行（临界区只
-                // 做 exists 探测），但探测→克隆→插入以「锁内先占位、锁外克隆、锁内回填」
-                // 不够简洁——这里直接锁内探测，克隆在锁外，最后锁内插回（若期间他 run
-                // 已插入，则以先插入者为准，后到者丢弃，保持「首个写工具前」语义）。
-                let mut captured = false;
-                {
+                let need_capture = {
                     let m = self.mutation_snapshot.lock().await;
-                    captured = m.contains_key(session_id);
-                }
-                if !captured {
+                    match m.get(session_id) {
+                        Some(s) => s.trace_id != trace_id,
+                        None => true,
+                    }
+                };
+                if need_capture {
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -7628,21 +7632,28 @@ impl AgentCore {
                         captured_at_ms: now_ms,
                         seq,
                     };
-                    // 容量上限：防「写了工具后不再 run 的会话」累积深克隆快照导致无界内存
-                    // 增长与敏感历史滞留（ocr 2026-08-12 第二轮 perf·medium）；超限时淘汰
-                    // 序号最旧条目。淘汰在锁内执行（代价小：仅一次 min 扫描）。
+                    // 深克隆在锁外完成后单锁插入；若探测后、插入前其他 run 已为本会话
+                    // 捕获（并发同 session），则保留先到者（其 trace_id 与本 run 不同，
+                    // 但先捕获者更接近「首个写工具前」）。
                     let mut m = self.mutation_snapshot.lock().await;
-                    if m.len() >= MUTATION_SNAPSHOT_MAX {
-                        let oldest = m
-                            .iter()
-                            .min_by_key(|(_, s)| s.seq)
-                            .map(|(k, _)| k.clone());
-                        if let Some(k) = oldest {
-                            m.remove(&k);
+                    let already = m
+                        .get(session_id)
+                        .map(|s| s.trace_id == trace_id)
+                        .unwrap_or(false);
+                    if !already {
+                        // 容量上限：防「写了工具后不再 run 的会话」累积深克隆快照导致
+                        // 无界内存增长与敏感历史滞留（ocr 2026-08-12 第二轮 perf·medium）；
+                        // 超限时淘汰序号最旧条目。淘汰在判重之后：避免先淘汰旧条目、
+                        // 随后又因已捕获而放弃插入，白丢一个有效快照（第五轮 bug·low）。
+                        if m.len() >= MUTATION_SNAPSHOT_MAX {
+                            let oldest = m
+                                .iter()
+                                .min_by_key(|(_, s)| s.seq)
+                                .map(|(k, _)| k.clone());
+                            if let Some(k) = oldest {
+                                m.remove(&k);
+                            }
                         }
-                    }
-                    // 双保险：若探测后、插入前其他 run 已为本会话捕获，则保留先到者
-                    if !m.contains_key(session_id) {
                         m.insert(session_id.to_string(), snap);
                         tracing::info!(tool = %tc.name, session = %session_id, "mutation_snapshot_captured");
                     }
