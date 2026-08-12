@@ -5324,12 +5324,12 @@ impl AgentCore {
         let mut step_results: HashMap<u32, String> =
             self.in_progress_step_results.lock().await.clone();
         // P1-C：checkpoint 缺失/过期的兜底——已执行步骤若本地无结果，尝试从
-        // memoria 外置召回（perf·medium：外置不能 write-only，读侧在续跑闭环
-        // 补齐；仅对缺失步骤召回，避免无谓 MCP 调用）。
-        // bug·medium（第二轮）：此前 `if !step_results.is_empty()` 守卫在空结果时
-        // 跳过召回——恰是 checkpoint 全丢的场景，条件反了；去掉守卫，一律对
-        // 缺失步骤尝试召回（本计划步骤数有限，MCP 调用量有界）。
-        {
+        // memoria 外置召回（外置不能 write-only，读侧在续跑闭环补齐）。
+        // bug·high（第四轮）：**仅续跑时召回**——首跑（无 checkpoint、无外置）
+        // 对每个缺失步骤打 MCP 是纯浪费；续跑判定 = 本次恢复出非空 step_results
+        // （说明此前执行过，外置可能已有记录）。
+        let is_resume = !step_results.is_empty();
+        if is_resume {
             let step_ns = allowed_ns
                 .first()
                 .cloned()
@@ -7983,14 +7983,19 @@ impl AgentCore {
             task_desc.to_string(),
             ns.to_string(),
         );
-        self.sub_agents.lock().await.insert(agent);
+        // 先持久化再入内存（bug·medium 第四轮：insert 先于 save，save 失败则
+        // 内存有磁盘无——重启丢句柄。改为：临时插入 → save → 失败回滚）。
+        {
+            let mut reg = self.sub_agents.lock().await;
+            reg.insert(agent.clone());
+        }
         // 统一用构造时固定路径（sub_agents_file），与 load 同一 cwd（bug·medium）
-        crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file)
-            .await
-            .map_err(|e| {
-                tracing::warn!(target: "agent.sub_agents", "子 agent 注册表持久化失败: {}", e);
-                format!("子 agent 注册失败（未持久化）: {}", e)
-            })?;
+        if let Err(e) = crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file).await {
+            tracing::warn!(target: "agent.sub_agents", "子 agent 注册表持久化失败: {}", e);
+            // 回滚内存插入（save 失败 = 断线续跑承诺失效，句柄不保留）
+            self.sub_agents.lock().await.remove(&id);
+            return Err(format!("子 agent 注册失败（未持久化）: {}", e));
+        }
         Ok(id)
     }
 
@@ -8036,12 +8041,19 @@ impl AgentCore {
                 .map(|a| std::mem::take(&mut a.inbox))
                 .unwrap_or_default()
         };
-        // 清空后落盘（bug·high：不清盘则重启后已消费消息重现 = 重复处理）
+        // 清空后落盘（bug·high：不清盘则重启后已消费消息重现 = 重复处理）。
+        // 事务化（bug·medium 第四轮）：save 失败则**回滚内存**（消息放回收件箱），
+        // 宁可本次消费失败，不让「已消费但未落盘」造成重启后重复处理。
         if !taken.is_empty() {
             if let Err(e) =
                 crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file).await
             {
-                tracing::warn!(target: "agent.sub_agents", "消费收件箱后持久化失败: {}", e);
+                tracing::warn!(target: "agent.sub_agents", "消费收件箱后持久化失败，回滚: {}", e);
+                let mut reg = self.sub_agents.lock().await;
+                if let Some(a) = reg.get_mut(sub_id) {
+                    a.inbox = taken;
+                }
+                return Vec::new();
             }
         }
         taken

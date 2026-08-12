@@ -115,9 +115,16 @@ pub async fn externalize_plan_step(
     result: &str,
     ns: &str,
 ) {
-    // 结果超长时截断存储体（4096 **字符**上限，非字节——bug·low 注释修正；
-    // 仅存核心结论 + 原始数据的可召回索引）
-    let stored: String = result.chars().take(4096).collect();
+    // 结果超长时截断存储体（bug·medium 第四轮：只存 head 会丢尾部结论——
+    // 工具结果的关键汇总常在末尾。改为 head + tail 摘要，中间省略标记；
+    // 总长仍限 4096 字符，防 memoria 单条过大）。
+    let stored: String = if result.chars().count() > 4096 {
+        let head: String = result.chars().take(3000).collect();
+        let tail: String = result.chars().skip(result.chars().count() - 1000).collect();
+        format!("{}…[中段省略 {} 字符]…{}", head, result.chars().count() - 4000, tail)
+    } else {
+        result.to_string()
+    };
     let content = format!(
         "[plan_step_result] session={} step={}\n{}",
         session_id, step_id, stored
