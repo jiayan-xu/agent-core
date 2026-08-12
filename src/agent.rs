@@ -1008,14 +1008,25 @@ impl AgentCore {
         let sub_agents_path = cwd.join("sub_agents.json").to_string_lossy().to_string();
         let (sub_agents_registry, load_status) =
             crate::persistent_subagent::load(&sub_agents_path);
-        if load_status == crate::persistent_subagent::LoadStatus::Corrupted {
-            tracing::warn!(
-                target: "agent.sub_agents",
-                path = %sub_agents_path,
-                "sub_agents.json 存在但解析失败（损坏）——已按空注册表启动，子 agent 句柄丢失"
-            );
+        match load_status {
+            crate::persistent_subagent::LoadStatus::Corrupted => {
+                tracing::warn!(
+                    target: "agent.sub_agents",
+                    path = %sub_agents_path,
+                    "sub_agents.json 存在但解析失败（损坏）——已按空注册表启动，子 agent 句柄丢失"
+                );
+            }
+            crate::persistent_subagent::LoadStatus::Unreadable => {
+                // bug·high 第五轮：读失败（权限/IO）不能当 Missing 静默
+                tracing::error!(
+                    target: "agent.sub_agents",
+                    path = %sub_agents_path,
+                    "sub_agents.json 存在但无法读取（权限/IO）——已按空注册表启动，断线续跑失效"
+                );
+            }
+            _ => {}
         }
-        let restored_seq = sub_agents_registry.max_seq();
+        let restored_seq = sub_agents_registry.max_seq(&config.identity.agent_id);
         let sub_agents = std::sync::Arc::new(tokio::sync::Mutex::new(sub_agents_registry));
         let sub_agent_seq = std::sync::atomic::AtomicU64::new(restored_seq + 1);
         let sub_agents_file = sub_agents_path;
@@ -8000,13 +8011,20 @@ impl AgentCore {
     }
 
     /// 向持久子 agent 投递消息（入其收件箱；未找到返回 Err，可回落 A2A 原生投递）。
+    /// 投递后落盘（bug·medium 第五轮：只改内存不 save 则重启丢消息——收件箱
+    /// 是断线续跑的核心状态，每条消息都必须持久化）。
     pub(crate) async fn sub_agent_send(
         &self,
         to_sub_id: &str,
         from: &str,
         content: &str,
     ) -> Result<(), String> {
-        crate::persistent_subagent::deliver(&self.sub_agents, to_sub_id, from, content).await
+        crate::persistent_subagent::deliver(&self.sub_agents, to_sub_id, from, content).await?;
+        if let Err(e) = crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file).await
+        {
+            tracing::warn!(target: "agent.sub_agents", "投递后持久化失败: {}", e);
+        }
+        Ok(())
     }
 
     /// 列出全部持久子 agent（id / 状态 / 收件箱数），供管理接口展示。
@@ -8044,6 +8062,8 @@ impl AgentCore {
         // 清空后落盘（bug·high：不清盘则重启后已消费消息重现 = 重复处理）。
         // 事务化（bug·medium 第四轮）：save 失败则**回滚内存**（消息放回收件箱），
         // 宁可本次消费失败，不让「已消费但未落盘」造成重启后重复处理。
+        // 回滚用 append 而非覆盖（bug·medium 第五轮：take 与 save 之间并发
+        // deliver 可能已追加新消息，直接 `inbox = taken` 会丢它们）。
         if !taken.is_empty() {
             if let Err(e) =
                 crate::persistent_subagent::save(&self.sub_agents, &self.sub_agents_file).await
@@ -8051,7 +8071,9 @@ impl AgentCore {
                 tracing::warn!(target: "agent.sub_agents", "消费收件箱后持久化失败，回滚: {}", e);
                 let mut reg = self.sub_agents.lock().await;
                 if let Some(a) = reg.get_mut(sub_id) {
-                    a.inbox = taken;
+                    let mut restored = taken.clone();
+                    restored.append(&mut a.inbox); // 并发新消息在回滚消息之后
+                    a.inbox = restored;
                 }
                 return Vec::new();
             }

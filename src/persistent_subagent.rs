@@ -137,10 +137,13 @@ impl SubAgentRegistry {
 
     /// 从现有 id 推断最大 seq（id 形如 `sub-<agent_id>-<seq>`）——重启后
     /// seq 恢复用，防新 id 与恢复的旧 id 重复（ocr 2026-08-12 bug·high）。
-    /// 无子 agent 时返回 0（调用方从 1 起）。
-    pub fn max_seq(&self) -> u64 {
+    /// bug·medium（第五轮）：仅统计**本 agent 前缀**的 id（agent_id 可能含数字，
+    /// 全局尾数推断会被其它 agent 的子 agent 污染）；无匹配返回 0（调用方从 1 起）。
+    pub fn max_seq(&self, agent_id: &str) -> u64 {
+        let prefix = format!("sub-{}-", agent_id);
         self.agents
             .keys()
+            .filter(|id| id.starts_with(&prefix))
             .filter_map(|id| id.rsplit('-').next().and_then(|s| s.parse::<u64>().ok()))
             .max()
             .unwrap_or(0)
@@ -204,18 +207,23 @@ pub async fn save(registry: &Arc<Mutex<SubAgentRegistry>>, path: &str) -> Result
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadStatus {
     Loaded,
+    /// 文件不存在（正常首启）
     Missing,
+    /// 文件存在但解析失败（落盘 bug）
     Corrupted,
+    /// 读失败（权限/IO 错误——bug·high 第五轮：此前折叠为 Missing 掩盖权限问题）
+    Unreadable,
 }
 
 /// 从 JSON 文件恢复注册表（重启续跑入口）。文件不存在/损坏 → 空注册表（不阻断启动）。
-/// 返回状态供调用方区分处理（损坏时告警）。
+/// 返回状态供调用方区分处理（损坏/不可读时告警）。
 /// 同步实现：供 AgentCore::new（非 async）启动恢复调用。
 pub fn load(path: &str) -> (SubAgentRegistry, LoadStatus) {
     let mut reg = SubAgentRegistry::new();
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(_) => return (reg, LoadStatus::Missing),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (reg, LoadStatus::Missing),
+        Err(_) => return (reg, LoadStatus::Unreadable),
     };
     match serde_json::from_str::<HashMap<String, PersistentSubAgent>>(&text) {
         Ok(map) => {
