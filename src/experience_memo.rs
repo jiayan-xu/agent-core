@@ -63,15 +63,21 @@ fn persist_recorded_ns() {
 }
 
 /// 从磁盘恢复登记集（幂等合并；文件缺失/损坏 → 保持现状不阻断）。
+/// 一次性（perf·medium 第七轮）：进程内只 restore 一次——每次 record 都重读
+/// 文件是纯浪费（文件由本进程维护，无外部写入方）。
+static RESTORED: std::sync::Once = std::sync::Once::new();
+
 fn restore_recorded_ns() {
-    let path = recorded_ns_path();
-    let Ok(text) = std::fs::read_to_string(&path) else { return };
-    let Ok(list): Result<Vec<String>, _> = serde_json::from_str(&text) else { return };
-    if let Ok(mut set) = recorded_ns().lock() {
-        for ns in list {
-            set.insert(ns);
+    RESTORED.call_once(|| {
+        let path = recorded_ns_path();
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let Ok(list): Result<Vec<String>, _> = serde_json::from_str(&text) else { return };
+        if let Ok(mut set) = recorded_ns().lock() {
+            for ns in list {
+                set.insert(ns);
+            }
         }
-    }
+    });
 }
 
 /// 是否 agent 形态 ns（`agent/{id}[/...]`）——登记/沉淀门（纯函数，测试直调）。
