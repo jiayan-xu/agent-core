@@ -13,14 +13,56 @@
 
 use crate::mcp_client::McpClient;
 
-/// 本进程记录过的会话 ns 集合（P2-E 沉淀任务用）：record 时登记，meta-evolution
-/// 时对登记过的 ns 批量沉淀到根 ns——避免枚举全部会话 ns（caller 维度有限，
-/// 本进程见过的才需沉淀）。
+/// 会话 ns 登记集（P2-E 沉淀任务用）：record 时登记，meta-evolution 时对登记过
+/// 的 ns 批量沉淀到根 ns——避免枚举全部会话 ns（caller 维度有限）。
+/// **跨重启持久化**（bug·high 第三轮）：纯进程内集合在崩溃/重启后清空，沉淀
+/// 永远枚举不到崩溃前记录的 ns → 根 ns 永久缺失（旧双写方案无此问题）。
+/// 登记集落盘 `cwd/experience_memo_ns.json`（本地 JSON，写入热路径便宜），
+/// sediment 前 load 合并。单实例部署下跨实例无此问题（多实例需共享存储，非
+/// 当前拓扑，已文档化）。
 static RECORDED_NS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
 
 fn recorded_ns() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
     RECORDED_NS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn recorded_ns_path() -> String {
+    std::env::current_dir()
+        .unwrap_or_default()
+        .join("experience_memo_ns.json")
+        .to_string_lossy()
+        .to_string()
+}
+
+/// 登记集落盘（best-effort：本地 JSON 小文件，失败仅告警）。
+fn persist_recorded_ns() {
+    let json = match recorded_ns().lock() {
+        Ok(set) => match serde_json::to_string(&*set) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(target: "agent.meta_evolve", "登记集序列化失败: {}", e);
+                return;
+            }
+        },
+        Err(_) => return,
+    };
+    let path = recorded_ns_path();
+    if let Err(e) = std::fs::write(&path, json.as_bytes()) {
+        tracing::warn!(target: "agent.meta_evolve", "登记集落盘失败: {}", e);
+    }
+}
+
+/// 从磁盘恢复登记集（幂等合并；文件缺失/损坏 → 保持现状不阻断）。
+fn restore_recorded_ns() {
+    let path = recorded_ns_path();
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let Ok(list): Result<Vec<String>, _> = serde_json::from_str(&text) else { return };
+    if let Ok(mut set) = recorded_ns().lock() {
+        for ns in list {
+            set.insert(ns);
+        }
+    }
 }
 
 /// 是否 agent 形态 ns（`agent/{id}[/...]`）——登记/沉淀门（纯函数，测试直调）。
@@ -46,11 +88,13 @@ pub async fn record_experience_memo(
         "[experience_memo] 工具 {} 执行失败：{}",
         tool, err_preview
     );
-    // 登记会话 ns（沉淀任务枚举用；非 agent 形态 ns 不登记——无根 ns 可沉淀）
+    // 登记会话 ns（沉淀任务枚举用；非 agent 形态 ns 不登记——无根 ns 可沉淀）。
+    // 登记即落盘（跨重启恢复，bug·high 第三轮）。
     if is_agent_ns(ns) {
         if let Ok(mut set) = recorded_ns().lock() {
             set.insert(ns.to_string());
         }
+        persist_recorded_ns();
     }
     let args = serde_json::json!({
         "content": content,
@@ -76,6 +120,9 @@ pub async fn record_experience_memo(
 /// 根 ns 全局经验，会话 ns 清理后经验不丢）。
 /// best-effort：任一 ns 失败仅告警，不阻断 collect。
 pub async fn sediment_to_root(mcp: &McpClient, root_ns: &str) {
+    // 先恢复磁盘登记集（跨重启：崩溃前记录过的会话 ns 重新进入枚举范围，
+    // bug·high 第三轮）
+    restore_recorded_ns();
     let ns_list: Vec<String> = {
         match recorded_ns().lock() {
             Ok(set) => set.iter().cloned().collect(),
@@ -95,7 +142,7 @@ pub async fn sediment_to_root(mcp: &McpClient, root_ns: &str) {
         if ns == root_ns {
             continue;
         }
-        let memos = collect_memo_samples(mcp, ns, 50).await;
+        let memos = collect_memo_samples(mcp, ns, 200).await; // cap 与去重基准对齐（bug·medium 第三轮）
         for m in memos {
             if existing.contains(&m.old_value) {
                 continue; // 根 ns 已有，跳过

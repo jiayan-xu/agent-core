@@ -1490,8 +1490,13 @@ impl LlmClient {
                             })
                             // bug·low（第一轮）：total=0 但 prompt/completion 有值
                             // 的 provider 响应不应整体丢弃——任一维度 >0 即有效
+                            // saturating 求和（bug·medium 第三轮：三个 u64 来自
+                            // 不可信上游 JSON，debug 模式直接相加可能溢出 panic）
                             .filter(|u| {
-                                u.prompt_tokens + u.completion_tokens + u.total_tokens > 0
+                                u.prompt_tokens
+                                    .saturating_add(u.completion_tokens)
+                                    .saturating_add(u.total_tokens)
+                                    > 0
                             });
 
                         // task 650：DeepSeek DSML 文本泄露 → 回填 structured tool_calls
