@@ -1,7 +1,7 @@
 # PR 流程规定（Pull Request Workflow）
 
 > 适用仓库：GitHub `jiayan-xu/agent-core`（本地 canonical 见 AGENTS.md）
-> 更新日期：2026-08-07
+> 更新日期：2026-08-13
 > 状态：**强制执行**（pre-push hook 已机械拦截直推默认分支）
 
 ---
@@ -21,6 +21,7 @@
 2. **所有改动必须走 PR**：feature 分支 → push → 开 PR → CI 通过 → 合入 master。
 3. **PR 合入时 required checks 必须全绿**（ocr-review + gitleaks），否则合并按钮灰掉。
 4. **禁止 force push 到 master / 删除分支**（分支保护已开，hook 也拦）。
+5. **开 PR 后必须前台轮询进展**（`gh pr checks --watch`）。禁止开完 PR 就结束对话、把「等 CI」甩给用户。绿了立刻汇报；红了立刻进入修复闭环。
 
 ---
 
@@ -50,17 +51,22 @@ git push origin feat/<简述>
 # hook 只审查该分支相对 origin/master 的增量，有评论会拦截
 ```
 
-### 3.4 开 PR + 等 CI
+### 3.4 开 PR + 前台轮询 CI
 
 ```bash
 # 用 gh CLI 或网页：feat/<简述> → master
 gh pr create --base master --title "..." --body "..."
+
+# 前台阻塞轮询该 PR 的 required checks（不要 gh run list --limit 1，会误拿并发会话）
+gh pr checks --watch
 ```
+
+预估：ocr-review + gitleaks 约 1–3 分钟。watch 结束前不要结束对话。
 
 PR 页面确认：
 - `ocr-review` ✅ 绿
 - `gitleaks` ✅ 绿
-- 有红灯 → 看评论 → 修 → push 更新分支（PR 自动刷新）→ 直到全绿
+- 有红灯 → 立刻提取意见 → 修 → push 同一 feat 分支（PR 自动刷新）→ **再前台 watch**，直到全绿
 
 ### 3.5 合并
 
@@ -75,7 +81,7 @@ gh pr merge --merge   # 或网页点 Merge
 | 情况 | 处理 |
 |---|---|
 | **hook 拦了但确实要直推**（如紧急回滚） | `git push --no-verify`，但**必须在 PR 描述/commit 里说明理由**，事后补 PR |
-| **PR CI 卡在 in_progress 很久** | 等；或看 Actions 日志确认是 runner 排队还是 API 超时 |
+| **PR CI 卡在 in_progress 很久** | 前台继续 `gh pr checks --watch`；看 Actions 日志区分 runner 排队 vs API 超时。给时间预估，不要把等待甩给用户 |
 | **只想改文档/注释** | 同样走 PR（小改动用 `feat/docs-*` 分支；hook 只放行 `feat/*`，`docs/` 前缀会被拦） |
 | **多人协作** | PR 里 @ 协作者 review；master 只有维护者能合并 |
 

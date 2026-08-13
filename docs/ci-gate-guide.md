@@ -56,11 +56,8 @@ git push -u origin HEAD
 # 开 PR（若还没有）
 gh pr create --base master --title "..." --body "..."
 
-# 查该 PR 上最新一次 ocr-review run
-gh run list --repo jiayan-xu/agent-core --limit 1 --workflow ocr-review.yml --branch "$(git branch --show-current)"
-
-# 等待结果（--exit-status：CI 失败时命令返回非 0）
-gh run watch <run-id> --repo jiayan-xu/agent-core --exit-status
+# 前台轮询该 PR 的 required checks（P0：禁止开完就结束对话）
+gh pr checks --watch --repo jiayan-xu/agent-core
 ```
 
 **怎么判断过没过：**
