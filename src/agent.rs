@@ -10256,13 +10256,53 @@ impl AgentCore {
         if subtasks.is_empty() {
             return None;
         }
-        // P2-2：黑板模式——compose 派发共享工作区，子 agent 可读写中间产物
-        let blackboard = crate::multiagent::SharedState::new();
+        // P2-2：黑板模式——compose 派发共享工作区，子 agent 可读写中间产物。
+        // 补全（P2-2 持久化）：按 session 隔离恢复黑板（`blackboard_<session>.json`
+        // 在 cwd），断线/崩溃后同 session 再 compose 可续跑；stage 间自动落盘。
+        let bb_file = {
+            // session_id 仅取安全字符（防路径注入：session 理论上内部生成，纵深防御）
+            let safe: String = _session_id
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .take(64)
+                .collect();
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join(format!("blackboard_{}.json", safe))
+                .to_string_lossy()
+                .to_string()
+        };
+        let (blackboard, bb_status) = crate::multiagent::SharedState::load(&bb_file);
+        match bb_status {
+            crate::multiagent::LoadStatus::Loaded => {
+                tracing::info!(
+                    target: "agent.multiagent",
+                    path = %bb_file,
+                    "黑板已从文件恢复（断线续跑）"
+                );
+            }
+            crate::multiagent::LoadStatus::Corrupted => {
+                tracing::warn!(
+                    target: "agent.multiagent",
+                    path = %bb_file,
+                    "黑板文件损坏——按空黑板启动（原始文件保留待查）"
+                );
+            }
+            crate::multiagent::LoadStatus::Unreadable => {
+                tracing::error!(
+                    target: "agent.multiagent",
+                    path = %bb_file,
+                    "黑板文件存在但无法读取（权限/IO）——按空黑板启动"
+                );
+            }
+            crate::multiagent::LoadStatus::Missing => {}
+        }
         let result = crate::multiagent::dispatch_with_timeout(
             &self.routed_llm,
             &subtasks,
             cfg.subagent_timeout_secs,
             Some(blackboard),
+            Some(&bb_file),
         )
         .await;
         if result.trim().is_empty() {

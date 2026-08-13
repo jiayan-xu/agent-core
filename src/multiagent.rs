@@ -210,6 +210,120 @@ impl SharedState {
         }
         self.version()
     }
+
+    // ── P2-2 补全：黑板持久化（断线协作恢复） ─────────────
+
+    /// 持久化黑板到 JSON 文件（格式 `{"version":N,"data":{...}}`）。
+    /// 复用 P1-B 受控写模式（ocr 已验证三件套）：
+    /// 1. **全程持写锁**——序列化到 rename 期间锁住，防并发 set/merge 造成
+    ///    lost-update（黑板小（≤64KB），锁持有时间微秒级）；
+    /// 2. **tmp 唯一后缀**（pid+seq）——并发 save 不互相覆盖；
+    /// 3. **fsync + rename**——断电/崩溃不丢已确认数据；失败路径清理残留 tmp。
+    /// 写失败返回 Err（调用方可决定告警/重试），不吞错。
+    pub async fn save(&self, path: &str) -> Result<(), String> {
+        // 持写锁全程（与 P1-B save 同理由：锁外写文件期间被并发修改 = 旧快照落盘）。
+        // 作用域块内显式 clone 出 (version, data) 后立即释放 guard——避免
+        // json! 宏对 guard 解引用的借用把 RwLockWriteGuard 拖进 future 状态
+        // （RwLockWriteGuard 非 Send，会导致 save future 无法跨线程 spawn，
+        // E0277）。
+        let (version, data) = {
+            let guard = match self.data.write() {
+                Ok(g) => g,
+                Err(p) => {
+                    tracing::warn!(target: "agent.multiagent", "黑板锁中毒恢复（save）");
+                    p.into_inner()
+                }
+            };
+            let data: BTreeMap<String, serde_json::Value> = guard.clone();
+            let v = self.version();
+            (v, data)
+        }; // guard 在此 drop
+        let payload = serde_json::json!({ "version": version, "data": data });
+        let json = serde_json::to_string_pretty(&payload)
+            .map_err(|e| format!("黑板序列化失败: {}", e))?;
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = format!("{}.tmp.{}.{}", path, std::process::id(), seq);
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut f = tokio::fs::File::create(&tmp)
+                .await
+                .map_err(|e| format!("创建黑板临时文件失败: {}", e))?;
+            if let Err(e) = async {
+                f.write_all(json.as_bytes()).await?;
+                f.flush().await?;
+                f.sync_all().await?;
+                Ok::<(), std::io::Error>(())
+            }
+            .await
+            {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!("写黑板临时文件失败: {}", e));
+            }
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("原子替换黑板文件失败: {}", e));
+        }
+        Ok(())
+    }
+
+    /// 从 JSON 文件恢复黑板（断线协作续跑：进程重启后按 session 文件恢复，
+    /// 版本号一并恢复，乐观锁不回退）。文件不存在 → 空黑板（首跑）。
+    /// 恢复时逐值重跑 value_allowed + 重算 total_bytes（防损坏/篡改文件
+    /// 引入超限值或总量计数失真）。
+    pub fn load(path: &str) -> (SharedState, LoadStatus) {
+        let bb = SharedState::new();
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return (bb, LoadStatus::Missing);
+            }
+            Err(_) => return (bb, LoadStatus::Unreadable),
+        };
+        let v: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => return (bb, LoadStatus::Corrupted),
+        };
+        let version = v.get("version").and_then(|x| x.as_u64()).unwrap_or(0);
+        let data = v.get("data").and_then(|x| x.as_object()).cloned().unwrap_or_default();
+        let mut guard = match bb.data.write() {
+            Ok(g) => g,
+            Err(p) => {
+                tracing::warn!(target: "agent.multiagent", "黑板锁中毒恢复（load）");
+                p.into_inner()
+            }
+        };
+        let mut bytes: usize = 0;
+        for (k, val) in data {
+            if !SharedState::value_allowed(&val) {
+                tracing::warn!(
+                    target: "agent.multiagent",
+                    key = %k,
+                    "黑板恢复：值超限剔除（深度/宽度/大小）"
+                );
+                continue;
+            }
+            bytes += value_bytes(&val).unwrap_or(0);
+            guard.insert(k, val);
+        }
+        let _ = bb.total_bytes.store(bytes, Ordering::Relaxed);
+        let _ = bb.version.store(version, Ordering::SeqCst);
+        drop(guard);
+        (bb, LoadStatus::Loaded)
+    }
+}
+
+/// 黑板文件加载状态（与 persistent_subagent 同款语义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadStatus {
+    Loaded,
+    /// 文件不存在（正常首跑）
+    Missing,
+    /// 文件存在但解析失败（落盘 bug 或人为损坏）
+    Corrupted,
+    /// 读失败（权限/IO）
+    Unreadable,
 }
 
 /// 从子 agent 回复中解析黑板回写块：回复末尾附
@@ -403,7 +517,7 @@ const DEFAULT_SUBAGENT_TIMEOUT_SECS: u64 = 120;
 /// 每个子任务包 `tokio::time::timeout` 隔离：超时/失败仅该子任务降级为说明，不拖垮整体输出。
 /// 结果按 subtask 原始顺序拼装，保证输出可预期。
 pub async fn dispatch(rt: &RoutedLlm, subtasks: &[SubTask]) -> String {
-    dispatch_with_timeout(rt, subtasks, DEFAULT_SUBAGENT_TIMEOUT_SECS, None).await
+    dispatch_with_timeout(rt, subtasks, DEFAULT_SUBAGENT_TIMEOUT_SECS, None, None).await
 }
 
 /// 带超时参数的派发（供 `maybe_compose` 传入配置中的 `subagent_timeout_secs`）。
@@ -418,6 +532,7 @@ pub async fn dispatch_with_timeout(
     subtasks: &[SubTask],
     timeout_secs: u64,
     blackboard: Option<SharedState>,
+    save_path: Option<&str>,
 ) -> String {
     let timeout = Duration::from_secs(timeout_secs);
     let mut out = String::new();
@@ -435,6 +550,19 @@ pub async fn dispatch_with_timeout(
             }
             for (_stage, group) in by_stage {
                 out.push_str(&dispatch_group(rt, &group, timeout, Some(bb)).await);
+                // P2-2 补全：每 stage 完成后持久化（stage 间是黑板最有价值的
+                // 恢复点——崩溃后可从最近 stage 续跑，不丢前序中间产物）。
+                // best-effort：失败告警不阻断（黑板是协作加速器非强一致状态）。
+                if let Some(p) = save_path {
+                    if let Err(e) = bb.save(p).await {
+                        tracing::warn!(
+                            target: "agent.multiagent",
+                            path = %p,
+                            "黑板 stage 持久化失败: {}",
+                            e
+                        );
+                    }
+                }
             }
             if bb.version() > 0 {
                 out.push_str(&format!(
@@ -656,5 +784,51 @@ mod tests {
         let bb = SharedState::new();
         let wide = serde_json::json!((0..600).collect::<Vec<u32>>()); // 600 元素 > 512 宽度上限
         assert_eq!(bb.set("wide", wide), 0); // 拒绝
+    }
+
+    #[tokio::test]
+    async fn blackboard_save_load_roundtrip() {
+        // P2-2 补全：持久化往返——数据 + 版本号均恢复（乐观锁不回退）
+        let bb = SharedState::new();
+        let v1 = bb.set("k1", serde_json::json!({"a": 1}));
+        assert!(v1 > 0);
+        let v2 = bb.set("k2", serde_json::json!([1, 2, 3]));
+        assert!(v2 > v1);
+        let tmp = std::env::temp_dir().join("blackboard_test.json");
+        let path = tmp.to_string_lossy().to_string();
+        bb.save(&path).await.unwrap();
+        let (restored, status) = SharedState::load(&path);
+        assert_eq!(status, LoadStatus::Loaded);
+        assert_eq!(restored.version(), v2); // 版本号恢复
+        assert_eq!(restored.get("k1"), Some(serde_json::json!({"a": 1})));
+        assert_eq!(restored.get("k2"), Some(serde_json::json!([1, 2, 3])));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn blackboard_load_status_semantics() {
+        // 文件缺失 = Missing；损坏 = Corrupted；恢复时超限值剔除
+        let missing = std::env::temp_dir().join("blackboard_nonexistent.json");
+        let (_, st) = SharedState::load(&missing.to_string_lossy().as_ref());
+        assert_eq!(st, LoadStatus::Missing);
+
+        // 损坏文件
+        let tmp = std::env::temp_dir().join("blackboard_corrupt.json");
+        std::fs::write(&tmp, "not-json{{{").unwrap();
+        let (_, st) = SharedState::load(&tmp.to_string_lossy().as_ref());
+        assert_eq!(st, LoadStatus::Corrupted);
+        let _ = std::fs::remove_file(&tmp);
+
+        // 超限值剔除（宽数组 600 元素 > 512）
+        let tmp2 = std::env::temp_dir().join("blackboard_oversize.json");
+        let wide = serde_json::json!((0..600).collect::<Vec<u32>>());
+        let payload = serde_json::json!({"version": 5, "data": {"wide": wide, "ok": 1}});
+        std::fs::write(&tmp2, serde_json::to_string(&payload).unwrap()).unwrap();
+        let (bb, st) = SharedState::load(&tmp2.to_string_lossy().as_ref());
+        assert_eq!(st, LoadStatus::Loaded);
+        assert_eq!(bb.get("wide"), None); // 超限剔除
+        assert_eq!(bb.get("ok"), Some(serde_json::json!(1)));
+        assert_eq!(bb.version(), 5); // 版本号仍恢复
+        let _ = std::fs::remove_file(&tmp2);
     }
 }
