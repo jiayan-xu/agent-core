@@ -2,6 +2,26 @@
 
 ## 2026-08-13
 
+### v0.9.0 · P2-2 黑板持久化（SharedState → blackboard_<hash>.json 断线协作续跑，新能力发版锚点）
+- **改动**：
+  - `SharedState::save`：受控写三件套（快照一致性写锁内 clone + tmp 唯一后缀
+    pid+seq+随机段 + fsync+rename），unix 下 0600 权限；错误路径清理 tmp（Windows
+    句柄先 drop 再删）。
+  - `SharedState::load` + LoadStatus（Loaded/Missing/Corrupted/Unreadable）：版本号
+    恢复（乐观锁不回退）；逐值 value_allowed + 键数/总量双上限恢复；根级/version/
+    data 类型严格校验；InvalidData→Corrupted；大小预检防整读巨文件；TTL 24h 过期
+    清理（mtime 不可得跳过防误删）。
+  - `dispatch_with_timeout` +save_path：每 stage 完成后落盘（stage 间恢复点）。
+  - maybe_compose：黑板身份 = user_id+session_id 双维度 FNV-1a 哈希文件名（不嵌
+    可读会话信息，长度前缀保单射）；current_dir 失败显式降级仅内存；损坏/不可读
+    文件备份（.corrupted/.unreadable.<ms>.<pid>.<seq>）。
+- **效果**：多 agent 协作黑板断线/崩溃后同会话可续跑（stage 级恢复点），不丢中间
+  产物；ocr-review 18 轮 40+ 条意见全修（含 bug·high×2/security·medium×4）。
+- **动机**：对照文档 §3 P2-2 剩余增量（SharedState 纯内存进程重启即丢），复用
+  P1-B 已验证的持久化三件套模式。
+
+## 2026-08-13
+
 ### v0.8.0 · P1 三项落地（/refine 样本池 + 持久子 agent + RLM 上下文外置，新能力发版锚点）
 - **改动**：
   - P1-A（/refine 合成点）：新增 `src/experience_memo.rs`，工具失败教训结构化沉淀
