@@ -76,7 +76,7 @@ gh pr merge --merge   # 或网页点 Merge
 |---|---|
 | **hook 拦了但确实要直推**（如紧急回滚） | `git push --no-verify`，但**必须在 PR 描述/commit 里说明理由**，事后补 PR |
 | **PR CI 卡在 in_progress 很久** | 等；或看 Actions 日志确认是 runner 排队还是 API 超时 |
-| **只想改文档/注释** | 同样走 PR（小改动用 `docs/` 前缀分支） |
+| **只想改文档/注释** | 同样走 PR（小改动用 `feat/docs-*` 分支；hook 只放行 `feat/*`，`docs/` 前缀会被拦） |
 | **多人协作** | PR 里 @ 协作者 review；master 只有维护者能合并 |
 
 ---
