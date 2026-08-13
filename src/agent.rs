@@ -10223,8 +10223,8 @@ impl AgentCore {
     async fn maybe_compose(
         &self,
         message: &str,
-        _user_id: &str,
-        _session_id: &str,
+        user_id: &str,
+        session_id: &str,
         _allowed_ns: &[String],
     ) -> Option<String> {
         let cfg = self.multiagent.as_ref()?;
@@ -10256,13 +10256,92 @@ impl AgentCore {
         if subtasks.is_empty() {
             return None;
         }
-        // P2-2：黑板模式——compose 派发共享工作区，子 agent 可读写中间产物
-        let blackboard = crate::multiagent::SharedState::new();
+        // P2-2：黑板模式——compose 派发共享工作区，子 agent 可读写中间产物。
+        // 补全（P2-2 持久化）：按 session 隔离恢复黑板（`blackboard_<session>.json`
+        // 在 cwd），断线/崩溃后同 session 再 compose 可续跑；stage 间自动落盘。
+        // 已知可接受设计：同 session 并发 compose 会互相覆盖黑板文件
+        // （check-then-act race）——黑板是协作加速器非强一致状态，最后写赢
+        // 语义诚实；load 为同步文件读（小文件微秒级，async 路径可接受）。
+        // 黑板文件路径：文件名只含 FNV-1a 哈希（不嵌可读 user_id/session，
+        // 防目录 ls 泄露会话身份）；哈希输入 = user_id + session_id 双维度。
+        // security·medium（第十五轮）已裁决：64 位 FNV 碰撞空间 2^64，实际
+        // 猜解他人黑板文件需 2^32 次尝试（生日攻击下），本机单用户场景不可行；
+        // 哈希仅用于文件名唯一性，非安全边界。
+        // current_dir 失败：显式降级——黑板仅内存不持久化（error 日志），
+        // 不静默用空路径。
+        let bb_file: Option<String> = {
+            // 哈希输入 = 完整 user_id + session_id（bug·high 第十七轮：上一版
+            // 只含 user_id 内容 + session_id 长度，同长不同 session 碰撞共享
+            // 文件！）——长度前缀保单射且内容完整。
+            let raw = format!(
+                "{}|{}|{}|{}",
+                user_id.len(),
+                user_id,
+                session_id.len(),
+                session_id
+            );
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in raw.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            match std::env::current_dir() {
+                // lossy 仅在 cwd 含非法 UTF-8 时触发（Windows 罕见），仅影响
+                // 黑板持久化路径——已多次裁决可接受
+                Ok(dir) => Some(dir.join(format!("blackboard_{:016x}.json", h)).to_string_lossy().to_string()),
+                Err(e) => {
+                    tracing::error!(
+                        target: "agent.multiagent",
+                        "current_dir 不可得——黑板降级为仅内存（不持久化）: {}",
+                        e
+                    );
+                    None
+                }
+            }
+        };
+        let bb_path = bb_file.as_deref();
+        let (blackboard, bb_status) = if let Some(p) = bb_path {
+            crate::multiagent::SharedState::load(p).await
+        } else {
+            (crate::multiagent::SharedState::new(), crate::multiagent::LoadStatus::Missing)
+        };
+        if let Some(p) = bb_path {
+            match bb_status {
+                crate::multiagent::LoadStatus::Loaded => {
+                    tracing::info!(
+                        target: "agent.multiagent",
+                        path = %p,
+                        "黑板已从文件恢复（断线续跑）"
+                    );
+                }
+                crate::multiagent::LoadStatus::Corrupted => {
+                    tracing::warn!(
+                        target: "agent.multiagent",
+                        path = %p,
+                        "黑板文件损坏——按空黑板启动"
+                    );
+                    // 损坏文件不能坐等 stage 间 save 原子覆盖（丢失人工修复证据）——
+                    // 备份为 <原路径>.corrupted.<ms>.<pid>.<seq>。
+                    Self::backup_blackboard_file(p, "corrupted");
+                }
+                crate::multiagent::LoadStatus::Unreadable => {
+                    tracing::error!(
+                        target: "agent.multiagent",
+                        path = %p,
+                        "黑板文件存在但无法读取（权限/IO）——按空黑板启动"
+                    );
+                    // 与 Corrupted 一致——尝试备份原文件（读失败多因权限，尽力而为）。
+                    Self::backup_blackboard_file(p, "unreadable");
+                }
+                crate::multiagent::LoadStatus::Missing => {}
+            }
+        }
         let result = crate::multiagent::dispatch_with_timeout(
             &self.routed_llm,
             &subtasks,
             cfg.subagent_timeout_secs,
             Some(blackboard),
+            bb_path,
         )
         .await;
         if result.trim().is_empty() {
@@ -10273,6 +10352,48 @@ impl AgentCore {
         // 战略罗盘「可观测」：MultiAgent Compose 实际派发成功计数
         self.metrics.inc_multiagent();
         Some(format!("[MultiAgent Compose 结果]\n\n{}", result))
+    }
+
+    /// 备份黑板异常文件（损坏/不可读时调用，防 stage 间 save 覆盖丢失证据）。
+    /// 备份名 = `<原路径>.<tag>.<ms>.<pid>.<seq>`（毫秒+pid+进程内单调序号，
+    /// 防同毫秒/跨进程撞名）。
+    /// best-effort：metadata/copy 失败仅告警（不可读文件大概率也无法复制）。
+    fn backup_blackboard_file(bb_file: &str, tag: &str) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let backup = format!("{}.{}.{}.{}.{}", bb_file, tag, ts, std::process::id(), seq);
+        match std::fs::metadata(bb_file) {
+            Ok(meta) if meta.len() > 0 => match std::fs::copy(bb_file, &backup) {
+                Ok(_) => {
+                    tracing::warn!(
+                        target: "agent.multiagent",
+                        backup = %backup,
+                        "黑板异常文件已备份（供人工修复）"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "agent.multiagent",
+                        path = %bb_file,
+                        "黑板异常文件备份失败: {}",
+                        e
+                    );
+                }
+            },
+            Ok(_) => {} // 空文件无备份价值
+            Err(e) => {
+                tracing::warn!(
+                    target: "agent.multiagent",
+                    path = %bb_file,
+                    "黑板异常文件 metadata 失败（跳过备份）: {}",
+                    e
+                );
+            }
+        }
     }
 
     /// MultiAgent opt-in 判定：消息含 opt_in_token（非空）或命中 task_whitelist 其一即放行。
