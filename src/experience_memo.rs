@@ -36,26 +36,29 @@ fn recorded_ns_path() -> String {
 }
 
 /// 登记集落盘（best-effort；本地 JSON 小文件，失败仅告警）。
-/// 原子写（bug·medium 第五轮）：临时文件 + rename，防半写/并发覆盖损坏；
-/// 序列化与写文件同锁（防 lost-update——锁内快照、锁内落盘）。
+/// 原子写：临时文件 + rename，防半写损坏。
+/// **全程持锁**（bug·high 第六轮）：序列化 + 写 tmp + rename 全部在锁内——
+/// 锁外写文件期间另一线程 insert 后落盘，本线程 rename 会用旧快照覆盖丢其 ns
+/// （lost-update）。本地小文件，锁持有微秒级。
 fn persist_recorded_ns() {
-    let json = match recorded_ns().lock() {
-        Ok(set) => match serde_json::to_string(&*set) {
+    let path = recorded_ns_path();
+    let tmp = format!("{}.tmp.{}", path, std::process::id());
+    if let Ok(set) = recorded_ns().lock() {
+        // guard 存活整个块：序列化 → 写 tmp → rename 全程持锁
+        let json = match serde_json::to_string(&*set) {
             Ok(j) => j,
             Err(e) => {
                 tracing::warn!(target: "agent.meta_evolve", "登记集序列化失败: {}", e);
                 return;
             }
-        },
-        Err(_) => return,
-    };
-    let path = recorded_ns_path();
-    let tmp = format!("{}.tmp.{}", path, std::process::id());
-    if std::fs::write(&tmp, json.as_bytes()).is_err() {
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        tracing::warn!(target: "agent.meta_evolve", "登记集落盘失败: {}", e);
+        };
+        if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+            tracing::warn!(target: "agent.meta_evolve", "登记集临时文件写入失败: {}", e);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            tracing::warn!(target: "agent.meta_evolve", "登记集落盘失败: {}", e);
+        }
     }
 }
 
