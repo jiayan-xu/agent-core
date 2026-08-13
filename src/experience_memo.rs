@@ -120,12 +120,19 @@ pub async fn record_experience_memo(
 /// 根 ns 全局经验，会话 ns 清理后经验不丢）。
 /// best-effort：任一 ns 失败仅告警，不阻断 collect。
 pub async fn sediment_to_root(mcp: &McpClient, root_ns: &str) {
-    // 先恢复磁盘登记集（跨重启：崩溃前记录过的会话 ns 重新进入枚举范围，
-    // bug·high 第三轮）
+    // 先恢复磁盘登记集（跨重启：崩溃前记录过的会话 ns 重新进入枚举范围）
     restore_recorded_ns();
+    // 跨 agent 隔离（bug·high 第四轮）：进程级登记集可能含其它 agent 的会话
+    // ns（多 AgentCore/分身同进程）——只沉淀与 root_ns 同 agent 前缀的 ns，
+    // 否则 A 的根 ns 会收进 B 的会话 memo（命名空间泄漏）。
+    let agent_prefix = format!("{}/", root_ns);
     let ns_list: Vec<String> = {
         match recorded_ns().lock() {
-            Ok(set) => set.iter().cloned().collect(),
+            Ok(set) => set
+                .iter()
+                .filter(|ns| ns.starts_with(&agent_prefix))
+                .cloned()
+                .collect(),
             Err(_) => return,
         }
     };
@@ -378,5 +385,23 @@ mod tests {
         assert!(is_agent_ns("agent/xujiayan/caller1"));
         assert!(!is_agent_ns("workspace/foo"));
         assert!(!is_agent_ns("agent/"));
+    }
+
+    #[test]
+    fn sediment_prefix_filter_isolates_agent() {
+        // 跨 agent 隔离（bug·high 第四轮）：只沉淀同 agent 前缀的 ns
+        let root_ns = "agent/xujiayan";
+        let agent_prefix = format!("{}/", root_ns);
+        let all = vec![
+            "agent/xujiayan/caller1".to_string(),
+            "agent/other/caller9".to_string(), // 其它 agent，必须过滤
+            "workspace/foo".to_string(),
+        ];
+        let filtered: Vec<&String> = all
+            .iter()
+            .filter(|ns| ns.starts_with(&agent_prefix))
+            .collect();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0], "agent/xujiayan/caller1");
     }
 }
