@@ -10259,6 +10259,9 @@ impl AgentCore {
         // P2-2：黑板模式——compose 派发共享工作区，子 agent 可读写中间产物。
         // 补全（P2-2 持久化）：按 session 隔离恢复黑板（`blackboard_<session>.json`
         // 在 cwd），断线/崩溃后同 session 再 compose 可续跑；stage 间自动落盘。
+        // 已知可接受设计（ocr 第一轮已裁决）：同 session 并发 compose 会互相覆盖
+        // 黑板文件（check-then-act race）——黑板是协作加速器非强一致状态，最后
+        // 写赢语义诚实；load 为同步文件读（小文件微秒级，async 路径可接受）。
         let bb_file = {
             // session_id 仅取安全字符（防路径注入：session 理论上内部生成，纵深防御）
             let safe: String = _session_id
@@ -10285,8 +10288,33 @@ impl AgentCore {
                 tracing::warn!(
                     target: "agent.multiagent",
                     path = %bb_file,
-                    "黑板文件损坏——按空黑板启动（原始文件保留待查）"
+                    "黑板文件损坏——按空黑板启动"
                 );
+                // bug·medium（第一轮）：损坏文件不能坐等 stage 间 save 原子覆盖
+                // （丢失人工修复证据）——先备份为 blackboard_<session>.json.corrupted.<ms>。
+                if let Ok(meta) = std::fs::metadata(&bb_file) {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    let backup = format!("{}.corrupted.{}", bb_file, ts);
+                    if meta.len() > 0 {
+                        if let Err(e) = std::fs::copy(&bb_file, &backup) {
+                            tracing::warn!(
+                                target: "agent.multiagent",
+                                path = %bb_file,
+                                "黑板损坏文件备份失败: {}",
+                                e
+                            );
+                        } else {
+                            tracing::warn!(
+                                target: "agent.multiagent",
+                                backup = %backup,
+                                "损坏的黑板文件已备份（供人工修复）"
+                            );
+                        }
+                    }
+                }
             }
             crate::multiagent::LoadStatus::Unreadable => {
                 tracing::error!(
