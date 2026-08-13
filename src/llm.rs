@@ -1471,21 +1471,28 @@ impl LlmClient {
 
                         // P2-D：提取上游 usage（OpenAI 兼容 `usage` 字段）——
                         // 预算记账真值来源；provider 未返回时 None（回落估算）。
+                        // token 兼容整数/字符串编码（bug·medium 第十轮：部分
+                        // provider 序列化为 JSON 字符串）
+                        let parse_token = |v: &serde_json::Value| -> u64 {
+                            v.as_u64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                                .unwrap_or(0)
+                        };
                         let usage = data
                             .get("usage")
                             .and_then(|u| u.as_object())
                             .map(|u| LlmUsage {
                                 prompt_tokens: u
                                     .get("prompt_tokens")
-                                    .and_then(|v| v.as_u64())
+                                    .map(parse_token)
                                     .unwrap_or(0),
                                 completion_tokens: u
                                     .get("completion_tokens")
-                                    .and_then(|v| v.as_u64())
+                                    .map(parse_token)
                                     .unwrap_or(0),
                                 total_tokens: u
                                     .get("total_tokens")
-                                    .and_then(|v| v.as_u64())
+                                    .map(parse_token)
                                     .unwrap_or(0),
                             })
                             // bug·low（第一轮）：total=0 但 prompt/completion 有值

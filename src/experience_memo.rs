@@ -154,7 +154,19 @@ fn root_ns_of(ns: &str) -> Option<String> {
 /// 该功能低频（24h cooldown）或关闭时根 ns 永远无 memo（recall 的 lesson 源
 /// 也依赖根 ns）。record 路径节流顺带沉淀（默认 600s 一次），保证根 ns 及时
 /// 性且成本受限；collect 前仍全量沉淀兜底。
-static LAST_SEDIMENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// **按 root_ns 分 key**（bug·high 第十轮）：进程全局时间戳会让 agent A 沉淀后
+/// 10 分钟内 B 的沉淀被节流挡掉（多 AgentCore/分身同进程）——每 agent 独立
+/// 节流窗口。
+static LAST_SEDIMENT: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::OnceLock::new();
+
+fn last_sediment_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    LAST_SEDIMENT.get_or_init(|| {
+        std::sync::Mutex::new(std::collections::HashMap::new())
+    })
+}
+
 const SEDIMENT_INTERVAL_SECS: u64 = 600;
 
 /// P2-E 沉淀任务：把本进程记录过的会话 ns 里的 experience_memo 批量复制到根 ns
@@ -162,15 +174,22 @@ const SEDIMENT_INTERVAL_SECS: u64 = 600;
 /// 触发时机：collect_negative_samples 前（全量兜底）+ record 路径节流（及时性）。
 /// best-effort：任一 ns 失败仅告警，不阻断调用方。
 pub async fn sediment_to_root(mcp: &McpClient, root_ns: &str) {
-    use std::sync::atomic::Ordering;
-    // 节流闸（bug·high 第九轮）：10 分钟内只沉淀一次（record 热路径调用时）
+    // 节流闸（按 root_ns 分 key）：10 分钟内同 agent 只沉淀一次（record 热路径
+    // 调用时）；不同 agent 互不干扰
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let last = LAST_SEDIMENT.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < SEDIMENT_INTERVAL_SECS {
-        return;
+    {
+        let map = last_sediment_map().lock();
+        match map {
+            Ok(m) => {
+                if now.saturating_sub(*m.get(root_ns).unwrap_or(&0)) < SEDIMENT_INTERVAL_SECS {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
     }
     // 先恢复磁盘登记集（跨重启：崩溃前记录过的会话 ns 重新进入枚举范围）
     restore_recorded_ns();
@@ -228,8 +247,10 @@ pub async fn sediment_to_root(mcp: &McpClient, root_ns: &str) {
             }
         }
     }
-    // 沉淀成功完成 → 更新节流时间戳（失败不更新，允许下次重试）
-    LAST_SEDIMENT.store(now, Ordering::Relaxed);
+    // 沉淀成功完成 → 更新节流时间戳（按 root_ns；失败不更新，允许下次重试）
+    if let Ok(mut map) = last_sediment_map().lock() {
+        map.insert(root_ns.to_string(), now);
+    }
 }
 
 /// 从 memo content 提取工具名（"[experience_memo] 工具 X 执行失败：..."）。
