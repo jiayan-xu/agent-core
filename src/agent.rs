@@ -5265,7 +5265,7 @@ impl AgentCore {
     async fn rephrase_and_confirm(
         &self,
         message: &str,
-        user_id: &str,
+        _user_id: &str,
         session_id: &str,
         allowed_ns: &[String],
     ) -> String {
