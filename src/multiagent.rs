@@ -269,10 +269,14 @@ impl SharedState {
             }
             .await
             {
+                // bug·low（第四轮）：remove_file 前必须显式 drop(f)——f 在
+                // 外层作用域仍存活，Windows 上文件句柄未关时删除必失败
+                // （sharing violation），残留 tmp。
+                drop(f);
                 let _ = std::fs::remove_file(&tmp);
                 return Err(format!("写黑板临时文件失败: {}", e));
             }
-        }
+        } // f 在此 drop（成功路径）
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(format!("原子替换黑板文件失败: {}", e));

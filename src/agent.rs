@@ -10308,12 +10308,13 @@ impl AgentCore {
                 // （丢失人工修复证据）——先备份为 blackboard_<session>.json.corrupted.<ms>。
                 // Unreadable 分支同款备份（bug·medium 第三轮：不可读但可复制时
                 // 同样要留证据；备份失败仅告警——本就读不到，copy 大概率失败）。
+                // 备份名加 seq（maintainability·low 第四轮：同毫秒两次失败会撞名）。
                 if let Ok(meta) = std::fs::metadata(&bb_file) {
                     let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis())
                         .unwrap_or(0);
-                    let backup = format!("{}.corrupted.{}", bb_file, ts);
+                    let backup = format!("{}.corrupted.{}.{}", bb_file, ts, Self::next_backup_seq());
                     if meta.len() > 0 {
                         if let Err(e) = std::fs::copy(&bb_file, &backup) {
                             tracing::warn!(
@@ -10344,7 +10345,7 @@ impl AgentCore {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
-                let backup = format!("{}.unreadable.{}", bb_file, ts);
+                let backup = format!("{}.unreadable.{}.{}", bb_file, ts, Self::next_backup_seq());
                 if let Err(e) = std::fs::copy(&bb_file, &backup) {
                     tracing::warn!(
                         target: "agent.multiagent",
@@ -10378,6 +10379,13 @@ impl AgentCore {
         // 战略罗盘「可观测」：MultiAgent Compose 实际派发成功计数
         self.metrics.inc_multiagent();
         Some(format!("[MultiAgent Compose 结果]\n\n{}", result))
+    }
+
+    /// 黑板备份文件名序号（maintainability·low 第四轮：毫秒时间戳同毫秒碰撞，
+    /// 加进程内单调序号彻底避免）。
+    fn next_backup_seq() -> u64 {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// MultiAgent opt-in 判定：消息含 opt_in_token（非空）或命中 task_whitelist 其一即放行。
