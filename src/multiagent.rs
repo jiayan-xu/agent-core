@@ -220,7 +220,10 @@ impl SharedState {
     ///    与 P1-B 的强一致锁内写文件不同——黑板非强一致状态，可接受）；
     /// 2. **tmp 不可预测后缀**（pid+seq+随机段）——并发 save 不互相覆盖，且
     ///    防符号链接预创建攻击（security·medium 第三轮：纯 pid+seq 可猜测）；
-    /// 3. **fsync + rename**——断电/崩溃不丢已确认数据；失败路径清理残留 tmp。
+    /// 3. **fsync + rename**——tmp 数据 fsync 落盘后原子替换；**目录 fsync 未做**
+    ///    （Windows 平台不支持目录 fsync；断电瞬间 rename 元数据可能未落盘，
+    ///    最坏丢失最近一次黑板快照，但不会产生半写损坏——诚实表述，bug·medium
+    ///    第六轮：doc 不再宣称「断电不丢已确认数据」）。
     /// 写失败返回 Err（调用方可决定告警/重试），不吞错。
     pub async fn save(&self, path: &str) -> Result<(), String> {
         // 写锁内 clone 快照后立即释放 guard（不持锁跨 await）——guard 借用
@@ -384,6 +387,9 @@ impl SharedState {
         let mut bytes: usize = 0;
         let mut inserted: usize = 0;
         // 键数上限恢复：排序键遍历（BTreeMap 已有序），超出 BB_MAX_KEYS 截断
+        // 总量上限恢复（bug·medium 第六轮）：超 BB_MAX_TOTAL_BYTES 时按序
+        // 截断——否则恢复后 total_bytes 超上限，后续 set 的增量检查基于
+        // 超限总量，护栏失效。
         for (k, val) in data {
             if inserted >= BB_MAX_KEYS {
                 tracing::warn!(
@@ -402,7 +408,17 @@ impl SharedState {
                 );
                 continue;
             }
-            bytes += value_bytes(&val).unwrap_or(0);
+            let val_bytes = value_bytes(&val).unwrap_or(0);
+            if bytes + val_bytes > BB_MAX_TOTAL_BYTES {
+                tracing::warn!(
+                    target: "agent.multiagent",
+                    key = %k,
+                    "黑板恢复：总量超上限 {}，截断",
+                    BB_MAX_TOTAL_BYTES
+                );
+                break;
+            }
+            bytes += val_bytes;
             guard.insert(k, val);
             inserted += 1;
         }

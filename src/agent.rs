@@ -10308,30 +10308,9 @@ impl AgentCore {
                 // （丢失人工修复证据）——先备份为 blackboard_<session>.json.corrupted.<ms>。
                 // Unreadable 分支同款备份（bug·medium 第三轮：不可读但可复制时
                 // 同样要留证据；备份失败仅告警——本就读不到，copy 大概率失败）。
-                // 备份名加 seq（maintainability·low 第四轮：同毫秒两次失败会撞名）。
-                if let Ok(meta) = std::fs::metadata(&bb_file) {
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0);
-                    let backup = format!("{}.corrupted.{}.{}", bb_file, ts, Self::next_backup_seq());
-                    if meta.len() > 0 {
-                        if let Err(e) = std::fs::copy(&bb_file, &backup) {
-                            tracing::warn!(
-                                target: "agent.multiagent",
-                                path = %bb_file,
-                                "黑板损坏文件备份失败: {}",
-                                e
-                            );
-                        } else {
-                            tracing::warn!(
-                                target: "agent.multiagent",
-                                backup = %backup,
-                                "损坏的黑板文件已备份（供人工修复）"
-                            );
-                        }
-                    }
-                }
+                // 统一走 backup_blackboard_file（maintainability·low 第六轮：消除
+                // 两分支 ~20 行重复）。
+                Self::backup_blackboard_file(&bb_file, "corrupted");
             }
             crate::multiagent::LoadStatus::Unreadable => {
                 tracing::error!(
@@ -10341,25 +10320,7 @@ impl AgentCore {
                 );
                 // bug·medium（第三轮）：与 Corrupted 一致——尝试备份原文件
                 // （防后续 save 覆盖；读失败多因权限，备份尽力而为）。
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                let backup = format!("{}.unreadable.{}.{}", bb_file, ts, Self::next_backup_seq());
-                if let Err(e) = std::fs::copy(&bb_file, &backup) {
-                    tracing::warn!(
-                        target: "agent.multiagent",
-                        path = %bb_file,
-                        "黑板不可读文件备份失败（预期内，权限问题通常无法复制）: {}",
-                        e
-                    );
-                } else {
-                    tracing::warn!(
-                        target: "agent.multiagent",
-                        backup = %backup,
-                        "不可读的黑板文件已备份"
-                    );
-                }
+                Self::backup_blackboard_file(&bb_file, "unreadable");
             }
             crate::multiagent::LoadStatus::Missing => {}
         }
@@ -10383,9 +10344,46 @@ impl AgentCore {
 
     /// 黑板备份文件名序号（maintainability·low 第四轮：毫秒时间戳同毫秒碰撞，
     /// 加进程内单调序号彻底避免）。
-    fn next_backup_seq() -> u64 {
+    /// 备份黑板异常文件（损坏/不可读时调用，防 stage 间 save 覆盖丢失证据）。
+    /// 备份名 = `<原路径>.<tag>.<ms>.<pid>.<seq>`：毫秒+pid+进程内单调序号三段
+    /// 组合（bug·low 第六轮：纯进程内 seq 跨进程同毫秒仍可能撞名）。
+    /// best-effort：metadata/copy 失败仅告警（不可读文件大概率也无法复制）。
+    fn backup_blackboard_file(bb_file: &str, tag: &str) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let backup = format!("{}.{}.{}.{}.{}", bb_file, tag, ts, std::process::id(), seq);
+        match std::fs::metadata(bb_file) {
+            Ok(meta) if meta.len() > 0 => match std::fs::copy(bb_file, &backup) {
+                Ok(_) => {
+                    tracing::warn!(
+                        target: "agent.multiagent",
+                        backup = %backup,
+                        "黑板异常文件已备份（供人工修复）"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "agent.multiagent",
+                        path = %bb_file,
+                        "黑板异常文件备份失败: {}",
+                        e
+                    );
+                }
+            },
+            Ok(_) => {} // 空文件无备份价值
+            Err(e) => {
+                tracing::warn!(
+                    target: "agent.multiagent",
+                    path = %bb_file,
+                    "黑板异常文件 metadata 失败（跳过备份）: {}",
+                    e
+                );
+            }
+        }
     }
 
     /// MultiAgent opt-in 判定：消息含 opt_in_token（非空）或命中 task_whitelist 其一即放行。
