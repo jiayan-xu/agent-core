@@ -10259,74 +10259,77 @@ impl AgentCore {
         // P2-2：黑板模式——compose 派发共享工作区，子 agent 可读写中间产物。
         // 补全（P2-2 持久化）：按 session 隔离恢复黑板（`blackboard_<session>.json`
         // 在 cwd），断线/崩溃后同 session 再 compose 可续跑；stage 间自动落盘。
-        // 已知可接受设计（ocr 第一轮已裁决）：同 session 并发 compose 会互相覆盖
-        // 黑板文件（check-then-act race）——黑板是协作加速器非强一致状态，最后
-        // 写赢语义诚实；load 为同步文件读（小文件微秒级，async 路径可接受）。
-        let bb_file = {
-            // 黑板身份 = user_id + session_id 双维度（防跨用户同 session 串扰）。
-            // raw 含 ':' 分隔符 → 白名单过滤后 safe != raw 恒成立（冒号必被滤），
-            // 故恒走哈希路径（第十二轮：删除不可达的 safe==raw 分支）；哈希仅
-            // 用于文件名唯一性（FNV 非加密可接受，路径注入已由白名单挡住）。
+        // 已知可接受设计：同 session 并发 compose 会互相覆盖黑板文件
+        // （check-then-act race）——黑板是协作加速器非强一致状态，最后写赢
+        // 语义诚实；load 为同步文件读（小文件微秒级，async 路径可接受）。
+        // 黑板文件路径（security·medium 第十四轮）：文件名**只含 FNV-1a 哈希**
+        // （不嵌可读的 user_id/session——防目录 ls 泄露会话身份）；哈希输入
+        // = user_id + session_id 双维度（防跨用户同 session 串扰）。哈希仅用于
+        // 文件名唯一性（非安全边界，路径注入已由白名单+哈希挡住）。
+        // current_dir 失败（bug·medium 第十四轮）：显式降级——不持久化黑板
+        // （仅内存），不再静默用空路径（空路径会落到进程 cwd 造成歧义）。
+        let bb_file: Option<String> = {
             let raw = format!("{}:{}", user_id, session_id);
-            let safe: String = raw
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-                .take(64)
-                .collect();
             let mut h: u64 = 0xcbf29ce484222325;
             for b in raw.bytes() {
                 h ^= b as u64;
                 h = h.wrapping_mul(0x100000001b3);
             }
-            let base = if safe.is_empty() { "empty" } else { &safe };
-            let safe = format!("{}-{:016x}", base, h);
-            std::env::current_dir()
-                .unwrap_or_default()
-                .join(format!("blackboard_{}.json", safe))
-                .to_string_lossy()
-                .to_string()
+            match std::env::current_dir() {
+                Ok(dir) => Some(dir.join(format!("blackboard_{:016x}.json", h)).to_string_lossy().to_string()),
+                Err(e) => {
+                    tracing::error!(
+                        target: "agent.multiagent",
+                        "current_dir 不可得——黑板降级为仅内存（不持久化）: {}",
+                        e
+                    );
+                    None
+                }
+            }
         };
-        let (blackboard, bb_status) = crate::multiagent::SharedState::load(&bb_file).await;
-        match bb_status {
+        let bb_path = bb_file.as_deref();
+        let (blackboard, bb_status) = if let Some(p) = bb_path {
+            crate::multiagent::SharedState::load(p).await
+        } else {
+            (crate::multiagent::SharedState::new(), crate::multiagent::LoadStatus::Missing)
+        };
+        if let Some(p) = bb_path {
+            match bb_status {
             crate::multiagent::LoadStatus::Loaded => {
                 tracing::info!(
                     target: "agent.multiagent",
-                    path = %bb_file,
+                    path = %p,
                     "黑板已从文件恢复（断线续跑）"
                 );
             }
             crate::multiagent::LoadStatus::Corrupted => {
                 tracing::warn!(
                     target: "agent.multiagent",
-                    path = %bb_file,
+                    path = %p,
                     "黑板文件损坏——按空黑板启动"
                 );
-                // bug·medium（第一轮）：损坏文件不能坐等 stage 间 save 原子覆盖
-                // （丢失人工修复证据）——先备份为 blackboard_<session>.json.corrupted.<ms>。
-                // Unreadable 分支同款备份（bug·medium 第三轮：不可读但可复制时
-                // 同样要留证据；备份失败仅告警——本就读不到，copy 大概率失败）。
-                // 统一走 backup_blackboard_file（maintainability·low 第六轮：消除
-                // 两分支 ~20 行重复）。
-                Self::backup_blackboard_file(&bb_file, "corrupted");
+                // 损坏文件不能坐等 stage 间 save 原子覆盖（丢失人工修复证据）——
+                // 备份为 <原路径>.corrupted.<ms>.<pid>.<seq>。
+                Self::backup_blackboard_file(p, "corrupted");
             }
             crate::multiagent::LoadStatus::Unreadable => {
                 tracing::error!(
                     target: "agent.multiagent",
-                    path = %bb_file,
+                    path = %p,
                     "黑板文件存在但无法读取（权限/IO）——按空黑板启动"
                 );
-                // bug·medium（第三轮）：与 Corrupted 一致——尝试备份原文件
-                // （防后续 save 覆盖；读失败多因权限，备份尽力而为）。
-                Self::backup_blackboard_file(&bb_file, "unreadable");
+                // 与 Corrupted 一致——尝试备份原文件（读失败多因权限，尽力而为）。
+                Self::backup_blackboard_file(p, "unreadable");
             }
             crate::multiagent::LoadStatus::Missing => {}
+        }
         }
         let result = crate::multiagent::dispatch_with_timeout(
             &self.routed_llm,
             &subtasks,
             cfg.subagent_timeout_secs,
             Some(blackboard),
-            Some(&bb_file),
+            bb_path,
         )
         .await;
         if result.trim().is_empty() {
@@ -10339,11 +10342,9 @@ impl AgentCore {
         Some(format!("[MultiAgent Compose 结果]\n\n{}", result))
     }
 
-    /// 黑板备份文件名序号（maintainability·low 第四轮：毫秒时间戳同毫秒碰撞，
-    /// 加进程内单调序号彻底避免）。
     /// 备份黑板异常文件（损坏/不可读时调用，防 stage 间 save 覆盖丢失证据）。
-    /// 备份名 = `<原路径>.<tag>.<ms>.<pid>.<seq>`：毫秒+pid+进程内单调序号三段
-    /// 组合（bug·low 第六轮：纯进程内 seq 跨进程同毫秒仍可能撞名）。
+    /// 备份名 = `<原路径>.<tag>.<ms>.<pid>.<seq>`（毫秒+pid+进程内单调序号，
+    /// 防同毫秒/跨进程撞名）。
     /// best-effort：metadata/copy 失败仅告警（不可读文件大概率也无法复制）。
     fn backup_blackboard_file(bb_file: &str, tag: &str) {
         let ts = std::time::SystemTime::now()
