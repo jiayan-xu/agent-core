@@ -246,7 +246,17 @@ impl SharedState {
         let tmp = format!("{}.tmp.{}.{}", path, std::process::id(), seq);
         {
             use tokio::io::AsyncWriteExt;
-            let mut f = tokio::fs::File::create(&tmp)
+            // security·medium（第二轮）：File::create 默认 0644——黑板数据可能含
+            // 敏感业务中间产物，0644 会让同机其它用户可读。unix 下显式 0600
+            // （仅属主读写）；Windows 权限模型（ACL）无此问题。
+            #[cfg(unix)]
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut opts = tokio::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            opts.mode(0o600);
+            let mut f = opts
+                .open(&tmp)
                 .await
                 .map_err(|e| format!("创建黑板临时文件失败: {}", e))?;
             if let Err(e) = async {
@@ -270,11 +280,16 @@ impl SharedState {
 
     /// 从 JSON 文件恢复黑板（断线协作续跑：进程重启后按 session 文件恢复，
     /// 版本号一并恢复，乐观锁不回退）。文件不存在 → 空黑板（首跑）。
-    /// 恢复时逐值重跑 value_allowed + 重算 total_bytes（防损坏/篡改文件
-    /// 引入超限值或总量计数失真）。
-    pub fn load(path: &str) -> (SharedState, LoadStatus) {
+    /// 恢复防护（ocr 第二轮 bug·medium）：
+    /// - 逐值重跑 value_allowed（超限剔除）；
+    /// - 键数恢复 BB_MAX_KEYS 上限（超出截断，防恢复后 set 拒绝但已有键超限）；
+    /// - 总量重算 total_bytes；
+    /// - version 字段类型严格校验：存在但非 u64（浮点/字符串/负数）→ Corrupted
+    ///   （文件损坏，静默归 0 会掩盖写侧 bug）；缺失 → 0 + 告警（老格式兼容）。
+    /// async 化（perf·medium 第二轮）：读文件改 tokio::fs，避免阻塞 async 路径。
+    pub async fn load(path: &str) -> (SharedState, LoadStatus) {
         let bb = SharedState::new();
-        let text = match std::fs::read_to_string(path) {
+        let text = match tokio::fs::read_to_string(path).await {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return (bb, LoadStatus::Missing);
@@ -285,7 +300,28 @@ impl SharedState {
             Ok(v) => v,
             Err(_) => return (bb, LoadStatus::Corrupted),
         };
-        let version = v.get("version").and_then(|x| x.as_u64()).unwrap_or(0);
+        // version 严格校验
+        let version = match v.get("version") {
+            None => {
+                tracing::warn!(
+                    target: "agent.multiagent",
+                    path = %path,
+                    "黑板文件缺 version 字段（老格式？）——按 0 恢复"
+                );
+                0
+            }
+            Some(x) => match x.as_u64() {
+                Some(n) => n,
+                None => {
+                    tracing::warn!(
+                        target: "agent.multiagent",
+                        path = %path,
+                        "黑板文件 version 字段类型非法（非 u64）——视为损坏"
+                    );
+                    return (bb, LoadStatus::Corrupted);
+                }
+            },
+        };
         let data = v.get("data").and_then(|x| x.as_object()).cloned().unwrap_or_default();
         let mut guard = match bb.data.write() {
             Ok(g) => g,
@@ -295,7 +331,18 @@ impl SharedState {
             }
         };
         let mut bytes: usize = 0;
+        let mut inserted: usize = 0;
+        // 键数上限恢复：排序键遍历（BTreeMap 已有序），超出 BB_MAX_KEYS 截断
         for (k, val) in data {
+            if inserted >= BB_MAX_KEYS {
+                tracing::warn!(
+                    target: "agent.multiagent",
+                    key = %k,
+                    "黑板恢复：键数超上限 {}，截断",
+                    BB_MAX_KEYS
+                );
+                break;
+            }
             if !SharedState::value_allowed(&val) {
                 tracing::warn!(
                     target: "agent.multiagent",
@@ -306,6 +353,7 @@ impl SharedState {
             }
             bytes += value_bytes(&val).unwrap_or(0);
             guard.insert(k, val);
+            inserted += 1;
         }
         let _ = bb.total_bytes.store(bytes, Ordering::Relaxed);
         let _ = bb.version.store(version, Ordering::SeqCst);
@@ -797,7 +845,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("blackboard_test.json");
         let path = tmp.to_string_lossy().to_string();
         bb.save(&path).await.unwrap();
-        let (restored, status) = SharedState::load(&path);
+        let (restored, status) = SharedState::load(&path).await;
         assert_eq!(status, LoadStatus::Loaded);
         assert_eq!(restored.version(), v2); // 版本号恢复
         assert_eq!(restored.get("k1"), Some(serde_json::json!({"a": 1})));
@@ -805,30 +853,55 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn blackboard_load_status_semantics() {
-        // 文件缺失 = Missing；损坏 = Corrupted；恢复时超限值剔除
+    #[tokio::test]
+    async fn blackboard_load_status_semantics() {
+        // 文件缺失 = Missing；损坏 = Corrupted；恢复时超限值剔除；version 类型校验
         let missing = std::env::temp_dir().join("blackboard_nonexistent.json");
-        let (_, st) = SharedState::load(&missing.to_string_lossy().as_ref());
+        let (_, st) = SharedState::load(&missing.to_string_lossy().as_ref()).await;
         assert_eq!(st, LoadStatus::Missing);
 
-        // 损坏文件
+        // 损坏文件（非法 JSON）
         let tmp = std::env::temp_dir().join("blackboard_corrupt.json");
         std::fs::write(&tmp, "not-json{{{").unwrap();
-        let (_, st) = SharedState::load(&tmp.to_string_lossy().as_ref());
+        let (_, st) = SharedState::load(&tmp.to_string_lossy().as_ref()).await;
         assert_eq!(st, LoadStatus::Corrupted);
         let _ = std::fs::remove_file(&tmp);
+
+        // version 字段类型非法 → Corrupted（bug·medium 第二轮：不静默归 0）
+        let tmp3 = std::env::temp_dir().join("blackboard_badversion.json");
+        let bad = serde_json::json!({"version": "abc", "data": {}});
+        std::fs::write(&tmp3, serde_json::to_string(&bad).unwrap()).unwrap();
+        let (_, st) = SharedState::load(&tmp3.to_string_lossy().as_ref()).await;
+        assert_eq!(st, LoadStatus::Corrupted);
+        let _ = std::fs::remove_file(&tmp3);
 
         // 超限值剔除（宽数组 600 元素 > 512）
         let tmp2 = std::env::temp_dir().join("blackboard_oversize.json");
         let wide = serde_json::json!((0..600).collect::<Vec<u32>>());
         let payload = serde_json::json!({"version": 5, "data": {"wide": wide, "ok": 1}});
         std::fs::write(&tmp2, serde_json::to_string(&payload).unwrap()).unwrap();
-        let (bb, st) = SharedState::load(&tmp2.to_string_lossy().as_ref());
+        let (bb, st) = SharedState::load(&tmp2.to_string_lossy().as_ref()).await;
         assert_eq!(st, LoadStatus::Loaded);
         assert_eq!(bb.get("wide"), None); // 超限剔除
         assert_eq!(bb.get("ok"), Some(serde_json::json!(1)));
         assert_eq!(bb.version(), 5); // 版本号仍恢复
         let _ = std::fs::remove_file(&tmp2);
+    }
+
+    #[tokio::test]
+    async fn blackboard_load_enforces_key_cap() {
+        // 键数上限恢复（bug·medium 第二轮）：文件 40 键 > BB_MAX_KEYS(32) → 截断
+        let tmp = std::env::temp_dir().join("blackboard_manykeys.json");
+        let mut data = serde_json::Map::new();
+        for i in 0..40 {
+            data.insert(format!("k{}", i), serde_json::json!(i));
+        }
+        let payload = serde_json::json!({"version": 3, "data": data});
+        std::fs::write(&tmp, serde_json::to_string(&payload).unwrap()).unwrap();
+        let (bb, st) = SharedState::load(&tmp.to_string_lossy().as_ref()).await;
+        assert_eq!(st, LoadStatus::Loaded);
+        assert_eq!(bb.snapshot().len(), BB_MAX_KEYS); // 截断到上限
+        assert_eq!(bb.version(), 3);
+        let _ = std::fs::remove_file(&tmp);
     }
 }

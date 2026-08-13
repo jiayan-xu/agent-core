@@ -10275,7 +10275,7 @@ impl AgentCore {
                 .to_string_lossy()
                 .to_string()
         };
-        let (blackboard, bb_status) = crate::multiagent::SharedState::load(&bb_file);
+        let (blackboard, bb_status) = crate::multiagent::SharedState::load(&bb_file).await;
         match bb_status {
             crate::multiagent::LoadStatus::Loaded => {
                 tracing::info!(
