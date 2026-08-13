@@ -2,6 +2,24 @@
 
 ## 2026-08-13
 
+### v0.10.0 · P2 收尾（usage 真值记账 + 会话→根 ns 沉淀任务，新能力发版锚点）
+- **改动**：
+  - P2-D estimate_tokens 精度：`LlmResponse` +usage（OpenAI 兼容解析，兼容
+    整数/字符串 token 编码）；`BudgetTracker::record_turn_accurate`（total 真值
+    记账，替代 chars/4 估算——估算对中文任务系统性偏低）；接线 meta_evolve
+    optimize_prompt + code_evolve propose_fn→handlers/evolve 真值优先、估算回落；
+    `LlmUsage::effective_total`（total 权威、回落 prompt+completion saturating）。
+  - P2-E 会话→根 ns 沉淀：`record_experience_memo` 双写改**单写**（热路径省一次
+    写）+ RECORDED_NS 登记集（落盘持久化跨重启、原子写、成功才置位 restore、
+    按 root_ns 节流 600s + collect 前全量兜底、跨 agent 前缀隔离）；record 路径
+    顺带节流沉淀保证根 ns 及时性。
+- **效果**：预算记账不再被中文任务低估（护栏真值化）；第二样本源写入成本减半
+  且根 ns 全局经验不依赖 meta-evolution 触发；ocr-review 11 轮 40+ 条意见全修
+  （含 bug·high×5/security 与维护性项）。
+- **动机**：对照文档 §3 P2 剩余两项收尾，借鉴系列（P0→P1→P2）全部落地。
+
+## 2026-08-13
+
 ### v0.9.0 · P2-2 黑板持久化（SharedState → blackboard_<hash>.json 断线协作续跑，新能力发版锚点）
 - **改动**：
   - `SharedState::save`：受控写三件套（快照一致性写锁内 clone + tmp 唯一后缀
