@@ -13,12 +13,22 @@
 
 use crate::mcp_client::McpClient;
 
+/// 本进程记录过的会话 ns 集合（P2-E 沉淀任务用）：record 时登记，meta-evolution
+/// 时对登记过的 ns 批量沉淀到根 ns——避免枚举全部会话 ns（caller 维度有限，
+/// 本进程见过的才需沉淀）。
+static RECORDED_NS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn recorded_ns() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    RECORDED_NS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
 /// 写入一条会话经验 memo（工具失败教训）。best-effort：失败仅告警不阻断。
 /// 结构：content 含 工具名 / 错误摘要 / 触发上下文；tag 便于按工具召回；
 /// 与 evolution_log 样本共走 `min_samples` 门槛（两源合并计数）。
-/// **双写**（bug·medium 第六轮）：会话 ns（隔离粒度，`agent/{id}/{caller}`）+ 根 ns
-/// （`agent/{id}`，collect 的检索源）各写一份——否则第二样本源永远取不到
-/// （写会话 ns、读根 ns 的缺口）。
+/// **P2-E 单写**：只写会话 ns（`agent/{id}/{caller}`，隔离粒度）——根 ns 的
+/// 全局副本由 `sediment_to_root`（meta-evolution 时批量沉淀）补齐，每次失败
+/// 省一次写（原双写方案）。ns 登记进 RECORDED_NS 供沉淀枚举。
 pub async fn record_experience_memo(
     mcp: &McpClient,
     tool: &str,
@@ -30,37 +40,79 @@ pub async fn record_experience_memo(
         "[experience_memo] 工具 {} 执行失败：{}",
         tool, err_preview
     );
-    // 从会话 ns 推导根 ns：`agent/{id}/{caller}` → `agent/{id}`；非该形态则
-    // 只写原 ns（不猜测）。
-    let root_ns: Option<String> = {
+    // 登记会话 ns（沉淀任务枚举用；非 agent 形态 ns 不登记——无根 ns 可沉淀）
+    {
         let parts: Vec<&str> = ns.split('/').collect();
         if parts.len() >= 2 && parts[0] == "agent" && !parts[1].is_empty() {
-            Some(format!("agent/{}", parts[1]))
-        } else {
-            None
-        }
-    };
-    let mut targets = vec![ns.to_string()];
-    if let Some(rn) = &root_ns {
-        if rn != ns {
-            targets.push(rn.clone());
+            if let Ok(mut set) = recorded_ns().lock() {
+                set.insert(ns.to_string());
+            }
         }
     }
-    for target in &targets {
-        let args = serde_json::json!({
-            "content": content,
-            "tags": ["experience_memo", "lesson", tool],
-            "category": "experience_memo",
-            "confidence": 70,
-            "importance": 3,
-            "namespace": target,
-        });
-        match mcp.call_json("memory_remember", &args).await {
-            Ok(_) => {
-                tracing::debug!(tool = %tool, ns = %target, "experience_memo 已写入");
+    let args = serde_json::json!({
+        "content": content,
+        "tags": ["experience_memo", "lesson", tool],
+        "category": "experience_memo",
+        "confidence": 70,
+        "importance": 3,
+        "namespace": ns,
+    });
+    match mcp.call_json("memory_remember", &args).await {
+        Ok(_) => {
+            tracing::debug!(tool = %tool, ns = %ns, "experience_memo 已写入（会话 ns 单写，P2-E）");
+        }
+        Err(e) => {
+            tracing::warn!(tool = %tool, ns = %ns, "experience_memo 写入失败（best-effort）: {}", e);
+        }
+    }
+}
+
+/// P2-E 沉淀任务：把本进程记录过的会话 ns 里的 experience_memo 批量复制到根 ns
+/// （`agent/{id}`）。幂等：根 ns 已有同 content 的跳过（按内容精确去重）。
+/// 触发时机：collect_negative_samples 前（meta-evolution 低频运行，批量补齐
+/// 根 ns 全局经验，会话 ns 清理后经验不丢）。
+/// best-effort：任一 ns 失败仅告警，不阻断 collect。
+pub async fn sediment_to_root(mcp: &McpClient, root_ns: &str) {
+    let ns_list: Vec<String> = {
+        match recorded_ns().lock() {
+            Ok(set) => set.iter().cloned().collect(),
+            Err(_) => return,
+        }
+    };
+    if ns_list.is_empty() {
+        return;
+    }
+    // 根 ns 已有 content（去重基准）
+    let mut existing: std::collections::HashSet<String> = collect_memo_samples(mcp, root_ns, 200)
+        .await
+        .into_iter()
+        .map(|s| s.old_value)
+        .collect();
+    for ns in &ns_list {
+        if ns == root_ns {
+            continue;
+        }
+        let memos = collect_memo_samples(mcp, ns, 50).await;
+        for m in memos {
+            if existing.contains(&m.old_value) {
+                continue; // 根 ns 已有，跳过
             }
-            Err(e) => {
-                tracing::warn!(tool = %tool, ns = %target, "experience_memo 写入失败（best-effort）: {}", e);
+            let args = serde_json::json!({
+                "content": m.old_value,
+                "tags": ["experience_memo", "lesson"],
+                "category": "experience_memo",
+                "confidence": 70,
+                "importance": 3,
+                "namespace": root_ns,
+            });
+            match mcp.call_json("memory_remember", &args).await {
+                Ok(_) => {
+                    existing.insert(m.old_value); // 防同批重复
+                    tracing::debug!(ns = %ns, "experience_memo 已沉淀到根 ns");
+                }
+                Err(e) => {
+                    tracing::warn!(ns = %ns, "experience_memo 沉淀失败（best-effort）: {}", e);
+                }
             }
         }
     }
@@ -265,5 +317,20 @@ mod tests {
             None => content.to_string(),
         };
         assert_eq!(rest, "查询结果：7 月进厂 42 车");
+    }
+
+    #[test]
+    fn recorded_ns_registration_gate() {
+        // P2-E：仅 agent 形态 ns 登记（沉淀枚举用）——非 agent 形态不登记
+        {
+            let parts: Vec<&str> = "agent/xujiayan/caller1".split('/').collect();
+            let ok = parts.len() >= 2 && parts[0] == "agent" && !parts[1].is_empty();
+            assert!(ok);
+        }
+        {
+            let parts: Vec<&str> = "workspace/foo".split('/').collect();
+            let ok = parts.len() >= 2 && parts[0] == "agent" && !parts[1].is_empty();
+            assert!(!ok);
+        }
     }
 }
