@@ -10270,13 +10270,17 @@ impl AgentCore {
         // current_dir 失败：显式降级——黑板仅内存不持久化（error 日志），
         // 不静默用空路径。
         let bb_file: Option<String> = {
-            let raw = format!("{}:{}", user_id, session_id);
+            // 哈希输入加长度前缀（bug·low 第十六轮）：'a:b'/'c' vs 'a'/'b:c' 用
+            // 冒号分隔不单射——长度前缀使拼接可逆，消除碰撞歧义。
+            let raw = format!("{}|{}|{}", user_id.len(), user_id, session_id.len());
             let mut h: u64 = 0xcbf29ce484222325;
             for b in raw.bytes() {
                 h ^= b as u64;
                 h = h.wrapping_mul(0x100000001b3);
             }
             match std::env::current_dir() {
+                // lossy 仅在 cwd 含非法 UTF-8 时触发（Windows 罕见），仅影响
+                // 黑板持久化路径——已多次裁决可接受
                 Ok(dir) => Some(dir.join(format!("blackboard_{:016x}.json", h)).to_string_lossy().to_string()),
                 Err(e) => {
                     tracing::error!(
@@ -10296,34 +10300,34 @@ impl AgentCore {
         };
         if let Some(p) = bb_path {
             match bb_status {
-            crate::multiagent::LoadStatus::Loaded => {
-                tracing::info!(
-                    target: "agent.multiagent",
-                    path = %p,
-                    "黑板已从文件恢复（断线续跑）"
-                );
+                crate::multiagent::LoadStatus::Loaded => {
+                    tracing::info!(
+                        target: "agent.multiagent",
+                        path = %p,
+                        "黑板已从文件恢复（断线续跑）"
+                    );
+                }
+                crate::multiagent::LoadStatus::Corrupted => {
+                    tracing::warn!(
+                        target: "agent.multiagent",
+                        path = %p,
+                        "黑板文件损坏——按空黑板启动"
+                    );
+                    // 损坏文件不能坐等 stage 间 save 原子覆盖（丢失人工修复证据）——
+                    // 备份为 <原路径>.corrupted.<ms>.<pid>.<seq>。
+                    Self::backup_blackboard_file(p, "corrupted");
+                }
+                crate::multiagent::LoadStatus::Unreadable => {
+                    tracing::error!(
+                        target: "agent.multiagent",
+                        path = %p,
+                        "黑板文件存在但无法读取（权限/IO）——按空黑板启动"
+                    );
+                    // 与 Corrupted 一致——尝试备份原文件（读失败多因权限，尽力而为）。
+                    Self::backup_blackboard_file(p, "unreadable");
+                }
+                crate::multiagent::LoadStatus::Missing => {}
             }
-            crate::multiagent::LoadStatus::Corrupted => {
-                tracing::warn!(
-                    target: "agent.multiagent",
-                    path = %p,
-                    "黑板文件损坏——按空黑板启动"
-                );
-                // 损坏文件不能坐等 stage 间 save 原子覆盖（丢失人工修复证据）——
-                // 备份为 <原路径>.corrupted.<ms>.<pid>.<seq>。
-                Self::backup_blackboard_file(p, "corrupted");
-            }
-            crate::multiagent::LoadStatus::Unreadable => {
-                tracing::error!(
-                    target: "agent.multiagent",
-                    path = %p,
-                    "黑板文件存在但无法读取（权限/IO）——按空黑板启动"
-                );
-                // 与 Corrupted 一致——尝试备份原文件（读失败多因权限，尽力而为）。
-                Self::backup_blackboard_file(p, "unreadable");
-            }
-            crate::multiagent::LoadStatus::Missing => {}
-        }
         }
         let result = crate::multiagent::dispatch_with_timeout(
             &self.routed_llm,
