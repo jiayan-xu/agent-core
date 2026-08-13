@@ -303,7 +303,16 @@ impl SharedState {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return (bb, LoadStatus::Missing);
             }
-            Err(_) => return (bb, LoadStatus::Unreadable),
+            // other·low（第七轮）：保留底层 IO 错误详情供排查（此前静默丢弃）
+            Err(e) => {
+                tracing::warn!(
+                    target: "agent.multiagent",
+                    path = %path,
+                    "黑板文件读取失败（权限/IO）: {}",
+                    e
+                );
+                return (bb, LoadStatus::Unreadable);
+            }
         };
         let v: serde_json::Value = match serde_json::from_str(&text) {
             Ok(v) => v,
