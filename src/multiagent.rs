@@ -215,17 +215,16 @@ impl SharedState {
 
     /// 持久化黑板到 JSON 文件（格式 `{"version":N,"data":{...}}`）。
     /// 复用 P1-B 受控写模式（ocr 已验证三件套）：
-    /// 1. **全程持写锁**——序列化到 rename 期间锁住，防并发 set/merge 造成
-    ///    lost-update（黑板小（≤64KB），锁持有时间微秒级）；
-    /// 2. **tmp 唯一后缀**（pid+seq）——并发 save 不互相覆盖；
+    /// 1. **快照一致性**——写锁内 clone 出 (version, data) 快照（黑板 ≤64KB，
+    ///    clone 微秒级；快照语义 = 定期落盘点，此后并发 set 由下次 save 覆盖，
+    ///    与 P1-B 的强一致锁内写文件不同——黑板非强一致状态，可接受）；
+    /// 2. **tmp 不可预测后缀**（pid+seq+随机段）——并发 save 不互相覆盖，且
+    ///    防符号链接预创建攻击（security·medium 第三轮：纯 pid+seq 可猜测）；
     /// 3. **fsync + rename**——断电/崩溃不丢已确认数据；失败路径清理残留 tmp。
     /// 写失败返回 Err（调用方可决定告警/重试），不吞错。
     pub async fn save(&self, path: &str) -> Result<(), String> {
-        // 持写锁全程（与 P1-B save 同理由：锁外写文件期间被并发修改 = 旧快照落盘）。
-        // 作用域块内显式 clone 出 (version, data) 后立即释放 guard——避免
-        // json! 宏对 guard 解引用的借用把 RwLockWriteGuard 拖进 future 状态
-        // （RwLockWriteGuard 非 Send，会导致 save future 无法跨线程 spawn，
-        // E0277）。
+        // 写锁内 clone 快照后立即释放 guard（不持锁跨 await）——guard 借用
+        // 若被 json! 宏拖进 future 会因 RwLockWriteGuard 非 Send 报 E0277。
         let (version, data) = {
             let guard = match self.data.write() {
                 Ok(g) => g,
@@ -243,7 +242,10 @@ impl SharedState {
             .map_err(|e| format!("黑板序列化失败: {}", e))?;
         static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = format!("{}.tmp.{}.{}", path, std::process::id(), seq);
+        // security·medium（第三轮）：pid+seq 可预测 → 攻击者可预创建同名 symlink
+        // 让 save 写穿；追加随机段（rand::thread_rng，64 位随机）。
+        let rnd: u64 = rand::random();
+        let tmp = format!("{}.tmp.{}.{}.{:016x}", path, std::process::id(), seq, rnd);
         {
             use tokio::io::AsyncWriteExt;
             // security·medium（第二轮）：File::create 默认 0644——黑板数据可能含
@@ -322,7 +324,29 @@ impl SharedState {
                 }
             },
         };
-        let data = v.get("data").and_then(|x| x.as_object()).cloned().unwrap_or_default();
+        // data 字段严格校验（bug·medium 第三轮）：存在但非对象（"data": 123 /
+        // [] / "str"）→ Corrupted——静默当空黑板会掩盖写侧 bug（save 永远写对象）。
+        let data = match v.get("data") {
+            None => {
+                tracing::warn!(
+                    target: "agent.multiagent",
+                    path = %path,
+                    "黑板文件缺 data 字段（老格式？）——按空数据恢复"
+                );
+                serde_json::Map::new()
+            }
+            Some(x) => match x.as_object() {
+                Some(o) => o.clone(),
+                None => {
+                    tracing::warn!(
+                        target: "agent.multiagent",
+                        path = %path,
+                        "黑板文件 data 字段非对象——视为损坏"
+                    );
+                    return (bb, LoadStatus::Corrupted);
+                }
+            },
+        };
         let mut guard = match bb.data.write() {
             Ok(g) => g,
             Err(p) => {

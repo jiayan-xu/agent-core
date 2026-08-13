@@ -10263,12 +10263,26 @@ impl AgentCore {
         // 黑板文件（check-then-act race）——黑板是协作加速器非强一致状态，最后
         // 写赢语义诚实；load 为同步文件读（小文件微秒级，async 路径可接受）。
         let bb_file = {
-            // session_id 仅取安全字符（防路径注入：session 理论上内部生成，纵深防御）
-            let safe: String = _session_id
+            // session_id 仅取安全字符（防路径注入：session 理论上内部生成，纵深防御）。
+            // bug·low（第三轮）：过滤/截断可能让不同长 session 碰撞到同一文件——
+            // 若清洗后与原始不同（有字符被过滤或截断），追加 16 位 FNV-1a 哈希尾，
+            // 碰撞概率降到可忽略。
+            let raw = _session_id;
+            let safe: String = raw
                 .chars()
                 .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
                 .take(64)
                 .collect();
+            let safe = if safe == raw {
+                safe
+            } else {
+                let mut h: u64 = 0xcbf29ce484222325;
+                for b in raw.bytes() {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                format!("{}-{:016x}", safe, h)
+            };
             std::env::current_dir()
                 .unwrap_or_default()
                 .join(format!("blackboard_{}.json", safe))
@@ -10292,6 +10306,8 @@ impl AgentCore {
                 );
                 // bug·medium（第一轮）：损坏文件不能坐等 stage 间 save 原子覆盖
                 // （丢失人工修复证据）——先备份为 blackboard_<session>.json.corrupted.<ms>。
+                // Unreadable 分支同款备份（bug·medium 第三轮：不可读但可复制时
+                // 同样要留证据；备份失败仅告警——本就读不到，copy 大概率失败）。
                 if let Ok(meta) = std::fs::metadata(&bb_file) {
                     let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -10322,6 +10338,27 @@ impl AgentCore {
                     path = %bb_file,
                     "黑板文件存在但无法读取（权限/IO）——按空黑板启动"
                 );
+                // bug·medium（第三轮）：与 Corrupted 一致——尝试备份原文件
+                // （防后续 save 覆盖；读失败多因权限，备份尽力而为）。
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let backup = format!("{}.unreadable.{}", bb_file, ts);
+                if let Err(e) = std::fs::copy(&bb_file, &backup) {
+                    tracing::warn!(
+                        target: "agent.multiagent",
+                        path = %bb_file,
+                        "黑板不可读文件备份失败（预期内，权限问题通常无法复制）: {}",
+                        e
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "agent.multiagent",
+                        backup = %backup,
+                        "不可读的黑板文件已备份"
+                    );
+                }
             }
             crate::multiagent::LoadStatus::Missing => {}
         }
