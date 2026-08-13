@@ -6877,6 +6877,7 @@ impl AgentCore {
                     let mut chosen = crate::llm::LlmResponse {
                         text: reply.clone(),
                         tool_calls: Vec::new(),
+                        usage: None,
                     };
                     // 1) 终答自一致性（N 路采样 + 选择器择优）
                     if matches!(ttc.decide(), crate::ttc::TtcAction::Sample) {

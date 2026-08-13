@@ -800,12 +800,12 @@ impl MetaEvolver {
             .unwrap_or_default();
         let mut samples = Self::parse_negative_samples(&raw);
         // P1-A：追加 experience_memo 样本（第二源；best-effort）。
-        // ns 语义（bug·medium 第四轮修正）：record_experience_memo 写入的是
-        // **会话 ns**（execute_tool_calls 的 allowed_ns.first() = `agent/{id}/{caller}`），
-        // 而本采集面向跨会话全局经验，统一在根 ns `agent/{id}` 检索——会话 ns 的
-        // memo 由未来的「会话→根 ns 沉淀任务」（P1-A 后续）归并；当前阶段只取
-        // 根 ns 下已沉淀的全局经验（与 recall_failure_lesson 的 root_ns 一致）。
+        // ns 语义（P2-E 更新）：record_experience_memo 写入**会话 ns**
+        // （`agent/{id}/{caller}`）；采集前先跑沉淀任务（sediment_to_root）——
+        // 把本进程记录过的会话 ns memo 批量复制到根 ns（幂等去重），随后
+        // 统一在根 ns `agent/{id}` 检索全局经验（与 recall_failure_lesson 一致）。
         let root_ns = format!("agent/{}", self.agent_id);
+        crate::experience_memo::sediment_to_root(mem_client, &root_ns).await;
         let memos = crate::experience_memo::collect_memo_samples(mem_client, &root_ns, limit).await;
         // 去重键：change_type + old_value 复合（仅 old_value 会误并不同样本，
         // bug·low——同错误文本可能来自不同工具/场景，change_type 承载工具名）
@@ -895,12 +895,17 @@ impl MetaEvolver {
                 return Err(OptimizeError::Llm(e.to_string()));
             }
         };
-        // 预算记账（过渡期 chars/4 估算，方案 §6）：turns/tokens/wall-clock 违约
-        // 必须显式传播——静默忽略会导致超限仍继续（ocr 2026-08-12 bug·high 修复）；
-        // 违约类型保持结构化（bug·medium：不扁平为 String）
-        tracker
-            .record_turn(crate::autonomy_budget::estimate_tokens(&reply.text))
-            .map_err(OptimizeError::Budget)?;
+        // 预算记账（P2-D：上游 usage 真值优先，回落 chars/4 估算）：turns/tokens/
+        // wall-clock 违约必须显式传播——静默忽略会导致超限仍继续（bug·high 修复）；
+        // 违约类型保持结构化（不扁平为 String）
+        match reply.usage {
+            Some(u) => tracker
+                .record_turn_accurate(u.effective_total())
+                .map_err(OptimizeError::Budget)?,
+            None => tracker
+                .record_turn(crate::autonomy_budget::estimate_tokens(&reply.text))
+                .map_err(OptimizeError::Budget)?,
+        }
         let text = reply.text.trim().to_string();
         if text.is_empty() {
             return Err(OptimizeError::Llm("optimizer 返回空提示词".to_string()));
