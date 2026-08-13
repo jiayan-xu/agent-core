@@ -5265,7 +5265,7 @@ impl AgentCore {
     async fn rephrase_and_confirm(
         &self,
         message: &str,
-        _user_id: &str,
+        user_id: &str,
         session_id: &str,
         allowed_ns: &[String],
     ) -> String {
@@ -10223,7 +10223,7 @@ impl AgentCore {
     async fn maybe_compose(
         &self,
         message: &str,
-        _user_id: &str,
+        user_id: &str,
         session_id: &str,
         _allowed_ns: &[String],
     ) -> Option<String> {
@@ -10263,28 +10263,23 @@ impl AgentCore {
         // 黑板文件（check-then-act race）——黑板是协作加速器非强一致状态，最后
         // 写赢语义诚实；load 为同步文件读（小文件微秒级，async 路径可接受）。
         let bb_file = {
-            // 黑板身份 = user_id + session_id 双维度（security·medium 第十一轮：
-            // 仅 session_id 时不同用户的同 session 值共享黑板，跨用户数据串扰）。
-            // session 部分白名单过滤 + 64 截断 + FNV-1a 哈希尾防路径注入/碰撞；
-            // 哈希输入含 user_id（FNV 非加密但仅用于文件名唯一性，非安全边界）。
-            // 空/全被过滤的 session 强制走哈希路径（防空串跳过哈希共享文件）。
-            let raw = format!("{}:{}", _user_id, session_id);
+            // 黑板身份 = user_id + session_id 双维度（防跨用户同 session 串扰）。
+            // raw 含 ':' 分隔符 → 白名单过滤后 safe != raw 恒成立（冒号必被滤），
+            // 故恒走哈希路径（第十二轮：删除不可达的 safe==raw 分支）；哈希仅
+            // 用于文件名唯一性（FNV 非加密可接受，路径注入已由白名单挡住）。
+            let raw = format!("{}:{}", user_id, session_id);
             let safe: String = raw
                 .chars()
                 .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
                 .take(64)
                 .collect();
-            let safe = if safe == raw && !safe.is_empty() {
-                safe
-            } else {
-                let mut h: u64 = 0xcbf29ce484222325;
-                for b in raw.bytes() {
-                    h ^= b as u64;
-                    h = h.wrapping_mul(0x100000001b3);
-                }
-                let base = if safe.is_empty() { "empty" } else { &safe };
-                format!("{}-{:016x}", base, h)
-            };
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in raw.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            let base = if safe.is_empty() { "empty" } else { &safe };
+            let safe = format!("{}-{:016x}", base, h);
             std::env::current_dir()
                 .unwrap_or_default()
                 .join(format!("blackboard_{}.json", safe))
