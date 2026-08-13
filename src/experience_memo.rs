@@ -129,6 +129,11 @@ pub async fn record_experience_memo(
     match mcp.call_json("memory_remember", &args).await {
         Ok(_) => {
             tracing::debug!(tool = %tool, ns = %ns, "experience_memo 已写入（会话 ns 单写，P2-E）");
+            // 节流顺带沉淀（bug·high 第九轮）：根 ns 及时性不依赖 meta-evolution
+            // 触发——10 分钟窗口内至多一次，成本受限；best-effort 不阻断。
+            if let Some(root_ns) = root_ns_of(ns) {
+                sediment_to_root(mcp, &root_ns).await;
+            }
         }
         Err(e) => {
             tracing::warn!(tool = %tool, ns = %ns, "experience_memo 写入失败（best-effort）: {}", e);
@@ -136,12 +141,37 @@ pub async fn record_experience_memo(
     }
 }
 
+/// 从会话 ns 推导根 ns（`agent/{id}/{caller}` → `agent/{id}`）；非 agent 形态返回 None。
+fn root_ns_of(ns: &str) -> Option<String> {
+    if !is_agent_ns(ns) {
+        return None;
+    }
+    let parts: Vec<&str> = ns.split('/').collect();
+    Some(format!("agent/{}", parts[1]))
+}
+
+/// 沉淀节流（bug·high 第九轮）：根 ns 填充不能只依赖 meta-evolution 触发——
+/// 该功能低频（24h cooldown）或关闭时根 ns 永远无 memo（recall 的 lesson 源
+/// 也依赖根 ns）。record 路径节流顺带沉淀（默认 600s 一次），保证根 ns 及时
+/// 性且成本受限；collect 前仍全量沉淀兜底。
+static LAST_SEDIMENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const SEDIMENT_INTERVAL_SECS: u64 = 600;
+
 /// P2-E 沉淀任务：把本进程记录过的会话 ns 里的 experience_memo 批量复制到根 ns
 /// （`agent/{id}`）。幂等：根 ns 已有同 content 的跳过（按内容精确去重）。
-/// 触发时机：collect_negative_samples 前（meta-evolution 低频运行，批量补齐
-/// 根 ns 全局经验，会话 ns 清理后经验不丢）。
-/// best-effort：任一 ns 失败仅告警，不阻断 collect。
+/// 触发时机：collect_negative_samples 前（全量兜底）+ record 路径节流（及时性）。
+/// best-effort：任一 ns 失败仅告警，不阻断调用方。
 pub async fn sediment_to_root(mcp: &McpClient, root_ns: &str) {
+    use std::sync::atomic::Ordering;
+    // 节流闸（bug·high 第九轮）：10 分钟内只沉淀一次（record 热路径调用时）
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_SEDIMENT.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < SEDIMENT_INTERVAL_SECS {
+        return;
+    }
     // 先恢复磁盘登记集（跨重启：崩溃前记录过的会话 ns 重新进入枚举范围）
     restore_recorded_ns();
     // 跨 agent 隔离（bug·high 第四轮）：进程级登记集可能含其它 agent 的会话
@@ -198,6 +228,8 @@ pub async fn sediment_to_root(mcp: &McpClient, root_ns: &str) {
             }
         }
     }
+    // 沉淀成功完成 → 更新节流时间戳（失败不更新，允许下次重试）
+    LAST_SEDIMENT.store(now, Ordering::Relaxed);
 }
 
 /// 从 memo content 提取工具名（"[experience_memo] 工具 X 执行失败：..."）。
