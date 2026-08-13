@@ -63,21 +63,25 @@ fn persist_recorded_ns() {
 }
 
 /// 从磁盘恢复登记集（幂等合并；文件缺失/损坏 → 保持现状不阻断）。
-/// 一次性（perf·medium 第七轮）：进程内只 restore 一次——每次 record 都重读
-/// 文件是纯浪费（文件由本进程维护，无外部写入方）。
-static RESTORED: std::sync::Once = std::sync::Once::new();
+/// 成功才置位（bug·high 第八轮）：Once 语义下闭包内失败也会置位——文件瞬时
+/// 损坏（如外部工具改坏）修复后永不重试，崩溃前登记的 ns 永久丢失。改
+/// AtomicBool：读取+解析成功才置位，失败可下次重试（幂等合并，并发无害）。
+static RESTORED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn restore_recorded_ns() {
-    RESTORED.call_once(|| {
-        let path = recorded_ns_path();
-        let Ok(text) = std::fs::read_to_string(&path) else { return };
-        let Ok(list): Result<Vec<String>, _> = serde_json::from_str(&text) else { return };
-        if let Ok(mut set) = recorded_ns().lock() {
-            for ns in list {
-                set.insert(ns);
-            }
+    use std::sync::atomic::Ordering;
+    if RESTORED.load(Ordering::Relaxed) {
+        return;
+    }
+    let path = recorded_ns_path();
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let Ok(list): Result<Vec<String>, _> = serde_json::from_str(&text) else { return };
+    if let Ok(mut set) = recorded_ns().lock() {
+        for ns in list {
+            set.insert(ns);
         }
-    });
+    }
+    RESTORED.store(true, Ordering::Relaxed);
 }
 
 /// 是否 agent 形态 ns（`agent/{id}[/...]`）——登记/沉淀门（纯函数，测试直调）。
