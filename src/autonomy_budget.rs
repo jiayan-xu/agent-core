@@ -130,6 +130,20 @@ impl BudgetTracker {
         Ok(())
     }
 
+    /// P2-D：按上游 usage **真值**记账（prompt + completion），替代 chars/4 估算。
+    /// 估算对中文任务系统性偏低（1 汉字 ≈ 1 token 而非 4 字符/token），真值记账
+    /// 让 max_tokens 预算不再被低估；语义与 record_turn 完全一致（turns+1、
+    /// 同样检查、`>` 违约语义）。调用方在 LlmResponse.usage 为 Some 时走本路径，
+    /// None 时回落 record_turn(estimate_tokens)。
+    pub fn record_turn_accurate(
+        &mut self,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) -> Result<(), BudgetBreach> {
+        let total = prompt_tokens.saturating_add(completion_tokens);
+        self.record_turn(total)
+    }
+
     /// 仅在循环顶部做纯墙钟检查（不消耗 turn）。同 record_turn 的 `>` 语义。
     pub fn check_wall_clock(&self) -> Result<(), BudgetBreach> {
         if self.budget.max_wall_clock_secs > 0
@@ -301,6 +315,23 @@ mod tests {
         assert_eq!(estimate_tokens("abcd"), 1);
         // 中文 4 chars → 1 token
         assert_eq!(estimate_tokens("固废监管"), 1);
+    }
+
+    #[test]
+    fn record_turn_accurate_uses_real_tokens() {
+        // P2-D：真值记账（prompt+completion）与 record_turn 语义一致
+        let mut t = BudgetTracker::new(AutonomyBudget {
+            max_turns: 0,
+            max_tokens: 1000,
+            max_wall_clock_secs: 0,
+            ..Default::default()
+        });
+        t.record_turn_accurate(600, 300).unwrap(); // 900 token 真值
+        assert_eq!(t.tokens_used(), 900);
+        assert_eq!(t.turns_used(), 1);
+        // 真值违约：+200 → 1100 > 1000
+        let err = t.record_turn_accurate(100, 100);
+        assert!(matches!(err, Err(BudgetBreach::Tokens)));
     }
 
     #[test]

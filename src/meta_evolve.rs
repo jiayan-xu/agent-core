@@ -895,12 +895,17 @@ impl MetaEvolver {
                 return Err(OptimizeError::Llm(e.to_string()));
             }
         };
-        // 预算记账（过渡期 chars/4 估算，方案 §6）：turns/tokens/wall-clock 违约
-        // 必须显式传播——静默忽略会导致超限仍继续（ocr 2026-08-12 bug·high 修复）；
-        // 违约类型保持结构化（bug·medium：不扁平为 String）
-        tracker
-            .record_turn(crate::autonomy_budget::estimate_tokens(&reply.text))
-            .map_err(OptimizeError::Budget)?;
+        // 预算记账（P2-D：上游 usage 真值优先，回落 chars/4 估算）：turns/tokens/
+        // wall-clock 违约必须显式传播——静默忽略会导致超限仍继续（bug·high 修复）；
+        // 违约类型保持结构化（不扁平为 String）
+        match reply.usage {
+            Some(u) => tracker
+                .record_turn_accurate(u.prompt_tokens, u.completion_tokens)
+                .map_err(OptimizeError::Budget)?,
+            None => tracker
+                .record_turn(crate::autonomy_budget::estimate_tokens(&reply.text))
+                .map_err(OptimizeError::Budget)?,
+        }
         let text = reply.text.trim().to_string();
         if text.is_empty() {
             return Err(OptimizeError::Llm("optimizer 返回空提示词".to_string()));

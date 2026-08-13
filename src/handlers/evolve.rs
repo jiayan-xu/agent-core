@@ -223,9 +223,9 @@ pub(crate) async fn handle_code_evolve(
             };
             send("gen_start", serde_json::json!({"gen": gen, "best_ms": best}));
 
-            // 1) LLM 提议
-            let new_fn = match propose_fn(&proposer, &fn_name, &current, &goal).await {
-                Ok(f) => f,
+            // 1) LLM 提议（P2-D：返回带 usage，真值记账替代 chars/4 估算）
+            let (new_fn, propose_usage) = match propose_fn(&proposer, &fn_name, &current, &goal).await {
+                Ok(pair) => pair,
                 Err(e) => {
                     send("proposal_error", serde_json::json!({"gen": gen, "msg": e}));
                     consecutive += 1;
@@ -237,10 +237,15 @@ pub(crate) async fn handle_code_evolve(
                 }
             };
             send("proposal", serde_json::json!({"gen": gen, "code": new_fn}));
-            // ② 记一轮 + token 记账（过渡期 chars/4 估算，方案 §6）；违约立即停 + 回退
-            if let Err(b) = tracker.record_turn(
-                agent_core::autonomy_budget::estimate_tokens(&new_fn),
-            ) {
+            // ② 记一轮 + token 记账（P2-D：上游 usage 真值优先，回落估算）；
+            // 违约立即停 + 回退
+            let budget_result = match propose_usage {
+                Some(u) => tracker.record_turn_accurate(u.prompt_tokens, u.completion_tokens),
+                None => tracker.record_turn(
+                    agent_core::autonomy_budget::estimate_tokens(&new_fn),
+                ),
+            };
+            if let Err(b) = budget_result {
                 let _ = git_revert(&repo, &target_p); // 硬红线：回到干净基线
                 send(
                     "budget_break",

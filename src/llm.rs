@@ -903,6 +903,18 @@ pub struct ToolCall {
 pub struct LlmResponse {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    /// 上游 usage（OpenAI 兼容 `usage` 字段；provider 未返回时为 None）。
+    /// P2-D：预算记账真值来源——有 usage 时 BudgetTracker 走 accurate 记账，
+    /// 不再依赖 chars/4 估算（估算对中文任务系统性偏低）。
+    pub usage: Option<LlmUsage>,
+}
+
+/// LLM 用量（OpenAI 兼容 usage 结构）
+#[derive(Debug, Clone, Copy)]
+pub struct LlmUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
 }
 
 /// DeepSeek DSML 工具调用文本泄露解析（task 650）。
@@ -1444,8 +1456,29 @@ impl LlmClient {
                             tracing::info!(failover_to = %model, provider_index = idx, "LLM provider failover（主 Provider 失败）");
                         }
 
+                        // P2-D：提取上游 usage（OpenAI 兼容 `usage` 字段）——
+                        // 预算记账真值来源；provider 未返回时 None（回落估算）。
+                        let usage = data
+                            .get("usage")
+                            .and_then(|u| u.as_object())
+                            .map(|u| LlmUsage {
+                                prompt_tokens: u
+                                    .get("prompt_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                                completion_tokens: u
+                                    .get("completion_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                                total_tokens: u
+                                    .get("total_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                            })
+                            .filter(|u| u.total_tokens > 0);
+
                         // task 650：DeepSeek DSML 文本泄露 → 回填 structured tool_calls
-                        return Ok(apply_dsml_fallback(LlmResponse { text, tool_calls }));
+                        return Ok(apply_dsml_fallback(LlmResponse { text, tool_calls, usage }));
                     }
                     Err(e) => {
                         let msg = format!("连接失败: {}", e);
@@ -1705,6 +1738,7 @@ mod routing_tests {
         let c = LlmResponse {
             text: String::new(),
             tool_calls: vec![],
+            usage: None,
         };
         let s = score_heuristic(&c, false);
         assert!(s.is_infinite() && s.is_sign_negative());
@@ -1715,6 +1749,7 @@ mod routing_tests {
         let c = LlmResponse {
             text: "```rust\nfn main() {}\n```".to_string(),
             tool_calls: vec![],
+            usage: None,
         };
         assert!(score_heuristic(&c, true) > 0.0);
     }
@@ -1726,10 +1761,12 @@ mod routing_tests {
         let concise = LlmResponse {
             text: "步骤如下：\n1. 打开配置\n2. 修改端口\n3. 重启服务".to_string(),
             tool_calls: vec![],
+            usage: None,
         };
         let verbose = LlmResponse {
             text: "关于这个问题，我想说的是，其实有很多种方法可以考虑，通常我们会从多个角度去想，比如说第一个方面，第二个方面，第三个方面，总之大家都觉得这个事情比较复杂，需要慢慢来，不能着急，因为着急容易出错，所以我们还是要稳妥一点比较好，当然这也取决于具体情况。".to_string(),
             tool_calls: vec![],
+            usage: None,
         };
         assert!(
             score_heuristic(&concise, false) > score_heuristic(&verbose, false),
@@ -1743,10 +1780,12 @@ mod routing_tests {
         let moderate = LlmResponse {
             text: "a".repeat(600),
             tool_calls: vec![],
+            usage: None,
         };
         let bloated = LlmResponse {
             text: "b".repeat(3000),
             tool_calls: vec![],
+            usage: None,
         };
         // 同等无结构情况下，超长不应显著优于中等（长度权重被压制）
         let delta = score_heuristic(&bloated, false) - score_heuristic(&moderate, false);
@@ -1924,6 +1963,7 @@ mod dsml_tests {
         let filled = apply_dsml_fallback(LlmResponse {
             text: text.clone(),
             tool_calls: vec![],
+            usage: None,
         });
         assert_eq!(filled.tool_calls.len(), 1);
         assert!(!filled.text.contains("DSML"));
@@ -1935,6 +1975,7 @@ mod dsml_tests {
                 name: "already_there".into(),
                 arguments: serde_json::json!({}),
             }],
+            usage: None,
         });
         assert_eq!(keep.tool_calls.len(), 1);
         assert_eq!(keep.tool_calls[0].name, "already_there");
