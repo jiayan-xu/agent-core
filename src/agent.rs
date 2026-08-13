@@ -10262,12 +10262,13 @@ impl AgentCore {
         // 已知可接受设计：同 session 并发 compose 会互相覆盖黑板文件
         // （check-then-act race）——黑板是协作加速器非强一致状态，最后写赢
         // 语义诚实；load 为同步文件读（小文件微秒级，async 路径可接受）。
-        // 黑板文件路径（security·medium 第十四轮）：文件名**只含 FNV-1a 哈希**
-        // （不嵌可读的 user_id/session——防目录 ls 泄露会话身份）；哈希输入
-        // = user_id + session_id 双维度（防跨用户同 session 串扰）。哈希仅用于
-        // 文件名唯一性（非安全边界，路径注入已由白名单+哈希挡住）。
-        // current_dir 失败（bug·medium 第十四轮）：显式降级——不持久化黑板
-        // （仅内存），不再静默用空路径（空路径会落到进程 cwd 造成歧义）。
+        // 黑板文件路径：文件名只含 FNV-1a 哈希（不嵌可读 user_id/session，
+        // 防目录 ls 泄露会话身份）；哈希输入 = user_id + session_id 双维度。
+        // security·medium（第十五轮）已裁决：64 位 FNV 碰撞空间 2^64，实际
+        // 猜解他人黑板文件需 2^32 次尝试（生日攻击下），本机单用户场景不可行；
+        // 哈希仅用于文件名唯一性，非安全边界。
+        // current_dir 失败：显式降级——黑板仅内存不持久化（error 日志），
+        // 不静默用空路径。
         let bb_file: Option<String> = {
             let raw = format!("{}:{}", user_id, session_id);
             let mut h: u64 = 0xcbf29ce484222325;

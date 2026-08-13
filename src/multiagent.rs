@@ -371,7 +371,18 @@ impl SharedState {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return (bb, LoadStatus::Missing);
             }
-            // 保留底层 IO 错误详情供排查（此前静默丢弃）
+            // InvalidData（非 UTF-8/二进制/截断）→ Corrupted（内容非法，bug·low
+            // 第十五轮：此前归 Unreadable 掩盖了「文件损坏」性质）
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                tracing::warn!(
+                    target: "agent.multiagent",
+                    path = %path,
+                    "黑板文件内容非法（非 UTF-8/截断）: {}",
+                    e
+                );
+                return (bb, LoadStatus::Corrupted);
+            }
+            // 保留底层 IO 错误详情供排查
             Err(e) => {
                 tracing::warn!(
                     target: "agent.multiagent",
