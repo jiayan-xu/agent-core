@@ -10224,7 +10224,7 @@ impl AgentCore {
         &self,
         message: &str,
         _user_id: &str,
-        _session_id: &str,
+        session_id: &str,
         _allowed_ns: &[String],
     ) -> Option<String> {
         let cfg = self.multiagent.as_ref()?;
@@ -10267,7 +10267,7 @@ impl AgentCore {
             // bug·low（第三轮）：过滤/截断可能让不同长 session 碰撞到同一文件——
             // 若清洗后与原始不同（有字符被过滤或截断），追加 16 位 FNV-1a 哈希尾，
             // 碰撞概率降到可忽略。
-            let raw = _session_id;
+            let raw = session_id;
             let safe: String = raw
                 .chars()
                 .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')

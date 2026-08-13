@@ -306,6 +306,29 @@ impl SharedState {
             Ok(v) => v,
             Err(_) => return (bb, LoadStatus::Corrupted),
         };
+        // 根级类型校验（bug·medium 第五轮）：JSON 合法但根非对象（`[1,2,3]` /
+        // `"str"` / `123`）→ Corrupted——save 永远写对象，非对象根 = 文件损坏，
+        // 静默当空黑板会掩盖写侧 bug。
+        if !v.is_object() {
+            let kind = if v.is_array() {
+                "array"
+            } else if v.is_string() {
+                "string"
+            } else if v.is_number() {
+                "number"
+            } else if v.is_boolean() {
+                "boolean"
+            } else {
+                "null"
+            };
+            tracing::warn!(
+                target: "agent.multiagent",
+                path = %path,
+                "黑板文件根元素非对象（{}）——视为损坏",
+                kind
+            );
+            return (bb, LoadStatus::Corrupted);
+        }
         // version 严格校验
         let version = match v.get("version") {
             None => {
