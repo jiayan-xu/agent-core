@@ -10270,9 +10270,16 @@ impl AgentCore {
         // current_dir 失败：显式降级——黑板仅内存不持久化（error 日志），
         // 不静默用空路径。
         let bb_file: Option<String> = {
-            // 哈希输入加长度前缀（bug·low 第十六轮）：'a:b'/'c' vs 'a'/'b:c' 用
-            // 冒号分隔不单射——长度前缀使拼接可逆，消除碰撞歧义。
-            let raw = format!("{}|{}|{}", user_id.len(), user_id, session_id.len());
+            // 哈希输入 = 完整 user_id + session_id（bug·high 第十七轮：上一版
+            // 只含 user_id 内容 + session_id 长度，同长不同 session 碰撞共享
+            // 文件！）——长度前缀保单射且内容完整。
+            let raw = format!(
+                "{}|{}|{}|{}",
+                user_id.len(),
+                user_id,
+                session_id.len(),
+                session_id
+            );
             let mut h: u64 = 0xcbf29ce484222325;
             for b in raw.bytes() {
                 h ^= b as u64;
