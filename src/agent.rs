@@ -10263,13 +10263,12 @@ impl AgentCore {
         // 黑板文件（check-then-act race）——黑板是协作加速器非强一致状态，最后
         // 写赢语义诚实；load 为同步文件读（小文件微秒级，async 路径可接受）。
         let bb_file = {
-            // session_id 仅取安全字符（防路径注入）：白名单过滤 + 64 截断 +
-            // FNV-1a 哈希尾覆盖任意 session 输入（过滤后不可能含路径分隔符）。
-            // FNV-1a 用途仅为文件名唯一性（非安全边界——路径注入已由白名单
-            // 挡住；可预测至多导致两 session 共享黑板，非敏感跨用户数据）。
-            // 空/全被过滤的 session（bug·low 第十轮）：`safe == raw` 对空串成立
-            // 会跳过哈希 → 所有空 session 共享同一文件——强制走哈希路径。
-            let raw = session_id;
+            // 黑板身份 = user_id + session_id 双维度（security·medium 第十一轮：
+            // 仅 session_id 时不同用户的同 session 值共享黑板，跨用户数据串扰）。
+            // session 部分白名单过滤 + 64 截断 + FNV-1a 哈希尾防路径注入/碰撞；
+            // 哈希输入含 user_id（FNV 非加密但仅用于文件名唯一性，非安全边界）。
+            // 空/全被过滤的 session 强制走哈希路径（防空串跳过哈希共享文件）。
+            let raw = format!("{}:{}", _user_id, session_id);
             let safe: String = raw
                 .chars()
                 .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
