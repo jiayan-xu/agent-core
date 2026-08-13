@@ -10263,10 +10263,10 @@ impl AgentCore {
         // 黑板文件（check-then-act race）——黑板是协作加速器非强一致状态，最后
         // 写赢语义诚实；load 为同步文件读（小文件微秒级，async 路径可接受）。
         let bb_file = {
-            // session_id 仅取安全字符（防路径注入：session 理论上内部生成，纵深防御）。
-            // bug·low（第三轮）：过滤/截断可能让不同长 session 碰撞到同一文件——
-            // 若清洗后与原始不同（有字符被过滤或截断），追加 16 位 FNV-1a 哈希尾，
-            // 碰撞概率降到可忽略。
+            // session_id 仅取安全字符（防路径注入）。bug·medium（第八轮）：
+            // 非 streaming chat 路径 session_id 可能非内部生成（外部可影响），
+            // 但防护不依赖该假设——白名单过滤 + 64 截断 + FNV-1a 哈希尾已
+            // 覆盖任意 session 输入（过滤后不可能含路径分隔符/..）。
             let raw = session_id;
             let safe: String = raw
                 .chars()

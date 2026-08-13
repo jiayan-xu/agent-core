@@ -422,10 +422,13 @@ impl SharedState {
                 tracing::warn!(
                     target: "agent.multiagent",
                     key = %k,
-                    "黑板恢复：总量超上限 {}，截断",
+                    "黑板恢复：单键使总量超上限 {}，跳过该键",
                     BB_MAX_TOTAL_BYTES
                 );
-                break;
+                // bug·medium（第八轮）：continue 而非 break——BTreeMap 键序中
+                // 超限键之后可能还有更小的键（"big" 在 "small" 前），break 会
+                // 丢掉本可容纳的后续键。
+                continue;
             }
             bytes += val_bytes;
             guard.insert(k, val);
