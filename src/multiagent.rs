@@ -46,6 +46,9 @@ const BB_MAX_VALUE_DEPTH: usize = 4; // 单值最大嵌套深度
 const BB_MAX_VALUE_WIDTH: usize = 512; // 单值数组/对象最大元素数（宽度预检，防宽数组物化）
 const BB_MAX_VALUE_BYTES: usize = 4096; // 单值序列化最大字节
 const BB_MAX_TOTAL_BYTES: usize = 65536; // 黑板全量序列化字节上限（merge 时强校验）
+/// 黑板文件 TTL（bug·medium 第九轮）：session 复用无失效机制会污染新任务，
+/// mtime 超此值视为过期（load 时清理）
+const BB_TTL_HOURS: u64 = 24;
 
 fn json_depth(v: &serde_json::Value) -> usize {
     match v {
@@ -298,6 +301,43 @@ impl SharedState {
     /// async 化（perf·medium 第二轮）：读文件改 tokio::fs，避免阻塞 async 路径。
     pub async fn load(path: &str) -> (SharedState, LoadStatus) {
         let bb = SharedState::new();
+        // TTL 失效（bug·medium 第九轮）：黑板按 session 键且无失效机制——同一
+        // session 数天后再次 compose 会恢复陈旧黑板污染新任务。文件 mtime 超
+        // BB_TTL_HOURS 视为过期：按 Missing 处理并删除（删除失败仅告警）。
+        match tokio::fs::metadata(path).await {
+            Ok(meta) => {
+                let age_secs = std::time::SystemTime::now()
+                    .duration_since(meta.modified().unwrap_or(std::time::UNIX_EPOCH))
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if age_secs > BB_TTL_HOURS * 3600 {
+                    tracing::info!(
+                        target: "agent.multiagent",
+                        path = %path,
+                        "黑板文件已过期（{}h TTL）——按空黑板启动并清理",
+                        BB_TTL_HOURS
+                    );
+                    if let Err(e) = tokio::fs::remove_file(path).await {
+                        tracing::warn!(
+                            target: "agent.multiagent",
+                            path = %path,
+                            "过期黑板文件删除失败: {}",
+                            e
+                        );
+                    }
+                    return (bb, LoadStatus::Missing);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(
+                    target: "agent.multiagent",
+                    path = %path,
+                    "黑板文件 metadata 失败（按不存在处理）: {}",
+                    e
+                );
+            }
+        }
         let text = match tokio::fs::read_to_string(path).await {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

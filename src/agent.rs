@@ -10276,6 +10276,11 @@ impl AgentCore {
             let safe = if safe == raw {
                 safe
             } else {
+                // security·medium（第九轮）已裁决：FNV-1a 非加密且可逆，但用途
+                // 仅是「文件名唯一性」（防过滤/截断碰撞），不是安全边界——路径
+                // 注入已由白名单过滤挡住；哈希可预测至多导致两 session 共享
+                // 黑板（低风险，黑板非敏感跨用户数据），不接受此风险也无需
+                // 密码学哈希（无保密性要求）。
                 let mut h: u64 = 0xcbf29ce484222325;
                 for b in raw.bytes() {
                     h ^= b as u64;
