@@ -46,7 +46,7 @@ const BB_MAX_VALUE_DEPTH: usize = 4; // 单值最大嵌套深度
 const BB_MAX_VALUE_WIDTH: usize = 512; // 单值数组/对象最大元素数（宽度预检，防宽数组物化）
 const BB_MAX_VALUE_BYTES: usize = 4096; // 单值序列化最大字节
 const BB_MAX_TOTAL_BYTES: usize = 65536; // 黑板全量序列化字节上限（merge 时强校验）
-/// 黑板文件 TTL（bug·medium 第九轮）：session 复用无失效机制会污染新任务，
+/// 黑板文件 TTL：session 复用无失效机制会污染新任务，
 /// mtime 超此值视为过期（load 时清理）
 const BB_TTL_HOURS: u64 = 24;
 
@@ -222,11 +222,11 @@ impl SharedState {
     ///    clone 微秒级；快照语义 = 定期落盘点，此后并发 set 由下次 save 覆盖，
     ///    与 P1-B 的强一致锁内写文件不同——黑板非强一致状态，可接受）；
     /// 2. **tmp 不可预测后缀**（pid+seq+随机段）——并发 save 不互相覆盖，且
-    ///    防符号链接预创建攻击（security·medium 第三轮：纯 pid+seq 可猜测）；
+    ///    防符号链接预创建攻击（纯 pid+seq 可猜测，防符号链接预创建）；
     /// 3. **fsync + rename**——tmp 数据 fsync 落盘后原子替换；**目录 fsync 未做**
     ///    （Windows 平台不支持目录 fsync；断电瞬间 rename 元数据可能未落盘，
     ///    最坏丢失最近一次黑板快照，但不会产生半写损坏——诚实表述，bug·medium
-    ///    第六轮：doc 不再宣称「断电不丢已确认数据」）。
+    ///    （诚实表述：不再宣称「断电不丢已确认数据」）。
     /// 写失败返回 Err（调用方可决定告警/重试），不吞错。
     pub async fn save(&self, path: &str) -> Result<(), String> {
         // 写锁内 clone 快照后立即释放 guard（不持锁跨 await）——guard 借用
@@ -248,13 +248,13 @@ impl SharedState {
             .map_err(|e| format!("黑板序列化失败: {}", e))?;
         static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // security·medium（第三轮）：pid+seq 可预测 → 攻击者可预创建同名 symlink
+        // pid+seq 可预测 → 攻击者可预创建同名 symlink
         // 让 save 写穿；追加随机段（rand::thread_rng，64 位随机）。
         let rnd: u64 = rand::random();
         let tmp = format!("{}.tmp.{}.{}.{:016x}", path, std::process::id(), seq, rnd);
         {
             use tokio::io::AsyncWriteExt;
-            // security·medium（第二轮）：File::create 默认 0644——黑板数据可能含
+            // File::create 默认 0644——黑板数据可能含
             // 敏感业务中间产物，0644 会让同机其它用户可读。unix 下显式 0600
             // （仅属主读写）；Windows 权限模型（ACL）无此问题。
             #[cfg(unix)]
@@ -275,7 +275,7 @@ impl SharedState {
             }
             .await
             {
-                // bug·low（第四轮）：remove_file 前必须显式 drop(f)——f 在
+                // remove_file 前必须显式 drop(f)——f 在
                 // 外层作用域仍存活，Windows 上文件句柄未关时删除必失败
                 // （sharing violation），残留 tmp。
                 drop(f);
@@ -292,40 +292,66 @@ impl SharedState {
 
     /// 从 JSON 文件恢复黑板（断线协作续跑：进程重启后按 session 文件恢复，
     /// 版本号一并恢复，乐观锁不回退）。文件不存在 → 空黑板（首跑）。
-    /// 恢复防护（ocr 第二轮 bug·medium）：
+    /// 恢复防护：
     /// - 逐值重跑 value_allowed（超限剔除）；
     /// - 键数恢复 BB_MAX_KEYS 上限（超出截断，防恢复后 set 拒绝但已有键超限）；
     /// - 总量重算 total_bytes；
     /// - version 字段类型严格校验：存在但非 u64（浮点/字符串/负数）→ Corrupted
     ///   （文件损坏，静默归 0 会掩盖写侧 bug）；缺失 → 0 + 告警（老格式兼容）。
-    /// async 化（perf·medium 第二轮）：读文件改 tokio::fs，避免阻塞 async 路径。
+    /// 读文件用 tokio::fs（async 路径不阻塞）。
     pub async fn load(path: &str) -> (SharedState, LoadStatus) {
         let bb = SharedState::new();
-        // TTL 失效（bug·medium 第九轮）：黑板按 session 键且无失效机制——同一
-        // session 数天后再次 compose 会恢复陈旧黑板污染新任务。文件 mtime 超
-        // BB_TTL_HOURS 视为过期：按 Missing 处理并删除（删除失败仅告警）。
+        // TTL 失效：黑板按 session 键且无失效机制——同一 session 数天后再次
+        // compose 会恢复陈旧黑板污染新任务。文件 mtime 超 BB_TTL_HOURS 视为
+        // 过期：按 Missing 处理并删除（删除失败仅告警）。
+        // 边界（bug·medium 第十轮）：modified() 失败时**跳过 TTL 检查**——此前
+        // fallback UNIX_EPOCH 使 age≈56 年 → 误删未过期文件（数据丢失）。
+        // 同时做大小预检（security·medium：损坏文件可能超大，整读前拒绝，
+        // 上限取正常黑板上限 8 倍宽松值）。
         match tokio::fs::metadata(path).await {
             Ok(meta) => {
-                let age_secs = std::time::SystemTime::now()
-                    .duration_since(meta.modified().unwrap_or(std::time::UNIX_EPOCH))
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                if age_secs > BB_TTL_HOURS * 3600 {
-                    tracing::info!(
+                if meta.len() > BB_MAX_TOTAL_BYTES as u64 * 8 {
+                    tracing::warn!(
                         target: "agent.multiagent",
                         path = %path,
-                        "黑板文件已过期（{}h TTL）——按空黑板启动并清理",
-                        BB_TTL_HOURS
+                        "黑板文件异常巨大（{} B）——视为损坏",
+                        meta.len()
                     );
-                    if let Err(e) = tokio::fs::remove_file(path).await {
+                    return (bb, LoadStatus::Corrupted);
+                }
+                match meta.modified() {
+                    Ok(mtime) => {
+                        let age_secs = std::time::SystemTime::now()
+                            .duration_since(mtime)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if age_secs > BB_TTL_HOURS * 3600 {
+                            tracing::info!(
+                                target: "agent.multiagent",
+                                path = %path,
+                                "黑板文件已过期（{}h TTL）——按空黑板启动并清理",
+                                BB_TTL_HOURS
+                            );
+                            if let Err(e) = tokio::fs::remove_file(path).await {
+                                tracing::warn!(
+                                    target: "agent.multiagent",
+                                    path = %path,
+                                    "过期黑板文件删除失败: {}",
+                                    e
+                                );
+                            }
+                            return (bb, LoadStatus::Missing);
+                        }
+                    }
+                    Err(e) => {
+                        // mtime 不可得 → 不判 TTL（防误删），继续正常加载
                         tracing::warn!(
                             target: "agent.multiagent",
                             path = %path,
-                            "过期黑板文件删除失败: {}",
+                            "黑板文件 mtime 不可得（跳过 TTL 检查）: {}",
                             e
                         );
                     }
-                    return (bb, LoadStatus::Missing);
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -343,7 +369,7 @@ impl SharedState {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return (bb, LoadStatus::Missing);
             }
-            // other·low（第七轮）：保留底层 IO 错误详情供排查（此前静默丢弃）
+            // 保留底层 IO 错误详情供排查（此前静默丢弃）
             Err(e) => {
                 tracing::warn!(
                     target: "agent.multiagent",
@@ -358,7 +384,7 @@ impl SharedState {
             Ok(v) => v,
             Err(_) => return (bb, LoadStatus::Corrupted),
         };
-        // 根级类型校验（bug·medium 第五轮）：JSON 合法但根非对象（`[1,2,3]` /
+        // 根级类型校验：JSON 合法但根非对象（`[1,2,3]` /
         // `"str"` / `123`）→ Corrupted——save 永远写对象，非对象根 = 文件损坏，
         // 静默当空黑板会掩盖写侧 bug。
         if !v.is_object() {
@@ -403,7 +429,7 @@ impl SharedState {
                 }
             },
         };
-        // data 字段严格校验（bug·medium 第三轮）：存在但非对象（"data": 123 /
+        // data 字段严格校验：存在但非对象（"data": 123 /
         // [] / "str"）→ Corrupted——静默当空黑板会掩盖写侧 bug（save 永远写对象）。
         let data = match v.get("data") {
             None => {
@@ -436,7 +462,7 @@ impl SharedState {
         let mut bytes: usize = 0;
         let mut inserted: usize = 0;
         // 键数上限恢复：排序键遍历（BTreeMap 已有序），超出 BB_MAX_KEYS 截断
-        // 总量上限恢复（bug·medium 第六轮）：超 BB_MAX_TOTAL_BYTES 时按序
+        // 总量上限恢复：超 BB_MAX_TOTAL_BYTES 时按序
         // 截断——否则恢复后 total_bytes 超上限，后续 set 的增量检查基于
         // 超限总量，护栏失效。
         for (k, val) in data {
@@ -465,7 +491,7 @@ impl SharedState {
                     "黑板恢复：单键使总量超上限 {}，跳过该键",
                     BB_MAX_TOTAL_BYTES
                 );
-                // bug·medium（第八轮）：continue 而非 break——BTreeMap 键序中
+                // continue 而非 break——BTreeMap 键序中
                 // 超限键之后可能还有更小的键（"big" 在 "small" 前），break 会
                 // 丢掉本可容纳的后续键。
                 continue;
@@ -986,7 +1012,7 @@ mod tests {
         assert_eq!(st, LoadStatus::Corrupted);
         let _ = std::fs::remove_file(&tmp);
 
-        // version 字段类型非法 → Corrupted（bug·medium 第二轮：不静默归 0）
+        // version 字段类型非法 → Corrupted（不静默归 0）
         let tmp3 = std::env::temp_dir().join("blackboard_badversion.json");
         let bad = serde_json::json!({"version": "abc", "data": {}});
         std::fs::write(&tmp3, serde_json::to_string(&bad).unwrap()).unwrap();
@@ -1009,7 +1035,7 @@ mod tests {
 
     #[tokio::test]
     async fn blackboard_load_enforces_key_cap() {
-        // 键数上限恢复（bug·medium 第二轮）：文件 40 键 > BB_MAX_KEYS(32) → 截断
+        // 键数上限恢复：文件 40 键 > BB_MAX_KEYS(32) → 截断
         let tmp = std::env::temp_dir().join("blackboard_manykeys.json");
         let mut data = serde_json::Map::new();
         for i in 0..40 {

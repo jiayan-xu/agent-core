@@ -10263,30 +10263,28 @@ impl AgentCore {
         // 黑板文件（check-then-act race）——黑板是协作加速器非强一致状态，最后
         // 写赢语义诚实；load 为同步文件读（小文件微秒级，async 路径可接受）。
         let bb_file = {
-            // session_id 仅取安全字符（防路径注入）。bug·medium（第八轮）：
-            // 非 streaming chat 路径 session_id 可能非内部生成（外部可影响），
-            // 但防护不依赖该假设——白名单过滤 + 64 截断 + FNV-1a 哈希尾已
-            // 覆盖任意 session 输入（过滤后不可能含路径分隔符/..）。
+            // session_id 仅取安全字符（防路径注入）：白名单过滤 + 64 截断 +
+            // FNV-1a 哈希尾覆盖任意 session 输入（过滤后不可能含路径分隔符）。
+            // FNV-1a 用途仅为文件名唯一性（非安全边界——路径注入已由白名单
+            // 挡住；可预测至多导致两 session 共享黑板，非敏感跨用户数据）。
+            // 空/全被过滤的 session（bug·low 第十轮）：`safe == raw` 对空串成立
+            // 会跳过哈希 → 所有空 session 共享同一文件——强制走哈希路径。
             let raw = session_id;
             let safe: String = raw
                 .chars()
                 .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
                 .take(64)
                 .collect();
-            let safe = if safe == raw {
+            let safe = if safe == raw && !safe.is_empty() {
                 safe
             } else {
-                // security·medium（第九轮）已裁决：FNV-1a 非加密且可逆，但用途
-                // 仅是「文件名唯一性」（防过滤/截断碰撞），不是安全边界——路径
-                // 注入已由白名单过滤挡住；哈希可预测至多导致两 session 共享
-                // 黑板（低风险，黑板非敏感跨用户数据），不接受此风险也无需
-                // 密码学哈希（无保密性要求）。
                 let mut h: u64 = 0xcbf29ce484222325;
                 for b in raw.bytes() {
                     h ^= b as u64;
                     h = h.wrapping_mul(0x100000001b3);
                 }
-                format!("{}-{:016x}", safe, h)
+                let base = if safe.is_empty() { "empty" } else { &safe };
+                format!("{}-{:016x}", base, h)
             };
             std::env::current_dir()
                 .unwrap_or_default()
