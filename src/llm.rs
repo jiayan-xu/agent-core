@@ -2129,4 +2129,15 @@ mod sanitize_messages_tests {
         assert!(matches!(out, Cow::Borrowed(_)), "tool 消息不在脱敏范围，应走 Borrowed");
         assert_eq!(out[0].content.as_ref().unwrap(), "result sk-abc1234567890abcdefgh");
     }
+
+    #[test]
+    fn effective_total_fallback_logic() {
+        // P2-D：total>0 用 total；否则回落 prompt+completion（saturating）
+        let u1 = LlmUsage { prompt_tokens: 100, completion_tokens: 50, total_tokens: 200 };
+        assert_eq!(u1.effective_total(), 200);
+        let u2 = LlmUsage { prompt_tokens: 100, completion_tokens: 50, total_tokens: 0 };
+        assert_eq!(u2.effective_total(), 150);
+        let u3 = LlmUsage { prompt_tokens: u64::MAX, completion_tokens: u64::MAX, total_tokens: 0 };
+        assert_eq!(u3.effective_total(), u64::MAX); // saturating 不溢出
+    }
 }

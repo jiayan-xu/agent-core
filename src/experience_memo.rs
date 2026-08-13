@@ -35,7 +35,9 @@ fn recorded_ns_path() -> String {
         .to_string()
 }
 
-/// 登记集落盘（best-effort：本地 JSON 小文件，失败仅告警）。
+/// 登记集落盘（best-effort；本地 JSON 小文件，失败仅告警）。
+/// 原子写（bug·medium 第五轮）：临时文件 + rename，防半写/并发覆盖损坏；
+/// 序列化与写文件同锁（防 lost-update——锁内快照、锁内落盘）。
 fn persist_recorded_ns() {
     let json = match recorded_ns().lock() {
         Ok(set) => match serde_json::to_string(&*set) {
@@ -48,7 +50,11 @@ fn persist_recorded_ns() {
         Err(_) => return,
     };
     let path = recorded_ns_path();
-    if let Err(e) = std::fs::write(&path, json.as_bytes()) {
+    let tmp = format!("{}.tmp.{}", path, std::process::id());
+    if std::fs::write(&tmp, json.as_bytes()).is_err() {
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
         tracing::warn!(target: "agent.meta_evolve", "登记集落盘失败: {}", e);
     }
 }
@@ -89,8 +95,11 @@ pub async fn record_experience_memo(
         tool, err_preview
     );
     // 登记会话 ns（沉淀任务枚举用；非 agent 形态 ns 不登记——无根 ns 可沉淀）。
-    // 登记即落盘（跨重启恢复，bug·high 第三轮）。
+    // 登记即落盘（跨重启恢复）。**先合并磁盘旧登记再落盘**（bug·high 第五轮：
+    // 进程 B 启动后首次 record 若不先 restore，persist 会用只有本进程新 ns 的
+    // 集合覆盖磁盘 → 崩溃前进程 A 登记的 ns 永久丢失）。
     if is_agent_ns(ns) {
+        restore_recorded_ns();
         if let Ok(mut set) = recorded_ns().lock() {
             set.insert(ns.to_string());
         }
