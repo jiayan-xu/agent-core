@@ -240,7 +240,7 @@ pub(crate) async fn handle_code_evolve(
             // ② 记一轮 + token 记账（P2-D：上游 usage 真值优先，回落估算）；
             // 违约立即停 + 回退
             let budget_result = match propose_usage {
-                Some(u) => tracker.record_turn_accurate(u.total_tokens),
+                Some(u) => tracker.record_turn_accurate(u.effective_total()),
                 None => tracker.record_turn(
                     agent_core::autonomy_budget::estimate_tokens(&new_fn),
                 ),

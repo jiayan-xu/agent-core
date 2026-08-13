@@ -917,6 +917,19 @@ pub struct LlmUsage {
     pub total_tokens: u64,
 }
 
+impl LlmUsage {
+    /// 有效总量（bug·medium 第二轮）：total>0 用 total（权威）；否则回落
+    /// prompt+completion（部分 provider 只报分项）——saturating 防溢出。
+    /// 消费端（budget 记账）统一走此方法，杜绝 total=0 时记 0 的低估。
+    pub fn effective_total(&self) -> u64 {
+        if self.total_tokens > 0 {
+            self.total_tokens
+        } else {
+            self.prompt_tokens.saturating_add(self.completion_tokens)
+        }
+    }
+}
+
 /// DeepSeek DSML 工具调用文本泄露解析（task 650）。
 ///
 /// 部分模型（尤其 DeepSeek V3/R1）会把 tool call 写成 content 里的 DSML 标记，
