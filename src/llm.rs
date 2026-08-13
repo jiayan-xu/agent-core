@@ -1475,7 +1475,11 @@ impl LlmClient {
                                     .and_then(|v| v.as_u64())
                                     .unwrap_or(0),
                             })
-                            .filter(|u| u.total_tokens > 0);
+                            // bug·low（第一轮）：total=0 但 prompt/completion 有值
+                            // 的 provider 响应不应整体丢弃——任一维度 >0 即有效
+                            .filter(|u| {
+                                u.prompt_tokens + u.completion_tokens + u.total_tokens > 0
+                            });
 
                         // task 650：DeepSeek DSML 文本泄露 → 回填 structured tool_calls
                         return Ok(apply_dsml_fallback(LlmResponse { text, tool_calls, usage }));

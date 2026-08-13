@@ -23,6 +23,12 @@ fn recorded_ns() -> &'static std::sync::Mutex<std::collections::HashSet<String>>
     RECORDED_NS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
+/// 是否 agent 形态 ns（`agent/{id}[/...]`）——登记/沉淀门（纯函数，测试直调）。
+pub fn is_agent_ns(ns: &str) -> bool {
+    let parts: Vec<&str> = ns.split('/').collect();
+    parts.len() >= 2 && parts[0] == "agent" && !parts[1].is_empty()
+}
+
 /// 写入一条会话经验 memo（工具失败教训）。best-effort：失败仅告警不阻断。
 /// 结构：content 含 工具名 / 错误摘要 / 触发上下文；tag 便于按工具召回；
 /// 与 evolution_log 样本共走 `min_samples` 门槛（两源合并计数）。
@@ -41,12 +47,9 @@ pub async fn record_experience_memo(
         tool, err_preview
     );
     // 登记会话 ns（沉淀任务枚举用；非 agent 形态 ns 不登记——无根 ns 可沉淀）
-    {
-        let parts: Vec<&str> = ns.split('/').collect();
-        if parts.len() >= 2 && parts[0] == "agent" && !parts[1].is_empty() {
-            if let Ok(mut set) = recorded_ns().lock() {
-                set.insert(ns.to_string());
-            }
+    if is_agent_ns(ns) {
+        if let Ok(mut set) = recorded_ns().lock() {
+            set.insert(ns.to_string());
         }
     }
     let args = serde_json::json!({
@@ -97,9 +100,12 @@ pub async fn sediment_to_root(mcp: &McpClient, root_ns: &str) {
             if existing.contains(&m.old_value) {
                 continue; // 根 ns 已有，跳过
             }
+            // 沉淀保留工具 tag（maintainability·low 第一轮：content 含工具名，
+            // 解析回填 tags 保持与 record 侧一致的召回维度）
+            let tool = parse_tool_from_memo(&m.old_value);
             let args = serde_json::json!({
                 "content": m.old_value,
-                "tags": ["experience_memo", "lesson"],
+                "tags": ["experience_memo", "lesson", tool],
                 "category": "experience_memo",
                 "confidence": 70,
                 "importance": 3,
@@ -143,7 +149,7 @@ pub async fn collect_memo_samples(
         "query": "experience_memo 工具执行失败 lesson",
         "namespace": ns,
         "category": "experience_memo",
-        "max_results": limit.min(50),
+        "max_results": limit.min(200),
     });
     let raw = mcp
         .call_json("memory_search_v2", &args)
@@ -322,15 +328,8 @@ mod tests {
     #[test]
     fn recorded_ns_registration_gate() {
         // P2-E：仅 agent 形态 ns 登记（沉淀枚举用）——非 agent 形态不登记
-        {
-            let parts: Vec<&str> = "agent/xujiayan/caller1".split('/').collect();
-            let ok = parts.len() >= 2 && parts[0] == "agent" && !parts[1].is_empty();
-            assert!(ok);
-        }
-        {
-            let parts: Vec<&str> = "workspace/foo".split('/').collect();
-            let ok = parts.len() >= 2 && parts[0] == "agent" && !parts[1].is_empty();
-            assert!(!ok);
-        }
+        assert!(is_agent_ns("agent/xujiayan/caller1"));
+        assert!(!is_agent_ns("workspace/foo"));
+        assert!(!is_agent_ns("agent/"));
     }
 }

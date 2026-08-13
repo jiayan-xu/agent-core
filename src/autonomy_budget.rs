@@ -130,18 +130,16 @@ impl BudgetTracker {
         Ok(())
     }
 
-    /// P2-D：按上游 usage **真值**记账（prompt + completion），替代 chars/4 估算。
+    /// P2-D：按上游 usage **真值**记账，替代 chars/4 估算。
     /// 估算对中文任务系统性偏低（1 汉字 ≈ 1 token 而非 4 字符/token），真值记账
     /// 让 max_tokens 预算不再被低估；语义与 record_turn 完全一致（turns+1、
-    /// 同样检查、`>` 违约语义）。调用方在 LlmResponse.usage 为 Some 时走本路径，
-    /// None 时回落 record_turn(estimate_tokens)。
-    pub fn record_turn_accurate(
-        &mut self,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-    ) -> Result<(), BudgetBreach> {
-        let total = prompt_tokens.saturating_add(completion_tokens);
-        self.record_turn(total)
+    /// 同样检查、`>` 违约语义）。
+    /// **total_tokens 语义**（bug·medium 第一轮）：provider 可能只报 total（prompt/
+    /// completion 缺省为 0）——故直接收 total 而非 prompt+completion（两者相加
+    /// 在只报 total 时记 0，比估算还低估，护栏失效）。调用方在 LlmResponse.usage
+    /// 为 Some 时走本路径，None 时回落 record_turn(estimate_tokens)。
+    pub fn record_turn_accurate(&mut self, total_tokens: u64) -> Result<(), BudgetBreach> {
+        self.record_turn(total_tokens)
     }
 
     /// 仅在循环顶部做纯墙钟检查（不消耗 turn）。同 record_turn 的 `>` 语义。
@@ -326,11 +324,11 @@ mod tests {
             max_wall_clock_secs: 0,
             ..Default::default()
         });
-        t.record_turn_accurate(600, 300).unwrap(); // 900 token 真值
+        t.record_turn_accurate(900).unwrap(); // total 900 真值
         assert_eq!(t.tokens_used(), 900);
         assert_eq!(t.turns_used(), 1);
         // 真值违约：+200 → 1100 > 1000
-        let err = t.record_turn_accurate(100, 100);
+        let err = t.record_turn_accurate(200);
         assert!(matches!(err, Err(BudgetBreach::Tokens)));
     }
 

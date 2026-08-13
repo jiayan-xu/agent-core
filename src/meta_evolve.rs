@@ -900,7 +900,7 @@ impl MetaEvolver {
         // 违约类型保持结构化（不扁平为 String）
         match reply.usage {
             Some(u) => tracker
-                .record_turn_accurate(u.prompt_tokens, u.completion_tokens)
+                .record_turn_accurate(u.total_tokens)
                 .map_err(OptimizeError::Budget)?,
             None => tracker
                 .record_turn(crate::autonomy_budget::estimate_tokens(&reply.text))
