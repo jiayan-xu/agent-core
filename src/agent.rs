@@ -11279,6 +11279,33 @@ impl AgentCore {
         )
     }
 
+    /// 记忆库系统维护：衰减循环（memory_decay）+ GFS 轮转备份（memory_backup）。
+    /// 与 consolidate 同用维护身份（MEMORIA_ADMIN_KEY → admin / MEMORIA_JARVIS_BADGE → jarvis），
+    /// 由夜间 patrol（bootstrap.rs 02:00-04:59 块）每日调用一次，补齐 consolidate 之外的维护环节。
+    pub async fn memoria_maintenance(&self) -> String {
+        let mem_client = memoria_maintenance_client(&self.config.memoria_url, &self.mcp);
+        let parse = |raw: String| -> serde_json::Value {
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw))
+        };
+        let decay_raw = mem_client
+            .call("memory_decay", &serde_json::json!({}))
+            .await
+            .unwrap_or_else(|e| format!("decay failed: {}", e));
+        let backup_raw = mem_client
+            .call("memory_backup", &serde_json::json!({}))
+            .await
+            .unwrap_or_else(|e| format!("backup failed: {}", e));
+        let summary = serde_json::json!({
+            "decay": parse(decay_raw),
+            "backup": parse(backup_raw),
+        })
+        .to_string();
+        let log_line: String = summary.chars().take(400).collect();
+        tracing::info!("[maintenance] {}", log_line);
+        summary
+    }
+
     /// 巩固原料门槛：挡短文本 / 测试 / 会话助理前缀 / cron 流水
     fn obs_ok_for_consolidate(content: &str, min_chars: usize) -> bool {
         let c = content.trim();

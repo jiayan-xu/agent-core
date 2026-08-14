@@ -258,6 +258,9 @@ pub(crate) fn spawn_server(
                             let me_val = agent.run_meta_evolution(&default_ns).await;
                             tracing::info!(target: "consciousness", "meta_evolution(nightly): {}", me_val);
                             results.push(serde_json::json!({"ns": default_ns, "meta_evolution": me_val}));
+                            // 记忆库维护：衰减循环 + GFS 轮转备份（每日一次，与 consolidate 同周期）
+                            let maint = agent.memoria_maintenance().await;
+                            results.push(serde_json::json!({"ns": "system", "maintenance": maint}));
                             record_dream_health(&patrol_state, "nightly", results, true).await;
                         }
                         // 每轮检查 dashboard agent_worker 健康（端口 8011）
