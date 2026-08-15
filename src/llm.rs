@@ -202,6 +202,13 @@ impl RoutedLlm {
         classify_difficulty(&self.policy, messages).await
     }
 
+    /// 统一路由：分类 → 日志 → 选 provider（chat / chat_budgeted 共用，防两处漂移）。
+    async fn route_select(&self, messages: &[Message]) -> (TaskDifficulty, &LlmClient) {
+        let d = classify_difficulty(&self.policy, messages).await;
+        tracing::info!(difficulty = ?d, "difficulty_route");
+        (d, self.select(d))
+    }
+
     /// 暴露 judge_provider 构造的 LlmClient（价值网络 / verifier-guided 复用），无则 None
     pub fn judge_client(&self) -> Option<LlmClient> {
         self.policy
@@ -211,9 +218,7 @@ impl RoutedLlm {
     }
 
     pub async fn chat(&self, messages: &[Message], tools: &[ToolDef]) -> Result<LlmResponse, String> {
-        let d = classify_difficulty(&self.policy, messages).await;
-        tracing::info!(difficulty = ?d, "difficulty_route");
-        let selected = self.select(d);
+        let (d, selected) = self.route_select(messages).await;
         // P1-2：Best-of-N 与工具调用隔离——Agent 循环中终答常为「空文本 + tool_calls」，
         // 若进入 N 路采样，启发式打分只看 c.text 会把合法工具调用样本打成 -inf / 选错样本。
         // 故 tools 非空时跳过 BoN，直接走单次普通调用（BoN 只对纯文本终答有意义）。
@@ -235,9 +240,7 @@ impl RoutedLlm {
         tools: &[ToolDef],
         max_tokens: u32,
     ) -> Result<LlmResponse, String> {
-        let d = classify_difficulty(&self.policy, messages).await;
-        tracing::info!(difficulty = ?d, "difficulty_route");
-        let selected = self.select(d);
+        let (_d, selected) = self.route_select(messages).await;
         selected.chat_with_max_tokens(messages, tools, max_tokens).await
     }
 
@@ -1348,7 +1351,8 @@ impl LlmClient {
 
     /// ADR-017：运行时覆盖 max_tokens 的单次调用（flash bootstrap 首请求用）。
     /// clone 后覆盖字段，不改动 &self 配置——promote 后下一次调用自动恢复原值，
-    /// 杜绝「首轮预算残留整会话」。
+    /// 杜绝「首轮预算残留整会话」。显式以 budgeted=true 走 chat_impl，
+    /// 截断告警只在本路径生效（不再用魔法阈值推断调用性质）。
     pub async fn chat_with_max_tokens(
         &self,
         messages: &[Message],
@@ -1357,7 +1361,7 @@ impl LlmClient {
     ) -> Result<LlmResponse, String> {
         let mut client = self.clone();
         client.config.max_tokens = max_tokens;
-        client.chat(messages, tools).await
+        client.chat_impl(messages, tools, true).await
     }
 
     /// 发送聊天请求，返回响应（带重试 + failover）
@@ -1366,6 +1370,16 @@ impl LlmClient {
         &self,
         messages: &[Message],
         tools: &[ToolDef],
+    ) -> Result<LlmResponse, String> {
+        self.chat_impl(messages, tools, false).await
+    }
+
+    /// chat 的实现体；`budgeted` 仅用于截断告警语义，不改变请求内容。
+    async fn chat_impl(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        budgeted: bool,
     ) -> Result<LlmResponse, String> {
         // 传输层脱敏：user 消息凭证打码后再上送（不改历史/存储）
         let sanitized = sanitize_messages(messages);
@@ -1494,16 +1508,13 @@ impl LlmClient {
                             })
                             .unwrap_or_default();
 
-                        // 预算化调用（bootstrap 首轮 max_tokens=1024）：若被输出预算截断
-                        // 且工具调用解析为空，必须留痕。仅当本次调用 max_tokens ≤1024 时
-                        // 告警，避免普通 8192 长输出路径产生误导性噪音（ocr 修复）。
+                        // 预算化调用（bootstrap 首轮）截断留痕：显式 budgeted 判定，
+                        // 不依赖可配置的 max_tokens 魔法阈值（ocr 修复）。
                         let finish_reason = choice
                             .get("finish_reason")
                             .and_then(|f| f.as_str())
                             .unwrap_or("");
-                        if finish_reason == "length"
-                            && tool_calls.is_empty()
-                            && self.config.max_tokens <= 1024
+                        if budgeted_truncation_warn(finish_reason, !tool_calls.is_empty(), budgeted)
                         {
                             tracing::warn!(target = "agent.llm", model = %model,
                                 "finish_reason=length 且 tool_calls 为空：输出可能被 max_tokens 截断");
@@ -1756,6 +1767,17 @@ impl LlmClient {
     }
 }
 
+/// 预算化截断告警判定（纯函数，单测覆盖）。
+/// 只在 budgeted 调用（bootstrap 首轮）且 finish_reason=length 且无工具调用时告警；
+/// 不依赖可配置的 max_tokens 魔法阈值。
+pub(crate) fn budgeted_truncation_warn(
+    finish_reason: &str,
+    has_tool_calls: bool,
+    budgeted: bool,
+) -> bool {
+    budgeted && finish_reason == "length" && !has_tool_calls
+}
+
 #[cfg(test)]
 mod routing_tests {
     use super::*;
@@ -1781,6 +1803,18 @@ mod routing_tests {
             TaskDifficulty::Easy
         );
         assert_eq!(classify_heuristic(&[msg("user", "你好，在吗")]), TaskDifficulty::Easy);
+    }
+
+    #[test]
+    fn budgeted_truncation_warn_heuristic() {
+        // budgeted + length + 无工具 → 告警
+        assert!(budgeted_truncation_warn("length", false, true));
+        // 普通调用即使 length 也不告警
+        assert!(!budgeted_truncation_warn("length", false, false));
+        // 有工具调用（哪怕被截断）不告警
+        assert!(!budgeted_truncation_warn("length", true, true));
+        // 其他 finish_reason 不告警
+        assert!(!budgeted_truncation_warn("stop", false, true));
     }
 
     #[test]

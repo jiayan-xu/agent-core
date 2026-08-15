@@ -166,9 +166,15 @@ impl SessionPhaseStore {
             Ok(conn) => {
                 // 与 harness/session 连接并发写同一文件：设 busy_timeout + WAL，
                 // 避免默认 0ms 超时下 promote 偶发 database is locked 静默丢持久化
-                // （ocr 修复）。失败只告警，不降级整个 store。
-                let _ = conn.busy_timeout(std::time::Duration::from_secs(2));
-                let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+                // （ocr 修复）。失败必须留痕，不能静默吞错。
+                if let Err(e) = conn.busy_timeout(std::time::Duration::from_secs(2)) {
+                    tracing::warn!(target = "orchestration", db = %db_path, err = %e,
+                        "busy_timeout 设置失败");
+                }
+                if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
+                    tracing::warn!(target = "orchestration", db = %db_path, err = %e,
+                        "journal_mode=WAL 设置失败");
+                }
                 match conn.execute_batch(
                     "CREATE TABLE IF NOT EXISTS orchestration_phase (
                          session_id TEXT PRIMARY KEY,
@@ -359,11 +365,7 @@ impl OrchestrationController {
         let mut scored: Vec<(i32, usize, &ToolDef)> = full_tools
             .iter()
             .enumerate()
-            .filter(|(_, tool)| {
-                is_safe(&tool.function.name)
-                    && bootstrap_action_segments_ok(&tool.function.name)
-                    && !bootstrap_explicit_deny(&tool.function.name)
-            })
+            .filter(|(_, tool)| bootstrap_tool_allowed(&tool.function.name, is_safe(&tool.function.name)))
             .map(|(idx, tool)| {
                 (
                     bootstrap_tool_score(&tool.function.name, raw_message),
@@ -390,9 +392,11 @@ fn bootstrap_action_segments_ok(name: &str) -> bool {
     const DENY_ACTIONS: &[&str] = &[
         "write", "delete", "remove", "sync", "commit", "archive", "register", "login",
         "kill", "shutdown", "revoke", "merge", "evolve", "repair", "respond", "send",
-        "reboot", "restart", "manage", "fill", "batch_delete", "batch", "update",
-        "insert", "create", "remember", "dispatch", "save", "add", "put", "post",
-        "submit", "approve", "reject",
+        "reboot", "restart", "manage", "fill", "batch", "update", "insert", "create",
+        "remember", "dispatch", "save", "add", "put", "post", "submit", "approve",
+        "reject", "set", "reset", "clear", "purge", "refresh", "modify", "edit",
+        "export", "import", "upload", "enable", "disable", "start", "stop", "run",
+        "trigger", "forward",
     ];
     let lower = name.to_ascii_lowercase();
     let segments: Vec<&str> = lower.split('_').filter(|s| !s.is_empty()).collect();
@@ -402,6 +406,19 @@ fn bootstrap_action_segments_ok(name: &str) -> bool {
     let first = segments[0];
     let last = segments[segments.len() - 1];
     !DENY_ACTIONS.iter().any(|a| first == *a || last == *a)
+}
+
+/// 显式允许名（白名单优先）：经边界审查的已知只读工具，即使动作段表有歧义也放行。
+const BOOTSTRAP_EXPLICIT_ALLOW: &[&str] = &["execute_sql", "fuzzy_match_plate"];
+
+fn bootstrap_tool_allowed(name: &str, safe: bool) -> bool {
+    if BOOTSTRAP_EXPLICIT_ALLOW
+        .iter()
+        .any(|n| name.eq_ignore_ascii_case(n))
+    {
+        return true;
+    }
+    safe && bootstrap_action_segments_ok(name) && !bootstrap_explicit_deny(name)
 }
 
 /// 显式拒绝名：`boundary::is_read_only_tool` 的前缀启发式存在已知宽放项
@@ -604,7 +621,14 @@ impl HookRegistry {
             }
         }
         if let Some(r) = retry {
-            r
+            // Retry 时合并同挂载点其他 hook 的 Inject（ocr 修复：不能静默丢弃注入）
+            match r {
+                HookAction::Retry { mut messages } => {
+                    messages.extend(injected);
+                    HookAction::Retry { messages }
+                }
+                other => other,
+            }
         } else if injected.is_empty() {
             HookAction::Continue
         } else {
