@@ -199,7 +199,9 @@ trait OrchestrationHook: Send + Sync {
       `max_tokens` 运行时覆盖（`LlmClient::chat_with_max_tokens` / `RoutedLlm::chat_budgeted`）；
       首轮工具面 ≤3 且写/危险工具硬排除；完整清单/技能块/LATS 首轮剥离；promote 信号与持久化
 - [x] 单测：promote 幂等持久化、工具面选择/硬排除、预算默认值、降级路径
-- [ ] 生产灰度指标：Easy 查询首轮工具调用率 ↑、平均轮次/延迟 ↓（需带流量验证）
+- [x] 受控冒烟（2026-08-16）：临时开启 bootstrap 后生产实例 `bootstrap_promotes=2`、
+      每请求 `llm_calls=1`、真实数据查询正常；验证后已回滚开关（flag-off 恢复）
+- [ ] 正式灰度观察：按计划开启 bootstrap 观察多日指标（需用户决策，不在本次变更内）
 - [x] 写意图（`has_write_intent`）与危险工具不触发 bootstrap（接线条件保证）
 
 ### P2 — Plan-Act-Reflect + hooks（代码已落地）
@@ -209,7 +211,8 @@ trait OrchestrationHook: Send + Sync {
       priority 排序 / Inject / Retry / Abort 合并裁决；`OnToolResult` 挂载点已接线
 - [x] `/api/metrics` 可观测：`bootstrap_promotes` / `reflect_rounds` / `hook_retries` /
       `hook_aborts` / `read_parallel_batches` / `tool_summaries` 计数入快照
-- [ ] `e2e_controlled_write.py` 与审批/边界回归（需 live 环境，合入 PR 前必跑）
+- [x] `e2e_controlled_write.py --live` 回归（2026-08-16，新版本部署后运行）：
+      6 类受控写全部 AWAITING_APPROVAL（未写库），查询链路正常，LIVE OK
 
 ### P3 — 摘要 + TurnBudget + 并行（代码已落地）
 - [x] 工具结果 LLM 摘要：`maybe_summarize_tool_outputs`（阈值/起始轮可配，失败保留原文）
