@@ -6739,6 +6739,19 @@ impl AgentCore {
             .map(|t| (t.function.name.clone(), t.function.parameters.clone()))
             .collect();
 
+        // ADR-017 P1：bootstrap 首请求使用中性 system prompt
+        // （对齐 dsh 实测：带 spec 人设对 flash 反路由；promote 后恢复完整人设）。
+        if bootstrap_active {
+            if let Some(sys) = ctx.messages.first_mut() {
+                if sys.role == "system" {
+                    sys.content = Some(
+                        "You are a helpful assistant. 优先使用给定工具完成用户请求；没有把握时直接简洁回答。"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
         // P1 修复：把真实工具名动态注入 system prompt。
         // build_system_prompt 里写死的 query_sql/query_plate 与真实 MCP 工具
         // (execute_sql/fuzzy_match_plate) 对不上，会导致 LLM 调错或调不存在的工具。
@@ -6815,6 +6828,7 @@ impl AgentCore {
                     ctx.messages.extend(messages);
                 }
                 crate::orchestration::HookAction::Abort { reply } => {
+                    self.metrics.inc_hook_abort();
                     self.save_to_history(session_id, raw_message, &reply).await;
                     return reply;
                 }
@@ -6888,6 +6902,7 @@ impl AgentCore {
             if bootstrap_round {
                 bootstrap_round = false;
                 self.orchestration.promote(session_id);
+                self.metrics.inc_bootstrap_promote();
                 tracing::info!(target = "orchestration", session = %session_id, "bootstrap promoted");
             }
             // 标记本轮回合是否执行了工具（用于分身策展记忆门控）
@@ -6966,6 +6981,7 @@ impl AgentCore {
                     && reflect_rounds < self.orchestration.cfg.plan_reflect.max_reflect_rounds
                 {
                     reflect_rounds += 1;
+                    self.metrics.inc_reflect();
                     if !self.reflect_goal_satisfied(raw_message, &reply).await {
                         ctx.messages.push(Message {
                             role: "user".to_string(),
@@ -7004,12 +7020,14 @@ impl AgentCore {
                         .run_hooks(crate::orchestration::HookPoint::OnFinalAnswer, &hook_ctx)
                     {
                         crate::orchestration::HookAction::Retry { messages } => {
+                            self.metrics.inc_hook_retry();
                             ctx.messages.extend(messages);
                             tracing::info!(target = "agent.output_guardrail", round = _round,
                                 "终答泄漏，hook 注入自然语言重写重试");
                             continue;
                         }
                         crate::orchestration::HookAction::Abort { reply: hooked } => {
+                            self.metrics.inc_hook_abort();
                             self.save_to_history(session_id, raw_message, &hooked).await;
                             return hooked;
                         }
@@ -7598,6 +7616,7 @@ impl AgentCore {
             }];
             match self.llm.chat(&req, &[]).await {
                 Ok(r) if !r.text.trim().is_empty() => {
+                    self.metrics.inc_tool_summary();
                     tracing::info!(target = "orchestration.summary",
                         chars_before = content.chars().count(),
                         chars_after = r.text.chars().count(),
@@ -7758,6 +7777,7 @@ impl AgentCore {
         }
 
         // 并发执行：按 max_concurrent 分块，块内 join_all；结果按原始顺序归位。
+        self.metrics.inc_read_parallel();
         let cap = self.orchestration.cfg.read_parallel.max_concurrent.max(1);
         let persona = self.persona_for_session(session_id);
         let mut results: Vec<Result<String, String>> = Vec::with_capacity(tool_calls.len());
@@ -7793,6 +7813,16 @@ impl AgentCore {
                     text.clone()
                 }
                 Err(e) => {
+                    // ADR-017 §6：失败三分类写审计（与顺序路径同一语义）。
+                    let class = crate::orchestration::classify_tool_failure(&e);
+                    self.audit_logger
+                        .log_decision(
+                            &self.config.identity.agent_id,
+                            &tc.name,
+                            &format!("ToolFailure({:?}): {}", class, e),
+                            false,
+                        )
+                        .await;
                     let mut text = format!("执行失败: {}", e);
                     if let Some(lesson) = self.recall_failure_lesson(&tc.name, e, allowed_ns).await {
                         text.push_str(&format!("\n\n💡 历史教训参考（情境召回）：{}", lesson));
@@ -7868,6 +7898,39 @@ impl AgentCore {
                 tool_calls: None,
                 tool_call_id: Some(tc.id.clone()),
             });
+        }
+        // ADR-017 P2：OnToolResult hooks（默认无注册 hook → Continue，零行为变化；
+        // 新领域可在工具执行后注册 hook 做注入/中止）。
+        {
+            let hook_ctx = crate::orchestration::HookContext {
+                session_id,
+                raw_message,
+                trace_id,
+                messages,
+                executed_tools,
+                did_work: executed_any,
+                data_query: false,
+                attachment: false,
+                fast_path_data: false,
+                round: 0,
+                hard_max_rounds: self.config.max_tool_rounds,
+                candidate_reply: None,
+            };
+            match self
+                .orchestration
+                .run_hooks(crate::orchestration::HookPoint::OnToolResult, &hook_ctx)
+            {
+                crate::orchestration::HookAction::Inject { messages: injected }
+                | crate::orchestration::HookAction::Retry { messages: injected } => {
+                    messages.extend(injected);
+                }
+                crate::orchestration::HookAction::Abort { reply } => {
+                    self.metrics.inc_hook_abort();
+                    self.save_to_history(session_id, raw_message, &reply).await;
+                    return ToolExecOutcome::Abort(reply);
+                }
+                crate::orchestration::HookAction::Continue => {}
+            }
         }
         ToolExecOutcome::Executed(executed_any)
     }
@@ -8212,6 +8275,16 @@ impl AgentCore {
                     text
                 }
                 Err(e) => {
+                    // ADR-017 §6：失败三分类写审计，供运营观测 flash 主要死在哪个桶。
+                    let class = crate::orchestration::classify_tool_failure(&e);
+                    self.audit_logger
+                        .log_decision(
+                            &self.config.identity.agent_id,
+                            &tc.name,
+                            &format!("ToolFailure({:?}): {}", class, e),
+                            false,
+                        )
+                        .await;
                     // P1-3: 失败情境召回——用错误摘要查历史教训，命中追加注入（防重蹈覆辙）
                     let mut text = format!("执行失败: {}", e);
                     if let Some(lesson) = self
@@ -8312,6 +8385,39 @@ impl AgentCore {
                 tool_calls: None,
                 tool_call_id: Some(tc.id.clone()),
             });
+        }
+        // ADR-017 P2：OnToolResult hooks（默认无注册 hook → Continue，零行为变化；
+        // 新领域可在工具执行后注册 hook 做注入/中止）。
+        {
+            let hook_ctx = crate::orchestration::HookContext {
+                session_id,
+                raw_message,
+                trace_id,
+                messages,
+                executed_tools,
+                did_work: executed_any,
+                data_query: false,
+                attachment: false,
+                fast_path_data: false,
+                round: 0,
+                hard_max_rounds: self.config.max_tool_rounds,
+                candidate_reply: None,
+            };
+            match self
+                .orchestration
+                .run_hooks(crate::orchestration::HookPoint::OnToolResult, &hook_ctx)
+            {
+                crate::orchestration::HookAction::Inject { messages: injected }
+                | crate::orchestration::HookAction::Retry { messages: injected } => {
+                    messages.extend(injected);
+                }
+                crate::orchestration::HookAction::Abort { reply } => {
+                    self.metrics.inc_hook_abort();
+                    self.save_to_history(session_id, raw_message, &reply).await;
+                    return ToolExecOutcome::Abort(reply);
+                }
+                crate::orchestration::HookAction::Continue => {}
+            }
         }
         ToolExecOutcome::Executed(executed_any)
     }

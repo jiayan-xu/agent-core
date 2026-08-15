@@ -23,6 +23,13 @@ pub struct MetricsRegistry {
     lats_activations: AtomicU64,
     multiagent_activations: AtomicU64,
     skill_lookups: AtomicU64,
+    // ADR-017 编排层 v2 可观测计数
+    bootstrap_promotes: AtomicU64,
+    reflect_rounds: AtomicU64,
+    hook_retries: AtomicU64,
+    hook_aborts: AtomicU64,
+    read_parallel_batches: AtomicU64,
+    tool_summaries: AtomicU64,
     checkpoint_saves: AtomicU64,
     checkpoint_recoveries: AtomicU64,
     checkpoint_recovery_success: AtomicU64,
@@ -65,6 +72,24 @@ impl MetricsRegistry {
     }
     pub fn inc_skill(&self) {
         self.skill_lookups.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_bootstrap_promote(&self) {
+        self.bootstrap_promotes.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_reflect(&self) {
+        self.reflect_rounds.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_hook_retry(&self) {
+        self.hook_retries.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_hook_abort(&self) {
+        self.hook_aborts.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_read_parallel(&self) {
+        self.read_parallel_batches.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_tool_summary(&self) {
+        self.tool_summaries.fetch_add(1, Ordering::Relaxed);
     }
     pub fn inc_checkpoint_save(&self) {
         self.checkpoint_saves.fetch_add(1, Ordering::Relaxed);
@@ -154,6 +179,12 @@ impl MetricsRegistry {
                 "lats_activations": self.lats_activations.load(Ordering::Relaxed),
                 "multiagent_activations": self.multiagent_activations.load(Ordering::Relaxed),
                 "skill_lookups": self.skill_lookups.load(Ordering::Relaxed),
+                "bootstrap_promotes": self.bootstrap_promotes.load(Ordering::Relaxed),
+                "reflect_rounds": self.reflect_rounds.load(Ordering::Relaxed),
+                "hook_retries": self.hook_retries.load(Ordering::Relaxed),
+                "hook_aborts": self.hook_aborts.load(Ordering::Relaxed),
+                "read_parallel_batches": self.read_parallel_batches.load(Ordering::Relaxed),
+                "tool_summaries": self.tool_summaries.load(Ordering::Relaxed),
                 "checkpoint_saves": self.checkpoint_saves.load(Ordering::Relaxed),
                 "checkpoint_recoveries": self.checkpoint_recoveries.load(Ordering::Relaxed),
             },
@@ -184,6 +215,12 @@ mod tests {
         m.inc_lats();
         m.inc_skill();
         m.inc_checkpoint_save();
+        m.inc_bootstrap_promote();
+        m.inc_reflect();
+        m.inc_hook_retry();
+        m.inc_hook_abort();
+        m.inc_read_parallel();
+        m.inc_tool_summary();
         let snap = m.snapshot(serde_json::json!({}), serde_json::json!({}));
         assert_eq!(snap["counters"]["requests"], 1);
         assert_eq!(snap["counters"]["llm_calls"], 1);
@@ -191,6 +228,12 @@ mod tests {
         assert_eq!(snap["counters"]["lats_activations"], 1);
         assert_eq!(snap["counters"]["skill_lookups"], 1);
         assert_eq!(snap["counters"]["checkpoint_saves"], 1);
+        assert_eq!(snap["counters"]["bootstrap_promotes"], 1);
+        assert_eq!(snap["counters"]["reflect_rounds"], 1);
+        assert_eq!(snap["counters"]["hook_retries"], 1);
+        assert_eq!(snap["counters"]["hook_aborts"], 1);
+        assert_eq!(snap["counters"]["read_parallel_batches"], 1);
+        assert_eq!(snap["counters"]["tool_summaries"], 1);
     }
 
     #[test]

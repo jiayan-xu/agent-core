@@ -206,7 +206,9 @@ trait OrchestrationHook: Send + Sync {
 - [x] 状态机骨架：bootstrap 相位 + Plan-Reflect 终答评审（opt-in，评审失败视为达成、不阻断）
 - [x] guardrail hooks 迁移：`data_query` 强制工具 → `OnPreAct`；`reply_polish` 重试 →
       `OnFinalAnswer`（文本与条件逐字等价，等价性单测已覆盖）；HookRegistry 支持
-      priority 排序 / Inject / Retry / Abort 合并裁决
+      priority 排序 / Inject / Retry / Abort 合并裁决；`OnToolResult` 挂载点已接线
+- [x] `/api/metrics` 可观测：`bootstrap_promotes` / `reflect_rounds` / `hook_retries` /
+      `hook_aborts` / `read_parallel_batches` / `tool_summaries` 计数入快照
 - [ ] `e2e_controlled_write.py` 与审批/边界回归（需 live 环境，合入 PR 前必跑）
 
 ### P3 — 摘要 + TurnBudget + 并行（代码已落地）
