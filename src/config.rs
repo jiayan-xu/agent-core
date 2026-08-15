@@ -81,6 +81,9 @@ pub(crate) struct Config {
     /// 摄入侧治本过滤（落 [intake_filter]，缺省全默认：enabled=false，opt-in）
     #[serde(default)]
     pub(crate) intake_filter: Option<agent_core::intake_filter::IntakeFilterConfig>,
+    /// ADR-017：LLM 编排层 v2（落 [orchestration]，缺省全默认 OFF，flag-off 零行为变化）
+    #[serde(default)]
+    pub(crate) orchestration: Option<agent_core::orchestration::OrchestrationConfig>,
 }
 
 /// Phase 7：代码自我进化引擎配置
@@ -482,6 +485,7 @@ pub(crate) fn load_or_create_config() -> Config {
         multiagent: Default::default(),
         ttc: Default::default(),
         intake_filter: None,
+        orchestration: None,
     };
     init_domain_and_org(&cfg);
     let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());

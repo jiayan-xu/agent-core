@@ -225,6 +225,19 @@ impl RoutedLlm {
         }
     }
 
+    /// ADR-017：bootstrap 首请求的预算化调用（首轮输出预算覆盖）。
+    /// bootstrap 工具面恒非空，因此不进入 Best-of-N（与上方 BoN/tools 隔离策略一致）。
+    pub async fn chat_budgeted(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        max_tokens: u32,
+    ) -> Result<LlmResponse, String> {
+        let d = classify_difficulty(&self.policy, messages).await;
+        let selected = self.select(d);
+        selected.chat_with_max_tokens(messages, tools, max_tokens).await
+    }
+
     async fn chat_best_of_n(
         &self,
         base: &LlmClient,
@@ -1328,6 +1341,20 @@ impl LlmClient {
             .build()
             .expect("reqwest Client::build");
         LlmClient { client, config }
+    }
+
+    /// ADR-017：运行时覆盖 max_tokens 的单次调用（flash bootstrap 首请求用）。
+    /// clone 后覆盖字段，不改动 &self 配置——promote 后下一次调用自动恢复原值，
+    /// 杜绝「首轮预算残留整会话」。
+    pub async fn chat_with_max_tokens(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        max_tokens: u32,
+    ) -> Result<LlmResponse, String> {
+        let mut client = self.clone();
+        client.config.max_tokens = max_tokens;
+        client.chat(messages, tools).await
     }
 
     /// 发送聊天请求，返回响应（带重试 + failover）
