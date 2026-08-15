@@ -226,7 +226,9 @@ impl RoutedLlm {
     }
 
     /// ADR-017：bootstrap 首请求的预算化调用（首轮输出预算覆盖）。
-    /// bootstrap 工具面恒非空，因此不进入 Best-of-N（与上方 BoN/tools 隔离策略一致）。
+    /// 跳过 Best-of-N 的真实理由：bootstrap 的 1024 预算只适合**单次便宜调用**，
+    /// N 路采样与「锚定」目标相悖；工具面为空时的差异属已知权衡（空面时下一轮
+    /// promote 后自然恢复常规 chat 语义）。路由轨迹与 `chat` 一致，保持可观测。
     pub async fn chat_budgeted(
         &self,
         messages: &[Message],
@@ -234,6 +236,7 @@ impl RoutedLlm {
         max_tokens: u32,
     ) -> Result<LlmResponse, String> {
         let d = classify_difficulty(&self.policy, messages).await;
+        tracing::info!(difficulty = ?d, "difficulty_route");
         let selected = self.select(d);
         selected.chat_with_max_tokens(messages, tools, max_tokens).await
     }
@@ -1490,6 +1493,17 @@ impl LlmClient {
                                     .collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
+
+                        // bootstrap 首轮 max_tokens=1024：若被输出预算截断且工具调用
+                        // 解析为空，必须留痕（否则 LLM 空答被当成正常终答，无信号）。
+                        let finish_reason = choice
+                            .get("finish_reason")
+                            .and_then(|f| f.as_str())
+                            .unwrap_or("");
+                        if finish_reason == "length" && tool_calls.is_empty() {
+                            tracing::warn!(target = "agent.llm", model = %model,
+                                "finish_reason=length 且 tool_calls 为空：输出可能被 max_tokens 截断");
+                        }
 
                         // 备用 Provider 调用成功时记录日志
                         if idx > 0 {

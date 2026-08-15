@@ -1118,7 +1118,7 @@ impl AgentCore {
         } else {
             None
         };
-        // ADR-017：编排控制器（bootstrap 相位存 harness.db；开关全 OFF 时仅建表，零热路径影响）
+        // ADR-017：编排控制器。开关全 OFF 时不建表、不开库（零文件副作用）。
         let orchestration =
             crate::orchestration::OrchestrationController::new(config.orchestration.clone());
         let core = AgentCore {
@@ -6724,14 +6724,20 @@ impl AgentCore {
             && is_easy_query
             && !Self::has_write_intent(raw_message)
             && !self.orchestration.is_promoted(session_id);
-        let tools = if bootstrap_active {
+        // 保存原始 system prompt：bootstrap 替换为中性人设后，promote 时（同请求内）恢复。
+        let original_system_content: Option<String> = ctx
+            .messages
+            .first()
+            .filter(|m| m.role == "system")
+            .and_then(|m| m.content.clone());
+        let mut tools = if bootstrap_active {
             let picked = self.orchestration.bootstrap_tools(raw_message, &full_tools);
             tracing::info!(target = "orchestration", session = %session_id,
                 full_tools = full_tools.len(), bootstrap_tools = picked.len(),
                 "bootstrap 首请求最小工具面");
             picked
         } else {
-            full_tools
+            full_tools.clone()
         };
         // P1-4: 构建工具名 → JSON Schema 映射，用于参数校验
         ctx.tool_schemas = tools
@@ -6741,11 +6747,13 @@ impl AgentCore {
 
         // ADR-017 P1：bootstrap 首请求使用中性 system prompt
         // （对齐 dsh 实测：带 spec 人设对 flash 反路由；promote 后恢复完整人设）。
+        // 文本与 OnPreAct 的 data_query 强制工具提示保持兼容（都指向「先用工具」），
+        // 避免互相矛盾的指令（ocr 2026-08-16 finding）。
         if bootstrap_active {
             if let Some(sys) = ctx.messages.first_mut() {
                 if sys.role == "system" {
                     sys.content = Some(
-                        "You are a helpful assistant. 优先使用给定工具完成用户请求；没有把握时直接简洁回答。"
+                        "You are a helpful assistant. 请优先调用给定的工具获取真实数据后再回答；没有可用的工具时再直接简洁回答。"
                             .to_string(),
                     );
                 }
@@ -6827,12 +6835,19 @@ impl AgentCore {
                 crate::orchestration::HookAction::Inject { messages } => {
                     ctx.messages.extend(messages);
                 }
+                crate::orchestration::HookAction::Retry { messages } => {
+                    // OnPreAct 无循环语义：Retry 等价于 Inject，但显式处理并留痕，
+                    // 防止未来 hook 的 Retry 被静默丢弃（ocr 修复）。
+                    tracing::warn!(target = "orchestration.hooks",
+                        session = %session_id, "OnPreAct hook 返回 Retry（按 Inject 处理）");
+                    ctx.messages.extend(messages);
+                }
                 crate::orchestration::HookAction::Abort { reply } => {
                     self.metrics.inc_hook_abort();
                     self.save_to_history(session_id, raw_message, &reply).await;
                     return reply;
                 }
-                _ => {}
+                crate::orchestration::HookAction::Continue => {}
             }
         }
         // Easy 查询轮次封顶：一轮工具 + 一轮总结 = 3 轮足够（原 20 轮导致简单查询
@@ -6898,12 +6913,26 @@ impl AgentCore {
                 }
             };
             // ADR-017：首个 LLM 响应即 promote（either 语义：首个响应要么带工具调用、要么是终答）。
-            // promote 为 append-only + 幂等落盘，失败只告警，下一请求仍可重试 bootstrap。
+            // promote 为 append-only + 幂等落盘；**同请求内**立即展开全量工具面、schema 与
+            // 原始 system prompt（ocr 修复：此前仅恢复预算，后续轮次仍被困在 3 工具面）。
             if bootstrap_round {
                 bootstrap_round = false;
                 self.orchestration.promote(session_id);
                 self.metrics.inc_bootstrap_promote();
-                tracing::info!(target = "orchestration", session = %session_id, "bootstrap promoted");
+                tools = full_tools.clone();
+                ctx.tool_schemas = tools
+                    .iter()
+                    .map(|t| (t.function.name.clone(), t.function.parameters.clone()))
+                    .collect();
+                if let (Some(sys), Some(orig)) =
+                    (ctx.messages.first_mut(), original_system_content.as_ref())
+                {
+                    if sys.role == "system" {
+                        sys.content = Some(orig.clone());
+                    }
+                }
+                tracing::info!(target = "orchestration", session = %session_id,
+                    restored_tools = tools.len(), "bootstrap promoted（同请求已展开全量目录）");
             }
             // 标记本轮回合是否执行了工具（用于分身策展记忆门控）
             ctx.did_work |= !response.tool_calls.is_empty();
@@ -6982,7 +7011,7 @@ impl AgentCore {
                 {
                     reflect_rounds += 1;
                     self.metrics.inc_reflect();
-                    if !self.reflect_goal_satisfied(raw_message, &reply).await {
+                    if !self.reflect_goal_satisfied(raw_message, &reply, &budget).await {
                         ctx.messages.push(Message {
                             role: "user".to_string(),
                             content: Some(
@@ -7082,6 +7111,9 @@ impl AgentCore {
                     raw_message,
                     allowed_ns,
                     trace_id,
+                    _round,
+                    &intent,
+                    fast_path_data,
                 )
                 .await
             {
@@ -7092,7 +7124,7 @@ impl AgentCore {
             if self.orchestration.cfg.tool_summary.enabled
                 && (_round as usize + 1) >= self.orchestration.cfg.tool_summary.start_round
             {
-                self.maybe_summarize_tool_outputs(&mut ctx.messages).await;
+                self.maybe_summarize_tool_outputs(&mut ctx.messages, &budget).await;
             }
             // Phase B：每轮工具执行后按字节预算截断陈旧 tool 输出（防跨轮载荷越滚越大）
             Self::squash_stale_tool_outputs(&mut ctx.messages);
@@ -7592,11 +7624,20 @@ impl AgentCore {
     }
 
     /// ADR-017 P3：工具结果 LLM 摘要（opt-in，默认关；开关关时本方法不进入热路径）。
-    /// 只摘要 role=tool 且超过阈值的消息；摘要失败保留原文（由 squash 截断兜底）。
-    async fn maybe_summarize_tool_outputs(&self, messages: &mut Vec<Message>) {
+    /// 只摘要 role=tool 且超过阈值的消息；每轮最多 `max_per_round` 条；
+    /// 辅助 LLM 调用按估算计入同一 TurnBudget；摘要失败保留原文（由 squash 截断兜底）。
+    async fn maybe_summarize_tool_outputs(
+        &self,
+        messages: &mut Vec<Message>,
+        budget: &crate::orchestration::TurnBudget,
+    ) {
         const MARKER: &str = "[工具结果摘要]";
         let cfg = &self.orchestration.cfg.tool_summary;
+        let mut summarized_this_round = 0usize;
         for m in messages.iter_mut().filter(|m| m.role == "tool") {
+            if summarized_this_round >= cfg.max_per_round.max(1) {
+                break;
+            }
             let Some(content) = m.content.as_ref() else {
                 continue;
             };
@@ -7608,6 +7649,11 @@ impl AgentCore {
                  人名/车牌/企业名等实体、结论性语句。禁止添加原输出中不存在的信息。\n\n工具输出：\n{}",
                 content
             );
+            let req_est = (prompt.chars().count() as u64) / 4;
+            if let Err(e) = budget.check_token(req_est) {
+                tracing::warn!(target = "orchestration.summary", err = %e, "摘要预算不足，保留原文");
+                break;
+            }
             let req = vec![Message {
                 role: "user".to_string(),
                 content: Some(prompt),
@@ -7616,7 +7662,10 @@ impl AgentCore {
             }];
             match self.llm.chat(&req, &[]).await {
                 Ok(r) if !r.text.trim().is_empty() => {
+                    let resp_est = (r.text.chars().count() as u64) / 4;
+                    budget.record_token(req_est + resp_est);
                     self.metrics.inc_tool_summary();
+                    summarized_this_round += 1;
                     tracing::info!(target = "orchestration.summary",
                         chars_before = content.chars().count(),
                         chars_after = r.text.chars().count(),
@@ -7629,13 +7678,24 @@ impl AgentCore {
         }
     }
 
-    /// ADR-017 P2：Plan-Reflect 终答评审（opt-in，默认关）。评审失败视为「达成」
-    /// （降级方向永远向可用），绝不因评审器故障阻断用户。
-    async fn reflect_goal_satisfied(&self, goal: &str, candidate: &str) -> bool {
+    /// ADR-017 P2：Plan-Reflect 终答评审（opt-in，默认关）。
+    /// 严格 YES/NO 解析；歧义与评审失败一律视为「达成」（fail-open，不阻断用户）。
+    /// 辅助 LLM 调用按估算计入同一 TurnBudget。
+    async fn reflect_goal_satisfied(
+        &self,
+        goal: &str,
+        candidate: &str,
+        budget: &crate::orchestration::TurnBudget,
+    ) -> bool {
         let prompt = format!(
             "你是结果评审员。用户目标：{goal}\n\n候选回答：{candidate}\n\n\
              请判断候选回答是否已充分达成用户目标。只回答 YES 或 NO，再加一句不超过 20 字的理由。"
         );
+        let req_est = (prompt.chars().count() as u64) / 4;
+        if let Err(e) = budget.check_token(req_est) {
+            tracing::warn!(target = "orchestration.reflect", err = %e, "评审预算不足，视为达成（不阻断）");
+            return true;
+        }
         let req = vec![Message {
             role: "user".to_string(),
             content: Some(prompt),
@@ -7643,7 +7703,11 @@ impl AgentCore {
             tool_call_id: None,
         }];
         match self.llm.chat(&req, &[]).await {
-            Ok(r) => !r.text.trim_start().to_ascii_uppercase().starts_with("NO"),
+            Ok(r) => {
+                let resp_est = (r.text.chars().count() as u64) / 4;
+                budget.record_token(req_est + resp_est);
+                crate::orchestration::parse_yes_no(&r.text).unwrap_or(true)
+            }
             Err(e) => {
                 tracing::warn!(target = "orchestration.reflect", err = %e, "评审失败，视为达成（不阻断）");
                 true
@@ -7685,6 +7749,9 @@ impl AgentCore {
         raw_message: &str,
         allowed_ns: &[String],
         trace_id: &str,
+        round: u32,
+        intent: &crate::intent::Intent,
+        fast_path_data: bool,
     ) -> ToolExecOutcome {
         if self.orchestration.cfg.read_parallel.enabled
             && tool_calls.len() > 1
@@ -7702,6 +7769,9 @@ impl AgentCore {
                     raw_message,
                     allowed_ns,
                     trace_id,
+                    round,
+                    intent,
+                    fast_path_data,
                 )
                 .await;
         }
@@ -7714,6 +7784,9 @@ impl AgentCore {
             raw_message,
             allowed_ns,
             trace_id,
+            round,
+            intent,
+            fast_path_data,
         )
         .await
     }
@@ -7730,6 +7803,9 @@ impl AgentCore {
         raw_message: &str,
         allowed_ns: &[String],
         trace_id: &str,
+        round: u32,
+        intent: &crate::intent::Intent,
+        fast_path_data: bool,
     ) -> ToolExecOutcome {
         // 预检 1：边界全绿（任一拒绝 → 回退顺序路径，保留既有拒绝/审批分支）
         {
@@ -7741,6 +7817,7 @@ impl AgentCore {
                         .execute_tool_calls_sequential(
                             messages, tool_calls, executed_tools, tool_schemas,
                             session_id, raw_message, allowed_ns, trace_id,
+                            round, intent, fast_path_data,
                         )
                         .await;
                 }
@@ -7757,6 +7834,7 @@ impl AgentCore {
                         .execute_tool_calls_sequential(
                             messages, tool_calls, executed_tools, tool_schemas,
                             session_id, raw_message, allowed_ns, trace_id,
+                            round, intent, fast_path_data,
                         )
                         .await;
                 }
@@ -7770,6 +7848,7 @@ impl AgentCore {
                         .execute_tool_calls_sequential(
                             messages, tool_calls, executed_tools, tool_schemas,
                             session_id, raw_message, allowed_ns, trace_id,
+                            round, intent, fast_path_data,
                         )
                         .await;
                 }
@@ -7813,16 +7892,11 @@ impl AgentCore {
                     text.clone()
                 }
                 Err(e) => {
-                    // ADR-017 §6：失败三分类写审计（与顺序路径同一语义）。
+                    // ADR-017 §6：失败三分类写结构化日志（与顺序路径同一语义，不污染审计类型）。
                     let class = crate::orchestration::classify_tool_failure(&e);
-                    self.audit_logger
-                        .log_decision(
-                            &self.config.identity.agent_id,
-                            &tc.name,
-                            &format!("ToolFailure({:?}): {}", class, e),
-                            false,
-                        )
-                        .await;
+                    tracing::info!(target = "orchestration.failure", class = ?class,
+                        tool = %tc.name, error = %e, trace_id, session_id,
+                        "工具失败三分类（并行路径）");
                     let mut text = format!("执行失败: {}", e);
                     if let Some(lesson) = self.recall_failure_lesson(&tc.name, e, allowed_ns).await {
                         text.push_str(&format!("\n\n💡 历史教训参考（情境召回）：{}", lesson));
@@ -7900,7 +7974,8 @@ impl AgentCore {
             });
         }
         // ADR-017 P2：OnToolResult hooks（默认无注册 hook → Continue，零行为变化；
-        // 新领域可在工具执行后注册 hook 做注入/中止）。
+        // 新领域可在工具执行后注册 hook 做注入/中止）。上下文携带真实轮次与意图
+        // （ocr 修复：此前硬编码 round=0 / intent=false）。
         {
             let hook_ctx = crate::orchestration::HookContext {
                 session_id,
@@ -7909,10 +7984,10 @@ impl AgentCore {
                 messages,
                 executed_tools,
                 did_work: executed_any,
-                data_query: false,
-                attachment: false,
-                fast_path_data: false,
-                round: 0,
+                data_query: intent.data_query,
+                attachment: intent.attachment,
+                fast_path_data,
+                round,
                 hard_max_rounds: self.config.max_tool_rounds,
                 candidate_reply: None,
             };
@@ -7946,6 +8021,9 @@ impl AgentCore {
         raw_message: &str,
         allowed_ns: &[String],
         trace_id: &str,
+        round: u32,
+        intent: &crate::intent::Intent,
+        fast_path_data: bool,
     ) -> ToolExecOutcome {
         let mut executed_any = false;
         for tc in tool_calls {
@@ -8275,16 +8353,13 @@ impl AgentCore {
                     text
                 }
                 Err(e) => {
-                    // ADR-017 §6：失败三分类写审计，供运营观测 flash 主要死在哪个桶。
+                    // ADR-017 §6：失败三分类写结构化日志（带 trace_id/session_id）。
+                    // 不写 AuditLogger：log_decision 会误落 BoundaryDeny 类型并污染
+                    // 运营计数（ocr 修复）；专用 ToolFailure 审计事件类型后续补。
                     let class = crate::orchestration::classify_tool_failure(&e);
-                    self.audit_logger
-                        .log_decision(
-                            &self.config.identity.agent_id,
-                            &tc.name,
-                            &format!("ToolFailure({:?}): {}", class, e),
-                            false,
-                        )
-                        .await;
+                    tracing::info!(target = "orchestration.failure", class = ?class,
+                        tool = %tc.name, error = %e, trace_id, session_id,
+                        "工具失败三分类");
                     // P1-3: 失败情境召回——用错误摘要查历史教训，命中追加注入（防重蹈覆辙）
                     let mut text = format!("执行失败: {}", e);
                     if let Some(lesson) = self
@@ -8387,7 +8462,8 @@ impl AgentCore {
             });
         }
         // ADR-017 P2：OnToolResult hooks（默认无注册 hook → Continue，零行为变化；
-        // 新领域可在工具执行后注册 hook 做注入/中止）。
+        // 新领域可在工具执行后注册 hook 做注入/中止）。上下文携带真实轮次与意图
+        // （ocr 修复：此前硬编码 round=0 / intent=false）。
         {
             let hook_ctx = crate::orchestration::HookContext {
                 session_id,
@@ -8396,10 +8472,10 @@ impl AgentCore {
                 messages,
                 executed_tools,
                 did_work: executed_any,
-                data_query: false,
-                attachment: false,
-                fast_path_data: false,
-                round: 0,
+                data_query: intent.data_query,
+                attachment: intent.attachment,
+                fast_path_data,
+                round,
                 hard_max_rounds: self.config.max_tool_rounds,
                 candidate_reply: None,
             };
