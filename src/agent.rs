@@ -6731,7 +6731,21 @@ impl AgentCore {
             .filter(|m| m.role == "system")
             .and_then(|m| m.content.clone());
         let mut tools = if bootstrap_active {
-            let picked = self.orchestration.bootstrap_tools(raw_message, &full_tools);
+            // 权威安全谓词：优先用边界 ToolClassifier（已从注册工具学习）判 read；
+            // 锁不可用时回退 boundary::is_read_only_tool 前缀启发式。
+            let boundary_ref = self.boundary.clone();
+            let is_safe = move |name: &str| -> bool {
+                match boundary_ref.try_lock() {
+                    Ok(b) => match b.classifier.lock() {
+                        Ok(c) => c.classify(name) == "read",
+                        Err(_) => crate::boundary::is_read_only_tool(name),
+                    },
+                    Err(_) => crate::boundary::is_read_only_tool(name),
+                }
+            };
+            let picked = self
+                .orchestration
+                .bootstrap_tools(raw_message, &full_tools, &is_safe);
             tracing::info!(target = "orchestration", session = %session_id,
                 full_tools = full_tools.len(), bootstrap_tools = picked.len(),
                 "bootstrap 首请求最小工具面");
@@ -6931,6 +6945,39 @@ impl AgentCore {
                         sys.content = Some(orig.clone());
                     }
                 }
+                // 重新应用完整请求注入（promote 前被剥离的三项，ocr medium 修复：
+                // 只恢复 system 文本会让后续轮次回到「写死 query_sql/query_plate」的旧坑）。
+                if !tools.is_empty() {
+                    if let Some(sys_msg) = ctx.messages.first_mut() {
+                        if sys_msg.role == "system" {
+                            if let Some(ref mut content) = sys_msg.content {
+                                let mut extra = String::from(
+                                    "\n\n## 当前真实可用工具（调用时务必使用以下名称）\n",
+                                );
+                                for t in tools.iter() {
+                                    let desc: String =
+                                        t.function.description.chars().take(120).collect();
+                                    extra.push_str(&format!("- `{}`: {}\n", t.function.name, desc));
+                                }
+                                extra.push_str("\n注意：以上为系统中真实存在的工具。严禁臆造工具名，请直接选用上面列出的工具。\n");
+                                content.push_str(&extra);
+                            }
+                        }
+                    }
+                }
+                if let Some(reg) = self.skill_registry.as_ref() {
+                    if let Some(sys_msg) = ctx.messages.first_mut() {
+                        if let Some(ref mut content) = sys_msg.content {
+                            if let Some(block) =
+                                crate::features::render_skill_block(reg.as_ref(), raw_message, 3)
+                            {
+                                self.metrics.inc_skill();
+                                content.push_str(&block);
+                            }
+                        }
+                    }
+                }
+                self.maybe_lats_expand(&mut ctx.messages, raw_message).await;
                 tracing::info!(target = "orchestration", session = %session_id,
                     restored_tools = tools.len(), "bootstrap promoted（同请求已展开全量目录）");
             }
@@ -7807,19 +7854,17 @@ impl AgentCore {
         intent: &crate::intent::Intent,
         fast_path_data: bool,
     ) -> ToolExecOutcome {
-        // 预检 1：边界全绿（任一拒绝 → 回退顺序路径，保留既有拒绝/审批分支）
+        // 预检 1：边界全绿（任一拒绝 → 回退顺序路径，保留既有拒绝/审批分支）。
+        // 关键：预检完成后先 drop boundary 锁再回退——tokio Mutex 非重入，
+        // 若持锁调用 execute_tool_calls_sequential 会自锁挂死（ocr critical 修复）。
+        let mut boundary_precheck_ok = true;
         {
             let boundary = self.boundary.lock().await;
             let ns = self.current_ns_paths();
             for tc in tool_calls {
                 if !crate::boundary::is_read_only_tool(&tc.name) {
-                    return self
-                        .execute_tool_calls_sequential(
-                            messages, tool_calls, executed_tools, tool_schemas,
-                            session_id, raw_message, allowed_ns, trace_id,
-                            round, intent, fast_path_data,
-                        )
-                        .await;
+                    boundary_precheck_ok = false;
+                    break;
                 }
                 let check = boundary.check_tool(
                     &tc.name,
@@ -7830,15 +7875,19 @@ impl AgentCore {
                     ns.as_deref(),
                 );
                 if !check.allow {
-                    return self
-                        .execute_tool_calls_sequential(
-                            messages, tool_calls, executed_tools, tool_schemas,
-                            session_id, raw_message, allowed_ns, trace_id,
-                            round, intent, fast_path_data,
-                        )
-                        .await;
+                    boundary_precheck_ok = false;
+                    break;
                 }
             }
+        } // boundary guard 在此 drop
+        if !boundary_precheck_ok {
+            return self
+                .execute_tool_calls_sequential(
+                    messages, tool_calls, executed_tools, tool_schemas,
+                    session_id, raw_message, allowed_ns, trace_id,
+                    round, intent, fast_path_data,
+                )
+                .await;
         }
         // 预检 2：schema 全绿（任一错误 → 回退顺序路径，保留 strict 拒绝 / 非严格回灌分支）
         for tc in tool_calls {

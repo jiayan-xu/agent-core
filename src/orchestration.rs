@@ -163,22 +163,29 @@ impl SessionPhaseStore {
     /// 任何失败都降级为内存模式（可用性优先，ADR-017 §1 降级安全）。
     pub fn open(db_path: &str) -> Self {
         match rusqlite::Connection::open(db_path) {
-            Ok(conn) => match conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS orchestration_phase (
-                     session_id TEXT PRIMARY KEY,
-                     phase      TEXT NOT NULL,
-                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-                 );",
-            ) {
-                Ok(_) => Self {
-                    conn: Some(Arc::new(Mutex::new(conn))),
-                },
-                Err(e) => {
-                    tracing::warn!(target = "orchestration", db = %db_path, err = %e,
-                        "orchestration_phase 表创建失败，phase 存储降级为内存模式");
-                    Self { conn: None }
+            Ok(conn) => {
+                // 与 harness/session 连接并发写同一文件：设 busy_timeout + WAL，
+                // 避免默认 0ms 超时下 promote 偶发 database is locked 静默丢持久化
+                // （ocr 修复）。失败只告警，不降级整个 store。
+                let _ = conn.busy_timeout(std::time::Duration::from_secs(2));
+                let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+                match conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS orchestration_phase (
+                         session_id TEXT PRIMARY KEY,
+                         phase      TEXT NOT NULL,
+                         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                     );",
+                ) {
+                    Ok(_) => Self {
+                        conn: Some(Arc::new(Mutex::new(conn))),
+                    },
+                    Err(e) => {
+                        tracing::warn!(target = "orchestration", db = %db_path, err = %e,
+                            "orchestration_phase 表创建失败，phase 存储降级为内存模式");
+                        Self { conn: None }
+                    }
                 }
-            },
+            }
             Err(e) => {
                 tracing::warn!(target = "orchestration", db = %db_path, err = %e,
                     "harness.db 打开失败，phase 存储降级为内存模式");
@@ -331,11 +338,17 @@ impl OrchestrationController {
         self.store.promote(session_id);
     }
 
-    /// 构造 bootstrap 工具面：仅保留「边界判定只读」的工具，按意图相关性取前
+    /// 构造 bootstrap 工具面：只保留「权威边界判定为只读」的工具（`is_safe` 谓词
+    /// 由调用方用 `boundary` 的 ToolClassifier/启发式实现），再按意图相关性取前
     /// `max_tools` 个。配置关闭时原样返回全量目录（自检，保护「flag-off 零行为变化」）。
     /// `max_tools=0` 表示「不给任何工具」（操作者显式意图，不静默改成 1）。
     /// 无安全候选时返回空（LLM 先诚实作答；promote 后同请求即恢复全量目录）。
-    pub fn bootstrap_tools(&self, raw_message: &str, full_tools: &[ToolDef]) -> Vec<ToolDef> {
+    pub fn bootstrap_tools(
+        &self,
+        raw_message: &str,
+        full_tools: &[ToolDef],
+        is_safe: &dyn Fn(&str) -> bool,
+    ) -> Vec<ToolDef> {
         if !self.cfg.bootstrap.enabled {
             return full_tools.to_vec();
         }
@@ -347,7 +360,7 @@ impl OrchestrationController {
             .iter()
             .enumerate()
             .filter(|(_, tool)| {
-                crate::boundary::is_read_only_tool(&tool.function.name)
+                is_safe(&tool.function.name)
                     && bootstrap_action_segments_ok(&tool.function.name)
                     && !bootstrap_explicit_deny(&tool.function.name)
             })
@@ -472,6 +485,7 @@ pub fn classify_tool_failure(error: &str) -> FailureClass {
         || e.contains("配额")
         || e.contains("kill switch")
         || e.contains("拒绝")
+        || e.contains("denied")
         || e.contains("unauthorized")
         || e.contains("forbidden")
         || e.contains("invalid token")
@@ -763,7 +777,9 @@ mod tests {
             tool("read_doc"),
             tool("query_archive_log"),
         ];
-        let picked = ctrl.bootstrap_tools("查进厂记录", &full);
+        let picked = ctrl.bootstrap_tools("查进厂记录", &full, &|n| {
+            crate::boundary::is_read_only_tool(n)
+        });
         let names: Vec<&str> = picked.iter().map(|t| t.function.name.as_str()).collect();
         assert_eq!(picked.len(), 3);
         assert!(names.contains(&"query_entrance"));
@@ -774,7 +790,7 @@ mod tests {
             OrchestrationConfig::default(),
             SessionPhaseStore::new_in_memory(),
         );
-        assert_eq!(disabled.bootstrap_tools("x", &full).len(), full.len());
+        assert_eq!(disabled.bootstrap_tools("x", &full, &|_| true).len(), full.len());
     }
 
     #[test]
@@ -782,7 +798,7 @@ mod tests {
         let cfg = bootstrap_on_cfg();
         let ctrl = OrchestrationController::new_with_store(cfg, SessionPhaseStore::new_in_memory());
         let full = vec![tool("cw_write"), tool("repo_ws_write")];
-        assert!(ctrl.bootstrap_tools("x", &full).is_empty());
+        assert!(ctrl.bootstrap_tools("x", &full, &|_| true).is_empty());
     }
 
     #[test]
@@ -798,13 +814,13 @@ mod tests {
         };
         let ctrl = OrchestrationController::new_with_store(cfg_zero, SessionPhaseStore::new_in_memory());
         let full = vec![tool("query_entrance")];
-        assert!(ctrl.bootstrap_tools("x", &full).is_empty());
+        assert!(ctrl.bootstrap_tools("x", &full, &|_| true).is_empty());
 
         // is_read_only 前缀启发式的已知宽放项必须被显式名单排除
         let cfg = bootstrap_on_cfg();
         let ctrl = OrchestrationController::new_with_store(cfg, SessionPhaseStore::new_in_memory());
         let full = vec![tool("cross_agent_query"), tool("query_entrance")];
-        let picked = ctrl.bootstrap_tools("x", &full);
+        let picked = ctrl.bootstrap_tools("x", &full, &|_| true);
         let names: Vec<&str> = picked.iter().map(|t| t.function.name.as_str()).collect();
         assert!(!names.contains(&"cross_agent_query"));
         assert!(names.contains(&"query_entrance"));

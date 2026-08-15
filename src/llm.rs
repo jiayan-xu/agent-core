@@ -1494,13 +1494,17 @@ impl LlmClient {
                             })
                             .unwrap_or_default();
 
-                        // bootstrap 首轮 max_tokens=1024：若被输出预算截断且工具调用
-                        // 解析为空，必须留痕（否则 LLM 空答被当成正常终答，无信号）。
+                        // 预算化调用（bootstrap 首轮 max_tokens=1024）：若被输出预算截断
+                        // 且工具调用解析为空，必须留痕。仅当本次调用 max_tokens ≤1024 时
+                        // 告警，避免普通 8192 长输出路径产生误导性噪音（ocr 修复）。
                         let finish_reason = choice
                             .get("finish_reason")
                             .and_then(|f| f.as_str())
                             .unwrap_or("");
-                        if finish_reason == "length" && tool_calls.is_empty() {
+                        if finish_reason == "length"
+                            && tool_calls.is_empty()
+                            && self.config.max_tokens <= 1024
+                        {
                             tracing::warn!(target = "agent.llm", model = %model,
                                 "finish_reason=length 且 tool_calls 为空：输出可能被 max_tokens 截断");
                         }
