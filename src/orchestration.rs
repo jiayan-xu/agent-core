@@ -420,9 +420,12 @@ impl OrchestrationController {
                 negative.remove(session_id);
             }
         } else if let Ok(mut negative) = self.not_promoted_cache.lock() {
-            // 有界 + 惰性清理：插入前清掉过期项；超过容量时再按过期清理一次，
-            // 仍超限则跳过本次负缓存（正确性只影响下次是否回查 store）。
-            negative.retain(|_, at| at.elapsed() < NOT_PROMOTED_NEGATIVE_TTL);
+            // 有界 + 惰性过期：查询路径已按 TTL 判活，插入只在容量打满时
+            // 才 retain 清理一次，miss 路径保持 O(1)、缩短持锁时间
+            //（ocr perf·low 修复：不再每次 miss 都全表扫描）。
+            if negative.len() >= SESSION_SET_CACHE_MAX {
+                negative.retain(|_, at| at.elapsed() < NOT_PROMOTED_NEGATIVE_TTL);
+            }
             if negative.len() < SESSION_SET_CACHE_MAX {
                 negative.insert(session_id.to_string(), Instant::now());
             } else {
@@ -523,9 +526,18 @@ impl OrchestrationController {
     /// 异步包装：把同步 SQLite 冷路径移出 tokio worker（spawn_blocking）。
     pub async fn is_promoted_async(self: &Arc<Self>, session_id: String) -> bool {
         let this = Arc::clone(self);
-        tokio::task::spawn_blocking(move || this.is_promoted(&session_id))
-            .await
-            .unwrap_or(false)
+        let log_sid = session_id.clone();
+        match tokio::task::spawn_blocking(move || this.is_promoted(&session_id)).await {
+            Ok(v) => v,
+            Err(e) => {
+                // join 失败（任务未执行/panic）与「未 promoted」不可混为一谈：
+                // 前者会导致已 promoted 会话被重复 bootstrap，必须可诊断
+                //（ocr other·low 修复：不暴露 panic payload）。
+                tracing::error!(target = "orchestration", session = %log_sid,
+                    err = %e, "is_promoted_async spawn_blocking join 失败，按未 promoted 处理");
+                false
+            }
+        }
     }
 
     /// 原子取得 per-session bootstrap 预留，返回 RAII guard。
@@ -538,9 +550,17 @@ impl OrchestrationController {
     ) -> Option<BootstrapReservation> {
         let this = Arc::clone(self);
         let sid = session_id.clone();
-        let won = tokio::task::spawn_blocking(move || this.try_begin_bootstrap(&sid))
-            .await
-            .unwrap_or(false);
+        let won = match tokio::task::spawn_blocking(move || this.try_begin_bootstrap(&sid)).await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // join 失败：预留尝试被静默丢弃，会话回退全量工具面——
+                // 与「没抢到预留」不可混为一谈，必须可诊断（ocr other·low 修复）。
+                tracing::error!(target = "orchestration", session = %session_id,
+                    err = %e, "acquire_bootstrap_async spawn_blocking join 失败，按未取得预留处理");
+                false
+            }
+        };
         won.then(|| BootstrapReservation {
             controller: Arc::clone(self),
             session_id,
@@ -564,14 +584,15 @@ impl OrchestrationController {
     }
 
     /// 构造 bootstrap 工具面：只保留「权威边界判定为只读」的工具（`is_safe` 谓词
-    /// 由调用方用 `boundary` 的 ToolClassifier/启发式实现），再按意图相关性取前
+    /// 由调用方用 `boundary` 的 ToolClassifier 实现），再按意图相关性取前
     /// `max_tools` 个。`max_tools=0` 表示「不给任何工具」（操作者显式意图，不静默改成 1）。
     /// 无安全候选时返回空（LLM 先诚实作答；promote 后同请求即恢复全量目录）。
     ///
-    /// ⚠️ 安全语义：无论开关是否开启，`is_safe` 过滤**始终生效**。开关关闭时
-    /// 不做相关性排序与 `max_tools` 截断，返回「通过安全谓词的全量目录」——
-    /// 本函数是安全过滤器，不是 feature-flag pass-through；新增调用点不能假设
-    /// 关闭时会原样返回输入。
+    /// ⚠️ 开关语义与模块头一致（flag-off 零行为变化）：`bootstrap.enabled=false`
+    /// 时**原样返回** `full_tools`（本函数只服务 bootstrap 面，而 bootstrap 面
+    /// 仅在 enabled 路径存在；agent.rs 也只在 bootstrap_active 时调用本函数）。
+    /// 安全过滤/相关性排序/截断只作用于 enabled 路径，避免未来新增调用点
+    /// 在开关关闭时被本函数静默裁剪工具目录（ocr maintainability·low 修复）。
     pub fn bootstrap_tools(
         &self,
         raw_message: &str,
@@ -579,11 +600,7 @@ impl OrchestrationController {
         is_safe: &dyn Fn(&str) -> bool,
     ) -> Vec<ToolDef> {
         if !self.cfg.bootstrap.enabled {
-            return full_tools
-                .iter()
-                .filter(|tool| bootstrap_tool_allowed(&tool.function.name, is_safe(&tool.function.name)))
-                .cloned()
-                .collect();
+            return full_tools.to_vec();
         }
         let max = self.cfg.bootstrap.max_tools;
         if max == 0 {
@@ -641,7 +658,9 @@ impl BootstrapReservation {
                 controller.finish_bootstrap(&session_id);
             })
             .await;
-            if joined.is_err() {
+            if let Err(e) = joined {
+                tracing::error!(target = "orchestration", session = %self.session_id,
+                    err = %e, "promote_async spawn_blocking join 失败，同步回退释放预留");
                 self.controller.cancel_bootstrap(&self.session_id);
             }
             self.active = false;
@@ -719,13 +738,20 @@ fn action_segments(name: &str) -> Vec<String> {
     segments
 }
 
+/// SELECT-only SQL 工具能力标签：仅 `execute_sql`（dashboard 侧实现强制
+/// SELECT-only，见 db_write.rs 注释与 `boundary::ToolClassifier` 的 read 分类）。
+/// bootstrap 面放行 SQL 执行工具必须同时满足「边界判 read + 本能力标签」：
+/// 未来若出现 `execute_sql_write` 之类别名或分类漂移，能力标签不匹配即拒绝
+///（ocr security·medium 修复：不依赖通用 Read 分类单独放行写能力工具）。
+fn is_select_only_sql_tool(name: &str) -> bool {
+    name.eq_ignore_ascii_case("execute_sql")
+}
+
 /// 显式允许名：只覆盖动作段兜底检查的**已知只读工具**（`query_archive_log` 的
-/// 中间段 `archive` 是名词，不是写动作；`execute_sql` 在 dashboard 侧强制
-/// SELECT-only，见 `db_write.rs` 注释与 `boundary::ToolClassifier` read 分类）。
+/// 中间段 `archive` 是名词，不是写动作）。
 /// 白名单不再越过 `safe` 门，也不越过 `bootstrap_explicit_deny`：边界分类为
 /// 写/危险的工具永远进不了 bootstrap 面。
-const BOOTSTRAP_EXPLICIT_ALLOW: &[&str] =
-    &["execute_sql", "fuzzy_match_plate", "query_archive_log"];
+const BOOTSTRAP_EXPLICIT_ALLOW: &[&str] = &["fuzzy_match_plate", "query_archive_log"];
 
 fn bootstrap_tool_allowed(name: &str, safe: bool) -> bool {
     // 权威边界判定优先：safe=false 一律拒绝，白名单只豁免动作段启发式，
@@ -740,6 +766,10 @@ fn bootstrap_tool_allowed(name: &str, safe: bool) -> bool {
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
     {
+        return true;
+    }
+    // SQL 执行类工具走独立能力标签（SELECT-only），不并入普通白名单
+    if is_select_only_sql_tool(name) {
         return true;
     }
     bootstrap_action_segments_ok(name)
@@ -1186,16 +1216,54 @@ mod tests {
         assert!(names.contains(&"query_entrance"));
         assert!(names.contains(&"get_vehicle"));
         assert!(!names.iter().any(|n| n.contains("write")));
-        // 默认关闭时不做 max_tools 截断，但安全过滤（safe 谓词 + 动作段兜底）仍生效：
-        // 本函数不是 pass-through，写工具即使传入 |_|true 也不能通过。
+        // 开关关闭 = 真 pass-through（模块头 flag-off 零行为变化）：原样返回
+        // 全量目录；安全过滤只服务 bootstrap 面（enabled 路径），避免未来
+        // 调用点在开关关闭时被本函数静默裁剪工具目录（ocr maintainability·low 修复）。
         let disabled = OrchestrationController::new_with_store(
             OrchestrationConfig::default(),
             SessionPhaseStore::new_in_memory(),
         );
-        assert_eq!(disabled.bootstrap_tools("x", &full, &|_| true).len(), 5);
-        assert!(disabled.bootstrap_tools("x", &full, &|n| n != "cw_write").iter().all(|t| {
-            t.function.name != "cw_write"
-        }));
+        assert_eq!(disabled.bootstrap_tools("x", &full, &|_| true).len(), full.len());
+    }
+
+    #[test]
+    fn bootstrap_face_only_contains_read_tools() {
+        // 回归锁（ocr security·medium 修复）：bootstrap 面只允许边界判 read 的
+        // 工具（execute_sql 经 SELECT-only 能力标签放行）；未来 execute_sql
+        // 别名或分类漂移被学成 write 时，本测试直接拦截 flash 首轮拿写能力工具。
+        let c = crate::boundary::ToolClassifier::new();
+        let cfg = OrchestrationConfig {
+            bootstrap: BootstrapConfig {
+                enabled: true,
+                max_tools: 50,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ctrl = OrchestrationController::new_with_store(cfg, SessionPhaseStore::new_in_memory());
+        let full = vec![
+            tool("execute_sql"),
+            tool("fuzzy_match_plate"),
+            tool("query_archive_log"),
+            tool("query_plate"),
+            tool("cross_validate"),
+            tool("memory_recall"),
+            tool("delete_entrance_record"),
+            tool("repo_ws_diff"),
+            tool("memory_remember"),
+        ];
+        let picked = ctrl.bootstrap_tools("查一下数据", &full, &|n| {
+            c.classify_typed(n) == crate::boundary::ToolClass::Read
+        });
+        assert!(!picked.is_empty());
+        for t in &picked {
+            assert_eq!(
+                c.classify_typed(&t.function.name),
+                crate::boundary::ToolClass::Read,
+                "bootstrap 面混入非 read 工具: {}",
+                t.function.name
+            );
+        }
     }
 
     #[test]

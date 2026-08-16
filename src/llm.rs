@@ -256,9 +256,12 @@ impl RoutedLlm {
     /// N 路采样与「锚定」目标相悖；工具面为空时的差异属已知权衡（空面时下一轮
     /// promote 后自然恢复常规 chat 语义）。
     ///
-    /// 不重新做难度分类：`BootstrapEasyRoute` 在类型层保证只能走 Easy 路由，
-    /// 且 Judge 模式下 `classify_difficulty` 是一次真实 LLM 往返——再分类会把
-    /// ADR-017 承诺的「1024 预算 = 单次便宜调用」变成 3 次往返。
+    /// 不重新做难度分类：`BootstrapEasyRoute` 只固定**路由**（Easy 直连 flash），
+    /// 不承担内容级保证——「消息确实 Easy」由唯一调用点 agent.rs::llm_loop 负责
+    ///（is_easy_query + 无写意图守卫）；未来新增调用点必须自带同样的内容级
+    /// 判定，不能假设标记本身校验内容（ocr maintainability·low 修复：文档化
+    /// 调用方责任）。Judge 模式下 `classify_difficulty` 是一次真实 LLM 往返，
+    /// 再分类会把 ADR-017 承诺的「1024 预算 = 单次便宜调用」变成 3 次往返。
     pub(crate) async fn chat_budgeted(
         &self,
         _route: BootstrapEasyRoute,
@@ -1402,7 +1405,7 @@ impl LlmClient {
             return Err("bootstrap max_tokens 必须大于 0".to_string());
         }
         self.with_max_tokens_override(max_tokens)
-            .chat_impl(messages, tools, true)
+            .chat_impl(messages, tools, Some(max_tokens))
             .await
     }
 
@@ -1413,15 +1416,19 @@ impl LlmClient {
         messages: &[Message],
         tools: &[ToolDef],
     ) -> Result<LlmResponse, String> {
-        self.chat_impl(messages, tools, false).await
+        self.chat_impl(messages, tools, None).await
     }
 
-    /// chat 的实现体；`budgeted` 仅用于截断告警语义，不改变请求内容。
+    /// chat 的实现体；`budget: Option<u32>` 把「预算化模式」与「本次覆盖的
+    /// max_tokens」绑定在类型层：Some(cap) = 预算化调用（bootstrap 首轮），
+    /// 截断告警按 cap 判定；None = 常规调用。二者不可能漂移——未来若有人
+    /// 传 Some 却不覆盖 max_tokens，告警也按传入的 cap 计算，不会误用
+    /// 全局默认 8192（ocr maintainability·low 修复）。
     async fn chat_impl(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
-        budgeted: bool,
+        budget: Option<u32>,
     ) -> Result<LlmResponse, String> {
         // 传输层脱敏：user 消息凭证打码后再上送（不改历史/存储）
         let sanitized = sanitize_messages(messages);
@@ -1607,6 +1614,8 @@ impl LlmClient {
                             .get("finish_reason")
                             .and_then(|f| f.as_str())
                             .unwrap_or("");
+                        let budgeted = budget.is_some();
+                        let budget_max = budget.unwrap_or(self.config.max_tokens);
                         // usage 整体缺失时 completion_tokens 记 0：budgeted_truncation_warn
                         // 返回 false（不误报），下方单独 debug 留痕记录「无法判定」。
                         let usage = response.usage.as_ref();
@@ -1616,30 +1625,31 @@ impl LlmClient {
                         if budgeted_truncation_warn(
                             finish_reason,
                             completion_tokens,
-                            self.config.max_tokens,
+                            budget_max,
                             !response.tool_calls.is_empty(),
                             budgeted,
                         ) {
                             tracing::warn!(target = "agent.llm", model = %model,
-                                finish_reason, completion_tokens, max_tokens = self.config.max_tokens,
+                                finish_reason, completion_tokens, max_tokens = budget_max,
                                 "budgeted 输出疑似被截断（finish_reason=length 或 completion_tokens 触及 max_tokens）且 tool_calls 为空");
                         } else if budgeted
                             && response.tool_calls.is_empty()
                             && !finish_reason.is_empty()
                             // 与 budgeted_truncation_warn 的成功标记口径一致
                             //（共享 is_normal_finish_reason，避免白名单漂移）：
-                            // stop / end_turn / function_call / tool_calls /
-                            // stop_sequence / tool_use 都是正常完成，恰好填满
-                            // max_tokens 也不留误导性日志（ocr maintainability·low 修复）。
+                            // stop / end_turn / stop_sequence / tool_use 都是正常完成，
+                            // 恰好填满 max_tokens 也不留误导性日志；工具调用类标记
+                            //（function_call / tool_calls）在 tool_calls 为空时是异常
+                            // 信号，不算正常完成（ocr maintainability·low 修复）。
                             && !is_normal_finish_reason(finish_reason)
-                            && self.config.max_tokens > 0
-                            && completion_tokens >= u64::from(self.config.max_tokens)
+                            && budget_max > 0
+                            && completion_tokens >= u64::from(budget_max)
                         {
                             // content_filter 等非成功 finish_reason + tokens 触及上限：
                             // 保持「不告警、防推理模型误报」的既有策略，但补一条 debug
                             // 留痕，避免该盲区完全不可观测（ocr other·low 修复）。
                             tracing::debug!(target = "agent.llm", model = %model,
-                                finish_reason, completion_tokens, max_tokens = self.config.max_tokens,
+                                finish_reason, completion_tokens, max_tokens = budget_max,
                                 "budgeted 输出以非成功 finish_reason 结束且 tokens 触及上限，仅留痕不告警");
                         } else if budgeted
                             && response.tool_calls.is_empty()
@@ -1856,14 +1866,16 @@ impl LlmClient {
     }
 }
 
-/// 正常完成标记（与截断无关的成功信号）：标准 `stop` + 主流 provider 的非标准
-/// 成功标记（OpenAI 系 function_call/tool_calls、Anthropic 系 stop_sequence/
-/// tool_use、Gemini 系 end_turn）。budgeted 截断留痕与告警共用此口径，
-/// 避免两处成功标记白名单漂移（ocr maintainability·low 修复）。
+/// 纯完成类成功标记（与截断无关）：标准 `stop` + 主流 provider 的完成类
+/// 非标准标记（Anthropic `stop_sequence`、Gemini `end_turn`、`tool_use`）。
+/// 工具调用类标记（`function_call` / `tool_calls`）**不在此列**：截断留痕分支
+/// 只在「tool_calls 为空」时运行，带工具标记却无工具调用恰是异常信号，
+/// 需要可观测（ocr maintainability·low 修复：标记集合与使用场景一致，
+/// 且 budgeted_truncation_warn 的截断集是独立的 length/max_tokens，不需要本表）。
 fn is_normal_finish_reason(finish_reason: &str) -> bool {
     matches!(
         finish_reason,
-        "stop" | "end_turn" | "function_call" | "tool_calls" | "stop_sequence" | "tool_use"
+        "stop" | "end_turn" | "stop_sequence" | "tool_use"
     )
 }
 
@@ -1890,11 +1902,9 @@ pub(crate) fn budgeted_truncation_warn(
     if matches!(finish_reason, "length" | "max_tokens") {
         return true;
     }
-    // 正常完成标记（stop / end_turn / function_call / tool_calls / stop_sequence /
-    // tool_use）不告警；finish_reason 缺失时用 completion_tokens 触及上限兜底判定。
-    // 与截断留痕共用 is_normal_finish_reason 口径，避免两处白名单漂移。
-    !is_normal_finish_reason(finish_reason)
-        && finish_reason.is_empty()
+    // finish_reason 缺失时用 completion_tokens 触及上限兜底判定；
+    // 正常完成标记（stop 等）在此天然不告警（is_empty 为 false）。
+    finish_reason.is_empty()
         && max_tokens > 0
         && completion_tokens >= u64::from(max_tokens)
 }

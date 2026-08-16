@@ -983,23 +983,24 @@ impl AgentCore {
         // 跨重启生效——否则进程重启后 learn_tools 刷新会按前缀启发式静默撤销
         //（如 query_* → dangerous 回退 read，ocr security·medium 修复）。
         if !config.tool_overrides.is_empty() {
-            let applied = boundary.replay_tool_overrides(&config.tool_overrides);
-            if applied != config.tool_overrides.len() {
-                // 锁中毒时收紧全部未生效：必须显式告警，否则 operator 的 pin
-                // 静默失效、工具回退前缀启发式（ocr security·low 修复）。
-                tracing::warn!(
-                    target = "boundary",
-                    total = config.tool_overrides.len(),
-                    applied,
-                    "启动重放工具分类手动收紧失败（分类器锁中毒），收紧未生效"
-                );
-            } else {
-                tracing::info!(
-                    target = "boundary",
-                    total = config.tool_overrides.len(),
-                    applied,
-                    "启动重放工具分类手动收紧"
-                );
+            match boundary.replay_tool_overrides(&config.tool_overrides) {
+                None => {
+                    // 锁中毒时收紧全部未生效：必须显式告警，否则 operator 的 pin
+                    // 静默失效、工具回退前缀启发式（ocr security·low 修复）。
+                    tracing::warn!(
+                        target = "boundary",
+                        total = config.tool_overrides.len(),
+                        "启动重放工具分类手动收紧失败（分类器锁中毒），收紧未生效"
+                    );
+                }
+                Some(applied) => {
+                    tracing::info!(
+                        target = "boundary",
+                        total = applied,
+                        applied,
+                        "启动重放工具分类手动收紧"
+                    );
+                }
             }
         }
         // 注册 agent 自身到权限链（锁中毒时跳过）
@@ -7262,7 +7263,7 @@ impl AgentCore {
                         fast_path_data,
                         query_tool_available,
                         round: _round,
-                        hard_max_rounds: self.config.max_tool_rounds,
+                        hard_max_rounds: max_rounds,
                         candidate_reply: Some(&reply),
                     };
                     match self
@@ -7274,7 +7275,15 @@ impl AgentCore {
                             ctx.messages.extend(messages);
                             tracing::info!(target = "agent.output_guardrail", round = _round,
                                 "终答泄漏，hook 注入自然语言重写重试");
-                            continue;
+                            // 最后一轮不能继续循环：continue 会让循环耗尽后走轮数耗尽
+                            // 兜底，丢弃已生成的终答并绕过 persist_final_reply 统一
+                            // 持久化序列（ocr bug·high 修复）。末轮泄漏按 Continue
+                            // 语义落盘，由 chat 出口的 reply_polish 包裹兜底。
+                            if (_round + 1) < budget.max_rounds() {
+                                continue;
+                            }
+                            tracing::warn!(target = "agent.output_guardrail", round = _round,
+                                "终答泄漏发生在最后一轮，放弃重试，按当前回复落盘");
                         }
                         crate::orchestration::HookAction::Abort { reply: hooked } => {
                             self.metrics.inc_hook_abort();
@@ -7295,7 +7304,11 @@ impl AgentCore {
                             tracing::info!(target = "agent.output_guardrail", round = _round,
                                 "OnFinalAnswer hook 返回 Inject，按 Retry 处理回到循环");
                             ctx.messages.extend(messages);
-                            continue;
+                            if (_round + 1) < budget.max_rounds() {
+                                continue;
+                            }
+                            tracing::warn!(target = "agent.output_guardrail", round = _round,
+                                "OnFinalAnswer Inject 发生在最后一轮，放弃重试，按当前回复落盘");
                         }
                         crate::orchestration::HookAction::Continue => {}
                     }
@@ -7369,16 +7382,18 @@ impl AgentCore {
 
         match self.llm.chat(&ctx.messages, &[]).await {
             Ok(r) => {
-                let reply = Self::honesty_guard_readonly_as_write(
+                // 轮数耗尽兜底也是终答：必须走统一持久化序列（摄入过滤/强偏好/
+                // 分身任务记忆/honesty guard），不能裸 save_to_history
+                //（ocr bug·high 修复：与 persist_final_reply 的唯一出口对齐）。
+                self.persist_final_reply(
+                    session_id,
                     raw_message,
-                    &ctx.executed_tools,
+                    user_id,
                     &r.text,
-                );
-                // 分身在「执行过工具」的任务完成后，写策展记忆到其专属 ns
-                self.maybe_persona_task_memory(session_id, raw_message, &reply).await;
-                // 保存到内存缓存（工具调用后的总结也需要保存）
-                self.save_to_history(session_id, raw_message, &reply).await;
-                reply
+                    &ctx.executed_tools,
+                    ctx.did_work,
+                )
+                .await
             }
             Err(e) => format!("LLM 总结失败: {}", e),
         }
@@ -7875,10 +7890,22 @@ impl AgentCore {
             if content.starts_with(MARKER) || content.chars().count() <= cfg.threshold_chars {
                 continue;
             }
+            // 上下文窗口保护：超长 tool 输出先截断到有界前缀再进 prompt——
+            // 预算检查按 token 配额估算（chars/4），不是模型上下文窗口；
+            // threshold_chars=0（全量摘要）时原始输出可能超过模型 max input，
+            // 造成 API 失败与浪费（ocr bug·medium 修复）。
+            const SUMMARY_INPUT_CAP_CHARS: usize = 16_000;
+            let input_head: String = content.chars().take(SUMMARY_INPUT_CAP_CHARS).collect();
+            let input_truncated = content.chars().count() > SUMMARY_INPUT_CAP_CHARS;
             let prompt = format!(
                 "请把下面的工具输出压缩成不超过 800 字的要点摘要。必须保留：数值、日期、\
-                 人名/车牌/企业名等实体、结论性语句。禁止添加原输出中不存在的信息。\n\n工具输出：\n{}",
-                content
+                 人名/车牌/企业名等实体、结论性语句。禁止添加原输出中不存在的信息。\n\n工具输出：\n{}{}",
+                input_head,
+                if input_truncated {
+                    "\n…[超长输出已截断，仅保留前 16000 字]"
+                } else {
+                    ""
+                }
             );
             let req_est = (prompt.chars().count() as u64) / 4;
             if let Err(e) =
@@ -8317,7 +8344,10 @@ impl AgentCore {
                 trace_id,
                 messages,
                 executed_tools,
-                did_work: executed_any,
+                // did_work 用累计信号：executed_any 只反映本批工具，多轮 turn 中
+                // 前几轮已执行过工具时不能误报 false（ocr bug·medium 修复，
+                // 与 OnPreAct/OnFinalAnswer 的 ctx.did_work 口径一致）。
+                did_work: !executed_tools.is_empty(),
                 data_query: intent.data_query,
                 attachment: intent.attachment,
                 fast_path_data,
@@ -8823,7 +8853,10 @@ impl AgentCore {
                 trace_id,
                 messages,
                 executed_tools,
-                did_work: executed_any,
+                // did_work 用累计信号：executed_any 只反映本批工具，多轮 turn 中
+                // 前几轮已执行过工具时不能误报 false（ocr bug·medium 修复，
+                // 与 OnPreAct/OnFinalAnswer 的 ctx.did_work 口径一致）。
+                did_work: !executed_tools.is_empty(),
                 data_query: intent.data_query,
                 attachment: intent.attachment,
                 fast_path_data,

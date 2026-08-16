@@ -798,20 +798,21 @@ impl ComplianceBoundary {
 
     /// 启动路径重放配置中的手动收紧（与 register_tool 同语义）。
     /// 使 operator 的 pin 跨重启持续，learn_tools 刷新不会静默撤销
-    ///（ocr security·medium 修复）。单次锁内批量应用（原子性）；返回成功条数
-    ///（0 = 锁中毒，全部未应用）。非法 level 已在配置→ToolClass 转换层被过滤。
-    #[must_use = "返回 0 表示分类器锁中毒、全部未应用，调用方应告警"]
-    pub fn replay_tool_overrides(&self, overrides: &[(String, ToolClass)]) -> usize {
+    ///（ocr security·medium 修复）。单次锁内批量应用（原子性）。
+    /// 返回 `Some(条数)` = 全部应用；`None` = 分类器锁中毒、全部未应用
+    ///（Option 使「空列表成功」与「中毒失败」可区分，ocr other·low 修复）。
+    #[must_use = "None = 分类器锁中毒、全部未应用，调用方应告警"]
+    pub fn replay_tool_overrides(&self, overrides: &[(String, ToolClass)]) -> Option<usize> {
         match self.classifier.lock() {
             Ok(mut c) => {
                 for (tool, level) in overrides {
                     c.register(tool, *level);
                 }
-                overrides.len()
+                Some(overrides.len())
             }
             Err(_) => {
                 tracing::error!("ToolClassifier Mutex 中毒，跳过全部 override 重放");
-                0
+                None
             }
         }
     }
@@ -1163,7 +1164,8 @@ pub struct ToolClassifier {
     write_tools: std::collections::HashSet<String>,
     dangerous_tools: std::collections::HashSet<String>,
     unknown_tools: std::collections::HashSet<String>,
-    /// operator 经 `register_tool` 手动指定的分类（canonical 小写 key）。
+    /// operator 经 `register_tool` 手动指定的分类：canonical 小写 key → pin 前的
+    /// 分类快照（Option<String>，None = 原本 unknown）。
     /// `register_from_tools`（learn_tools）刷新时跳过这些 key，避免手动的
     /// 收紧（如 query_* → dangerous）被前缀启发式重新降级为 read。
     ///
@@ -1171,7 +1173,7 @@ pub struct ToolClassifier {
     /// 跨重启生效，调用方必须在启动时经 `register_tool` 重放（如从 agent.toml
     /// 等配置读取），否则下一次 learn_tools 刷新会按内置表/前缀启发式重新
     /// 分类，静默回到未收紧状态（ocr security·low 修复：显式文档化语义）。
-    manual_overrides: std::collections::HashSet<String>,
+    manual_overrides: std::collections::HashMap<String, Option<String>>,
 }
 
 impl ToolClassifier {
@@ -1181,7 +1183,7 @@ impl ToolClassifier {
             write_tools: std::collections::HashSet::new(),
             dangerous_tools: std::collections::HashSet::new(),
             unknown_tools: std::collections::HashSet::new(),
-            manual_overrides: std::collections::HashSet::new(),
+            manual_overrides: std::collections::HashMap::new(),
         };
         // 内置默认分类（保留原有列表）
         for t in [
@@ -1343,23 +1345,46 @@ impl ToolClassifier {
         // 存储侧统一小写：classify 用 lowercase lookup，避免动态注册的大小写漂移
         let key = tool_name.to_lowercase();
         // 手动注册记为 operator override：后续 learn_tools 刷新不得覆盖。
-        self.manual_overrides.insert(key.clone());
+        // 同时记录 pin 前的分类快照，unregister 时恢复——否则撤销 pin 会连
+        // 内置默认分类（如 cross_validate 经 EXPLICIT_READ_CROSS_TOOLS 登记的
+        // read）一起抹掉（ocr bug·medium 修复）。
+        let prior = self.classify_without_override(&key);
+        self.manual_overrides.insert(key.clone(), prior);
         self.insert_classification(key, level.as_str());
     }
 
+    /// pin 前的分类快照：按 classify 的查询顺序（read→write→dangerous→unknown
+    /// 集合，未命中再查内置精确表）取当前生效级别；均无则 None（= 原本 unknown）。
+    fn classify_without_override(&self, key: &str) -> Option<String> {
+        if self.read_tools.contains(key) {
+            Some("read".to_string())
+        } else if self.write_tools.contains(key) {
+            Some("write".to_string())
+        } else if self.dangerous_tools.contains(key) {
+            Some("dangerous".to_string())
+        } else if self.unknown_tools.contains(key) {
+            Some("unknown".to_string())
+        } else {
+            classify_memoria_tool(key).map(|l| l.to_string())
+        }
+    }
+
     /// 撤销 operator 手动 override：工具改名/下架/误注册后恢复自动学习通道。
-    /// 解除后**立即生效**：同时清除分类集合中的 pin，classify 即刻回退到
-    /// 内置表/unknown，不残留旧级别到下次 register_from_tools 刷新
-    ///（ocr bug·medium 修复：否则放松型 pin（如 delete_record → read）撤销后
-    /// 仍持续生效；ocr maintainability·medium 修复：文档与实际行为一致）。
+    /// 解除后**立即生效**：清除 pin 并恢复 pin 前的分类快照（内置默认/自动学习
+    /// 结果；无快照则回退 unknown，fail-closed），无需等待下一次
+    /// register_from_tools 刷新（ocr bug·medium 修复：撤销不抹掉内置默认分类）。
     /// 对不存在或大小写变体的 key 幂等。
     pub fn unregister_override(&mut self, tool_name: &str) {
         let key = tool_name.to_lowercase();
-        self.manual_overrides.remove(&key);
-        self.read_tools.remove(&key);
-        self.write_tools.remove(&key);
-        self.dangerous_tools.remove(&key);
-        self.unknown_tools.remove(&key);
+        if let Some(prior) = self.manual_overrides.remove(&key) {
+            self.read_tools.remove(&key);
+            self.write_tools.remove(&key);
+            self.dangerous_tools.remove(&key);
+            self.unknown_tools.remove(&key);
+            if let Some(level) = prior {
+                self.insert_classification(key, &level);
+            }
+        }
     }
 
     /// 分类写入唯一入口（register 与 register_from_tools 共用）：
@@ -1408,7 +1433,7 @@ impl ToolClassifier {
                 lower = name.to_lowercase();
                 &lower
             };
-            if self.manual_overrides.contains(key) {
+            if self.manual_overrides.contains_key(key) {
                 continue;
             }
             // Memoria 具名工具：优先精确匹配（key 已 canonical）；
@@ -1511,7 +1536,7 @@ impl ToolClassifier {
         // 大小写判定必须 Unicode-aware（存储侧 to_lowercase 会折叠 'É' 等非 ASCII
         // 大写），否则带重音大写的工具名会被 ASCII 快路径误判为全小写、永久漏分类。
         if tool_name.chars().all(|c| !c.is_uppercase()) {
-            if !self.manual_overrides.contains(tool_name) {
+            if !self.manual_overrides.contains_key(tool_name) {
                 // 快路径：常见小写工具名直接精确命中，零额外分配。
                 if let Some(level) = classify_memoria_tool(tool_name) {
                     return level;
@@ -1533,7 +1558,7 @@ impl ToolClassifier {
         }
         // 慢路径：名称含大写，lowercase 后按 canonical key 对齐查找，override 同样命中。
         let key = tool_name.to_lowercase();
-        if !self.manual_overrides.contains(&key) {
+        if !self.manual_overrides.contains_key(&key) {
             if let Some(level) = classify_memoria_tool(&key) {
                 return level;
             }
@@ -1702,11 +1727,21 @@ fn classify_memoria_tool(name: &str) -> Option<&'static str> {
 /// 注意：这里用前缀启发式而非 `ToolClassifier::new()` 实例——后者是空分类器，
 /// 不含 `register_from_tools` 学到的前缀，会把 `query_today` 之类误判为 unknown。
 pub fn is_read_only_tool(name: &str) -> bool {
+    // 快路径：全小写名称零分配直接判定（授权热路径逐工具调用，避免无条件
+    // to_lowercase 分配——ocr perf·low 修复，与 classify 的 canonical 快路径同构）。
+    if name.chars().all(|c| !c.is_uppercase()) {
+        return is_read_only_tool_lower(name);
+    }
     let lower = name.to_lowercase();
-    if matches!(classify_memoria_tool(&lower), Some("read")) {
+    is_read_only_tool_lower(&lower)
+}
+
+/// is_read_only_tool 的 canonical 小写实现（name 必须已小写）。
+fn is_read_only_tool_lower(lower: &str) -> bool {
+    if matches!(classify_memoria_tool(lower), Some("read")) {
         return true;
     }
-    if matches!(classify_memoria_tool(&lower), Some("write") | Some("dangerous")) {
+    if matches!(classify_memoria_tool(lower), Some("write") | Some("dangerous")) {
         return false;
     }
     // 写 / 危险前缀：永远需要确认，绝不自动执行
@@ -1901,6 +1936,25 @@ mod read_only_tests {
     }
 
     #[test]
+    fn unregister_restores_builtin_classification() {
+        // 回归锁：撤销 pin 恢复 pin 前的内置默认分类（cross_validate 由
+        // EXPLICIT_READ_CROSS_TOOLS 内置登记），不得连内置分类一起抹掉、
+        // 本进程生命周期内持续走黄线（ocr bug·medium 修复）。
+        let mut c = ToolClassifier::new();
+        assert_eq!(c.classify("cross_validate"), "read");
+        c.register("cross_validate", ToolClass::Dangerous);
+        assert_eq!(c.classify("cross_validate"), "dangerous");
+        c.unregister_override("cross_validate");
+        assert_eq!(c.classify("cross_validate"), "read");
+        // 自动学习结果同样恢复（query_secret 刷新学成 read 后再 pin/unpin）
+        c.register_from_tools(&[("query_secret".to_string(), String::new())]);
+        assert_eq!(c.classify("query_secret"), "read");
+        c.register("query_secret", ToolClass::Dangerous);
+        c.unregister_override("query_secret");
+        assert_eq!(c.classify("query_secret"), "read");
+    }
+
+    #[test]
     fn replay_tool_overrides_pins_across_learn_refresh() {
         // 回归锁：启动重放的手动收紧与运行时 register_tool 同语义，
         // learn_tools 刷新不得撤销（ocr security·medium 修复：pin 跨重启
@@ -1910,7 +1964,7 @@ mod read_only_tests {
             ("query_secret".to_string(), ToolClass::Dangerous),
             ("manage_whitelist".to_string(), ToolClass::Write),
         ]);
-        assert_eq!(applied, 2);
+        assert_eq!(applied, Some(2));
         assert!(!b.classifier_says_read("query_secret"));
         b.learn_tools(&[("query_secret".to_string(), String::new())]);
         assert!(!b.classifier_says_read("query_secret"));
