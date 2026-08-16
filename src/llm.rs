@@ -1377,7 +1377,7 @@ impl LlmClient {
     /// 杜绝「首轮预算残留整会话」。显式以 budgeted=true 走 chat_impl，
     /// 截断告警只在本路径生效（不再用魔法阈值推断调用性质）。
     #[tracing::instrument(skip_all, fields(model = %self.config.model, provider = %self.config.base_url, tool_count = tools.len()))]
-    pub async fn chat_with_max_tokens(
+    pub(crate) async fn chat_with_max_tokens(
         &self,
         messages: &[Message],
         tools: &[ToolDef],

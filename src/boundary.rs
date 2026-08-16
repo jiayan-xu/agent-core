@@ -771,6 +771,8 @@ impl ComplianceBoundary {
     /// 权威分类器是否把工具判为 read。
     /// 与 bootstrap 的 `is_safe` 谓词同一口径；分类器不可用/返回 unknown 时
     /// 一律 false（fail-closed），不回退前缀启发式。
+    /// 注意：分类器自身不再把 `cross_*` 按前缀自动归 read（见 register_from_tools），
+    /// 已知只读 cross 工具必须显式注册。
     pub fn classifier_says_read(&self, tool_name: &str) -> bool {
         with_classifier(&self.classifier, ToolClass::Unknown, |c| c.classify_typed(tool_name))
             == ToolClass::Read
@@ -1326,6 +1328,9 @@ impl ToolClassifier {
             let lower = name.to_lowercase();
             // SQL 查询类工具（execute_sql / query_* 等，仅 SELECT）一律按只读处理，
             // 排除明显的写操作前缀（update_/insert_/delete_/create_）
+            // ⚠️ `cross_*` **不再**按前缀自动归 read：该前缀在历史上过宽
+            // （cross_agent_query 实际可写，由 classify_memoria_tool 显式归 write）。
+            // 只读 cross 工具（如 cross_validate）必须走内置/显式注册白名单。
             let is_sql_read = lower.contains("sql")
                 && !lower.starts_with("update")
                 && !lower.starts_with("insert")
@@ -1343,7 +1348,6 @@ impl ToolClassifier {
                 || name.starts_with("diagnose_")
                 || name.starts_with("explain_")
                 || name.starts_with("validate_")
-                || name.starts_with("cross_")
                 || is_sql_read
             {
                 self.read_tools.insert(name.clone());
