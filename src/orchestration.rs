@@ -310,8 +310,9 @@ impl BoundedSessionSet {
                 self.set.remove(&evicted);
             }
         }
-        self.order.push_back(session_id.to_string());
-        self.set.insert(session_id.to_string());
+        let owned = session_id.to_string();
+        self.order.push_back(owned.clone());
+        self.set.insert(owned);
     }
 }
 
@@ -373,6 +374,12 @@ impl OrchestrationController {
         self.hooks.run(point, ctx)
     }
 
+    /// 查询 session 是否已 promoted（缓存命中即真；miss 时同步查 SQLite）。
+    ///
+    /// ⚠️ 异步调用方注意：缓存未命中时这里是同步 rusqlite 查询（std Mutex +
+    /// busy_timeout 上限 2s）。bootstrap 开启时每个未命中 session 只在首请求
+    /// 走一次该冷路径；若 harness.db 高并发写竞争，后续可把 store 调用迁到
+    /// `tokio::task::spawn_blocking`。
     pub fn is_promoted(&self, session_id: &str) -> bool {
         {
             let Ok(cache) = self.promoted_cache.lock() else {
@@ -669,7 +676,7 @@ fn bootstrap_explicit_deny(name: &str) -> bool {
 /// 工具名打分：查询/读取类优先；`raw_message` 带数据查询语义时 query/sql 类加权。
 fn bootstrap_tool_score(name: &str, raw_message: &str) -> i32 {
     let n = name.to_ascii_lowercase();
-    let query_intent = ["查询", "多少", "进厂", "车", "数据", "记录", "统计", "白名单"]
+    let query_intent = ["查询", "多少", "进厂", "车次", "数据", "记录", "统计", "白名单"]
         .iter()
         .any(|k| raw_message.contains(k));
     let mut score = if n.contains("query") {
@@ -755,6 +762,9 @@ pub fn classify_tool_failure(error: &str) -> FailureClass {
         || e.contains("token expired")
         || e.contains("session timeout")
         || e.contains("token timeout")
+        || e.contains("会话超时")
+        || e.contains("令牌超时")
+        || e.contains("token 超时")
         || e.contains("无权限")
         || e.contains("无权")
         || e.contains("权限不足")
@@ -764,6 +774,7 @@ pub fn classify_tool_failure(error: &str) -> FailureClass {
         FailureClass::Fatal
     } else if e.contains("schema")
         || e.contains("参数")
+        || e.contains("超时")
         || e.contains("timeout")
     {
         FailureClass::Retryable
@@ -1238,6 +1249,8 @@ mod tests {
         // 会话/token 过期是认证终态，即使文本含 timeout 也必须 Fatal
         assert_eq!(classify_tool_failure("session timeout"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("token timeout"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("会话超时"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("执行超时"), FailureClass::Retryable);
         // 认证/会话类 invalid 属于 Fatal，不因宽泛 invalid 误判为可重试
         assert_eq!(classify_tool_failure("invalid token"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("invalid session"), FailureClass::Fatal);

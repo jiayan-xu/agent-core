@@ -1840,11 +1840,10 @@ pub(crate) fn budgeted_truncation_warn(
     if !budgeted || has_tool_calls {
         return false;
     }
-    if finish_reason == "length" {
+    if matches!(finish_reason, "length" | "max_tokens") {
         return true;
     }
-    let truncation_marker = matches!(finish_reason, "length" | "max_tokens");
-    (finish_reason.is_empty() || truncation_marker)
+    finish_reason.is_empty()
         && max_tokens > 0
         && completion_tokens >= u64::from(max_tokens)
 }
@@ -1889,8 +1888,9 @@ mod routing_tests {
 
     #[test]
     fn budgeted_truncation_warn_heuristic() {
-        // budgeted + length + 无工具 → 告警
+        // 明确的截断标记无论 completion_tokens 是否触顶都告警
         assert!(budgeted_truncation_warn("length", 10, 1024, false, true));
+        assert!(budgeted_truncation_warn("max_tokens", 10, 1024, false, true));
         // finish_reason 缺失或明确截断标记且 completion_tokens 触及上限 → 告警
         assert!(budgeted_truncation_warn("", 1024, 1024, false, true));
         assert!(budgeted_truncation_warn("max_tokens", 1024, 1024, false, true));

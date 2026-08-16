@@ -1373,20 +1373,23 @@ impl ToolClassifier {
     }
 
     pub fn classify(&self, tool_name: &str) -> &'static str {
+        // 统一小写 canonical key：MCP 工具名大小写漂移时，分类器与
+        // is_read_only_tool / bootstrap 动作段检查保持同一口径。
+        let key = tool_name.to_lowercase();
         // 具名 Memoria/编排工具优先（避免仅靠 HashSet 内置表漏网 → unknown 黄线）
-        if let Some(level) = classify_memoria_tool(tool_name) {
+        if let Some(level) = classify_memoria_tool(&key) {
             return level;
         }
-        if self.read_tools.contains(tool_name) {
+        if self.read_tools.contains(&key) {
             return "read";
         }
-        if self.write_tools.contains(tool_name) {
+        if self.write_tools.contains(&key) {
             return "write";
         }
-        if self.dangerous_tools.contains(tool_name) {
+        if self.dangerous_tools.contains(&key) {
             return "dangerous";
         }
-        if self.unknown_tools.contains(tool_name) {
+        if self.unknown_tools.contains(&key) {
             return "unknown";
         }
         "unknown"
@@ -1641,6 +1644,9 @@ mod read_only_tests {
         assert_eq!(c.classify_typed("cross_sql_select"), ToolClass::Unknown);
         assert!(!is_read_only_tool("cross_sql_select"));
         assert_eq!(c.classify_typed("cross_validate"), ToolClass::Read);
+        // 大小写漂移在两个只读门之间保持一致
+        assert!(is_read_only_tool("Cross_validate"));
+        assert_eq!(c.classify_typed("Cross_validate"), ToolClass::Read);
         assert_eq!(c.classify_typed("cross_agent_query"), ToolClass::Write);
     }
 
