@@ -262,6 +262,10 @@ impl RoutedLlm {
         tools: &[ToolDef],
         max_tokens: u32,
     ) -> Result<LlmResponse, String> {
+        debug_assert!(
+            matches!(difficulty, TaskDifficulty::Easy),
+            "bootstrap 预算化调用只允许 Easy 路由"
+        );
         let selected = self.select(difficulty);
         tracing::info!(?difficulty, "difficulty_route_budgeted");
         selected.chat_with_max_tokens(messages, tools, max_tokens).await
@@ -1374,8 +1378,8 @@ impl LlmClient {
 
     /// 返回一个仅覆盖 `max_tokens` 的克隆，不改动原 client 配置。
     /// bootstrap 的「首轮预算不残留整会话」契约由本方法固化并可单测。
+    /// 唯一受保护入口是 `chat_with_max_tokens`（含 max_tokens>0 运行时校验）。
     pub(crate) fn with_max_tokens_override(&self, max_tokens: u32) -> Self {
-        debug_assert!(max_tokens > 0, "bootstrap max_tokens must be > 0");
         let mut client = self.clone();
         client.config.max_tokens = max_tokens;
         client

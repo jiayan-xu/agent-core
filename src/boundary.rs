@@ -1266,18 +1266,20 @@ impl ToolClassifier {
 
     /// 注册工具到指定权限级别
     pub fn register(&mut self, tool_name: &str, level: &str) {
+        // 存储侧统一小写：classify 用 lowercase lookup，避免动态注册的大小写漂移
+        let key = tool_name.to_lowercase();
         match level {
             "read" => {
-                self.read_tools.insert(tool_name.to_string());
+                self.read_tools.insert(key);
             }
             "write" => {
-                self.write_tools.insert(tool_name.to_string());
+                self.write_tools.insert(key);
             }
             "dangerous" => {
-                self.dangerous_tools.insert(tool_name.to_string());
+                self.dangerous_tools.insert(key);
             }
             _ => {
-                self.unknown_tools.insert(tool_name.to_string());
+                self.unknown_tools.insert(key);
             }
         }
     }
@@ -1286,7 +1288,7 @@ impl ToolClassifier {
     pub fn register_from_tools(&mut self, tools: &[(String, String)]) {
         for (name, _desc) in tools {
             // Memoria 具名工具：优先精确分类，避免 memory_* 落入 unknown 黄线
-            if let Some(level) = classify_memoria_tool(name) {
+            if let Some(level) = classify_memoria_tool(&name.to_lowercase()) {
                 self.register(name, level);
                 continue;
             }
@@ -1359,15 +1361,17 @@ impl ToolClassifier {
                 || name.starts_with("validate_")
                 || is_sql_read
             {
-                self.read_tools.insert(name.clone());
+                self.read_tools.insert(name.to_lowercase());
             } else if name.starts_with("delete_")
                 || name.starts_with("batch_delete")
                 || name.starts_with("shutdown_")
             {
-                self.dangerous_tools.insert(name.clone());
-            } else if !self.read_tools.contains(name) && !self.dangerous_tools.contains(name) {
+                self.dangerous_tools.insert(name.to_lowercase());
+            } else if !self.read_tools.contains(&name.to_lowercase())
+                && !self.dangerous_tools.contains(&name.to_lowercase())
+            {
                 // P0-4：未知工具不再默认当 write 放行，先标记为 unknown，由 check_tool 走黄线确认
-                self.unknown_tools.insert(name.clone());
+                self.unknown_tools.insert(name.to_lowercase());
             }
         }
     }
@@ -1544,13 +1548,13 @@ fn classify_memoria_tool(name: &str) -> Option<&'static str> {
 /// 注意：这里用前缀启发式而非 `ToolClassifier::new()` 实例——后者是空分类器，
 /// 不含 `register_from_tools` 学到的前缀，会把 `query_today` 之类误判为 unknown。
 pub fn is_read_only_tool(name: &str) -> bool {
-    if matches!(classify_memoria_tool(name), Some("read")) {
+    let lower = name.to_lowercase();
+    if matches!(classify_memoria_tool(&lower), Some("read")) {
         return true;
     }
-    if matches!(classify_memoria_tool(name), Some("write") | Some("dangerous")) {
+    if matches!(classify_memoria_tool(&lower), Some("write") | Some("dangerous")) {
         return false;
     }
-    let lower = name.to_lowercase();
     // 写 / 危险前缀：永远需要确认，绝不自动执行
     if lower.starts_with("delete_")
         || lower.starts_with("batch_delete")
@@ -1648,6 +1652,11 @@ mod read_only_tests {
         assert!(is_read_only_tool("Cross_validate"));
         assert_eq!(c.classify_typed("Cross_validate"), ToolClass::Read);
         assert_eq!(c.classify_typed("cross_agent_query"), ToolClass::Write);
+        // 动态注册的混合大小写工具也按统一 canonical case 存储/查询
+        let mut d = ToolClassifier::new();
+        d.register("Query_Plate", "read");
+        assert_eq!(d.classify_typed("query_plate"), ToolClass::Read);
+        assert_eq!(d.classify_typed("QUERY_PLATE"), ToolClass::Read);
     }
 
     #[test]

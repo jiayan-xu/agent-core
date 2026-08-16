@@ -6837,9 +6837,9 @@ impl AgentCore {
                 if let Some(sys_msg) = ctx.messages.first_mut() {
                     if let Some(ref mut content) = sys_msg.content {
                         if let Some(block) = crate::features::render_skill_block(reg.as_ref(), raw_message, 3) {
-                            if append_unique_block(content, "## 可用技能（技能库检索）", &block) {
-                                self.metrics.inc_skill();
-                            }
+                            // 指标保持「尝试注入」语义，与去重后的实际追加无关
+                            self.metrics.inc_skill();
+                            append_unique_block(content, "## 可用技能（技能库检索）", &block);
                         }
                     }
                 }
@@ -6904,8 +6904,16 @@ impl AgentCore {
         }
         // Easy 查询轮次封顶：一轮工具 + 一轮总结 = 3 轮足够（原 20 轮导致简单查询
         // 反复重试 6-7 轮 → 70s+）。Hard 任务保持 20 轮（固废多步推理）。
-        // 下限 1：max_rounds=0 会让循环体（含 bootstrap 预留释放/预算硬拒检查）整体跳过。
-        let max_rounds = (if is_easy_query { 3u32 } else { self.config.max_tool_rounds }).max(1);
+        // max_tool_rounds=0 是无效配置（配置校验未覆盖的存量值）：显式告警并按 1
+        // 处理，确保 bootstrap 预留释放与预算硬拒检查至少执行一次。
+        let configured_max_rounds = if is_easy_query { 3u32 } else { self.config.max_tool_rounds };
+        let max_rounds = if configured_max_rounds == 0 {
+            tracing::warn!(target = "orchestration", session = %session_id,
+                "max_tool_rounds=0 为无效配置，本请求按 1 轮处理");
+            1
+        } else {
+            configured_max_rounds
+        };
         // ADR-017 §5：TurnBudget 统一轮次上限与日 token 预算（同一 quota 调用，行为等价，
         // 仅把循环中的预算检查收口到一处）。
         let budget =
@@ -7032,9 +7040,9 @@ impl AgentCore {
                             if let Some(block) =
                                 crate::features::render_skill_block(reg.as_ref(), raw_message, 3)
                             {
-                                if append_unique_block(content, "## 可用技能（技能库检索）", &block) {
-                                    self.metrics.inc_skill();
-                                }
+                                // 指标保持「尝试注入」语义，与去重后的实际追加无关
+                                self.metrics.inc_skill();
+                                append_unique_block(content, "## 可用技能（技能库检索）", &block);
                             }
                         }
                     }
@@ -7797,11 +7805,17 @@ impl AgentCore {
                         chars_before = content.chars().count(),
                         chars_after = r.text.chars().count(),
                         "工具结果已 LLM 摘要");
-                    // 设计权衡（opt-in）：摘要覆盖 ctx.messages 中的原文；仓库的
-                    // history 只持久化 user/assistant 文本，audit/execution_log 不存
-                    // tool 输出，因此不会把摘要当原始事实落盘。[工具结果摘要] 标记
-                    // 区分来源；若未来 history 开始持久化 tool 消息，必须同步保留原文。
-                    m.content = Some(format!("{MARKER}\n{}", r.text));
+                    // opt-in 摘要：保留 bounded 原文头部，防止后续轮次需要的关键事实
+                    // 因摘要遗漏而永久丢失（摘要 + 原文头部仍然显著压缩超长输出）。
+                    const RAW_RETAIN_CHARS: usize = 2000;
+                    let raw_head: String = content.chars().take(RAW_RETAIN_CHARS).collect();
+                    let truncated = content.chars().count() > RAW_RETAIN_CHARS;
+                    m.content = Some(format!(
+                        "{MARKER}\n{}\n\n[原文保留前{RAW_RETAIN_CHARS}字]\n{}{}",
+                        r.text,
+                        raw_head,
+                        if truncated { "…" } else { "" }
+                    ));
                 }
                 Ok(_) => tracing::warn!(target = "orchestration.summary", "摘要返回空文本，保留原文"),
                 Err(e) => tracing::warn!(target = "orchestration.summary", err = %e, "摘要失败，保留原文"),
@@ -8004,7 +8018,49 @@ impl AgentCore {
         }
 
         // 并发执行：按 max_concurrent 分块，块内 join_all；结果按原始顺序归位。
+        // 配额说明：call_tool_routed 的工具轮次配额是单次 `quota.lock()` 内
+        // check+increment（quota.rs::check_tool_round），并发调用不会形成
+        // check-then-act 竞态；token 预算不在此处扣费（由主循环 TurnBudget 统一记）。
         self.metrics.inc_read_parallel();
+        // 保守快照兜底：分类器判 read 但前缀启发式判非 read 的工具（可能被误标为
+        // 写/确认类）在并发执行前先捕获变更前快照，避免跳过顺序路径的 Phase B 语义。
+        if tool_calls
+            .iter()
+            .any(|tc| !crate::boundary::is_read_only_tool(&tc.name))
+        {
+            let snap_key = snapshot_key(session_id, trace_id);
+            let mut m = self.mutation_snapshot.lock().await;
+            if !m.contains_key(&snap_key) {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let seq = self
+                    .snapshot_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let snap = MutationSnapshot {
+                    tool_name: tool_calls[0].name.clone(),
+                    messages_before: messages.clone(),
+                    session_id: session_id.to_string(),
+                    trace_id: trace_id.to_string(),
+                    captured_at_ms: now_ms,
+                    seq,
+                };
+                if m.len() >= MUTATION_SNAPSHOT_MAX {
+                    let oldest = m
+                        .iter()
+                        .filter(|(k, _)| k.as_str() != snap_key)
+                        .min_by_key(|(_, s)| s.seq)
+                        .map(|(k, _)| k.clone());
+                    if let Some(k) = oldest {
+                        m.remove(&k);
+                    }
+                }
+                m.insert(snap_key, snap);
+                tracing::info!(tool = %tool_calls[0].name, session = %session_id,
+                    "mutation_snapshot_captured (parallel preflight)");
+            }
+        }
         let cap = self.orchestration.cfg.read_parallel.max_concurrent.max(1);
         let persona = self.persona_for_session(session_id);
         let mut results: Vec<Result<String, String>> = Vec::with_capacity(tool_calls.len());
@@ -8036,7 +8092,7 @@ impl AgentCore {
         // pending_action 只有一个槽位，必须显式暴露冲突，不能静默覆盖前一个确认。
         let mut pending_action_set = false;
         for (idx, tc) in tool_calls.iter().enumerate() {
-            let text = match &results[idx] {
+            let mut text = match &results[idx] {
                 Ok(text) => {
                     executed_tools.push(tc.name.clone());
                     executed_any = true;
@@ -8075,9 +8131,13 @@ impl AgentCore {
             }
             if text.contains("require_confirm") || text.contains("确认") {
                 if pending_action_set {
-                    tracing::warn!(target = "orchestration.read_parallel",
+                    tracing::error!(target = "orchestration.read_parallel",
                         tool = %tc.name, session_id, trace_id,
-                        "并行路径出现多个确认请求，pending_action 保留首个，后续确认被丢弃（read 工具不应触发确认，需排查分类器）");
+                        "并行路径出现多个确认请求；会话只保留首个 pending_action，本工具结果已如实回灌并标注需人工复核");
+                    text = format!(
+                        "⚠️ 并行确认冲突：该工具也要求确认，但会话只保留第一个审批项；请人工复核。原始结果：\n{}",
+                        text
+                    );
                 } else {
                     let action = PendingAction {
                         tool_name: tc.name.clone(),
