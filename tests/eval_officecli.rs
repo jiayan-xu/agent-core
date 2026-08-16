@@ -207,6 +207,8 @@ fn agent_with_officecli() -> AgentCore {
         multiagent: agent_core::multiagent::MultiAgentConfig::default(),
         ttc: agent_core::ttc::TtcConfig::default(),
         intake_filter: agent_core::intake_filter::IntakeFilterConfig::default(),
+        orchestration: agent_core::orchestration::OrchestrationConfig::default(),
+        tool_overrides: vec![],
     };
     let harness = HarnessStore::open_memory().unwrap();
     let cp = CheckpointStore::open_memory().unwrap();

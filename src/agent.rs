@@ -208,6 +208,12 @@ pub struct AgentConfig {
     pub ttc: crate::ttc::TtcConfig,
     /// 摄入侧治本过滤（opt-in）：测试命名空间隔离 / A2A 回执丢弃 / 对话实质筛选
     pub intake_filter: crate::intake_filter::IntakeFilterConfig,
+    /// ADR-017：LLM 编排层 v2 配置（全默认 OFF；flag-off 零行为变化）
+    pub orchestration: crate::orchestration::OrchestrationConfig,
+    /// 工具分类手动收紧（operator override，来自 [boundary.tool_overrides]）。
+    /// 与 register_tool 同语义：learn_tools 刷新不覆盖；启动时由 AgentCore::new 重放，
+    /// 使 pin 跨重启生效。level 为类型化 ToolClass，非法字符串已在配置转换层拒绝。
+    pub tool_overrides: Vec<(String, crate::boundary::ToolClass)>,
 }
 
 /// HY3 1.3 热路径接线开关。全部默认 false。
@@ -396,6 +402,8 @@ pub struct AgentCore {
     pub multiagent: Option<crate::multiagent::MultiAgentConfig>,
     /// HY3 TTC：推理时计算控制器（仅 features.ttc=true 时 Some；否则 None=原路径）
     pub ttc: Option<crate::ttc::TtcController>,
+    /// ADR-017：LLM 编排控制器（flash 锚定引导 + session 相位存储；默认全 OFF）
+    pub orchestration: std::sync::Arc<crate::orchestration::OrchestrationController>,
     /// HY3 1.3 收口：记忆自进化生产证据审计器（每次 consolidate 演化落盘 JSONL，可复验 G1-G4）
     pub evolution_auditor: crate::evolution_audit::EvolutionAuditor,
     /// 战略罗盘「可观测」：运行指标注册表（零行为变化、默认开启，供 /api/metrics 暴露）
@@ -971,6 +979,30 @@ impl AgentCore {
         }
         let llm = LlmClient::new(config.llm.clone());
         let boundary = ComplianceBoundary::new(config.skill_whitelist.clone());
+        // ADR-017：启动即重放 [boundary.tool_overrides] 的手动收紧，使 operator pin
+        // 跨重启生效——否则进程重启后 learn_tools 刷新会按前缀启发式静默撤销
+        //（如 query_* → dangerous 回退 read，ocr security·medium 修复）。
+        if !config.tool_overrides.is_empty() {
+            match boundary.replay_tool_overrides(&config.tool_overrides) {
+                None => {
+                    // 锁中毒时收紧全部未生效：必须显式告警，否则 operator 的 pin
+                    // 静默失效、工具回退前缀启发式（ocr security·low 修复）。
+                    tracing::warn!(
+                        target = "boundary",
+                        total = config.tool_overrides.len(),
+                        "启动重放工具分类手动收紧失败（分类器锁中毒），收紧未生效"
+                    );
+                }
+                Some(applied) => {
+                    tracing::info!(
+                        target = "boundary",
+                        total = applied,
+                        applied,
+                        "启动重放工具分类手动收紧"
+                    );
+                }
+            }
+        }
         // 注册 agent 自身到权限链（锁中毒时跳过）
         match boundary.perm_chain.lock() {
             Ok(mut chain) => {
@@ -1114,6 +1146,11 @@ impl AgentCore {
         } else {
             None
         };
+        // ADR-017：编排控制器。开关全 OFF 时不建表、不开库（零文件副作用）。
+        // Arc 包装：bootstrap 预留用 RAII guard 在 future 取消/panic 时也能自动释放。
+        let orchestration = std::sync::Arc::new(
+            crate::orchestration::OrchestrationController::new(config.orchestration.clone()),
+        );
         let core = AgentCore {
             config,
             mcp,
@@ -1186,6 +1223,7 @@ impl AgentCore {
             lats,
             multiagent,
             ttc,
+            orchestration,
             metrics,
             evolution_auditor: crate::evolution_audit::EvolutionAuditor::new(
                 crate::evolution_audit::EvolutionAuditor::default_path(),
@@ -4862,7 +4900,7 @@ impl AgentCore {
                 if let Some(plan) = plan_opt {
                     // 全只读计划（仅 query_/get_/explain_ 等读工具）→ 无需确认，直接执行。
                     // 只有含写/危险步骤的多步计划才走「执行/取消」确认闸，避免对只读咨询凭空制造摩擦。
-                    let needs_confirm = Self::plan_requires_confirmation(&plan);
+                    let needs_confirm = self.plan_requires_confirmation(&plan);
                     // P1-2: 预览优先（非续跑 + 开启 preview + 多步 + 含写/危险步骤）→ 先返回计划，不执行
                     let is_resume = self.in_progress_plan.lock().await.is_some();
                     if self.config.compositional_preview && !is_resume && plan.steps.len() > 1 && needs_confirm {
@@ -5786,13 +5824,30 @@ impl AgentCore {
 
     // ── P1-2 组合计划 HITL 辅助方法 ──
 
+    /// 生效只读判定：静态前缀启发式 **与** 权威分类器（含 operator manual
+    /// override）都判 read 才算只读。register_tool 收紧（如 query_secret →
+    /// dangerous）后，静态启发式仍可能按 query_ 前缀放行，必须用分类器
+    /// 兜底，否则收紧对确认闸/快照路径失效（ocr security·high 修复）。
+    /// 分类器锁不可用/未学习时 fail-closed（按非只读处理，更保守）。
+    /// 纯同步（try_lock + 静态谓词），零 future 分配（ocr maintainability·low 修复）。
+    fn is_effectively_read(&self, name: &str) -> bool {
+        let classifier_read = match self.boundary.try_lock() {
+            Ok(b) => b.classifier_says_read(name),
+            Err(_) => false,
+        };
+        crate::boundary::is_read_only_tool(name) && classifier_read
+    }
+
     /// 计划是否含写/危险步骤（需要用户确认闸）。
-    /// 仅当任一步骤的工具不是纯只读（见 `boundary::is_read_only_tool`）时返回 true。
+    /// 仅当任一步骤的工具不是纯只读（见 `is_effectively_read`）时返回 true。
     /// 全只读计划（如「查今日/昨日进厂 + 异常检测」）无需确认，应直接执行。
-    fn plan_requires_confirmation(plan: &crate::composer::ExecutionPlan) -> bool {
-        plan.steps
-            .iter()
-            .any(|s| !crate::boundary::is_read_only_tool(&s.tool))
+    fn plan_requires_confirmation(&self, plan: &crate::composer::ExecutionPlan) -> bool {
+        for s in &plan.steps {
+            if !self.is_effectively_read(&s.tool) {
+                return true;
+            }
+        }
+        false
     }
 
     /// 进入计划预览态：记录 plan 但不执行（等待用户确认）
@@ -6557,6 +6612,45 @@ impl AgentCore {
             .await;
     }
 
+    /// 终答统一持久化序列：摄入过滤（测试 ns 隔离 / A2A 回执 / 非实质对话）→
+    /// 强偏好/分身任务记忆 → honesty guard → save_to_history。
+    /// 正常终答与 hook Abort 路径都必须走这里，防止 hook 注册方直接 save_to_history
+    /// 绕过 intake_filter 持久化本应被过滤的数据（ocr bug·medium 修复）。
+    /// 返回经 honesty guard 修正后的最终回复。
+    async fn persist_final_reply(
+        &self,
+        session_id: &str,
+        raw_message: &str,
+        user_id: &str,
+        reply: &str,
+        executed_tools: &[String],
+        did_work: bool,
+    ) -> String {
+        self.observe_filtered(
+            raw_message,
+            "user",
+            &format!("user:{}", user_id),
+            session_id,
+            &self.caller_ns(session_id),
+        )
+        .await;
+        self.maybe_strong_pref_capture(session_id, raw_message).await;
+        self.observe_filtered(
+            reply,
+            "assistant",
+            &self.config.identity.agent_id,
+            session_id,
+            &self.caller_ns(session_id),
+        )
+        .await;
+        if did_work {
+            self.maybe_persona_task_memory(session_id, raw_message, reply).await;
+        }
+        let guarded = Self::honesty_guard_readonly_as_write(raw_message, executed_tools, reply);
+        self.save_to_history(session_id, raw_message, &guarded).await;
+        guarded
+    }
+
     /// LLM 调用循环（支持多轮 tool calling）
     // ── A1: 白龙马 ACI 请求前上下文预取（工具子集选择，只选 schema 不调工具）──
     const EXPOSE_TOOL_CAP: usize = 30; // 2026-08-05 二降：60 时单次 LLM 仍 20s（工具 schema 大）。30 = 相关查询 + 常驻诊断，Easy 查询足够；DeepSeek 裸 API 0.3s，慢在 prompt 体积
@@ -6621,6 +6715,20 @@ impl AgentCore {
             "写入", "录入", "导入", "同步", "删除", "新增",
         ];
         WRITE_KEYS.iter().any(|k| q.contains(k))
+    }
+
+    /// 当前工具面是否至少含一个数据查询类工具（HookContext.query_tool_available）。
+    /// 口径与旧内联判断一致；OnPreAct / OnFinalAnswer / OnToolResult 三处共享，
+    /// 避免 hook 上下文拿到硬编码 false 的错误快照（ocr bug·low 修复）。
+    fn has_query_tool<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
+        names.any(|n| {
+            // 零分配：固定前缀用 ASCII case-insensitive 比较，
+            // 不在热循环里为每个工具名 to_ascii_lowercase 建 String（ocr perf·low 修复）。
+            n.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("query_"))
+                || n.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("get_"))
+                || n.eq_ignore_ascii_case("nl_query")
+                || n.eq_ignore_ascii_case("execute_sql")
+        })
     }
 
     /// 白龙马 ACI 的 selectTools 等价物：按当前消息(task_context)从全量工具中选 top-K 暴露给 LLM。
@@ -6709,18 +6817,108 @@ impl AgentCore {
         } else {
             Self::EXPOSE_TOOL_CAP
         };
-        let tools = self.select_exposed_tools(raw_message, allowed_ns, expose_cap).await;
+        let full_tools = self.select_exposed_tools(raw_message, allowed_ns, expose_cap).await;
+        // ADR-017 P1：flash 锚定引导。仅 bootstrap 开启 + easy 路由 + 非写意图 + 未 promoted 触发；
+        // flag-off / 其他条件不满足时 `bootstrap_active=false`，以下所有分支与原路径逐字等价。
+        // per-session 原子预留：同 session 并发 run 只有一个能拿最小工具面，
+        // 其余 run 直接走常规路径（拿不到预留不算错误，也不取消其他 run 的预留）。
+        let bootstrap_eligible = self.orchestration.cfg.bootstrap.enabled
+            && is_easy_query
+            && !Self::has_write_intent(raw_message)
+            && !self
+                .orchestration
+                .is_promoted_async(session_id.to_string())
+                .await;
+        // RAII 预留：拿不到（同 session 并发 run 已持有 / 已 promoted）走常规路径；
+        // 拿到后所有 early-return、future 取消、panic 均由 guard Drop 自动释放。
+        // acquire 内部走 spawn_blocking，SQLite 冷路径不阻塞 tokio worker。
+        let mut bootstrap_reservation = if bootstrap_eligible {
+            self.orchestration
+                .acquire_bootstrap_async(session_id.to_string())
+                .await
+        } else {
+            None
+        };
+        let bootstrap_active = bootstrap_reservation.is_some();
+        if bootstrap_eligible && !bootstrap_active {
+            tracing::info!(target = "orchestration", session = %session_id,
+                "bootstrap 预留未获得（同 session 已有 run 在 bootstrap 或已 promoted），本 run 走常规路径");
+        }
+        // 保存原始 system prompt：bootstrap 替换为中性人设后，promote 时（同请求内）恢复。
+        // system 缺失/无内容时无法恢复人设，显式留痕（否则中性人设会静默残留整段 run）。
+        let original_system_content: Option<String> = ctx
+            .messages
+            .first()
+            .filter(|m| m.role == "system")
+            .and_then(|m| m.content.clone());
+        if original_system_content.is_none() && bootstrap_active {
+            tracing::warn!(target = "orchestration", session = %session_id,
+                "bootstrap 未找到可恢复的 system prompt，promote 后将保持中性人设");
+        }
+        // 幂等刷新：同名块已存在时从 marker 处截断再追加新块，避免 prompt 逐轮膨胀，
+        // 同时保证工具清单/技能块随最新会话上下文刷新（不会因旧 marker 而跳过更新）。
+        fn upsert_unique_block(content: &mut String, marker: &str, block: &str) {
+            if let Some(pos) = content.find(marker) {
+                content.truncate(pos);
+            }
+            content.push_str(block);
+        }
+        // 工具所有权：非 bootstrap 路径直接 move `full_tools`，避免每轮入口深克隆；
+        // bootstrap 路径把全量目录暂存到 Option，promote 时 move 回来（零克隆）。
+        let mut tools;
+        let mut bootstrap_full_tools: Option<Vec<ToolDef>> = None;
+        if bootstrap_active {
+            // 权威安全谓词：只用边界 ToolClassifier（已从注册工具学习）的 read 标签。
+            // 锁不可用/中毒时 **fail-closed**：前缀启发式对 cross_* 等过宽，
+            // 回退会把写能力工具放进来（与并行快速路径的 fail-closed 不一致）。
+            let boundary_ref = self.boundary.clone();
+            let is_safe = move |name: &str| -> bool {
+                match boundary_ref.try_lock() {
+                    Ok(b) => match b.classifier.lock() {
+                        Ok(c) => c.classify_typed(name) == crate::boundary::ToolClass::Read,
+                        Err(_) => false,
+                    },
+                    Err(_) => false,
+                }
+            };
+            let picked = self
+                .orchestration
+                .bootstrap_tools(raw_message, &full_tools, &is_safe);
+            tracing::info!(target = "orchestration", session = %session_id,
+                full_tools = full_tools.len(), bootstrap_tools = picked.len(),
+                "bootstrap 首请求最小工具面");
+            bootstrap_full_tools = Some(full_tools);
+            tools = picked;
+        } else {
+            tools = full_tools;
+        }
         // P1-4: 构建工具名 → JSON Schema 映射，用于参数校验
         ctx.tool_schemas = tools
             .iter()
             .map(|t| (t.function.name.clone(), t.function.parameters.clone()))
             .collect();
 
+        // ADR-017 P1：bootstrap 首请求使用中性 system prompt
+        // （对齐 dsh 实测：带 spec 人设对 flash 反路由；promote 后恢复完整人设）。
+        // 文本与 OnPreAct 的 data_query 强制工具提示保持兼容（都指向「先用工具」），
+        // 避免互相矛盾的指令（ocr 2026-08-16 finding）。
+        if bootstrap_active {
+            if let Some(sys) = ctx.messages.first_mut() {
+                if sys.role == "system" {
+                    sys.content = Some(
+                        "You are a helpful assistant. 请优先调用给定的工具获取真实数据后再回答；没有可用的工具时再直接简洁回答。"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
         // P1 修复：把真实工具名动态注入 system prompt。
         // build_system_prompt 里写死的 query_sql/query_plate 与真实 MCP 工具
         // (execute_sql/fuzzy_match_plate) 对不上，会导致 LLM 调错或调不存在的工具。
         // 这里以"权威工具清单"覆盖，确保 LLM 使用真实存在的工具名。
-        if !tools.is_empty() {
+        // ADR-017：bootstrap 首请求不注入完整清单（锚定式引导；promote 后恢复）。
+        if !tools.is_empty() && !bootstrap_active {
             if let Some(sys_msg) = ctx.messages.first_mut() {
                 if let Some(ref mut content) = sys_msg.content {
                     let mut extra =
@@ -6730,25 +6928,32 @@ impl AgentCore {
                         extra.push_str(&format!("- `{}`: {}\n", t.function.name, desc));
                     }
                     extra.push_str("\n注意：以上为系统中真实存在的工具。严禁臆造工具名（如 query_sql/query_plate 并不存在），请直接选用上面列出的工具。\n");
-                    content.push_str(&extra);
+                    upsert_unique_block(content, "## 当前真实可用工具", &extra);
                 }
             }
         }
 
         // HY3 1.3：技能库注入（features.skill_library=false 时 skill_registry=None → 不生效）
-        if let Some(reg) = self.skill_registry.as_ref() {
-            if let Some(sys_msg) = ctx.messages.first_mut() {
-                if let Some(ref mut content) = sys_msg.content {
-                    if let Some(block) = crate::features::render_skill_block(reg.as_ref(), raw_message, 3) {
-                        self.metrics.inc_skill();
-                        content.push_str(&block);
+        // ADR-017：bootstrap 首请求剥离自动注入（对齐 dsh 实测：注入越多 flash 锚定越差）。
+        if !bootstrap_active {
+            if let Some(reg) = self.skill_registry.as_ref() {
+                if let Some(sys_msg) = ctx.messages.first_mut() {
+                    if let Some(ref mut content) = sys_msg.content {
+                        if let Some(block) = crate::features::render_skill_block(reg.as_ref(), raw_message, 3) {
+                            // 指标保持「尝试注入」语义，与去重后的实际追加无关
+                            self.metrics.inc_skill();
+                            upsert_unique_block(content, "## 可用技能（技能库检索）", &block);
+                        }
                     }
                 }
             }
         }
 
         // HY3 1.3：LATS 过程树展开（features.lats=false 时 self.lats=None → 直接返回，原路径零改动）
-        self.maybe_lats_expand(&mut ctx.messages, raw_message).await;
+        // ADR-017：bootstrap 首请求不做过程树展开（保持最小面锚定）。
+        if !bootstrap_active {
+            self.maybe_lats_expand(&mut ctx.messages, raw_message).await;
+        }
 
         // P2-1: 配额命名空间（与 call_tool_routed 保持一致）
         let quota_ns_llm = allowed_ns
@@ -6759,33 +6964,85 @@ impl AgentCore {
         // 重构阶段3：一次分类，循环内守卫统一读取（消除散落 is_xxx / 豁免条件复制）
         let intent = Self::classify_intent(raw_message);
 
-        // ⚠️ 2026-08-05 提速：数据查询首轮即强制工具（不等 LLM 空手犯错被重试提示顶回）。
-        // deepseek-v4-flash 对 Easy 数据查询首轮常直接编答案 → did_work=false →
-        // 注入重试提示 → 第二轮才调工具（多耗 1 轮 5-20s）。首轮注入后一轮到位。
-        // 2026-08-06 ocr 修复：快速通道已注入数据时跳过强制工具提示（两者矛盾）
-        if intent.data_query && !intent.attachment && !fast_path_data {
-            ctx.messages.push(crate::llm::Message {
-                role: "system".to_string(),
-                content: Some(
-                    "你正在处理一个业务数据查询（如进厂/车次/重量/白名单/固废种类等）。\
-                     你必须先调用数据查询工具（query_* / nl_query / get_* / execute_sql）获取真实数据，\
-                     再基于工具结果回答。禁止第一轮空手回答或凭记忆编造。"
-                        .to_string(),
-                ),
-                tool_calls: None,
-                tool_call_id: None,
-            });
+        // ADR-017 P2：OnPreAct guardrail hooks。
+        // data_query 强制工具提示已从内联补丁迁移为内置 hook（文本与条件逐字等价）；
+        // 新领域只需注册 hook，不再改动循环体。
+        let query_tool_available =
+            Self::has_query_tool(tools.iter().map(|t| t.function.name.as_str()));
+        {
+            let hook_ctx = crate::orchestration::HookContext {
+                session_id,
+                raw_message,
+                trace_id,
+                messages: &ctx.messages,
+                executed_tools: &ctx.executed_tools,
+                did_work: ctx.did_work,
+                data_query: intent.data_query,
+                attachment: intent.attachment,
+                fast_path_data,
+                query_tool_available,
+                round: 0,
+                hard_max_rounds: self.config.max_tool_rounds,
+                candidate_reply: None,
+            };
+            match self
+                .orchestration
+                .run_hooks(crate::orchestration::HookPoint::OnPreAct, &hook_ctx)
+            {
+                crate::orchestration::HookAction::Inject { messages } => {
+                    ctx.messages.extend(messages);
+                }
+                crate::orchestration::HookAction::Retry { messages } => {
+                    // OnPreAct 无循环语义：Retry 等价于 Inject，但显式处理并留痕，
+                    // 防止未来 hook 的 Retry 被静默丢弃（ocr 修复）。
+                    tracing::warn!(target = "orchestration.hooks",
+                        session = %session_id, "OnPreAct hook 返回 Retry（按 Inject 处理）");
+                    ctx.messages.extend(messages);
+                }
+                crate::orchestration::HookAction::Abort { reply } => {
+                    self.metrics.inc_hook_abort();
+                    // bootstrap 预留由 BootstrapReservation Drop 自动释放
+                    return self
+                        .persist_final_reply(
+                            session_id,
+                            raw_message,
+                            user_id,
+                            &reply,
+                            &ctx.executed_tools,
+                            ctx.did_work,
+                        )
+                        .await;
+                }
+                crate::orchestration::HookAction::Continue => {}
+            }
         }
         // Easy 查询轮次封顶：一轮工具 + 一轮总结 = 3 轮足够（原 20 轮导致简单查询
         // 反复重试 6-7 轮 → 70s+）。Hard 任务保持 20 轮（固废多步推理）。
-        let max_rounds = if is_easy_query { 3u32 } else { self.config.max_tool_rounds };
+        // max_tool_rounds=0 是无效配置（配置校验未覆盖的存量值）：显式告警并按 1
+        // 处理，确保 bootstrap 预留释放与预算硬拒检查至少执行一次。
+        let configured_max_rounds = if is_easy_query { 3u32 } else { self.config.max_tool_rounds };
+        let max_rounds = if configured_max_rounds == 0 {
+            tracing::warn!(target = "orchestration", session = %session_id,
+                "max_tool_rounds=0 为无效配置，本请求按 1 轮处理");
+            1
+        } else {
+            configured_max_rounds
+        };
+        // ADR-017 §5：TurnBudget 统一轮次上限与日 token 预算（同一 quota 调用，行为等价，
+        // 仅把循环中的预算检查收口到一处）。
+        let budget =
+            crate::orchestration::TurnBudget::new(&quota_ns_llm, self.quota.clone(), max_rounds);
+        // ADR-017：仅 bootstrap 首轮用预算化调用；promote 后（同请求后续轮次）恢复常规调用。
+        let mut bootstrap_round = bootstrap_active;
+        // ADR-017 P2：Plan-Reflect 已消费的评审轮数（上限由 [orchestration.plan_reflect] 控制）。
+        let mut reflect_rounds: usize = 0;
 
         // Phase B：快照由捕获点管理（见 execute_tool_calls），run 起始**不**删除——
         // 否则同 session 并发 run 会互相删掉对方刚捕获的快照（ocr 2026-08-12
         // 第五轮 bug·medium）。捕获点通过 trace_id 区分「本 run 已捕获」与「旧 run
         // 残留」，旧残留会在首次写工具时被覆盖。
 
-        for _round in 0..max_rounds {
+        for _round in 0..budget.max_rounds() {
             // P2-1: 日 token 预算预估（请求上下文体量），超限硬拒
             let ctx_chars: usize = ctx
                 .messages
@@ -6793,13 +7050,10 @@ impl AgentCore {
                 .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
                 .sum();
             let req_est = ((raw_message.len() + ctx_chars) as u64) / 4;
-            let budget_check = self
-                .quota
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .check_token_budget(&quota_ns_llm, req_est);
+            let budget_check = budget.check_token(req_est);
             if let Err(e) = budget_check {
                 tracing::warn!("[QUOTA] 命名空间『{}』token 预算不足: {}", quota_ns_llm, e);
+                // bootstrap 预留由 BootstrapReservation Drop 自动释放
                 self.audit_logger
                     .log_decision(
                         &self.config.identity.agent_id,
@@ -6815,23 +7069,107 @@ impl AgentCore {
             }
             // 战略罗盘「可观测」：主 agent 循环 LLM 调用计数
             self.metrics.inc_llm_calls();
-            let response = match self.routed_llm.chat(&ctx.messages, &tools).await {
+            let response = match if bootstrap_round {
+                self.routed_llm
+                    .chat_budgeted(
+                        crate::llm::BootstrapEasyRoute,
+                        &ctx.messages,
+                        &tools,
+                        self.orchestration.cfg.bootstrap.max_tokens,
+                    )
+                    .await
+            } else {
+                self.routed_llm.chat(&ctx.messages, &tools).await
+            } {
                 Ok(r) => r,
                 // P1-5：LLM 主/备 Provider 均失败 → 返回「可重试错误」，而非裸崩
                 Err(e) => {
                     self.metrics.inc_errors();
+                    // bootstrap 预留由 BootstrapReservation Drop 自动释放
                     tracing::warn!("[DEGRADE] LLM 调用失败（已尝试主用+备用 Provider）: {}", e);
                     return "⚠️ LLM 服务暂时不可用（已尝试主用与备用 Provider 均失败）。请稍后重试，或检查网络与 API 密钥配置。".to_string();
                 }
             };
+            // ADR-017：首个 LLM 响应即 promote（either 语义：首个响应要么带工具调用、要么是终答）。
+            // promote 为 append-only + 幂等落盘；**同请求内**立即展开全量工具面、schema 与
+            // 原始 system prompt（ocr 修复：此前仅恢复预算，后续轮次仍被困在 3 工具面）。
+            if bootstrap_round {
+                bootstrap_round = false;
+                // guard.promote：append-only promote + 释放 per-session 预留；
+                // 之后 move 回全量目录——非 bootstrap 路径与 promote 路径都零克隆。
+                if let Some(reservation) = bootstrap_reservation.take() {
+                    reservation.promote_async().await;
+                } else {
+                    tracing::error!(target = "orchestration", session = %session_id,
+                        "bootstrap_reservation 缺失，promote 未执行");
+                }
+                self.metrics.inc_bootstrap_promote();
+                if let Some(full) = bootstrap_full_tools.take() {
+                    tools = full;
+                } else {
+                    // 不变量：bootstrap_round=true 时一定在本方法入口存过全量目录；
+                    // 保留日志防未来重构破坏该不变量，仍用最小面继续（不 panic）。
+                    tracing::error!(target = "orchestration", session = %session_id,
+                        "bootstrap_full_tools 缺失，promote 后未恢复全量工具目录");
+                }
+                ctx.tool_schemas = tools
+                    .iter()
+                    .map(|t| (t.function.name.clone(), t.function.parameters.clone()))
+                    .collect();
+                if let (Some(sys), Some(orig)) =
+                    (ctx.messages.first_mut(), original_system_content.as_ref())
+                {
+                    if sys.role == "system" {
+                        sys.content = Some(orig.clone());
+                    }
+                } else {
+                    // 入口处已 warn 过一次；这里再次留痕便于把「恢复被跳过」关联到 promote 时刻。
+                    tracing::warn!(target = "orchestration", session = %session_id,
+                        "promote 时未恢复原始 system prompt（首条消息非 system 或无内容）");
+                }
+                // 重新应用完整请求注入（promote 前被剥离的三项，ocr medium 修复：
+                // 只恢复 system 文本会让后续轮次回到「写死 query_sql/query_plate」的旧坑）。
+                // upsert_unique_block：original system 已含同名块时原位刷新，不追加。
+                if !tools.is_empty() {
+                    if let Some(sys_msg) = ctx.messages.first_mut() {
+                        if sys_msg.role == "system" {
+                            if let Some(ref mut content) = sys_msg.content {
+                                let mut extra = String::from(
+                                    "\n\n## 当前真实可用工具（调用时务必使用以下名称）\n",
+                                );
+                                for t in tools.iter() {
+                                    let desc: String =
+                                        t.function.description.chars().take(120).collect();
+                                    extra.push_str(&format!("- `{}`: {}\n", t.function.name, desc));
+                                }
+                                extra.push_str("\n注意：以上为系统中真实存在的工具。严禁臆造工具名，请直接选用上面列出的工具。\n");
+                                upsert_unique_block(content, "## 当前真实可用工具", &extra);
+                            }
+                        }
+                    }
+                }
+                if let Some(reg) = self.skill_registry.as_ref() {
+                    if let Some(sys_msg) = ctx.messages.first_mut() {
+                        if let Some(ref mut content) = sys_msg.content {
+                            if let Some(block) =
+                                crate::features::render_skill_block(reg.as_ref(), raw_message, 3)
+                            {
+                                // 指标保持「尝试注入」语义，与去重后的实际追加无关
+                                self.metrics.inc_skill();
+                                upsert_unique_block(content, "## 可用技能（技能库检索）", &block);
+                            }
+                        }
+                    }
+                }
+                self.maybe_lats_expand(&mut ctx.messages, raw_message).await;
+                tracing::info!(target = "orchestration", session = %session_id,
+                    restored_tools = tools.len(), "bootstrap promoted（同请求已展开全量目录）");
+            }
             // 标记本轮回合是否执行了工具（用于分身策展记忆门控）
             ctx.did_work |= !response.tool_calls.is_empty();
             // P2-1: 记录本次 token 消耗（请求 + 响应估算），跨天自动重置
             let resp_est = (response.text.len() as u64) / 4;
-            self.quota
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .record_token(&quota_ns_llm, req_est + resp_est);
+            budget.record_token(req_est + resp_est);
 
             // 无工具调用 → LLM 直接回复
             if response.tool_calls.is_empty() {
@@ -6896,54 +7234,114 @@ impl AgentCore {
                     }
                     reply = chosen.text;
                 }
-                // P1 guardrail：输出级——终答 JSON/代码块泄漏 → 注入「自然语言重写」重试一轮
-                // （OpenAI Agents SDK 输出 guardrail 语义）。末轮仍泄漏 → 由 chat 出口的
-                // reply_polish 包裹兜底（0205578）。
-                if crate::reply_polish::needs_polish(&reply)
-                    && (_round + 1) < self.config.max_tool_rounds
+                // ADR-017 P2：Plan-Reflect 终答评审（opt-in，默认关；仅执行过工具的任务）。
+                // 评审未达成 → 注入重规划提示回到循环；评审失败/预算尽 → 放行（可用性优先）。
+                if self.orchestration.cfg.plan_reflect.enabled
+                    && ctx.did_work
+                    && reflect_rounds < self.orchestration.cfg.plan_reflect.max_reflect_rounds
                 {
-                    ctx.messages.push(crate::llm::Message {
-                        role: "user".to_string(),
-                        content: Some(
-                            "⚠️ 请用自然语言重写你刚才的回答：不要输出 JSON 或代码块，直接把结果用中文文字、数字和表格描述清楚。".to_string(),
-                        ),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                    tracing::info!(target = "agent.output_guardrail", round = _round, "终答泄漏，注入自然语言重写重试");
-                    continue;
+                    reflect_rounds += 1;
+                    self.metrics.inc_reflect();
+                    if !self
+                        .reflect_goal_satisfied(raw_message, &reply, &ctx.messages, &budget)
+                        .await
+                    {
+                        ctx.messages.push(Message {
+                            role: "user".to_string(),
+                            content: Some(
+                                "⚠️ 评审发现你刚才的回答可能没有完全达成用户目标。请重新检查工具结果与目标，补充遗漏的事实或更正错误；直接给出更完整的回答。"
+                                    .to_string(),
+                            ),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
+                        tracing::info!(target = "orchestration.reflect",
+                            reflect_rounds, "reflect 未达成，注入重规划提示");
+                        continue;
+                    }
                 }
-                // 保存对话（摄入过滤：测试 ns / A2A 回执 / 非实质对话 在源头拦截）
-                self.observe_filtered(
-                    raw_message,
-                    "user",
-                    &format!("user:{}", user_id),
-                    session_id,
-                    &self.caller_ns(session_id),
-                )
-                .await;
-                // 肯定/硬规则强触发 → preference 落盘（不依赖 LLM 抽取）
-                self.maybe_strong_pref_capture(session_id, raw_message).await;
-                self.observe_filtered(
-                    &reply,
-                    "assistant",
-                    &self.config.identity.agent_id,
-                    session_id,
-                    &self.caller_ns(session_id),
-                )
-                .await;
-                // 分身在「执行过工具」的任务完成后，写策展记忆到其专属 ns
-                if ctx.did_work {
-                    self.maybe_persona_task_memory(session_id, raw_message, &reply).await;
+                // ADR-017 P2：OnFinalAnswer guardrail hooks。
+                // reply_polish 重试已迁移为内置 hook（条件与注入文本逐字等价）；
+                // 末轮仍泄漏 → hook 返回 Continue，由 chat 出口的 reply_polish 包裹兜底。
+                {
+                    // OnFinalAnswer 时已 promote 恢复全量目录，用真实工具面计算，
+                    // 不传硬编码 false（ocr bug·low 修复）。
+                    let query_tool_available =
+                        Self::has_query_tool(tools.iter().map(|t| t.function.name.as_str()));
+                    let hook_ctx = crate::orchestration::HookContext {
+                        session_id,
+                        raw_message,
+                        trace_id,
+                        messages: &ctx.messages,
+                        executed_tools: &ctx.executed_tools,
+                        did_work: ctx.did_work,
+                        data_query: intent.data_query,
+                        attachment: intent.attachment,
+                        fast_path_data,
+                        query_tool_available,
+                        round: _round,
+                        hard_max_rounds: max_rounds,
+                        candidate_reply: Some(&reply),
+                    };
+                    match self
+                        .orchestration
+                        .run_hooks(crate::orchestration::HookPoint::OnFinalAnswer, &hook_ctx)
+                    {
+                        crate::orchestration::HookAction::Retry { messages } => {
+                            self.metrics.inc_hook_retry();
+                            ctx.messages.extend(messages);
+                            tracing::info!(target = "agent.output_guardrail", round = _round,
+                                "终答泄漏，hook 注入自然语言重写重试");
+                            // 最后一轮不能继续循环：continue 会让循环耗尽后走轮数耗尽
+                            // 兜底，丢弃已生成的终答并绕过 persist_final_reply 统一
+                            // 持久化序列（ocr bug·high 修复）。末轮泄漏按 Continue
+                            // 语义落盘，由 chat 出口的 reply_polish 包裹兜底。
+                            if (_round + 1) < budget.max_rounds() {
+                                continue;
+                            }
+                            tracing::warn!(target = "agent.output_guardrail", round = _round,
+                                "终答泄漏发生在最后一轮，放弃重试，按当前回复落盘");
+                        }
+                        crate::orchestration::HookAction::Abort { reply: hooked } => {
+                            self.metrics.inc_hook_abort();
+                            return self
+                                .persist_final_reply(
+                                    session_id,
+                                    raw_message,
+                                    user_id,
+                                    &hooked,
+                                    &ctx.executed_tools,
+                                    ctx.did_work,
+                                )
+                                .await;
+                        }
+                        crate::orchestration::HookAction::Inject { messages } => {
+                            // 终答后没有下一 LLM 轮，Inject 若直接落盘会被静默吞掉；
+                            // 按 Retry 语义回到循环（轮数由 TurnBudget 封顶，不会死循环）。
+                            tracing::info!(target = "agent.output_guardrail", round = _round,
+                                "OnFinalAnswer hook 返回 Inject，按 Retry 处理回到循环");
+                            ctx.messages.extend(messages);
+                            if (_round + 1) < budget.max_rounds() {
+                                continue;
+                            }
+                            tracing::warn!(target = "agent.output_guardrail", round = _round,
+                                "OnFinalAnswer Inject 发生在最后一轮，放弃重试，按当前回复落盘");
+                        }
+                        crate::orchestration::HookAction::Continue => {}
+                    }
                 }
-                // 保存到内存缓存
-                let reply = Self::honesty_guard_readonly_as_write(
-                    raw_message,
-                    &ctx.executed_tools,
-                    &reply,
-                );
-                self.save_to_history(session_id, raw_message, &reply).await;
-                return reply;
+                // 保存对话：摄入过滤（测试 ns / A2A 回执 / 非实质对话）→ 强偏好/分身记忆
+                // → honesty guard → history。hook Abort 路径复用同一序列（persist_final_reply）。
+                return self
+                    .persist_final_reply(
+                        session_id,
+                        raw_message,
+                        user_id,
+                        &reply,
+                        &ctx.executed_tools,
+                        ctx.did_work,
+                    )
+                    .await;
             }
 
             // 有工具调用 → 执行工具（重构 L 阶段：Agents SDK turn 语义）
@@ -6956,13 +7354,23 @@ impl AgentCore {
                     &ctx.tool_schemas,
                     session_id,
                     raw_message,
+                    user_id,
                     allowed_ns,
                     trace_id,
+                    _round,
+                    &intent,
+                    fast_path_data,
                 )
                 .await
             {
                 ToolExecOutcome::Abort(reply) => return reply,
                 ToolExecOutcome::Executed(any) => ctx.did_work |= any,
+            }
+            // ADR-017 P3：长工具结果先 LLM 摘要（opt-in，默认关），再做字节预算截断兜底。
+            if self.orchestration.cfg.tool_summary.enabled
+                && (_round as usize + 1) >= self.orchestration.cfg.tool_summary.start_round
+            {
+                self.maybe_summarize_tool_outputs(&mut ctx.messages, &budget).await;
             }
             // Phase B：每轮工具执行后按字节预算截断陈旧 tool 输出（防跨轮载荷越滚越大）
             Self::squash_stale_tool_outputs(&mut ctx.messages);
@@ -6991,16 +7399,18 @@ impl AgentCore {
 
         match self.llm.chat(&ctx.messages, &[]).await {
             Ok(r) => {
-                let reply = Self::honesty_guard_readonly_as_write(
+                // 轮数耗尽兜底也是终答：必须走统一持久化序列（摄入过滤/强偏好/
+                // 分身任务记忆/honesty guard），不能裸 save_to_history
+                //（ocr bug·high 修复：与 persist_final_reply 的唯一出口对齐）。
+                self.persist_final_reply(
+                    session_id,
                     raw_message,
-                    &ctx.executed_tools,
+                    user_id,
                     &r.text,
-                );
-                // 分身在「执行过工具」的任务完成后，写策展记忆到其专属 ns
-                self.maybe_persona_task_memory(session_id, raw_message, &reply).await;
-                // 保存到内存缓存（工具调用后的总结也需要保存）
-                self.save_to_history(session_id, raw_message, &reply).await;
-                reply
+                    &ctx.executed_tools,
+                    ctx.did_work,
+                )
+                .await
             }
             Err(e) => format!("LLM 总结失败: {}", e),
         }
@@ -7461,6 +7871,160 @@ impl AgentCore {
         }
     }
 
+    /// ADR-017 P3：工具结果 LLM 摘要（opt-in，默认关；开关关时本方法不进入热路径）。
+    /// 只摘要 role=tool 且超过阈值的消息；每轮最多 `max_per_round` 条；
+    /// 辅助 LLM 调用按估算计入同一 TurnBudget；摘要失败保留原文（由 squash 截断兜底）。
+    /// `max_per_round: 0` 是显式语义「本轮不摘要」，此处直接返回，不静默改成 1；
+    /// `threshold_chars: 0` 是显式语义「所有 tool 结果都摘要」（见配置文档）。
+    async fn maybe_summarize_tool_outputs(
+        &self,
+        messages: &mut Vec<Message>,
+        budget: &crate::orchestration::TurnBudget,
+    ) {
+        const MARKER: &str = "[工具结果摘要]";
+        const SUMMARY_RESPONSE_EST: u64 = 200; // prompt 要求 <=800 字，预留响应估算
+        let cfg = &self.orchestration.cfg.tool_summary;
+        if cfg.max_per_round == 0 {
+            tracing::debug!(target = "orchestration.summary",
+                "tool_summary.max_per_round=0：本轮不摘要（0 是显式关闭语义，不静默改成 1）");
+            return;
+        }
+        // 摘要后主循环还要再发一次 LLM 请求：预算检查必须给下一轮主请求留出
+        // 余量，否则可选摘要会把额度吃光，下一轮被硬拒成「预算不足」。
+        let next_loop_est = messages
+            .iter()
+            .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
+            .sum::<usize>() as u64
+            / 4;
+        let mut summarized_this_round = 0usize;
+        for m in messages.iter_mut().filter(|m| m.role == "tool") {
+            if summarized_this_round >= cfg.max_per_round {
+                break;
+            }
+            let Some(content) = m.content.as_ref() else {
+                continue;
+            };
+            // 单次字符计数复用：跳过判定/截断标记/日志都用同一值，避免对超长
+            // 输出重复全量扫描（ocr perf·low 修复）。
+            let chars = content.chars().count();
+            if content.starts_with(MARKER) || chars <= cfg.threshold_chars {
+                continue;
+            }
+            // 上下文窗口保护：超长 tool 输出先截断到有界前缀再进 prompt——
+            // 预算检查按 token 配额估算（chars/4），不是模型上下文窗口；
+            // threshold_chars=0（全量摘要）时原始输出可能超过模型 max input，
+            // 造成 API 失败与浪费（ocr bug·medium 修复）。
+            const SUMMARY_INPUT_CAP_CHARS: usize = 16_000;
+            let input_head: String = content.chars().take(SUMMARY_INPUT_CAP_CHARS).collect();
+            let input_truncated = chars > SUMMARY_INPUT_CAP_CHARS;
+            let prompt = format!(
+                "请把下面的工具输出压缩成不超过 800 字的要点摘要。必须保留：数值、日期、\
+                 人名/车牌/企业名等实体、结论性语句。禁止添加原输出中不存在的信息。\n\n工具输出：\n{}{}",
+                input_head,
+                if input_truncated {
+                    "\n…[超长输出已截断，仅保留前 16000 字]"
+                } else {
+                    ""
+                }
+            );
+            let req_est = (prompt.chars().count() as u64) / 4;
+            if let Err(e) =
+                budget.check_token(req_est.saturating_add(next_loop_est + SUMMARY_RESPONSE_EST))
+            {
+                tracing::warn!(target = "orchestration.summary", err = %e,
+                    "摘要预算不足（含下一主循环预留），保留原文");
+                break;
+            }
+            let req = vec![Message {
+                role: "user".to_string(),
+                content: Some(prompt),
+                tool_calls: None,
+                tool_call_id: None,
+            }];
+            // 辅助 LLM 调用走 routed_llm（与主循环同一套难度路由 + provider failover/retry），
+            // 并计入 LLM 调用计数；chat_single 保证按预算估算执行单次调用（不进 Best-of-N）。
+            self.metrics.inc_llm_calls();
+            match self.routed_llm.chat_single(&req, &[]).await {
+                Ok(r) if !r.text.trim().is_empty() => {
+                    let resp_est = (r.text.chars().count() as u64) / 4;
+                    budget.record_token(req_est + resp_est);
+                    self.metrics.inc_tool_summary();
+                    summarized_this_round += 1;
+                    tracing::info!(target = "orchestration.summary",
+                        tool_call_id = ?m.tool_call_id,
+                        chars_before = chars,
+                        chars_after = r.text.chars().count(),
+                        "工具结果已 LLM 摘要");
+                    // opt-in 摘要：保留 bounded 原文头部，防止后续轮次需要的关键事实
+                    // 因摘要遗漏而永久丢失（摘要 + 原文头部仍然显著压缩超长输出）。
+                    const RAW_RETAIN_CHARS: usize = 2000;
+                    let raw_head: String = content.chars().take(RAW_RETAIN_CHARS).collect();
+                    let truncated = content.chars().count() > RAW_RETAIN_CHARS;
+                    m.content = Some(format!(
+                        "{MARKER}\n{}\n\n[原文保留前{RAW_RETAIN_CHARS}字]\n{}{}",
+                        r.text,
+                        raw_head,
+                        if truncated { "…" } else { "" }
+                    ));
+                }
+                Ok(_) => tracing::warn!(target = "orchestration.summary", "摘要返回空文本，保留原文"),
+                Err(e) => tracing::warn!(target = "orchestration.summary", err = %e, "摘要失败，保留原文"),
+            }
+        }
+    }
+
+    /// ADR-017 P2：Plan-Reflect 终答评审（opt-in，默认关）。
+    /// 严格 YES/NO 解析；歧义与评审失败一律视为「达成」（fail-open，不阻断用户）。
+    /// 辅助 LLM 调用按估算计入同一 TurnBudget。
+    async fn reflect_goal_satisfied(
+        &self,
+        goal: &str,
+        candidate: &str,
+        messages: &[Message],
+        budget: &crate::orchestration::TurnBudget,
+    ) -> bool {
+        const REFLECT_RESPONSE_EST: u64 = 16; // YES/NO + <=20 字理由
+        let prompt = format!(
+            "你是结果评审员。用户目标：{goal}\n\n候选回答：{candidate}\n\n\
+             请判断候选回答是否已充分达成用户目标。只回答 YES 或 NO，再加一句不超过 20 字的理由。"
+        );
+        let req_est = (prompt.chars().count() as u64) / 4;
+        // 若评审判定「未达成」会继续下一轮主循环：预算检查必须给下一轮主请求留出
+        // 余量，否则可选评审会把额度吃光，下一轮被硬拒成「预算不足」。
+        let next_loop_est = messages
+            .iter()
+            .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
+            .sum::<usize>() as u64
+            / 4;
+        if let Err(e) =
+            budget.check_token(req_est.saturating_add(next_loop_est + REFLECT_RESPONSE_EST))
+        {
+            tracing::warn!(target = "orchestration.reflect", err = %e,
+                "评审预算不足（含下一主循环预留），视为达成（不阻断）");
+            return true;
+        }
+        let req = vec![Message {
+            role: "user".to_string(),
+            content: Some(prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        // 与主循环同一套 routed_llm（难度路由 + provider failover/retry）+ LLM 计数；
+        // chat_single 不进入 Best-of-N，评审预算与真实调用次数一致。
+        self.metrics.inc_llm_calls();
+        match self.routed_llm.chat_single(&req, &[]).await {
+            Ok(r) => {
+                let resp_est = (r.text.chars().count() as u64) / 4;
+                budget.record_token(req_est + resp_est);
+                crate::orchestration::parse_yes_no(&r.text).unwrap_or(true)
+            }
+            Err(e) => {
+                tracing::warn!(target = "orchestration.reflect", err = %e, "评审失败，视为达成（不阻断）");
+                true
+            }
+        }
+    }
+
     /// 取走指定会话**当前 run**（trace_id 匹配）的变更前快照（首个非只读工具执行前
     /// 的消息列表），供回滚 UI / 自进化 dry_run 复用。
     /// None = 该会话本次 run 尚未执行写工具。
@@ -7481,6 +8045,10 @@ impl AgentCore {
 
     /// 执行 LLM 返回的工具调用（重构 L 阶段：Agents SDK turn 语义——校验→审批→执行→回灌）。
     /// 返回 ToolExecOutcome：Executed(是否执行了工具) 或 Abort(提前终止文案，llm_loop 直接返回)。
+    ///
+    /// ADR-017 P3：`[orchestration.read_parallel]` 开启且**同轮全部为只读工具**且
+    /// 预检全绿时走并行快速路径；其余任何情况走 `execute_tool_calls_sequential`
+    /// （与旧路径逐字等价）。因此 flag-off 时零行为变化。
     async fn execute_tool_calls(
         &self,
         messages: &mut Vec<Message>,
@@ -7489,8 +8057,371 @@ impl AgentCore {
         tool_schemas: &HashMap<String, serde_json::Value>,
         session_id: &str,
         raw_message: &str,
+        user_id: &str,
         allowed_ns: &[String],
         trace_id: &str,
+        round: u32,
+        intent: &crate::intent::Intent,
+        fast_path_data: bool,
+    ) -> ToolExecOutcome {
+        // 只读判定不在此处用前缀启发式短路：统一进 parallel 预检，
+        // 由 ToolClassifier 的 read 标签裁决（cross_* 等启发式过宽项 fail-closed）。
+        if self.orchestration.cfg.read_parallel.enabled && tool_calls.len() > 1 {
+            return self
+                .execute_tool_calls_parallel(
+                    messages,
+                    tool_calls,
+                    executed_tools,
+                    tool_schemas,
+                    session_id,
+                    raw_message,
+                    user_id,
+                    allowed_ns,
+                    trace_id,
+                    round,
+                    intent,
+                    fast_path_data,
+                )
+                .await;
+        }
+        self.execute_tool_calls_sequential(
+            messages,
+            tool_calls,
+            executed_tools,
+            tool_schemas,
+            session_id,
+            raw_message,
+            user_id,
+            allowed_ns,
+            trace_id,
+            round,
+            intent,
+            fast_path_data,
+        )
+        .await
+    }
+
+    /// ADR-017 P3：只读工具同轮并行快速路径（opt-in）。
+    /// 预检（边界 / schema）任一非全绿 → 回退顺序路径，确保拒绝/回灌/审批语义零漂移。
+    async fn execute_tool_calls_parallel(
+        &self,
+        messages: &mut Vec<Message>,
+        tool_calls: &[crate::llm::ToolCall],
+        executed_tools: &mut Vec<String>,
+        tool_schemas: &HashMap<String, serde_json::Value>,
+        session_id: &str,
+        raw_message: &str,
+        user_id: &str,
+        allowed_ns: &[String],
+        trace_id: &str,
+        round: u32,
+        intent: &crate::intent::Intent,
+        fast_path_data: bool,
+    ) -> ToolExecOutcome {
+        // 预检 1：边界全绿（任一拒绝 → 回退顺序路径，保留既有拒绝/审批分支）。
+        // 只读判定用权威 ToolClassifier（与 bootstrap is_safe 同一口径）：
+        // 前缀启发式 `is_read_only_tool` 对 cross_* 等过宽，写能力工具可能被
+        // 并发执行破坏顺序副作用；分类器不可用/unknown 时 fail-closed 回退顺序。
+        // 关键：预检完成后先 drop boundary 锁再回退——tokio Mutex 非重入，
+        // 若持锁调用 execute_tool_calls_sequential 会自锁挂死（ocr critical 修复）。
+        let mut boundary_precheck_ok = true;
+        {
+            let boundary = self.boundary.lock().await;
+            let ns = self.current_ns_paths();
+            for tc in tool_calls {
+                if !boundary.classifier_says_read(&tc.name) {
+                    boundary_precheck_ok = false;
+                    break;
+                }
+                let check = boundary.check_tool(
+                    &tc.name,
+                    &tc.arguments,
+                    &self.config.identity.agent_id,
+                    "user",
+                    &self.config.parent_permission,
+                    ns.as_deref(),
+                );
+                if !check.allow {
+                    boundary_precheck_ok = false;
+                    break;
+                }
+            }
+        } // boundary guard 在此 drop
+        if !boundary_precheck_ok {
+            return self
+                .execute_tool_calls_sequential(
+                    messages, tool_calls, executed_tools, tool_schemas,
+                    session_id, raw_message, user_id, allowed_ns, trace_id,
+                    round, intent, fast_path_data,
+                )
+                .await;
+        }
+        // 预检 2：schema 全绿（任一错误 → 回退顺序路径，保留 strict 拒绝 / 非严格回灌分支）
+        for tc in tool_calls {
+            if let Some(schema) = tool_schemas.get(&tc.name) {
+                if Self::validate_tool_args(&tc.arguments, schema).is_err() {
+                    return self
+                        .execute_tool_calls_sequential(
+                            messages, tool_calls, executed_tools, tool_schemas,
+                            session_id, raw_message, user_id, allowed_ns, trace_id,
+                            round, intent, fast_path_data,
+                        )
+                        .await;
+                }
+            }
+        }
+
+        // 并发执行：按 max_concurrent 分块，块内 join_all；结果按原始顺序归位。
+        // 配额说明：call_tool_routed 的工具轮次配额是单次 `quota.lock()` 内
+        // check+increment（quota.rs::check_tool_round），并发调用不会形成
+        // check-then-act 竞态；token 预算不在此处扣费（由主循环 TurnBudget 统一记）。
+        self.metrics.inc_read_parallel();
+        // 保守快照兜底：分类器判 read 但前缀启发式判非 read 的工具（可能被误标为
+        // 写/确认类）在并发执行前先捕获变更前快照，避免跳过顺序路径的 Phase B 语义。
+        // 先收集生效非只读名单（含 operator override，ocr security·high 修复）。
+        let mut write_like: Vec<&String> = Vec::new();
+        for tc in tool_calls.iter() {
+            if !self.is_effectively_read(&tc.name) {
+                write_like.push(&tc.name);
+            }
+        }
+        if !write_like.is_empty() {
+            let snap_key = snapshot_key(session_id, trace_id);
+            let mut m = self.mutation_snapshot.lock().await;
+            if !m.contains_key(&snap_key) {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let seq = self
+                    .snapshot_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let first_write_like = write_like[0].clone();
+                let snap = MutationSnapshot {
+                    tool_name: first_write_like.clone(),
+                    messages_before: messages.clone(),
+                    session_id: session_id.to_string(),
+                    trace_id: trace_id.to_string(),
+                    captured_at_ms: now_ms,
+                    seq,
+                };
+                if m.len() >= MUTATION_SNAPSHOT_MAX {
+                    let oldest = m
+                        .iter()
+                        .filter(|(k, _)| k.as_str() != snap_key)
+                        .min_by_key(|(_, s)| s.seq)
+                        .map(|(k, _)| k.clone());
+                    if let Some(k) = oldest {
+                        m.remove(&k);
+                    }
+                }
+                m.insert(snap_key, snap);
+                tracing::info!(tool = %first_write_like, session = %session_id,
+                    "mutation_snapshot_captured (parallel preflight)");
+            }
+        }
+        let cap = self.orchestration.cfg.read_parallel.max_concurrent.max(1);
+        let persona = self.persona_for_session(session_id);
+        let mut results: Vec<Result<String, String>> = Vec::with_capacity(tool_calls.len());
+        let mut start = 0usize;
+        while start < tool_calls.len() {
+            let end = (start + cap).min(tool_calls.len());
+            let chunk = &tool_calls[start..end];
+            let futs: Vec<_> = chunk
+                .iter()
+                .map(|tc| {
+                    let name = tc.name.clone();
+                    let args = tc.arguments.clone();
+                    let persona = persona.clone();
+                    let ns = allowed_ns.to_vec();
+                    let trace = trace_id.to_string();
+                    async move {
+                        self.call_tool_routed(&name, &persona, &args, &ns, &trace).await
+                    }
+                })
+                .collect();
+            let mut chunk_results = futures::future::join_all(futs).await;
+            results.append(&mut chunk_results);
+            start = end;
+        }
+
+        // 回灌阶段：按原始顺序处理（与顺序路径同语义：成功/失败/召回/沉淀/日志/确认/消息）。
+        let mut executed_any = false;
+        // read 分类工具本不应触发确认；若分类器误标导致多工具同时回 require_confirm，
+        // pending_action 只有一个槽位，必须显式暴露冲突，不能静默覆盖前一个确认。
+        let mut pending_action_set = false;
+        for (idx, tc) in tool_calls.iter().enumerate() {
+            let mut text = match &results[idx] {
+                Ok(text) => {
+                    executed_tools.push(tc.name.clone());
+                    executed_any = true;
+                    text.clone()
+                }
+                Err(e) => {
+                    // ADR-017 §6：失败三分类写结构化日志（与顺序路径同一语义，不污染审计类型）。
+                    let class = crate::orchestration::classify_tool_failure(&e);
+                    tracing::info!(target = "orchestration.failure", class = ?class,
+                        tool = %tc.name, error = %e, trace_id, session_id,
+                        "工具失败三分类（并行路径）");
+                    let mut text = format!("执行失败: {}", e);
+                    if let Some(lesson) = self.recall_failure_lesson(&tc.name, e, allowed_ns).await {
+                        text.push_str(&format!("\n\n💡 历史教训参考（情境召回）：{}", lesson));
+                    }
+                    let memo_ns = allowed_ns
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| self.config.identity.ns());
+                    crate::experience_memo::record_experience_memo(
+                        &self.mcp, &tc.name, e, &memo_ns,
+                    )
+                    .await;
+                    text
+                }
+            };
+            {
+                let mut log = self.execution_log.lock().await;
+                log.push(ExecutionLog {
+                    name: tc.name.clone(),
+                    trigger_conditions: serde_json::json!({"tool": tc.name}),
+                    steps: serde_json::json!([{"tool": tc.name, "args": tc.arguments}]),
+                    verify_rule: String::new(),
+                    success: !text.starts_with("执行失败"),
+                });
+            }
+            if text.contains("require_confirm") || text.contains("确认") {
+                if pending_action_set {
+                    tracing::error!(target = "orchestration.read_parallel",
+                        tool = %tc.name, session_id, trace_id,
+                        "并行路径出现多个确认请求；会话只保留首个 pending_action，本工具结果已如实回灌并标注需人工复核");
+                    text = format!(
+                        "⚠️ 并行确认冲突：该工具也要求确认，但会话只保留第一个审批项；请人工复核。原始结果：\n{}",
+                        text
+                    );
+                } else {
+                    let action = PendingAction {
+                        tool_name: tc.name.clone(),
+                        arguments: {
+                            let mut args = tc.arguments.clone();
+                            if let Some(obj) = args.as_object_mut() {
+                                obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
+                            }
+                            args
+                        },
+                        description: format!("{} ({})", tc.name, tc.arguments),
+                        approval_id: None,
+                    };
+                    self.session_manager
+                        .set_pending_action(session_id, action)
+                        .await;
+                    pending_action_set = true;
+                }
+            }
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![crate::llm::ToolCallJson {
+                    id: tc.id.clone(),
+                    type_: "function".to_string(),
+                    function: crate::llm::ToolFunction {
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+            });
+            const TOOL_RESULT_CAP: usize = 4000;
+            let result_capped: String = match text.char_indices().nth(TOOL_RESULT_CAP) {
+                None => text,
+                Some((byte_idx, _)) => {
+                    let total = text.chars().count();
+                    let mut s: String = text[..byte_idx].to_string();
+                    s.push_str(&format!(
+                        "
+ …[结果已截断，共 {} 字符，仅保留前 {}；如需完整明细请要求汇总统计或缩小范围]",
+                        total, TOOL_RESULT_CAP
+                    ));
+                    s
+                }
+            };
+            messages.push(Message {
+                role: "tool".to_string(),
+                content: Some(result_capped),
+                tool_calls: None,
+                tool_call_id: Some(tc.id.clone()),
+            });
+        }
+        // ADR-017 P2：OnToolResult hooks（默认无注册 hook → Continue，零行为变化；
+        // 新领域可在工具执行后注册 hook 做注入/中止）。上下文携带真实轮次与意图
+        // （ocr 修复：此前硬编码 round=0 / intent=false）。
+        {
+            // tool_schemas 即当前暴露给 LLM 的工具面（bootstrap promote 后已恢复全量），
+            // 用真实值填充，不再硬编码 false（ocr bug·low 修复）。
+            let query_tool_available =
+                Self::has_query_tool(tool_schemas.keys().map(|s| s.as_str()));
+            let hook_ctx = crate::orchestration::HookContext {
+                session_id,
+                raw_message,
+                trace_id,
+                messages,
+                executed_tools,
+                // did_work 用累计信号：executed_any 只反映本批工具，多轮 turn 中
+                // 前几轮已执行过工具时不能误报 false（ocr bug·medium 修复，
+                // 与 OnPreAct/OnFinalAnswer 的 ctx.did_work 口径一致）。
+                did_work: !executed_tools.is_empty(),
+                data_query: intent.data_query,
+                attachment: intent.attachment,
+                fast_path_data,
+                query_tool_available,
+                round,
+                hard_max_rounds: self.config.max_tool_rounds,
+                candidate_reply: None,
+            };
+            match self
+                .orchestration
+                .run_hooks(crate::orchestration::HookPoint::OnToolResult, &hook_ctx)
+            {
+                crate::orchestration::HookAction::Inject { messages: injected }
+                | crate::orchestration::HookAction::Retry { messages: injected } => {
+                    messages.extend(injected);
+                }
+                crate::orchestration::HookAction::Abort { reply } => {
+                    self.metrics.inc_hook_abort();
+                    // did_work 用累计信号：executed_any 只反映本批工具是否成功，
+                    // 多轮 turn 中前几轮已执行过工具时不能跳过 persona 任务记忆。
+                    let did_work = !executed_tools.is_empty();
+                    let reply = self
+                        .persist_final_reply(
+                            session_id,
+                            raw_message,
+                            user_id,
+                            &reply,
+                            executed_tools,
+                            did_work,
+                        )
+                        .await;
+                    return ToolExecOutcome::Abort(reply);
+                }
+                crate::orchestration::HookAction::Continue => {}
+            }
+        }
+        ToolExecOutcome::Executed(executed_any)
+    }
+
+    /// 顺序执行路径（原 execute_tool_calls 本体，行为不变；仅函数名调整）。
+    async fn execute_tool_calls_sequential(
+        &self,
+        messages: &mut Vec<Message>,
+        tool_calls: &[crate::llm::ToolCall],
+        executed_tools: &mut Vec<String>,
+        tool_schemas: &HashMap<String, serde_json::Value>,
+        session_id: &str,
+        raw_message: &str,
+        user_id: &str,
+        allowed_ns: &[String],
+        trace_id: &str,
+        round: u32,
+        intent: &crate::intent::Intent,
+        fast_path_data: bool,
     ) -> ToolExecOutcome {
         let mut executed_any = false;
         for tc in tool_calls {
@@ -7771,7 +8702,7 @@ impl AgentCore {
             // 丢失「首个写工具前」语义）。
             // 捕获语义：无本 run 键 → 捕获；已有本 run 键 → 已捕获跳过。
             // 旧 run 残留（不同 trace 键）自然共存，由容量淘汰按 seq 清理。
-            if !crate::boundary::is_read_only_tool(&tc.name) {
+            if !self.is_effectively_read(&tc.name) {
                 let snap_key = snapshot_key(session_id, trace_id);
                 let mut m = self.mutation_snapshot.lock().await;
                 if !m.contains_key(&snap_key) {
@@ -7820,6 +8751,13 @@ impl AgentCore {
                     text
                 }
                 Err(e) => {
+                    // ADR-017 §6：失败三分类写结构化日志（带 trace_id/session_id）。
+                    // 不写 AuditLogger：log_decision 会误落 BoundaryDeny 类型并污染
+                    // 运营计数（ocr 修复）；专用 ToolFailure 审计事件类型后续补。
+                    let class = crate::orchestration::classify_tool_failure(&e);
+                    tracing::info!(target = "orchestration.failure", class = ?class,
+                        tool = %tc.name, error = %e, trace_id, session_id,
+                        "工具失败三分类");
                     // P1-3: 失败情境召回——用错误摘要查历史教训，命中追加注入（防重蹈覆辙）
                     let mut text = format!("执行失败: {}", e);
                     if let Some(lesson) = self
@@ -7920,6 +8858,60 @@ impl AgentCore {
                 tool_calls: None,
                 tool_call_id: Some(tc.id.clone()),
             });
+        }
+        // ADR-017 P2：OnToolResult hooks（默认无注册 hook → Continue，零行为变化；
+        // 新领域可在工具执行后注册 hook 做注入/中止）。上下文携带真实轮次与意图
+        // （ocr 修复：此前硬编码 round=0 / intent=false）。
+        {
+            // tool_schemas 即当前暴露给 LLM 的工具面（bootstrap promote 后已恢复全量），
+            // 用真实值填充，不再硬编码 false（ocr bug·low 修复）。
+            let query_tool_available =
+                Self::has_query_tool(tool_schemas.keys().map(|s| s.as_str()));
+            let hook_ctx = crate::orchestration::HookContext {
+                session_id,
+                raw_message,
+                trace_id,
+                messages,
+                executed_tools,
+                // did_work 用累计信号：executed_any 只反映本批工具，多轮 turn 中
+                // 前几轮已执行过工具时不能误报 false（ocr bug·medium 修复，
+                // 与 OnPreAct/OnFinalAnswer 的 ctx.did_work 口径一致）。
+                did_work: !executed_tools.is_empty(),
+                data_query: intent.data_query,
+                attachment: intent.attachment,
+                fast_path_data,
+                query_tool_available,
+                round,
+                hard_max_rounds: self.config.max_tool_rounds,
+                candidate_reply: None,
+            };
+            match self
+                .orchestration
+                .run_hooks(crate::orchestration::HookPoint::OnToolResult, &hook_ctx)
+            {
+                crate::orchestration::HookAction::Inject { messages: injected }
+                | crate::orchestration::HookAction::Retry { messages: injected } => {
+                    messages.extend(injected);
+                }
+                crate::orchestration::HookAction::Abort { reply } => {
+                    self.metrics.inc_hook_abort();
+                    // did_work 用累计信号：executed_any 只反映本批工具是否成功，
+                    // 多轮 turn 中前几轮已执行过工具时不能跳过 persona 任务记忆。
+                    let did_work = !executed_tools.is_empty();
+                    let reply = self
+                        .persist_final_reply(
+                            session_id,
+                            raw_message,
+                            user_id,
+                            &reply,
+                            executed_tools,
+                            did_work,
+                        )
+                        .await;
+                    return ToolExecOutcome::Abort(reply);
+                }
+                crate::orchestration::HookAction::Continue => {}
+            }
         }
         ToolExecOutcome::Executed(executed_any)
     }

@@ -96,6 +96,11 @@ pub enum TaskDifficulty {
     Hard,
 }
 
+/// bootstrap 预算化路由的 Easy-only 类型标记：让「只允许 Easy」在类型层成立，
+/// 调用方不可能传入 Hard（零字段，不可构造出其他状态）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BootstrapEasyRoute;
+
 /// 难度分类方式
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -202,6 +207,15 @@ impl RoutedLlm {
         classify_difficulty(&self.policy, messages).await
     }
 
+    /// 统一路由：分类 → 日志 → 选 provider（仅 `chat` 使用）。
+    /// 辅助调用走 `chat_single`（显式 base，不分类），bootstrap 走
+    /// `chat_budgeted`（显式 Easy），都有各自防漂移注释。
+    async fn route_select(&self, messages: &[Message]) -> (TaskDifficulty, &LlmClient) {
+        let d = classify_difficulty(&self.policy, messages).await;
+        tracing::info!(difficulty = ?d, "difficulty_route");
+        (d, self.select(d))
+    }
+
     /// 暴露 judge_provider 构造的 LlmClient（价值网络 / verifier-guided 复用），无则 None
     pub fn judge_client(&self) -> Option<LlmClient> {
         self.policy
@@ -211,9 +225,7 @@ impl RoutedLlm {
     }
 
     pub async fn chat(&self, messages: &[Message], tools: &[ToolDef]) -> Result<LlmResponse, String> {
-        let d = classify_difficulty(&self.policy, messages).await;
-        tracing::info!(difficulty = ?d, "difficulty_route");
-        let selected = self.select(d);
+        let (d, selected) = self.route_select(messages).await;
         // P1-2：Best-of-N 与工具调用隔离——Agent 循环中终答常为「空文本 + tool_calls」，
         // 若进入 N 路采样，启发式打分只看 c.text 会把合法工具调用样本打成 -inf / 选错样本。
         // 故 tools 非空时跳过 BoN，直接走单次普通调用（BoN 只对纯文本终答有意义）。
@@ -223,6 +235,43 @@ impl RoutedLlm {
             }
             _ => selected.chat(messages, tools).await,
         }
+    }
+
+    /// 辅助调用专用：base provider 单次调用（不做 Best-of-N、不做难度分类）。
+    /// 供摘要/评审等路径使用：这些路径按**单次调用**估算 TurnBudget 与 LLM 计数，
+    /// 而 `route_select` 在 `ClassifyMode::Judge` 下本身会额外发起一次真实 LLM
+    /// 往返，会把声明的「单次调用」变成隐藏的 2 次。base 客户端仍具备 provider
+    /// fallback/retry，辅助调用保持与主循环同一套传输可靠性。
+    /// `pub(crate)`：该方法绕过难度路由策略，契约仅允许 crate 内辅助路径使用。
+    pub(crate) async fn chat_single(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+    ) -> Result<LlmResponse, String> {
+        self.base.chat(messages, tools).await
+    }
+
+    /// ADR-017：bootstrap 首请求的预算化调用（首轮输出预算覆盖）。
+    /// 跳过 Best-of-N 的真实理由：bootstrap 的 1024 预算只适合**单次便宜调用**，
+    /// N 路采样与「锚定」目标相悖；工具面为空时的差异属已知权衡（空面时下一轮
+    /// promote 后自然恢复常规 chat 语义）。
+    ///
+    /// 不重新做难度分类：`BootstrapEasyRoute` 只固定**路由**（Easy 直连 flash），
+    /// 不承担内容级保证——「消息确实 Easy」由唯一调用点 agent.rs::llm_loop 负责
+    ///（is_easy_query + 无写意图守卫）；未来新增调用点必须自带同样的内容级
+    /// 判定，不能假设标记本身校验内容（ocr maintainability·low 修复：文档化
+    /// 调用方责任）。Judge 模式下 `classify_difficulty` 是一次真实 LLM 往返，
+    /// 再分类会把 ADR-017 承诺的「1024 预算 = 单次便宜调用」变成 3 次往返。
+    pub(crate) async fn chat_budgeted(
+        &self,
+        _route: BootstrapEasyRoute,
+        messages: &[Message],
+        tools: &[ToolDef],
+        max_tokens: u32,
+    ) -> Result<LlmResponse, String> {
+        let selected = self.select(TaskDifficulty::Easy);
+        tracing::info!(difficulty = ?TaskDifficulty::Easy, "difficulty_route_budgeted");
+        selected.chat_with_max_tokens(messages, tools, max_tokens).await
     }
 
     async fn chat_best_of_n(
@@ -1330,12 +1379,58 @@ impl LlmClient {
         LlmClient { client, config }
     }
 
+    /// 返回一个仅覆盖 `max_tokens` 的克隆，不改动原 client 配置。
+    /// bootstrap 的「首轮预算不残留整会话」契约由本方法固化并可单测。
+    /// 唯一受保护入口是 `chat_with_max_tokens`（含 max_tokens>0 运行时校验）；
+    /// 0 不会进入本方法，这里只做 debug build 的编程不变量复核，生产不 panic。
+    fn with_max_tokens_override(&self, max_tokens: u32) -> Self {
+        debug_assert!(max_tokens > 0, "bootstrap max_tokens 必须大于 0");
+        let mut client = self.clone();
+        client.config.max_tokens = max_tokens;
+        client
+    }
+
+    /// ADR-017：运行时覆盖 max_tokens 的单次调用（flash bootstrap 首请求用）。
+    /// clone 后覆盖字段，不改动 &self 配置——promote 后下一次调用自动恢复原值，
+    /// 杜绝「首轮预算残留整会话」。显式以 budgeted=true 走 chat_impl，
+    /// 截断告警只在本路径生效（不再用魔法阈值推断调用性质）。
+    #[tracing::instrument(skip_all, fields(model = %self.config.model, provider = %self.config.base_url, tool_count = tools.len()))]
+    pub(crate) async fn chat_with_max_tokens(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        max_tokens: u32,
+    ) -> Result<LlmResponse, String> {
+        if max_tokens == 0 {
+            return Err("bootstrap max_tokens 必须大于 0".to_string());
+        }
+        self.with_max_tokens_override(max_tokens)
+            .chat_impl(messages, tools, Some(max_tokens))
+            .await
+    }
+
     /// 发送聊天请求，返回响应（带重试 + failover）
     #[tracing::instrument(skip_all, fields(model = %self.config.model, provider = %self.config.base_url, tool_count = tools.len()))]
     pub async fn chat(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
+    ) -> Result<LlmResponse, String> {
+        self.chat_impl(messages, tools, None).await
+    }
+
+    /// chat 的实现体；`budget: Option<u32>` 把「预算化模式」与「截断告警判定
+    /// 上限」绑定：Some(cap) = 预算化调用（bootstrap 首轮），告警按 cap 判定，
+    /// 不会误用全局默认 8192；None = 常规调用。
+    /// 注意：cap 与请求 max_tokens 的**约定式**一致性由调用方保证——
+    /// chat_with_max_tokens 是唯一传入 Some 的入口，其内部用同一 cap 覆盖
+    /// 配置（with_max_tokens_override），两者不可能漂移（ocr maintainability·low
+    /// 修复：文档如实描述，不夸大为类型级保证）。
+    async fn chat_impl(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        budget: Option<u32>,
     ) -> Result<LlmResponse, String> {
         // 传输层脱敏：user 消息凭证打码后再上送（不改历史/存储）
         let sanitized = sanitize_messages(messages);
@@ -1506,8 +1601,70 @@ impl LlmClient {
                                     > 0
                             });
 
-                        // task 650：DeepSeek DSML 文本泄露 → 回填 structured tool_calls
-                        return Ok(apply_dsml_fallback(LlmResponse { text, tool_calls, usage }));
+                        // task 650：DeepSeek DSML 文本泄露 → 回填 structured tool_calls。
+                        // 先做 fallback 再判截断告警：DSML 响应在 fallback 前 tool_calls
+                        // 为空，若先判告警会把「带工具调用的截断响应」误报为
+                        // 「空文本截断」（ocr bug·low）。
+                        let response = apply_dsml_fallback(LlmResponse { text, tool_calls, usage });
+
+                        // 预算化调用（bootstrap 首轮）截断留痕：显式 budgeted 判定，
+                        // 不依赖可配置的 max_tokens 魔法阈值（ocr 修复）。
+                        // 双信号：finish_reason=length/max_tokens 明确标记；或
+                        // finish_reason 缺失且 completion_tokens 触及覆盖预算。
+                        // 标准 stop/非标准成功标记不做 token 边界告警（防推理模型误报）。
+                        let finish_reason = choice
+                            .get("finish_reason")
+                            .and_then(|f| f.as_str())
+                            .unwrap_or("");
+                        let budgeted = budget.is_some();
+                        let budget_max = budget.unwrap_or(self.config.max_tokens);
+                        // usage 整体缺失时 completion_tokens 记 0：budgeted_truncation_warn
+                        // 返回 false（不误报），下方单独 debug 留痕记录「无法判定」。
+                        let usage = response.usage.as_ref();
+                        let completion_tokens = usage
+                            .map(|u| u.completion_tokens)
+                            .unwrap_or(0);
+                        if budgeted_truncation_warn(
+                            finish_reason,
+                            completion_tokens,
+                            budget_max,
+                            !response.tool_calls.is_empty(),
+                            budgeted,
+                        ) {
+                            tracing::warn!(target = "agent.llm", model = %model,
+                                finish_reason, completion_tokens, max_tokens = budget_max,
+                                "budgeted 输出疑似被截断（finish_reason=length 或 completion_tokens 触及 max_tokens）且 tool_calls 为空");
+                        } else if budgeted
+                            && response.tool_calls.is_empty()
+                            && !finish_reason.is_empty()
+                            // 与 budgeted_truncation_warn 的成功标记口径一致
+                            //（共享 is_normal_finish_reason，避免白名单漂移）：
+                            // stop / end_turn / stop_sequence / tool_use 都是正常完成，
+                            // 恰好填满 max_tokens 也不留误导性日志；工具调用类标记
+                            //（function_call / tool_calls）在 tool_calls 为空时是异常
+                            // 信号，不算正常完成（ocr maintainability·low 修复）。
+                            && !is_normal_finish_reason(finish_reason)
+                            && budget_max > 0
+                            && completion_tokens >= u64::from(budget_max)
+                        {
+                            // content_filter 等非成功 finish_reason + tokens 触及上限：
+                            // 保持「不告警、防推理模型误报」的既有策略，但补一条 debug
+                            // 留痕，避免该盲区完全不可观测（ocr other·low 修复）。
+                            tracing::debug!(target = "agent.llm", model = %model,
+                                finish_reason, completion_tokens, max_tokens = budget_max,
+                                "budgeted 输出以非成功 finish_reason 结束且 tokens 触及上限，仅留痕不告警");
+                        } else if budgeted
+                            && response.tool_calls.is_empty()
+                            && finish_reason.is_empty()
+                            && usage.is_none()
+                        {
+                            // provider 未上报 usage 且无 finish_reason：无法判定是否截断，
+                            // 只降级留痕，不把正常回答误报为截断（ocr other·low 修复）。
+                            tracing::debug!(target = "agent.llm", model = %model,
+                                "budgeted 响应缺少 finish_reason 且未上报 usage，截断判定不可用");
+                        }
+
+                        return Ok(response);
                     }
                     Err(e) => {
                         let msg = format!("连接失败: {}", e);
@@ -1711,6 +1868,56 @@ impl LlmClient {
     }
 }
 
+/// 纯完成类成功标记（与截断无关）：标准 `stop` + 主流 provider 的完成类
+/// 非标准标记（Anthropic `stop_sequence`、Gemini `end_turn`）。
+/// 工具调用类标记（`function_call` / `tool_calls` / Anthropic `tool_use`）
+/// **不在此列**：截断留痕分支只在「tool_calls 为空」时运行，带工具标记却无
+/// 工具调用恰是异常信号，需要可观测（ocr maintainability·low 修复：标记集合
+/// 与使用场景一致，`tool_use` 是 Anthropic 的工具调用 stop_reason 而非完成
+/// 标记，ocr bug·medium 修复）。
+/// 大小写不敏感（Gemini 可能上报 "STOP"），零分配（ocr perf·low 修复：
+/// eq_ignore_ascii_case 不建 String；budgeted_truncation_warn 的截断标记
+/// 同口径处理）。
+fn is_normal_finish_reason(finish_reason: &str) -> bool {
+    finish_reason.eq_ignore_ascii_case("stop")
+        || finish_reason.eq_ignore_ascii_case("end_turn")
+        || finish_reason.eq_ignore_ascii_case("stop_sequence")
+}
+
+/// 预算化截断告警判定（纯函数，单测覆盖）。
+/// 只在 budgeted 调用（bootstrap 首轮）且无工具调用时告警。双信号：
+/// 1) `finish_reason == "length"`（以及明确的 `max_tokens` 截断标记）；
+/// 2) `finish_reason` 缺失且 `completion_tokens` 触及本次覆盖后的 `max_tokens`。
+///
+/// 假设：标准 `stop` 与非标准成功标记（`end_turn` / `function_call` 等）视为正常
+/// 完成，不因 completion_tokens 恰好等于上限而告警——推理模型的 thinking/cache
+/// token 可能计入 completion_tokens，长回答也可能恰好填满 1024，会造成误报。
+/// ⚠️ `completion_tokens` 来自 provider 上报的 usage：当 usage 整体缺失时调用方
+/// 传 0，本函数返回 false（不误报）；该「无法判定」情况由调用方降级 debug 留痕。
+pub(crate) fn budgeted_truncation_warn(
+    finish_reason: &str,
+    completion_tokens: u64,
+    max_tokens: u32,
+    has_tool_calls: bool,
+    budgeted: bool,
+) -> bool {
+    if !budgeted || has_tool_calls {
+        return false;
+    }
+    // 截断标记大小写不敏感（与 is_normal_finish_reason 同口径，Gemini 可能
+    // 上报 "LENGTH"/"MAX_TOKENS"，ocr bug·medium 修复），零分配。
+    if finish_reason.eq_ignore_ascii_case("length")
+        || finish_reason.eq_ignore_ascii_case("max_tokens")
+    {
+        return true;
+    }
+    // finish_reason 缺失时用 completion_tokens 触及上限兜底判定；
+    // 正常完成标记（stop 等）在此天然不告警（is_empty 为 false）。
+    finish_reason.is_empty()
+        && max_tokens > 0
+        && completion_tokens >= u64::from(max_tokens)
+}
+
 #[cfg(test)]
 mod routing_tests {
     use super::*;
@@ -1736,6 +1943,58 @@ mod routing_tests {
             TaskDifficulty::Easy
         );
         assert_eq!(classify_heuristic(&[msg("user", "你好，在吗")]), TaskDifficulty::Easy);
+    }
+
+    #[test]
+    fn budgeted_max_tokens_override_does_not_mutate_original() {
+        let mut cfg = LlmConfig::default();
+        cfg.max_tokens = 4096;
+        let client = LlmClient::new(cfg);
+        let budgeted = client.with_max_tokens_override(1024);
+        // 核心契约：原 client 配置不残留 bootstrap 预算，下一次调用自动恢复
+        assert_eq!(client.config.max_tokens, 4096);
+        assert_eq!(budgeted.config.max_tokens, 1024);
+    }
+
+    #[test]
+    fn budgeted_truncation_warn_heuristic() {
+        // 明确的截断标记无论 completion_tokens 是否触顶都告警
+        assert!(budgeted_truncation_warn("length", 10, 1024, false, true));
+        assert!(budgeted_truncation_warn("max_tokens", 10, 1024, false, true));
+        // finish_reason 缺失或明确截断标记且 completion_tokens 触及上限 → 告警
+        assert!(budgeted_truncation_warn("", 1024, 1024, false, true));
+        assert!(budgeted_truncation_warn("max_tokens", 1024, 1024, false, true));
+        // 标准 stop 与非标准成功标记均视为正常完成，不误报
+        assert!(!budgeted_truncation_warn("stop", 1024, 1024, false, true));
+        assert!(!budgeted_truncation_warn("tool_calls", 1024, 1024, false, true));
+        assert!(!budgeted_truncation_warn("content_filter", 1024, 1024, false, true));
+        assert!(!budgeted_truncation_warn("end_turn", 1024, 1024, false, true));
+        assert!(!budgeted_truncation_warn("function_call", 1024, 1024, false, true));
+        // 未触及 max_tokens 且非 length → 不告警
+        assert!(!budgeted_truncation_warn("stop", 1023, 1024, false, true));
+        assert!(!budgeted_truncation_warn("", 1024, 0, false, true));
+        // 普通调用即使 length 也不告警
+        assert!(!budgeted_truncation_warn("length", 10, 1024, false, false));
+        // 有工具调用（哪怕被截断）不告警
+        assert!(!budgeted_truncation_warn("length", 1024, 1024, true, true));
+        // 其他 finish_reason 不告警
+        assert!(!budgeted_truncation_warn("stop", 10, 1024, false, true));
+    }
+
+    #[test]
+    fn is_normal_finish_reason_markers() {
+        // 回归锁（ocr test·low 修复）：纯完成类标记才属正常完成；
+        // 工具调用类标记（function_call / tool_calls / tool_use）不算——
+        // 留痕分支在 tool_calls 为空时运行，带工具标记却无工具调用是异常信号。
+        for normal in ["stop", "end_turn", "stop_sequence"] {
+            assert!(is_normal_finish_reason(normal), "{normal} 应属正常完成");
+        }
+        // 大小写不敏感（Gemini 可能上报 "STOP"）
+        assert!(is_normal_finish_reason("STOP"));
+        assert!(is_normal_finish_reason("Stop"));
+        for abnormal in ["", "length", "max_tokens", "content_filter", "function_call", "tool_calls", "tool_use"] {
+            assert!(!is_normal_finish_reason(abnormal), "{abnormal:?} 不应属正常完成");
+        }
     }
 
     #[test]

@@ -65,3 +65,40 @@ args = ["examples/skills/echo/server.py"]
 # url = "http://127.0.0.1:8001/mcp"
 # token = "${P1_MCP_TOKEN}"
 # namespace = "org/<组织>/div/<业务线>/dept/<部门>/proj/<项目A>"
+
+# ── ADR-017：LLM 编排层 v2（全部默认 OFF；flag-off 零行为变化）────────
+# [orchestration]
+#   # P1 flash 锚定引导：仅 easy/flash 路由 + 非写意图 + 未 promoted 会话生效；
+#   # 首请求最小工具面（≤3 个查询类工具）+ 1024 输出预算 + 剥离完整清单/技能注入。
+#   [orchestration.bootstrap]
+#   enabled = false
+#   max_tokens = 1024
+#   max_tools = 3
+#
+#   # P2 Plan-Act-Reflect：执行过工具的任务在终答前由评审器检查目标达成，
+#   # 未达成注入重规划提示（预算内 ≤max_reflect_rounds 次）。
+#   [orchestration.plan_reflect]
+#   enabled = false
+#   max_reflect_rounds = 2
+#
+#   # P3 工具结果摘要：超过阈值（或第 N 轮起）的 tool 输出用 LLM 摘要回灌，
+#   # 失败保留原文（squash 截断兜底）。
+#   [orchestration.tool_summary]
+#   enabled = false
+#   threshold_chars = 8192
+#   start_round = 4
+#
+#   # P3 只读工具同轮并行：同轮全部为 read 工具且边界/schema 预检全绿时并发执行；
+#   # 任一异常自动回退顺序路径；写/dangerous 永远串行。
+#   [orchestration.read_parallel]
+#   enabled = false
+#   max_concurrent = 4
+
+# ──── 工具分类手动收紧（operator override）────
+# 与运行时 register_tool 同语义：learn_tools 刷新不覆盖；
+# 进程启动时自动重放，使 pin 跨重启生效（否则重启后按前缀启发式重新分类）。
+# 级别仅接受 read / write / dangerous / unknown，非法值启动时告警并跳过。
+# [boundary]
+#   [[boundary.tool_overrides]]
+#   tool = "query_secret"
+#   level = "dangerous"
