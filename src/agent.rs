@@ -6677,11 +6677,12 @@ impl AgentCore {
     /// 避免 hook 上下文拿到硬编码 false 的错误快照（ocr bug·low 修复）。
     fn has_query_tool<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
         names.any(|n| {
-            let n = n.to_ascii_lowercase();
-            n.starts_with("query_")
-                || n.starts_with("get_")
-                || n == "nl_query"
-                || n == "execute_sql"
+            // 零分配：固定前缀用 ASCII case-insensitive 比较，
+            // 不在热循环里为每个工具名 to_ascii_lowercase 建 String（ocr perf·low 修复）。
+            n.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("query_"))
+                || n.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("get_"))
+                || n.eq_ignore_ascii_case("nl_query")
+                || n.eq_ignore_ascii_case("execute_sql")
         })
     }
 
@@ -7264,7 +7265,7 @@ impl AgentCore {
                         crate::orchestration::HookAction::Inject { messages } => {
                             // 终答后没有下一 LLM 轮，Inject 若直接落盘会被静默吞掉；
                             // 按 Retry 语义回到循环（轮数由 TurnBudget 封顶，不会死循环）。
-                            tracing::warn!(target = "agent.output_guardrail", round = _round,
+                            tracing::info!(target = "agent.output_guardrail", round = _round,
                                 "OnFinalAnswer hook 返回 Inject，按 Retry 处理回到循环");
                             ctx.messages.extend(messages);
                             continue;
@@ -8308,6 +8309,9 @@ impl AgentCore {
                 }
                 crate::orchestration::HookAction::Abort { reply } => {
                     self.metrics.inc_hook_abort();
+                    // did_work 用累计信号：executed_any 只反映本批工具是否成功，
+                    // 多轮 turn 中前几轮已执行过工具时不能跳过 persona 任务记忆。
+                    let did_work = !executed_tools.is_empty();
                     let reply = self
                         .persist_final_reply(
                             session_id,
@@ -8315,7 +8319,7 @@ impl AgentCore {
                             user_id,
                             &reply,
                             executed_tools,
-                            executed_any,
+                            did_work,
                         )
                         .await;
                     return ToolExecOutcome::Abort(reply);
@@ -8811,6 +8815,9 @@ impl AgentCore {
                 }
                 crate::orchestration::HookAction::Abort { reply } => {
                     self.metrics.inc_hook_abort();
+                    // did_work 用累计信号：executed_any 只反映本批工具是否成功，
+                    // 多轮 turn 中前几轮已执行过工具时不能跳过 persona 任务记忆。
+                    let did_work = !executed_tools.is_empty();
                     let reply = self
                         .persist_final_reply(
                             session_id,
@@ -8818,7 +8825,7 @@ impl AgentCore {
                             user_id,
                             &reply,
                             executed_tools,
-                            executed_any,
+                            did_work,
                         )
                         .await;
                     return ToolExecOutcome::Abort(reply);
