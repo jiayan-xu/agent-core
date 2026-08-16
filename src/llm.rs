@@ -1378,9 +1378,10 @@ impl LlmClient {
 
     /// 返回一个仅覆盖 `max_tokens` 的克隆，不改动原 client 配置。
     /// bootstrap 的「首轮预算不残留整会话」契约由本方法固化并可单测。
-    /// 唯一受保护入口是 `chat_with_max_tokens`（含 max_tokens>0 运行时校验）。
+    /// 唯一受保护入口是 `chat_with_max_tokens`（含 max_tokens>0 运行时校验）；
+    /// 0 不会进入本方法，这里只做 debug build 的编程不变量复核，生产不 panic。
     fn with_max_tokens_override(&self, max_tokens: u32) -> Self {
-        assert!(max_tokens > 0, "bootstrap max_tokens 必须大于 0");
+        debug_assert!(max_tokens > 0, "bootstrap max_tokens 必须大于 0");
         let mut client = self.clone();
         client.config.max_tokens = max_tokens;
         client
@@ -1606,9 +1607,10 @@ impl LlmClient {
                             .get("finish_reason")
                             .and_then(|f| f.as_str())
                             .unwrap_or("");
-                        let completion_tokens = response
-                            .usage
-                            .as_ref()
+                        // usage 整体缺失时 completion_tokens 记 0：budgeted_truncation_warn
+                        // 返回 false（不误报），下方单独 debug 留痕记录「无法判定」。
+                        let usage = response.usage.as_ref();
+                        let completion_tokens = usage
                             .map(|u| u.completion_tokens)
                             .unwrap_or(0);
                         if budgeted_truncation_warn(
@@ -1621,6 +1623,15 @@ impl LlmClient {
                             tracing::warn!(target = "agent.llm", model = %model,
                                 finish_reason, completion_tokens, max_tokens = self.config.max_tokens,
                                 "budgeted 输出疑似被截断（finish_reason=length 或 completion_tokens 触及 max_tokens）且 tool_calls 为空");
+                        } else if budgeted
+                            && response.tool_calls.is_empty()
+                            && finish_reason.is_empty()
+                            && usage.is_none()
+                        {
+                            // provider 未上报 usage 且无 finish_reason：无法判定是否截断，
+                            // 只降级留痕，不把正常回答误报为截断（ocr other·low 修复）。
+                            tracing::debug!(target = "agent.llm", model = %model,
+                                "budgeted 响应缺少 finish_reason 且未上报 usage，截断判定不可用");
                         }
 
                         return Ok(response);
@@ -1835,6 +1846,8 @@ impl LlmClient {
 /// 假设：标准 `stop` 与非标准成功标记（`end_turn` / `function_call` 等）视为正常
 /// 完成，不因 completion_tokens 恰好等于上限而告警——推理模型的 thinking/cache
 /// token 可能计入 completion_tokens，长回答也可能恰好填满 1024，会造成误报。
+/// ⚠️ `completion_tokens` 来自 provider 上报的 usage：当 usage 整体缺失时调用方
+/// 传 0，本函数返回 false（不误报）；该「无法判定」情况由调用方降级 debug 留痕。
 pub(crate) fn budgeted_truncation_warn(
     finish_reason: &str,
     completion_tokens: u64,

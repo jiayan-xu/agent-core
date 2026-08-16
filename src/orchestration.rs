@@ -94,12 +94,14 @@ pub struct ToolSummaryConfig {
     #[serde(default)]
     pub enabled: bool,
     /// 单条工具结果超过该字符数才触发摘要。
+    /// `0` 的语义是「所有 tool 结果都触发摘要」（显式值，不做下限兜底）。
     #[serde(default = "default_summary_threshold_chars")]
     pub threshold_chars: usize,
     /// 从第几轮起对所有工具结果摘要（防长会话上下文膨胀）。
     #[serde(default = "default_summary_start_round")]
     pub start_round: usize,
     /// 每轮最多摘要几条工具结果（防热路径串行 LLM 调用失控）。
+    /// `0` 的语义是「本轮不摘要」——调用点显式短路返回，不静默改成 1。
     #[serde(default = "default_summary_max_per_round")]
     pub max_per_round: usize,
 }
@@ -628,14 +630,20 @@ impl BootstrapReservation {
     }
 
     /// 异步首请求成功：promote 的 SQLite 写移出 tokio worker。
+    /// spawn_blocking join 失败（任务未执行 / panic）时同步回退释放预留，
+    /// 避免 `bootstrap_in_flight` 条目泄漏——Drop 兜底只看 `active`，而这里
+    /// `active=false` 会绕开 Drop，必须显式 cancel（ocr bug·low 修复）。
     pub async fn promote_async(mut self) {
         if self.active {
             let controller = Arc::clone(&self.controller);
             let session_id = self.session_id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            let joined = tokio::task::spawn_blocking(move || {
                 controller.finish_bootstrap(&session_id);
             })
             .await;
+            if joined.is_err() {
+                self.controller.cancel_bootstrap(&self.session_id);
+            }
             self.active = false;
         }
     }
@@ -670,12 +678,16 @@ fn bootstrap_action_segments_ok(name: &str) -> bool {
     ];
     !action_segments(name)
         .iter()
+        // 写动词粘数字尾（update2/create2024）先剥尾部数字再比；段内「数字 → 小写」
+        // 边界已由 action_segments 切分（get2update/stat2update 不再整段绕过）。
+        .map(|segment| segment.trim_end_matches(|c: char| c.is_ascii_digit()))
         .any(|segment| DENY_ACTIONS.iter().any(|a| segment == *a))
 }
 
-/// 把工具名切成动作段：`_`、`-`、camelCase 与「缩写/数字 + 大写」边界都是分隔符。
-/// 兼容 `updateState`、`getOSUpdate`、`OSSendMessage`、`get2Update` 这类命名，
-/// 避免 write 动词粘在缩写/数字后面绕过分段检查。
+/// 把工具名切成动作段：`_`、`-`、camelCase、「缩写/数字 + 大写」与「数字 + 小写」
+/// 边界都是分隔符。兼容 `updateState`、`getOSUpdate`、`OSSendMessage`、
+/// `get2Update`、`get2update` 这类命名，避免 write 动词粘在缩写/数字后面
+/// 绕过分段检查。
 fn action_segments(name: &str) -> Vec<String> {
     let chars: Vec<char> = name.chars().collect();
     let mut segments: Vec<String> = Vec::new();
@@ -689,10 +701,13 @@ fn action_segments(name: &str) -> Vec<String> {
         }
         let prev = i.checked_sub(1).and_then(|j| chars.get(j)).copied();
         let next = chars.get(i + 1).copied();
-        let boundary = ch.is_ascii_uppercase()
+        let boundary = (ch.is_ascii_uppercase()
             && !current.is_empty()
             && (matches!(prev, Some(p) if p.is_ascii_lowercase() || p.is_ascii_digit())
-                || matches!(next, Some(n) if n.is_ascii_lowercase()));
+                || matches!(next, Some(n) if n.is_ascii_lowercase())))
+            || (ch.is_ascii_lowercase()
+                && !current.is_empty()
+                && matches!(prev, Some(p) if p.is_ascii_digit()));
         if boundary {
             segments.push(std::mem::take(&mut current));
         }
@@ -1241,6 +1256,11 @@ mod tests {
         assert!(!bootstrap_action_segments_ok("getOSUpdate"));
         assert!(!bootstrap_action_segments_ok("OSSendMessage"));
         assert!(!bootstrap_action_segments_ok("get2Update"));
+        // 写动词粘数字尾 / 数字后接小写动词也不能绕过（ocr security·low 修复）
+        assert!(!bootstrap_action_segments_ok("update2"));
+        assert!(!bootstrap_action_segments_ok("create2024"));
+        assert!(!bootstrap_action_segments_ok("get2update"));
+        assert!(!bootstrap_action_segments_ok("stat2update"));
         // DDL/危险动词兜底（execute_sql 本身由白名单放行，见下）
         assert!(!bootstrap_action_segments_ok("alter_table"));
         assert!(!bootstrap_action_segments_ok("drop_table"));

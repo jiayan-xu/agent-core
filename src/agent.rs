@@ -6567,6 +6567,45 @@ impl AgentCore {
             .await;
     }
 
+    /// 终答统一持久化序列：摄入过滤（测试 ns 隔离 / A2A 回执 / 非实质对话）→
+    /// 强偏好/分身任务记忆 → honesty guard → save_to_history。
+    /// 正常终答与 hook Abort 路径都必须走这里，防止 hook 注册方直接 save_to_history
+    /// 绕过 intake_filter 持久化本应被过滤的数据（ocr bug·medium 修复）。
+    /// 返回经 honesty guard 修正后的最终回复。
+    async fn persist_final_reply(
+        &self,
+        session_id: &str,
+        raw_message: &str,
+        user_id: &str,
+        reply: &str,
+        executed_tools: &[String],
+        did_work: bool,
+    ) -> String {
+        self.observe_filtered(
+            raw_message,
+            "user",
+            &format!("user:{}", user_id),
+            session_id,
+            &self.caller_ns(session_id),
+        )
+        .await;
+        self.maybe_strong_pref_capture(session_id, raw_message).await;
+        self.observe_filtered(
+            reply,
+            "assistant",
+            &self.config.identity.agent_id,
+            session_id,
+            &self.caller_ns(session_id),
+        )
+        .await;
+        if did_work {
+            self.maybe_persona_task_memory(session_id, raw_message, reply).await;
+        }
+        let guarded = Self::honesty_guard_readonly_as_write(raw_message, executed_tools, reply);
+        self.save_to_history(session_id, raw_message, &guarded).await;
+        guarded
+    }
+
     /// LLM 调用循环（支持多轮 tool calling）
     // ── A1: 白龙马 ACI 请求前上下文预取（工具子集选择，只选 schema 不调工具）──
     const EXPOSE_TOOL_CAP: usize = 30; // 2026-08-05 二降：60 时单次 LLM 仍 20s（工具 schema 大）。30 = 相关查询 + 常驻诊断，Easy 查询足够；DeepSeek 裸 API 0.3s，慢在 prompt 体积
@@ -6631,6 +6670,19 @@ impl AgentCore {
             "写入", "录入", "导入", "同步", "删除", "新增",
         ];
         WRITE_KEYS.iter().any(|k| q.contains(k))
+    }
+
+    /// 当前工具面是否至少含一个数据查询类工具（HookContext.query_tool_available）。
+    /// 口径与旧内联判断一致；OnPreAct / OnFinalAnswer / OnToolResult 三处共享，
+    /// 避免 hook 上下文拿到硬编码 false 的错误快照（ocr bug·low 修复）。
+    fn has_query_tool<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
+        names.any(|n| {
+            let n = n.to_ascii_lowercase();
+            n.starts_with("query_")
+                || n.starts_with("get_")
+                || n == "nl_query"
+                || n == "execute_sql"
+        })
     }
 
     /// 白龙马 ACI 的 selectTools 等价物：按当前消息(task_context)从全量工具中选 top-K 暴露给 LLM。
@@ -6869,13 +6921,8 @@ impl AgentCore {
         // ADR-017 P2：OnPreAct guardrail hooks。
         // data_query 强制工具提示已从内联补丁迁移为内置 hook（文本与条件逐字等价）；
         // 新领域只需注册 hook，不再改动循环体。
-        let query_tool_available = tools.iter().any(|t| {
-            let n = t.function.name.to_ascii_lowercase();
-            n.starts_with("query_")
-                || n.starts_with("get_")
-                || n == "nl_query"
-                || n == "execute_sql"
-        });
+        let query_tool_available =
+            Self::has_query_tool(tools.iter().map(|t| t.function.name.as_str()));
         {
             let hook_ctx = crate::orchestration::HookContext {
                 session_id,
@@ -6909,8 +6956,16 @@ impl AgentCore {
                 crate::orchestration::HookAction::Abort { reply } => {
                     self.metrics.inc_hook_abort();
                     // bootstrap 预留由 BootstrapReservation Drop 自动释放
-                    self.save_to_history(session_id, raw_message, &reply).await;
-                    return reply;
+                    return self
+                        .persist_final_reply(
+                            session_id,
+                            raw_message,
+                            user_id,
+                            &reply,
+                            &ctx.executed_tools,
+                            ctx.did_work,
+                        )
+                        .await;
                 }
                 crate::orchestration::HookAction::Continue => {}
             }
@@ -7163,6 +7218,10 @@ impl AgentCore {
                 // reply_polish 重试已迁移为内置 hook（条件与注入文本逐字等价）；
                 // 末轮仍泄漏 → hook 返回 Continue，由 chat 出口的 reply_polish 包裹兜底。
                 {
+                    // OnFinalAnswer 时已 promote 恢复全量目录，用真实工具面计算，
+                    // 不传硬编码 false（ocr bug·low 修复）。
+                    let query_tool_available =
+                        Self::has_query_tool(tools.iter().map(|t| t.function.name.as_str()));
                     let hook_ctx = crate::orchestration::HookContext {
                         session_id,
                         raw_message,
@@ -7173,7 +7232,7 @@ impl AgentCore {
                         data_query: intent.data_query,
                         attachment: intent.attachment,
                         fast_path_data,
-                        query_tool_available: false,
+                        query_tool_available,
                         round: _round,
                         hard_max_rounds: self.config.max_tool_rounds,
                         candidate_reply: Some(&reply),
@@ -7191,46 +7250,40 @@ impl AgentCore {
                         }
                         crate::orchestration::HookAction::Abort { reply: hooked } => {
                             self.metrics.inc_hook_abort();
-                            self.save_to_history(session_id, raw_message, &hooked).await;
-                            return hooked;
+                            return self
+                                .persist_final_reply(
+                                    session_id,
+                                    raw_message,
+                                    user_id,
+                                    &hooked,
+                                    &ctx.executed_tools,
+                                    ctx.did_work,
+                                )
+                                .await;
                         }
                         crate::orchestration::HookAction::Inject { messages } => {
+                            // 终答后没有下一 LLM 轮，Inject 若直接落盘会被静默吞掉；
+                            // 按 Retry 语义回到循环（轮数由 TurnBudget 封顶，不会死循环）。
+                            tracing::warn!(target = "agent.output_guardrail", round = _round,
+                                "OnFinalAnswer hook 返回 Inject，按 Retry 处理回到循环");
                             ctx.messages.extend(messages);
+                            continue;
                         }
                         crate::orchestration::HookAction::Continue => {}
                     }
                 }
-                // 保存对话（摄入过滤：测试 ns / A2A 回执 / 非实质对话 在源头拦截）
-                self.observe_filtered(
-                    raw_message,
-                    "user",
-                    &format!("user:{}", user_id),
-                    session_id,
-                    &self.caller_ns(session_id),
-                )
-                .await;
-                // 肯定/硬规则强触发 → preference 落盘（不依赖 LLM 抽取）
-                self.maybe_strong_pref_capture(session_id, raw_message).await;
-                self.observe_filtered(
-                    &reply,
-                    "assistant",
-                    &self.config.identity.agent_id,
-                    session_id,
-                    &self.caller_ns(session_id),
-                )
-                .await;
-                // 分身在「执行过工具」的任务完成后，写策展记忆到其专属 ns
-                if ctx.did_work {
-                    self.maybe_persona_task_memory(session_id, raw_message, &reply).await;
-                }
-                // 保存到内存缓存
-                let reply = Self::honesty_guard_readonly_as_write(
-                    raw_message,
-                    &ctx.executed_tools,
-                    &reply,
-                );
-                self.save_to_history(session_id, raw_message, &reply).await;
-                return reply;
+                // 保存对话：摄入过滤（测试 ns / A2A 回执 / 非实质对话）→ 强偏好/分身记忆
+                // → honesty guard → history。hook Abort 路径复用同一序列（persist_final_reply）。
+                return self
+                    .persist_final_reply(
+                        session_id,
+                        raw_message,
+                        user_id,
+                        &reply,
+                        &ctx.executed_tools,
+                        ctx.did_work,
+                    )
+                    .await;
             }
 
             // 有工具调用 → 执行工具（重构 L 阶段：Agents SDK turn 语义）
@@ -7243,6 +7296,7 @@ impl AgentCore {
                     &ctx.tool_schemas,
                     session_id,
                     raw_message,
+                    user_id,
                     allowed_ns,
                     trace_id,
                     _round,
@@ -7760,6 +7814,8 @@ impl AgentCore {
     /// ADR-017 P3：工具结果 LLM 摘要（opt-in，默认关；开关关时本方法不进入热路径）。
     /// 只摘要 role=tool 且超过阈值的消息；每轮最多 `max_per_round` 条；
     /// 辅助 LLM 调用按估算计入同一 TurnBudget；摘要失败保留原文（由 squash 截断兜底）。
+    /// `max_per_round: 0` 是显式语义「本轮不摘要」，此处直接返回，不静默改成 1；
+    /// `threshold_chars: 0` 是显式语义「所有 tool 结果都摘要」（见配置文档）。
     async fn maybe_summarize_tool_outputs(
         &self,
         messages: &mut Vec<Message>,
@@ -7767,6 +7823,12 @@ impl AgentCore {
     ) {
         const MARKER: &str = "[工具结果摘要]";
         const SUMMARY_RESPONSE_EST: u64 = 200; // prompt 要求 <=800 字，预留响应估算
+        let cfg = &self.orchestration.cfg.tool_summary;
+        if cfg.max_per_round == 0 {
+            tracing::debug!(target = "orchestration.summary",
+                "tool_summary.max_per_round=0：本轮不摘要（0 是显式关闭语义，不静默改成 1）");
+            return;
+        }
         // 摘要后主循环还要再发一次 LLM 请求：预算检查必须给下一轮主请求留出
         // 余量，否则可选摘要会把额度吃光，下一轮被硬拒成「预算不足」。
         let next_loop_est = messages
@@ -7774,10 +7836,9 @@ impl AgentCore {
             .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
             .sum::<usize>() as u64
             / 4;
-        let cfg = &self.orchestration.cfg.tool_summary;
         let mut summarized_this_round = 0usize;
         for m in messages.iter_mut().filter(|m| m.role == "tool") {
-            if summarized_this_round >= cfg.max_per_round.max(1) {
+            if summarized_this_round >= cfg.max_per_round {
                 break;
             }
             let Some(content) = m.content.as_ref() else {
@@ -7921,6 +7982,7 @@ impl AgentCore {
         tool_schemas: &HashMap<String, serde_json::Value>,
         session_id: &str,
         raw_message: &str,
+        user_id: &str,
         allowed_ns: &[String],
         trace_id: &str,
         round: u32,
@@ -7938,6 +8000,7 @@ impl AgentCore {
                     tool_schemas,
                     session_id,
                     raw_message,
+                    user_id,
                     allowed_ns,
                     trace_id,
                     round,
@@ -7953,6 +8016,7 @@ impl AgentCore {
             tool_schemas,
             session_id,
             raw_message,
+            user_id,
             allowed_ns,
             trace_id,
             round,
@@ -7972,6 +8036,7 @@ impl AgentCore {
         tool_schemas: &HashMap<String, serde_json::Value>,
         session_id: &str,
         raw_message: &str,
+        user_id: &str,
         allowed_ns: &[String],
         trace_id: &str,
         round: u32,
@@ -8011,7 +8076,7 @@ impl AgentCore {
             return self
                 .execute_tool_calls_sequential(
                     messages, tool_calls, executed_tools, tool_schemas,
-                    session_id, raw_message, allowed_ns, trace_id,
+                    session_id, raw_message, user_id, allowed_ns, trace_id,
                     round, intent, fast_path_data,
                 )
                 .await;
@@ -8023,7 +8088,7 @@ impl AgentCore {
                     return self
                         .execute_tool_calls_sequential(
                             messages, tool_calls, executed_tools, tool_schemas,
-                            session_id, raw_message, allowed_ns, trace_id,
+                            session_id, raw_message, user_id, allowed_ns, trace_id,
                             round, intent, fast_path_data,
                         )
                         .await;
@@ -8214,6 +8279,10 @@ impl AgentCore {
         // 新领域可在工具执行后注册 hook 做注入/中止）。上下文携带真实轮次与意图
         // （ocr 修复：此前硬编码 round=0 / intent=false）。
         {
+            // tool_schemas 即当前暴露给 LLM 的工具面（bootstrap promote 后已恢复全量），
+            // 用真实值填充，不再硬编码 false（ocr bug·low 修复）。
+            let query_tool_available =
+                Self::has_query_tool(tool_schemas.keys().map(|s| s.as_str()));
             let hook_ctx = crate::orchestration::HookContext {
                 session_id,
                 raw_message,
@@ -8224,7 +8293,7 @@ impl AgentCore {
                 data_query: intent.data_query,
                 attachment: intent.attachment,
                 fast_path_data,
-                query_tool_available: false,
+                query_tool_available,
                 round,
                 hard_max_rounds: self.config.max_tool_rounds,
                 candidate_reply: None,
@@ -8239,7 +8308,16 @@ impl AgentCore {
                 }
                 crate::orchestration::HookAction::Abort { reply } => {
                     self.metrics.inc_hook_abort();
-                    self.save_to_history(session_id, raw_message, &reply).await;
+                    let reply = self
+                        .persist_final_reply(
+                            session_id,
+                            raw_message,
+                            user_id,
+                            &reply,
+                            executed_tools,
+                            executed_any,
+                        )
+                        .await;
                     return ToolExecOutcome::Abort(reply);
                 }
                 crate::orchestration::HookAction::Continue => {}
@@ -8257,6 +8335,7 @@ impl AgentCore {
         tool_schemas: &HashMap<String, serde_json::Value>,
         session_id: &str,
         raw_message: &str,
+        user_id: &str,
         allowed_ns: &[String],
         trace_id: &str,
         round: u32,
@@ -8703,6 +8782,10 @@ impl AgentCore {
         // 新领域可在工具执行后注册 hook 做注入/中止）。上下文携带真实轮次与意图
         // （ocr 修复：此前硬编码 round=0 / intent=false）。
         {
+            // tool_schemas 即当前暴露给 LLM 的工具面（bootstrap promote 后已恢复全量），
+            // 用真实值填充，不再硬编码 false（ocr bug·low 修复）。
+            let query_tool_available =
+                Self::has_query_tool(tool_schemas.keys().map(|s| s.as_str()));
             let hook_ctx = crate::orchestration::HookContext {
                 session_id,
                 raw_message,
@@ -8713,7 +8796,7 @@ impl AgentCore {
                 data_query: intent.data_query,
                 attachment: intent.attachment,
                 fast_path_data,
-                query_tool_available: false,
+                query_tool_available,
                 round,
                 hard_max_rounds: self.config.max_tool_rounds,
                 candidate_reply: None,
@@ -8728,7 +8811,16 @@ impl AgentCore {
                 }
                 crate::orchestration::HookAction::Abort { reply } => {
                     self.metrics.inc_hook_abort();
-                    self.save_to_history(session_id, raw_message, &reply).await;
+                    let reply = self
+                        .persist_final_reply(
+                            session_id,
+                            raw_message,
+                            user_id,
+                            &reply,
+                            executed_tools,
+                            executed_any,
+                        )
+                        .await;
                     return ToolExecOutcome::Abort(reply);
                 }
                 crate::orchestration::HookAction::Continue => {}

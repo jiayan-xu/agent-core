@@ -1366,7 +1366,7 @@ impl ToolClassifier {
                 || lower.starts_with("batch_delete")
                 || lower.starts_with("shutdown_")
             {
-                self.dangerous_tools.insert(lower.clone());
+                self.dangerous_tools.insert(lower);
             } else if !self.read_tools.contains(&lower)
                 && !self.write_tools.contains(&lower)
                 && !self.dangerous_tools.contains(&lower)
@@ -1394,9 +1394,11 @@ impl ToolClassifier {
         if self.unknown_tools.contains(tool_name) {
             return "unknown";
         }
-        // 慢路径：混合大小写的 MCP 工具名，lowercase 后与 canonical 存储对齐。
+        // 慢路径：大小写与 canonical 存储不一致的 MCP 工具名，lowercase 后对齐查找。
         // 常见全小写 unknown 工具在快路径未命中后直接返回，避免重复 lookups/alloc。
-        if tool_name.bytes().all(|b| !b.is_ascii_uppercase()) {
+        // 大小写判定必须 Unicode-aware（存储侧 to_lowercase 会折叠 'É' 等非 ASCII
+        // 大写），否则带重音大写的工具名会被 ASCII 快路径误判为全小写、永久漏分类。
+        if tool_name.chars().all(|c| !c.is_uppercase()) {
             return "unknown";
         }
         let key = tool_name.to_lowercase();
@@ -1681,6 +1683,17 @@ mod read_only_tests {
         e.register_from_tools(&[("Query_User".to_string(), String::new())]);
         assert_eq!(e.classify_typed("query_user"), ToolClass::Read);
         assert!(is_read_only_tool("Query_User"));
+    }
+
+    #[test]
+    fn classifier_slow_path_is_unicode_case_aware() {
+        // 回归锁：存储侧用 Unicode to_lowercase canonical 化，慢路径不得用 ASCII
+        // uppercase 快判短路，否则 'Écrire' 这类非 ASCII 大写工具名会永久返回 unknown。
+        let mut c = ToolClassifier::new();
+        c.register("Écrire", "write");
+        assert_eq!(c.classify("Écrire"), "write");
+        assert_eq!(c.classify("écrire"), "write");
+        assert_eq!(c.classify("ÉCRIRE"), "write");
     }
 
     #[test]
