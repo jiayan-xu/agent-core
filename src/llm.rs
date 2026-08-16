@@ -1626,13 +1626,12 @@ impl LlmClient {
                         } else if budgeted
                             && response.tool_calls.is_empty()
                             && !finish_reason.is_empty()
-                            // 与 budgeted_truncation_warn 的成功标记口径一致：
-                            // stop / end_turn / function_call / tool_calls 都是正常完成，
-                            // 恰好填满 max_tokens 也不留误导性日志（ocr maintainability·low 修复）。
-                            && !matches!(
-                                finish_reason,
-                                "stop" | "end_turn" | "function_call" | "tool_calls"
-                            )
+                            // 与 budgeted_truncation_warn 的成功标记口径一致
+                            //（共享 is_normal_finish_reason，避免白名单漂移）：
+                            // stop / end_turn / function_call / tool_calls /
+                            // stop_sequence / tool_use 都是正常完成，恰好填满
+                            // max_tokens 也不留误导性日志（ocr maintainability·low 修复）。
+                            && !is_normal_finish_reason(finish_reason)
                             && self.config.max_tokens > 0
                             && completion_tokens >= u64::from(self.config.max_tokens)
                         {
@@ -1857,6 +1856,17 @@ impl LlmClient {
     }
 }
 
+/// 正常完成标记（与截断无关的成功信号）：标准 `stop` + 主流 provider 的非标准
+/// 成功标记（OpenAI 系 function_call/tool_calls、Anthropic 系 stop_sequence/
+/// tool_use、Gemini 系 end_turn）。budgeted 截断留痕与告警共用此口径，
+/// 避免两处成功标记白名单漂移（ocr maintainability·low 修复）。
+fn is_normal_finish_reason(finish_reason: &str) -> bool {
+    matches!(
+        finish_reason,
+        "stop" | "end_turn" | "function_call" | "tool_calls" | "stop_sequence" | "tool_use"
+    )
+}
+
 /// 预算化截断告警判定（纯函数，单测覆盖）。
 /// 只在 budgeted 调用（bootstrap 首轮）且无工具调用时告警。双信号：
 /// 1) `finish_reason == "length"`（以及明确的 `max_tokens` 截断标记）；
@@ -1880,7 +1890,11 @@ pub(crate) fn budgeted_truncation_warn(
     if matches!(finish_reason, "length" | "max_tokens") {
         return true;
     }
-    finish_reason.is_empty()
+    // 正常完成标记（stop / end_turn / function_call / tool_calls / stop_sequence /
+    // tool_use）不告警；finish_reason 缺失时用 completion_tokens 触及上限兜底判定。
+    // 与截断留痕共用 is_normal_finish_reason 口径，避免两处白名单漂移。
+    !is_normal_finish_reason(finish_reason)
+        && finish_reason.is_empty()
         && max_tokens > 0
         && completion_tokens >= u64::from(max_tokens)
 }

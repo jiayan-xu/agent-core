@@ -212,8 +212,8 @@ pub struct AgentConfig {
     pub orchestration: crate::orchestration::OrchestrationConfig,
     /// 工具分类手动收紧（operator override，来自 [boundary.tool_overrides]）。
     /// 与 register_tool 同语义：learn_tools 刷新不覆盖；启动时由 AgentCore::new 重放，
-    /// 使 pin 跨重启生效（(tool, level) 对，level 仅 read/write/dangerous/unknown）。
-    pub tool_overrides: Vec<(String, String)>,
+    /// 使 pin 跨重启生效。level 为类型化 ToolClass，非法字符串已在配置转换层拒绝。
+    pub tool_overrides: Vec<(String, crate::boundary::ToolClass)>,
 }
 
 /// HY3 1.3 热路径接线开关。全部默认 false。
@@ -984,12 +984,23 @@ impl AgentCore {
         //（如 query_* → dangerous 回退 read，ocr security·medium 修复）。
         if !config.tool_overrides.is_empty() {
             let applied = boundary.replay_tool_overrides(&config.tool_overrides);
-            tracing::info!(
-                target = "boundary",
-                total = config.tool_overrides.len(),
-                applied,
-                "启动重放工具分类手动收紧"
-            );
+            if applied != config.tool_overrides.len() {
+                // 锁中毒时收紧全部未生效：必须显式告警，否则 operator 的 pin
+                // 静默失效、工具回退前缀启发式（ocr security·low 修复）。
+                tracing::warn!(
+                    target = "boundary",
+                    total = config.tool_overrides.len(),
+                    applied,
+                    "启动重放工具分类手动收紧失败（分类器锁中毒），收紧未生效"
+                );
+            } else {
+                tracing::info!(
+                    target = "boundary",
+                    total = config.tool_overrides.len(),
+                    applied,
+                    "启动重放工具分类手动收紧"
+                );
+            }
         }
         // 注册 agent 自身到权限链（锁中毒时跳过）
         match boundary.perm_chain.lock() {
