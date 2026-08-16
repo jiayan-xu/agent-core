@@ -6733,26 +6733,41 @@ impl AgentCore {
                 "bootstrap 预留未获得（同 session 已有 run 在 bootstrap 或已 promoted），本 run 走常规路径");
         }
         // 保存原始 system prompt：bootstrap 替换为中性人设后，promote 时（同请求内）恢复。
+        // system 缺失/无内容时无法恢复人设，显式留痕（否则中性人设会静默残留整段 run）。
         let original_system_content: Option<String> = ctx
             .messages
             .first()
             .filter(|m| m.role == "system")
             .and_then(|m| m.content.clone());
+        if original_system_content.is_none() && bootstrap_active {
+            tracing::warn!(target = "orchestration", session = %session_id,
+                "bootstrap 未找到可恢复的 system prompt，promote 后将保持中性人设");
+        }
+        // 幂等追加：同名块已存在时跳过，防止 promote 恢复原 system 后重复追加
+        // 工具清单/技能块导致 prompt 逐轮膨胀。
+        fn append_unique_block(content: &mut String, marker: &str, block: &str) -> bool {
+            if content.contains(marker) {
+                return false;
+            }
+            content.push_str(block);
+            true
+        }
         // 工具所有权：非 bootstrap 路径直接 move `full_tools`，避免每轮入口深克隆；
         // bootstrap 路径把全量目录暂存到 Option，promote 时 move 回来（零克隆）。
         let mut tools;
         let mut bootstrap_full_tools: Option<Vec<ToolDef>> = None;
         if bootstrap_active {
-            // 权威安全谓词：优先用边界 ToolClassifier（已从注册工具学习）判 read；
-            // 锁不可用时回退 boundary::is_read_only_tool 前缀启发式。
+            // 权威安全谓词：只用边界 ToolClassifier（已从注册工具学习）的 read 标签。
+            // 锁不可用/中毒时 **fail-closed**：前缀启发式对 cross_* 等过宽，
+            // 回退会把写能力工具放进来（与并行快速路径的 fail-closed 不一致）。
             let boundary_ref = self.boundary.clone();
             let is_safe = move |name: &str| -> bool {
                 match boundary_ref.try_lock() {
                     Ok(b) => match b.classifier.lock() {
                         Ok(c) => c.classify_typed(name) == crate::boundary::ToolClass::Read,
-                        Err(_) => crate::boundary::is_read_only_tool(name),
+                        Err(_) => false,
                     },
-                    Err(_) => crate::boundary::is_read_only_tool(name),
+                    Err(_) => false,
                 }
             };
             let picked = self
@@ -6802,7 +6817,7 @@ impl AgentCore {
                         extra.push_str(&format!("- `{}`: {}\n", t.function.name, desc));
                     }
                     extra.push_str("\n注意：以上为系统中真实存在的工具。严禁臆造工具名（如 query_sql/query_plate 并不存在），请直接选用上面列出的工具。\n");
-                    content.push_str(&extra);
+                    append_unique_block(content, "## 当前真实可用工具", &extra);
                 }
             }
         }
@@ -6814,8 +6829,9 @@ impl AgentCore {
                 if let Some(sys_msg) = ctx.messages.first_mut() {
                     if let Some(ref mut content) = sys_msg.content {
                         if let Some(block) = crate::features::render_skill_block(reg.as_ref(), raw_message, 3) {
-                            self.metrics.inc_skill();
-                            content.push_str(&block);
+                            if append_unique_block(content, "## 可用技能（技能库检索）", &block) {
+                                self.metrics.inc_skill();
+                            }
                         }
                     }
                 }
@@ -6882,7 +6898,8 @@ impl AgentCore {
         }
         // Easy 查询轮次封顶：一轮工具 + 一轮总结 = 3 轮足够（原 20 轮导致简单查询
         // 反复重试 6-7 轮 → 70s+）。Hard 任务保持 20 轮（固废多步推理）。
-        let max_rounds = if is_easy_query { 3u32 } else { self.config.max_tool_rounds };
+        // 下限 1：max_rounds=0 会让循环体（含 bootstrap 预留释放/预算硬拒检查）整体跳过。
+        let max_rounds = (if is_easy_query { 3u32 } else { self.config.max_tool_rounds }).max(1);
         // ADR-017 §5：TurnBudget 统一轮次上限与日 token 预算（同一 quota 调用，行为等价，
         // 仅把循环中的预算检查收口到一处）。
         let budget =
@@ -6975,9 +6992,14 @@ impl AgentCore {
                     if sys.role == "system" {
                         sys.content = Some(orig.clone());
                     }
+                } else {
+                    // 入口处已 warn 过一次；这里再次留痕便于把「恢复被跳过」关联到 promote 时刻。
+                    tracing::warn!(target = "orchestration", session = %session_id,
+                        "promote 时未恢复原始 system prompt（首条消息非 system 或无内容）");
                 }
                 // 重新应用完整请求注入（promote 前被剥离的三项，ocr medium 修复：
                 // 只恢复 system 文本会让后续轮次回到「写死 query_sql/query_plate」的旧坑）。
+                // append_unique_block 防重：original system 可能已含同名块时不再追加。
                 if !tools.is_empty() {
                     if let Some(sys_msg) = ctx.messages.first_mut() {
                         if sys_msg.role == "system" {
@@ -6991,7 +7013,7 @@ impl AgentCore {
                                     extra.push_str(&format!("- `{}`: {}\n", t.function.name, desc));
                                 }
                                 extra.push_str("\n注意：以上为系统中真实存在的工具。严禁臆造工具名，请直接选用上面列出的工具。\n");
-                                content.push_str(&extra);
+                                append_unique_block(content, "## 当前真实可用工具", &extra);
                             }
                         }
                     }
@@ -7002,8 +7024,9 @@ impl AgentCore {
                             if let Some(block) =
                                 crate::features::render_skill_block(reg.as_ref(), raw_message, 3)
                             {
-                                self.metrics.inc_skill();
-                                content.push_str(&block);
+                                if append_unique_block(content, "## 可用技能（技能库检索）", &block) {
+                                    self.metrics.inc_skill();
+                                }
                             }
                         }
                     }
@@ -7089,7 +7112,10 @@ impl AgentCore {
                 {
                     reflect_rounds += 1;
                     self.metrics.inc_reflect();
-                    if !self.reflect_goal_satisfied(raw_message, &reply, &budget).await {
+                    if !self
+                        .reflect_goal_satisfied(raw_message, &reply, &ctx.messages, &budget)
+                        .await
+                    {
                         ctx.messages.push(Message {
                             role: "user".to_string(),
                             content: Some(
@@ -7710,6 +7736,14 @@ impl AgentCore {
         budget: &crate::orchestration::TurnBudget,
     ) {
         const MARKER: &str = "[工具结果摘要]";
+        const SUMMARY_RESPONSE_EST: u64 = 200; // prompt 要求 <=800 字，预留响应估算
+        // 摘要后主循环还要再发一次 LLM 请求：预算检查必须给下一轮主请求留出
+        // 余量，否则可选摘要会把额度吃光，下一轮被硬拒成「预算不足」。
+        let next_loop_est = messages
+            .iter()
+            .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
+            .sum::<usize>() as u64
+            / 4;
         let cfg = &self.orchestration.cfg.tool_summary;
         let mut summarized_this_round = 0usize;
         for m in messages.iter_mut().filter(|m| m.role == "tool") {
@@ -7728,8 +7762,11 @@ impl AgentCore {
                 content
             );
             let req_est = (prompt.chars().count() as u64) / 4;
-            if let Err(e) = budget.check_token(req_est) {
-                tracing::warn!(target = "orchestration.summary", err = %e, "摘要预算不足，保留原文");
+            if let Err(e) =
+                budget.check_token(req_est.saturating_add(next_loop_est + SUMMARY_RESPONSE_EST))
+            {
+                tracing::warn!(target = "orchestration.summary", err = %e,
+                    "摘要预算不足（含下一主循环预留），保留原文");
                 break;
             }
             let req = vec![Message {
@@ -7748,9 +7785,14 @@ impl AgentCore {
                     self.metrics.inc_tool_summary();
                     summarized_this_round += 1;
                     tracing::info!(target = "orchestration.summary",
+                        tool_call_id = ?m.tool_call_id,
                         chars_before = content.chars().count(),
                         chars_after = r.text.chars().count(),
                         "工具结果已 LLM 摘要");
+                    // 设计权衡（opt-in）：摘要覆盖 ctx.messages 中的原文；仓库的
+                    // history 只持久化 user/assistant 文本，audit/execution_log 不存
+                    // tool 输出，因此不会把摘要当原始事实落盘。[工具结果摘要] 标记
+                    // 区分来源；若未来 history 开始持久化 tool 消息，必须同步保留原文。
                     m.content = Some(format!("{MARKER}\n{}", r.text));
                 }
                 Ok(_) => tracing::warn!(target = "orchestration.summary", "摘要返回空文本，保留原文"),
@@ -7766,15 +7808,27 @@ impl AgentCore {
         &self,
         goal: &str,
         candidate: &str,
+        messages: &[Message],
         budget: &crate::orchestration::TurnBudget,
     ) -> bool {
+        const REFLECT_RESPONSE_EST: u64 = 16; // YES/NO + <=20 字理由
         let prompt = format!(
             "你是结果评审员。用户目标：{goal}\n\n候选回答：{candidate}\n\n\
              请判断候选回答是否已充分达成用户目标。只回答 YES 或 NO，再加一句不超过 20 字的理由。"
         );
         let req_est = (prompt.chars().count() as u64) / 4;
-        if let Err(e) = budget.check_token(req_est) {
-            tracing::warn!(target = "orchestration.reflect", err = %e, "评审预算不足，视为达成（不阻断）");
+        // 若评审判定「未达成」会继续下一轮主循环：预算检查必须给下一轮主请求留出
+        // 余量，否则可选评审会把额度吃光，下一轮被硬拒成「预算不足」。
+        let next_loop_est = messages
+            .iter()
+            .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
+            .sum::<usize>() as u64
+            / 4;
+        if let Err(e) =
+            budget.check_token(req_est.saturating_add(next_loop_est + REFLECT_RESPONSE_EST))
+        {
+            tracing::warn!(target = "orchestration.reflect", err = %e,
+                "评审预算不足（含下一主循环预留），视为达成（不阻断）");
             return true;
         }
         let req = vec![Message {
@@ -7970,6 +8024,9 @@ impl AgentCore {
 
         // 回灌阶段：按原始顺序处理（与顺序路径同语义：成功/失败/召回/沉淀/日志/确认/消息）。
         let mut executed_any = false;
+        // read 分类工具本不应触发确认；若分类器误标导致多工具同时回 require_confirm，
+        // pending_action 只有一个槽位，必须显式暴露冲突，不能静默覆盖前一个确认。
+        let mut pending_action_set = false;
         for (idx, tc) in tool_calls.iter().enumerate() {
             let text = match &results[idx] {
                 Ok(text) => {
@@ -8009,21 +8066,28 @@ impl AgentCore {
                 });
             }
             if text.contains("require_confirm") || text.contains("确认") {
-                let action = PendingAction {
-                    tool_name: tc.name.clone(),
-                    arguments: {
-                        let mut args = tc.arguments.clone();
-                        if let Some(obj) = args.as_object_mut() {
-                            obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
-                        }
-                        args
-                    },
-                    description: format!("{} ({})", tc.name, tc.arguments),
-                    approval_id: None,
-                };
-                self.session_manager
-                    .set_pending_action(session_id, action)
-                    .await;
+                if pending_action_set {
+                    tracing::warn!(target = "orchestration.read_parallel",
+                        tool = %tc.name, session_id, trace_id,
+                        "并行路径出现多个确认请求，pending_action 保留首个，后续确认被丢弃（read 工具不应触发确认，需排查分类器）");
+                } else {
+                    let action = PendingAction {
+                        tool_name: tc.name.clone(),
+                        arguments: {
+                            let mut args = tc.arguments.clone();
+                            if let Some(obj) = args.as_object_mut() {
+                                obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
+                            }
+                            args
+                        },
+                        description: format!("{} ({})", tc.name, tc.arguments),
+                        approval_id: None,
+                    };
+                    self.session_manager
+                        .set_pending_action(session_id, action)
+                        .await;
+                    pending_action_set = true;
+                }
             }
             messages.push(Message {
                 role: "assistant".to_string(),
