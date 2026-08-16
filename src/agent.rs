@@ -6751,14 +6751,13 @@ impl AgentCore {
             tracing::warn!(target = "orchestration", session = %session_id,
                 "bootstrap 未找到可恢复的 system prompt，promote 后将保持中性人设");
         }
-        // 幂等追加：同名块已存在时跳过，防止 promote 恢复原 system 后重复追加
-        // 工具清单/技能块导致 prompt 逐轮膨胀。
-        fn append_unique_block(content: &mut String, marker: &str, block: &str) -> bool {
-            if content.contains(marker) {
-                return false;
+        // 幂等刷新：同名块已存在时从 marker 处截断再追加新块，避免 prompt 逐轮膨胀，
+        // 同时保证工具清单/技能块随最新会话上下文刷新（不会因旧 marker 而跳过更新）。
+        fn upsert_unique_block(content: &mut String, marker: &str, block: &str) {
+            if let Some(pos) = content.find(marker) {
+                content.truncate(pos);
             }
             content.push_str(block);
-            true
         }
         // 工具所有权：非 bootstrap 路径直接 move `full_tools`，避免每轮入口深克隆；
         // bootstrap 路径把全量目录暂存到 Option，promote 时 move 回来（零克隆）。
@@ -6825,7 +6824,7 @@ impl AgentCore {
                         extra.push_str(&format!("- `{}`: {}\n", t.function.name, desc));
                     }
                     extra.push_str("\n注意：以上为系统中真实存在的工具。严禁臆造工具名（如 query_sql/query_plate 并不存在），请直接选用上面列出的工具。\n");
-                    append_unique_block(content, "## 当前真实可用工具", &extra);
+                    upsert_unique_block(content, "## 当前真实可用工具", &extra);
                 }
             }
         }
@@ -6839,7 +6838,7 @@ impl AgentCore {
                         if let Some(block) = crate::features::render_skill_block(reg.as_ref(), raw_message, 3) {
                             // 指标保持「尝试注入」语义，与去重后的实际追加无关
                             self.metrics.inc_skill();
-                            append_unique_block(content, "## 可用技能（技能库检索）", &block);
+                            upsert_unique_block(content, "## 可用技能（技能库检索）", &block);
                         }
                     }
                 }
@@ -7015,7 +7014,7 @@ impl AgentCore {
                 }
                 // 重新应用完整请求注入（promote 前被剥离的三项，ocr medium 修复：
                 // 只恢复 system 文本会让后续轮次回到「写死 query_sql/query_plate」的旧坑）。
-                // append_unique_block 防重：original system 可能已含同名块时不再追加。
+                // upsert_unique_block：original system 已含同名块时原位刷新，不追加。
                 if !tools.is_empty() {
                     if let Some(sys_msg) = ctx.messages.first_mut() {
                         if sys_msg.role == "system" {
@@ -7029,7 +7028,7 @@ impl AgentCore {
                                     extra.push_str(&format!("- `{}`: {}\n", t.function.name, desc));
                                 }
                                 extra.push_str("\n注意：以上为系统中真实存在的工具。严禁臆造工具名，请直接选用上面列出的工具。\n");
-                                append_unique_block(content, "## 当前真实可用工具", &extra);
+                                upsert_unique_block(content, "## 当前真实可用工具", &extra);
                             }
                         }
                     }
@@ -7042,7 +7041,7 @@ impl AgentCore {
                             {
                                 // 指标保持「尝试注入」语义，与去重后的实际追加无关
                                 self.metrics.inc_skill();
-                                append_unique_block(content, "## 可用技能（技能库检索）", &block);
+                                upsert_unique_block(content, "## 可用技能（技能库检索）", &block);
                             }
                         }
                     }
@@ -8038,8 +8037,13 @@ impl AgentCore {
                 let seq = self
                     .snapshot_seq
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let first_write_like = tool_calls
+                    .iter()
+                    .find(|tc| !crate::boundary::is_read_only_tool(&tc.name))
+                    .map(|tc| tc.name.clone())
+                    .unwrap_or_else(|| tool_calls[0].name.clone());
                 let snap = MutationSnapshot {
-                    tool_name: tool_calls[0].name.clone(),
+                    tool_name: first_write_like.clone(),
                     messages_before: messages.clone(),
                     session_id: session_id.to_string(),
                     trace_id: trace_id.to_string(),
@@ -8057,7 +8061,7 @@ impl AgentCore {
                     }
                 }
                 m.insert(snap_key, snap);
-                tracing::info!(tool = %tool_calls[0].name, session = %session_id,
+                tracing::info!(tool = %first_write_like, session = %session_id,
                     "mutation_snapshot_captured (parallel preflight)");
             }
         }

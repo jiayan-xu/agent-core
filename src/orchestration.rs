@@ -9,8 +9,9 @@
 //!
 //! 本模块只放纯逻辑与状态；热路径接线在 `agent.rs::llm_loop`。
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -287,6 +288,7 @@ impl SessionPhaseStore {
 /// 进程内 session 集合的 LRU 上限：防止长驻服务中缓存随会话数无限增长。
 /// 淘汰只丢缓存（真相在 SessionPhaseStore / 幂等重算），不影响正确性。
 const SESSION_SET_CACHE_MAX: usize = 4096;
+const NOT_PROMOTED_NEGATIVE_TTL: Duration = Duration::from_secs(30);
 
 /// 有界 LRU session 集合：`contains` 命中不刷新顺序（promote 是 append-only，
 /// 无热/冷再排序语义），只保证容量上界。
@@ -327,6 +329,9 @@ pub struct OrchestrationController {
     /// **必须无界**：这是「进行中」锁而非可重建缓存，误淘汰会重新打开
     /// 并发 bootstrap 窗口；条目在 finish/cancel 时删除，常态不增长。
     bootstrap_in_flight: Mutex<HashSet<String>>,
+    /// 未 promoted 负缓存（短 TTL）：避免 bootstrap 竞争失败 / 冷启动期对同一
+    /// session 的每次请求都同步回查 SQLite。
+    not_promoted_cache: Mutex<HashMap<String, Instant>>,
     /// guardrail hooks（ADR-017 P2）。默认注册旧补丁的等价内置 hooks。
     hooks: HookRegistry,
 }
@@ -347,6 +352,7 @@ impl OrchestrationController {
             store,
             promoted_cache: Mutex::new(BoundedSessionSet::default()),
             bootstrap_in_flight: Mutex::new(HashSet::new()),
+            not_promoted_cache: Mutex::new(HashMap::new()),
             hooks,
         }
     }
@@ -360,6 +366,7 @@ impl OrchestrationController {
             store,
             promoted_cache: Mutex::new(BoundedSessionSet::default()),
             bootstrap_in_flight: Mutex::new(HashSet::new()),
+            not_promoted_cache: Mutex::new(HashMap::new()),
             hooks,
         }
     }
@@ -391,6 +398,14 @@ impl OrchestrationController {
                 return true;
             }
         }
+        // 短 TTL 负缓存：避免未 promoted session 在竞争失败/冷启动期重复同步查库
+        if let Ok(negative) = self.not_promoted_cache.lock() {
+            if let Some(at) = negative.get(session_id) {
+                if at.elapsed() < NOT_PROMOTED_NEGATIVE_TTL {
+                    return false;
+                }
+            }
+        }
         let promoted = self.store.is_promoted(session_id);
         if promoted {
             if let Ok(mut cache) = self.promoted_cache.lock() {
@@ -399,6 +414,11 @@ impl OrchestrationController {
                 tracing::warn!(target = "orchestration", session = %session_id,
                     "promoted_cache Mutex 中毒，命中结果未写入缓存");
             }
+            if let Ok(mut negative) = self.not_promoted_cache.lock() {
+                negative.remove(session_id);
+            }
+        } else if let Ok(mut negative) = self.not_promoted_cache.lock() {
+            negative.insert(session_id.to_string(), Instant::now());
         }
         promoted
     }
@@ -425,6 +445,9 @@ impl OrchestrationController {
         };
         if won {
             self.store.promote(session_id);
+            if let Ok(mut negative) = self.not_promoted_cache.lock() {
+                negative.remove(session_id);
+            }
         }
         won
     }
@@ -765,6 +788,11 @@ pub fn classify_tool_failure(error: &str) -> FailureClass {
         || e.contains("会话超时")
         || e.contains("令牌超时")
         || e.contains("token 超时")
+        || e.contains("令牌已过期")
+        || e.contains("会话已过期")
+        || e.contains("登录已过期")
+        || e.contains("凭证已过期")
+        || e.contains("已过期")
         || e.contains("无权限")
         || e.contains("无权")
         || e.contains("权限不足")
@@ -871,9 +899,12 @@ impl HookRegistry {
     pub fn run(&self, point: HookPoint, ctx: &HookContext) -> HookAction {
         let snapshot: Vec<std::sync::Arc<dyn OrchestrationHook>> = {
             let Ok(guard) = self.hooks.lock() else {
-                tracing::warn!(target = "orchestration.hooks", point = ?point,
-                    "hooks Mutex 中毒，全部 guardrail hook 本轮静默失效，按 Continue 放行");
-                return HookAction::Continue;
+                tracing::error!(target = "orchestration.hooks", point = ?point,
+                    "hooks Mutex 中毒，guardrail hook 全部失效；fail-closed Abort");
+                return HookAction::Abort {
+                    reply: "⚠️ 内部安全钩子（guardrail）注册表不可用，本次操作已中止。请重启服务或人工介入。"
+                        .to_string(),
+                };
             };
             let mut v: Vec<_> = guard.iter().filter(|h| h.point() == point).cloned().collect();
             v.sort_by_key(|h| h.priority());
@@ -1250,6 +1281,8 @@ mod tests {
         assert_eq!(classify_tool_failure("session timeout"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("token timeout"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("会话超时"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("令牌已过期"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("登录已过期"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("执行超时"), FailureClass::Retryable);
         // 认证/会话类 invalid 属于 Fatal，不因宽泛 invalid 误判为可重试
         assert_eq!(classify_tool_failure("invalid token"), FailureClass::Fatal);

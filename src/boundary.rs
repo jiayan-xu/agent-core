@@ -1347,40 +1347,53 @@ impl ToolClassifier {
                 && !lower.starts_with("delete")
                 && !lower.starts_with("create")
                 && !lower.starts_with("cross_");
-            if name.starts_with("query_")
-                || name.starts_with("search_")
-                || name.starts_with("get_")
-                || name.starts_with("check_")
-                || name.starts_with("read_")
-                || name.starts_with("list_")
-                || name.starts_with("fuzzy_match_")
-                || name.starts_with("match_")
-                || name.starts_with("review_")
-                || name.starts_with("diagnose_")
-                || name.starts_with("explain_")
-                || name.starts_with("validate_")
+            if lower.starts_with("query_")
+                || lower.starts_with("search_")
+                || lower.starts_with("get_")
+                || lower.starts_with("check_")
+                || lower.starts_with("read_")
+                || lower.starts_with("list_")
+                || lower.starts_with("fuzzy_match_")
+                || lower.starts_with("match_")
+                || lower.starts_with("review_")
+                || lower.starts_with("diagnose_")
+                || lower.starts_with("explain_")
+                || lower.starts_with("validate_")
                 || is_sql_read
             {
-                self.read_tools.insert(name.to_lowercase());
-            } else if name.starts_with("delete_")
-                || name.starts_with("batch_delete")
-                || name.starts_with("shutdown_")
+                self.read_tools.insert(lower);
+            } else if lower.starts_with("delete_")
+                || lower.starts_with("batch_delete")
+                || lower.starts_with("shutdown_")
             {
-                self.dangerous_tools.insert(name.to_lowercase());
-            } else if !self.read_tools.contains(&name.to_lowercase())
-                && !self.dangerous_tools.contains(&name.to_lowercase())
+                self.dangerous_tools.insert(lower.clone());
+            } else if !self.read_tools.contains(&lower) && !self.dangerous_tools.contains(&lower)
             {
                 // P0-4：未知工具不再默认当 write 放行，先标记为 unknown，由 check_tool 走黄线确认
-                self.unknown_tools.insert(name.to_lowercase());
+                self.unknown_tools.insert(lower);
             }
         }
     }
 
     pub fn classify(&self, tool_name: &str) -> &'static str {
-        // 统一小写 canonical key：MCP 工具名大小写漂移时，分类器与
-        // is_read_only_tool / bootstrap 动作段检查保持同一口径。
+        // 快路径：存储侧已 canonical 小写，常见小写工具名直接精确命中，零额外分配。
+        if let Some(level) = classify_memoria_tool(tool_name) {
+            return level;
+        }
+        if self.read_tools.contains(tool_name) {
+            return "read";
+        }
+        if self.write_tools.contains(tool_name) {
+            return "write";
+        }
+        if self.dangerous_tools.contains(tool_name) {
+            return "dangerous";
+        }
+        if self.unknown_tools.contains(tool_name) {
+            return "unknown";
+        }
+        // 慢路径：混合大小写的 MCP 工具名，lowercase 后与 canonical 存储对齐。
         let key = tool_name.to_lowercase();
-        // 具名 Memoria/编排工具优先（避免仅靠 HashSet 内置表漏网 → unknown 黄线）
         if let Some(level) = classify_memoria_tool(&key) {
             return level;
         }
@@ -1657,6 +1670,11 @@ mod read_only_tests {
         d.register("Query_Plate", "read");
         assert_eq!(d.classify_typed("query_plate"), ToolClass::Read);
         assert_eq!(d.classify_typed("QUERY_PLATE"), ToolClass::Read);
+        // register_from_tools 的混合大小写前缀判定也必须与 is_read_only_tool 一致
+        let mut e = ToolClassifier::new();
+        e.register_from_tools(&[("Query_User".to_string(), String::new())]);
+        assert_eq!(e.classify_typed("query_user"), ToolClass::Read);
+        assert!(is_read_only_tool("Query_User"));
     }
 
     #[test]

@@ -262,10 +262,9 @@ impl RoutedLlm {
         tools: &[ToolDef],
         max_tokens: u32,
     ) -> Result<LlmResponse, String> {
-        debug_assert!(
-            matches!(difficulty, TaskDifficulty::Easy),
-            "bootstrap 预算化调用只允许 Easy 路由"
-        );
+        if !matches!(difficulty, TaskDifficulty::Easy) {
+            return Err("bootstrap 预算化调用只允许 Easy 路由".to_string());
+        }
         let selected = self.select(difficulty);
         tracing::info!(?difficulty, "difficulty_route_budgeted");
         selected.chat_with_max_tokens(messages, tools, max_tokens).await
