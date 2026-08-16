@@ -201,7 +201,9 @@ trait OrchestrationHook: Send + Sync {
 - [x] 单测：promote 幂等持久化、工具面选择/硬排除、预算默认值、降级路径
 - [x] 受控冒烟（2026-08-16）：临时开启 bootstrap 后生产实例 `bootstrap_promotes=2`、
       每请求 `llm_calls=1`、真实数据查询正常；验证后已回滚开关（flag-off 恢复）
-- [ ] 正式灰度观察：按计划开启 bootstrap 观察多日指标（需用户决策，不在本次变更内）
+- [x] 正式灰度启动（2026-08-16）：clean 构建 A/B 验收通过（详见
+      `docs/reviews/pr39-live-gray-validation-20260816.md`），bootstrap 生产开启，
+      长期多日指标观察由日常监控持续跟踪
 - [x] 写意图（`has_write_intent`）与危险工具不触发 bootstrap（接线条件保证）
 
 ### P2 — Plan-Act-Reflect + hooks（代码已落地）
