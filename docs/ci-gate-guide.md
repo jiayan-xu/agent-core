@@ -2,22 +2,27 @@
 
 > 给 reasonix（或任何操作 agent-core 的 agent/同事）的实操说明。
 > 适用仓库：GitHub `jiayan-xu/agent-core`（本地工作副本见 AGENTS.md 的 canonical 目录说明）
-> 更新日期：2026-08-06
+> 更新日期：2026-08-13
+>
+> **流程以 [`docs/PR_PROCESS.md`](PR_PROCESS.md) 为准。** 禁止直推 `master`；
+> 本文只讲门禁怎么过，不替代 PR 流程。
 
 ---
 
 ## 0. 门禁是什么（30 秒理解）
 
-**push 到 master 自动触发两个 GitHub Actions 检查，两个都绿才算通过：**
+**PR 合入 `master` 前，两个 GitHub Actions required checks 必须全绿：**
 
 | 检查 | 干什么 | 失败后果 |
 |---|---|---|
-| **ocr-review** | AI 代码审查**最近一次 commit 的 diff**（HEAD~1..HEAD），发现 bug/安全/性能/可维护性问题就报评论 | exit 1 拦截合并 |
+| **ocr-review** | AI 代码审查 **PR 的 `base..head` diff**（整段功能分支，不是单 commit），发现 bug/安全/性能/可维护性问题就报评论 | exit 1，合并按钮灰掉 |
 | **gitleaks** | 用 `.gitleaks.toml` 扫密钥/敏感信息（api_key、token、secret、密码等） | 拦截合并 |
 
+（workflow 仍监听 `push` 到 `master`/`main`：那种情况下审查范围才是 `HEAD~1..HEAD`。日常开发走 PR，不会走到这条。）
+
 **关键认知：**
-- push 本身不会被拒绝，但 CI 红 = 代码没过审，等于"提交了但没通过"。
-- ocr 审查的是 **HEAD~1..HEAD 这一个 commit**，不是整个分支。一次只推一个 commit 最清晰。
+- 直推 `master` 已被 `pre-push` hook 拦截（见 PR_PROCESS）。门禁发生在 **PR 合并前**，不是事后检查。
+- PR 上 ocr 审查的是 **整段 `base..head`**。功能分支可以多 commit；修 OCR 意见后继续往同一分支 push，PR 自动刷新。
 - ocr 意见按严重度分级：`[bug·high]` / `[bug·medium]` / `[performance]` / `[maintainability]` / `[other]` / `[test]`。**大部分是真问题，不要直接忽略**——实战中它抓到过：并发数据竞争、字符串截断 bug、NaN 序列化绕过防护、O(n²) 性能陷阱。
 
 ---
@@ -45,14 +50,14 @@ git commit -m "fix(context): 修复 XXX" -m "- 具体改动点1"
 ## P1 推送与 CI 查看
 
 ```bash
-# 推送
-git push origin master
+# 推送到 feature 分支（禁止 origin master）
+git push -u origin HEAD
 
-# 查最新一次 ocr-review run 的 id（⚠️ 可能同时有并发会话的 run，取最新一条）
-gh run list --repo jiayan-xu/agent-core --limit 1 --workflow ocr-review.yml
+# 开 PR（若还没有）
+gh pr create --base master --title "..." --body "..."
 
-# 等待结果（--exit-status：CI 失败时命令返回非 0）
-gh run watch <run-id> --repo jiayan-xu/agent-core --exit-status
+# 前台轮询该 PR 的 required checks（P0：禁止开完就结束对话）
+gh pr checks --watch --repo jiayan-xu/agent-core
 ```
 
 **怎么判断过没过：**
@@ -75,11 +80,11 @@ gh run view <run-id> --repo jiayan-xu/agent-core --log-failed \
 #    ─── src/agent.rs:3524-3532 ───
 #    [bug·high] 描述...
 
-# 3. 修复 → 本地验证 → 提交 → 推送 → 再看 CI
+# 3. 修复 → 本地验证 → 提交 → 推送同一 feat 分支 → 再看 CI
 cargo check && cargo test --lib
 git add -p src/xxx.rs        # 只 stage 自己的改动（见 P3-3）
 git commit -m "fix(xxx): 按 ocr 门禁意见修——问题一句话"
-git push origin master
+git push origin HEAD         # 仍是 feat/*，PR 自动刷新
 gh run watch <新run-id> --repo jiayan-xu/agent-core --exit-status
 ```
 
@@ -138,7 +143,9 @@ git diff --cached src/agent.rs | grep -E "^\+" | grep -vE "^\+{3}" | grep -E "�
 [ ] git diff 无密钥 / 无 C:\Users 绝对路径
 [ ] 并发场景：git diff --cached 只含自己的 hunk（add -p 已排除对方改动）
 [ ] 提交信息中文规范（fix(模块): 一句话 + 要点）
-[ ] 推送后 gh run list 取最新 id → watch 到双绿：ocr-review ✅ + gitleaks ✅
+[ ] 推的是 feat/*（或 docs/*），不是 master
+[ ] 推送后 gh run list --branch <当前分支> 取最新 id → watch 到双绿：ocr-review ✅ + gitleaks ✅
+[ ] PR 合入前 required checks 全绿（见 docs/PR_PROCESS.md）
 ```
 
 ---
@@ -147,7 +154,7 @@ git diff --cached src/agent.rs | grep -E "^\+" | grep -vE "^\+{3}" | grep -E "�
 
 | 目的 | 命令 |
 |---|---|
-| 查最新 ocr run | `gh run list --repo jiayan-xu/agent-core --limit 1 --workflow ocr-review.yml` |
+| 查当前分支最新 ocr run | `gh run list --repo jiayan-xu/agent-core --limit 1 --workflow ocr-review.yml --branch "$(git branch --show-current)"` |
 | 等结果 | `gh run watch <id> --repo jiayan-xu/agent-core --exit-status` |
 | 提取意见 | `gh run view <id> --repo jiayan-xu/agent-core --log-failed \| grep -A 4 -E "───" \| sed 's/\x1b\[[0-9;]*m//g'` |
 | 密钥扫描 | `git diff \| grep -E "api_key\|token\|secret\|password\|C:\\\\Users"` |
