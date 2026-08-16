@@ -237,7 +237,8 @@ impl RoutedLlm {
     /// 而 `route_select` 在 `ClassifyMode::Judge` 下本身会额外发起一次真实 LLM
     /// 往返，会把声明的「单次调用」变成隐藏的 2 次。base 客户端仍具备 provider
     /// fallback/retry，辅助调用保持与主循环同一套传输可靠性。
-    pub async fn chat_single(
+    /// `pub(crate)`：该方法绕过难度路由策略，契约仅允许 crate 内辅助路径使用。
+    pub(crate) async fn chat_single(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
@@ -1374,6 +1375,7 @@ impl LlmClient {
     /// 返回一个仅覆盖 `max_tokens` 的克隆，不改动原 client 配置。
     /// bootstrap 的「首轮预算不残留整会话」契约由本方法固化并可单测。
     pub(crate) fn with_max_tokens_override(&self, max_tokens: u32) -> Self {
+        debug_assert!(max_tokens > 0, "bootstrap max_tokens must be > 0");
         let mut client = self.clone();
         client.config.max_tokens = max_tokens;
         client
@@ -1390,6 +1392,9 @@ impl LlmClient {
         tools: &[ToolDef],
         max_tokens: u32,
     ) -> Result<LlmResponse, String> {
+        if max_tokens == 0 {
+            return Err("bootstrap max_tokens 必须大于 0".to_string());
+        }
         self.with_max_tokens_override(max_tokens)
             .chat_impl(messages, tools, true)
             .await

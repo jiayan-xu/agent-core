@@ -1077,7 +1077,8 @@ impl ComplianceBoundary {
 }
 
 /// 工具权限分类（类型化标签，避免调用方与字符串字面量比较）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ToolClass {
     Read,
     Write,
@@ -1335,7 +1336,8 @@ impl ToolClassifier {
                 && !lower.starts_with("update")
                 && !lower.starts_with("insert")
                 && !lower.starts_with("delete")
-                && !lower.starts_with("create");
+                && !lower.starts_with("create")
+                && !lower.starts_with("cross_");
             if name.starts_with("query_")
                 || name.starts_with("search_")
                 || name.starts_with("get_")
@@ -1568,7 +1570,8 @@ pub fn is_read_only_tool(name: &str) -> bool {
             && !lower.starts_with("update")
             && !lower.starts_with("insert")
             && !lower.starts_with("delete")
-            && !lower.starts_with("create"))
+            && !lower.starts_with("create")
+            && !lower.starts_with("cross_"))
 }
 
 #[cfg(test)]
@@ -1628,6 +1631,8 @@ mod read_only_tests {
             ("cross_validate".to_string(), String::new()),
         ]);
         assert_eq!(c.classify_typed("cross_unknown_thing"), ToolClass::Unknown);
+        assert_eq!(c.classify_typed("cross_sql_select"), ToolClass::Unknown);
+        assert!(!is_read_only_tool("cross_sql_select"));
         assert_eq!(c.classify_typed("cross_validate"), ToolClass::Read);
         assert_eq!(c.classify_typed("cross_agent_query"), ToolClass::Write);
     }

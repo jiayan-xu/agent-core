@@ -241,14 +241,20 @@ impl SessionPhaseStore {
                 "phase 存储连接 Mutex 中毒，按未 promoted 处理");
             return false;
         };
-        guard
-            .query_row(
-                "SELECT phase FROM orchestration_phase WHERE session_id=?1",
-                rusqlite::params![session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map(|phase| phase == "promoted")
-            .unwrap_or(false)
+        // 每次请求最多走到这里一次（promoted_cache 命中后短路）；busy_timeout 上限 2s。
+        // SQLite 查询错误必须与「未 promoted」区分留痕，不能静默吞掉。
+        match guard.query_row(
+            "SELECT phase FROM orchestration_phase WHERE session_id=?1",
+            rusqlite::params![session_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(phase) => phase == "promoted",
+            Err(e) => {
+                tracing::warn!(target = "orchestration", session = %session_id, err = %e,
+                    "phase 查询失败，按未 promoted 处理（该会话可能重新 bootstrap）");
+                false
+            }
+        }
     }
 
     /// 标记 promoted（INSERT OR IGNORE：append-only 幂等）。失败只告警，不阻断主流程。
@@ -728,7 +734,10 @@ pub fn classify_tool_failure(error: &str) -> FailureClass {
         || e.contains("审批")
         || e.contains("配额")
         || e.contains("kill switch")
-        || e.contains("拒绝")
+        || e.contains("审批拒绝")
+        || e.contains("拒绝访问")
+        || e.contains("权限拒绝")
+        || e.contains("拒绝执行")
         || e.contains("denied")
         || e.contains("unauthorized")
         || e.contains("forbidden")
@@ -840,6 +849,8 @@ impl HookRegistry {
     pub fn run(&self, point: HookPoint, ctx: &HookContext) -> HookAction {
         let snapshot: Vec<std::sync::Arc<dyn OrchestrationHook>> = {
             let Ok(guard) = self.hooks.lock() else {
+                tracing::warn!(target = "orchestration.hooks", point = ?point,
+                    "hooks Mutex 中毒，全部 guardrail hook 本轮静默失效，按 Continue 放行");
                 return HookAction::Continue;
             };
             let mut v: Vec<_> = guard.iter().filter(|h| h.point() == point).cloned().collect();
@@ -1210,6 +1221,8 @@ mod tests {
         assert_eq!(classify_tool_failure("权限不足"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("未授权"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("禁止操作"), FailureClass::Fatal);
+        // 网络层「连接被拒绝」是瞬时故障，不得被宽泛「拒绝」误判为 Fatal
+        assert_eq!(classify_tool_failure("连接被拒绝"), FailureClass::Recoverable);
         // 认证/会话类 invalid 属于 Fatal，不因宽泛 invalid 误判为可重试
         assert_eq!(classify_tool_failure("invalid token"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("invalid session"), FailureClass::Fatal);
