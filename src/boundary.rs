@@ -1367,7 +1367,9 @@ impl ToolClassifier {
                 || lower.starts_with("shutdown_")
             {
                 self.dangerous_tools.insert(lower.clone());
-            } else if !self.read_tools.contains(&lower) && !self.dangerous_tools.contains(&lower)
+            } else if !self.read_tools.contains(&lower)
+                && !self.write_tools.contains(&lower)
+                && !self.dangerous_tools.contains(&lower)
             {
                 // P0-4：未知工具不再默认当 write 放行，先标记为 unknown，由 check_tool 走黄线确认
                 self.unknown_tools.insert(lower);
@@ -1393,6 +1395,10 @@ impl ToolClassifier {
             return "unknown";
         }
         // 慢路径：混合大小写的 MCP 工具名，lowercase 后与 canonical 存储对齐。
+        // 常见全小写 unknown 工具在快路径未命中后直接返回，避免重复 lookups/alloc。
+        if tool_name.bytes().all(|b| !b.is_ascii_uppercase()) {
+            return "unknown";
+        }
         let key = tool_name.to_lowercase();
         if let Some(level) = classify_memoria_tool(&key) {
             return level;

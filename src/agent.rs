@@ -6727,11 +6727,17 @@ impl AgentCore {
         let bootstrap_eligible = self.orchestration.cfg.bootstrap.enabled
             && is_easy_query
             && !Self::has_write_intent(raw_message)
-            && !self.orchestration.is_promoted(session_id);
+            && !self
+                .orchestration
+                .is_promoted_async(session_id.to_string())
+                .await;
         // RAII 预留：拿不到（同 session 并发 run 已持有 / 已 promoted）走常规路径；
         // 拿到后所有 early-return、future 取消、panic 均由 guard Drop 自动释放。
+        // acquire 内部走 spawn_blocking，SQLite 冷路径不阻塞 tokio worker。
         let mut bootstrap_reservation = if bootstrap_eligible {
-            self.orchestration.acquire_bootstrap(session_id)
+            self.orchestration
+                .acquire_bootstrap_async(session_id.to_string())
+                .await
         } else {
             None
         };
@@ -6863,6 +6869,13 @@ impl AgentCore {
         // ADR-017 P2：OnPreAct guardrail hooks。
         // data_query 强制工具提示已从内联补丁迁移为内置 hook（文本与条件逐字等价）；
         // 新领域只需注册 hook，不再改动循环体。
+        let query_tool_available = tools.iter().any(|t| {
+            let n = t.function.name.to_ascii_lowercase();
+            n.starts_with("query_")
+                || n.starts_with("get_")
+                || n == "nl_query"
+                || n == "execute_sql"
+        });
         {
             let hook_ctx = crate::orchestration::HookContext {
                 session_id,
@@ -6874,6 +6887,7 @@ impl AgentCore {
                 data_query: intent.data_query,
                 attachment: intent.attachment,
                 fast_path_data,
+                query_tool_available,
                 round: 0,
                 hard_max_rounds: self.config.max_tool_rounds,
                 candidate_reply: None,
@@ -6957,7 +6971,7 @@ impl AgentCore {
             let response = match if bootstrap_round {
                 self.routed_llm
                     .chat_budgeted(
-                        crate::llm::TaskDifficulty::Easy,
+                        crate::llm::BootstrapEasyRoute,
                         &ctx.messages,
                         &tools,
                         self.orchestration.cfg.bootstrap.max_tokens,
@@ -6983,7 +6997,7 @@ impl AgentCore {
                 // guard.promote：append-only promote + 释放 per-session 预留；
                 // 之后 move 回全量目录——非 bootstrap 路径与 promote 路径都零克隆。
                 if let Some(reservation) = bootstrap_reservation.take() {
-                    reservation.promote();
+                    reservation.promote_async().await;
                 } else {
                     tracing::error!(target = "orchestration", session = %session_id,
                         "bootstrap_reservation 缺失，promote 未执行");
@@ -7159,6 +7173,7 @@ impl AgentCore {
                         data_query: intent.data_query,
                         attachment: intent.attachment,
                         fast_path_data,
+                        query_tool_available: false,
                         round: _round,
                         hard_max_rounds: self.config.max_tool_rounds,
                         candidate_reply: Some(&reply),
@@ -8209,6 +8224,7 @@ impl AgentCore {
                 data_query: intent.data_query,
                 attachment: intent.attachment,
                 fast_path_data,
+                query_tool_available: false,
                 round,
                 hard_max_rounds: self.config.max_tool_rounds,
                 candidate_reply: None,
@@ -8697,6 +8713,7 @@ impl AgentCore {
                 data_query: intent.data_query,
                 attachment: intent.attachment,
                 fast_path_data,
+                query_tool_available: false,
                 round,
                 hard_max_rounds: self.config.max_tool_rounds,
                 candidate_reply: None,

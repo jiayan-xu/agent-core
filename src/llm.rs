@@ -96,6 +96,11 @@ pub enum TaskDifficulty {
     Hard,
 }
 
+/// bootstrap 预算化路由的 Easy-only 类型标记：让「只允许 Easy」在类型层成立，
+/// 调用方不可能传入 Hard（零字段，不可构造出其他状态）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BootstrapEasyRoute;
+
 /// 难度分类方式
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -251,22 +256,18 @@ impl RoutedLlm {
     /// N 路采样与「锚定」目标相悖；工具面为空时的差异属已知权衡（空面时下一轮
     /// promote 后自然恢复常规 chat 语义）。
     ///
-    /// 不重新做难度分类：调用方必须显式传入已判定的 `TaskDifficulty`（agent.rs
-    /// 的 bootstrap 门槛保证为 Easy），且 Judge 模式下 `classify_difficulty` 是
-    /// 一次真实 LLM 往返——再分类会把 ADR-017 承诺的「1024 预算 = 单次便宜调用」
-    /// 变成 3 次往返。`pub(crate)` + 显式参数让契约在 API 层成立，而非仅靠文档。
+    /// 不重新做难度分类：`BootstrapEasyRoute` 在类型层保证只能走 Easy 路由，
+    /// 且 Judge 模式下 `classify_difficulty` 是一次真实 LLM 往返——再分类会把
+    /// ADR-017 承诺的「1024 预算 = 单次便宜调用」变成 3 次往返。
     pub(crate) async fn chat_budgeted(
         &self,
-        difficulty: TaskDifficulty,
+        _route: BootstrapEasyRoute,
         messages: &[Message],
         tools: &[ToolDef],
         max_tokens: u32,
     ) -> Result<LlmResponse, String> {
-        if !matches!(difficulty, TaskDifficulty::Easy) {
-            return Err("bootstrap 预算化调用只允许 Easy 路由".to_string());
-        }
-        let selected = self.select(difficulty);
-        tracing::info!(?difficulty, "difficulty_route_budgeted");
+        let selected = self.select(TaskDifficulty::Easy);
+        tracing::info!(difficulty = ?TaskDifficulty::Easy, "difficulty_route_budgeted");
         selected.chat_with_max_tokens(messages, tools, max_tokens).await
     }
 
@@ -1378,7 +1379,8 @@ impl LlmClient {
     /// 返回一个仅覆盖 `max_tokens` 的克隆，不改动原 client 配置。
     /// bootstrap 的「首轮预算不残留整会话」契约由本方法固化并可单测。
     /// 唯一受保护入口是 `chat_with_max_tokens`（含 max_tokens>0 运行时校验）。
-    pub(crate) fn with_max_tokens_override(&self, max_tokens: u32) -> Self {
+    fn with_max_tokens_override(&self, max_tokens: u32) -> Self {
+        assert!(max_tokens > 0, "bootstrap max_tokens 必须大于 0");
         let mut client = self.clone();
         client.config.max_tokens = max_tokens;
         client
@@ -1597,9 +1599,9 @@ impl LlmClient {
 
                         // 预算化调用（bootstrap 首轮）截断留痕：显式 budgeted 判定，
                         // 不依赖可配置的 max_tokens 魔法阈值（ocr 修复）。
-                        // 双信号：finish_reason=length 之外，`completion_tokens`
-                        // 触到被覆盖的 max_tokens 也判为截断——provider 省略或改用
-                        // 其他 finish_reason 标记时仍能留痕。
+                        // 双信号：finish_reason=length/max_tokens 明确标记；或
+                        // finish_reason 缺失且 completion_tokens 触及覆盖预算。
+                        // 标准 stop/非标准成功标记不做 token 边界告警（防推理模型误报）。
                         let finish_reason = choice
                             .get("finish_reason")
                             .and_then(|f| f.as_str())

@@ -418,7 +418,15 @@ impl OrchestrationController {
                 negative.remove(session_id);
             }
         } else if let Ok(mut negative) = self.not_promoted_cache.lock() {
-            negative.insert(session_id.to_string(), Instant::now());
+            // 有界 + 惰性清理：插入前清掉过期项；超过容量时再按过期清理一次，
+            // 仍超限则跳过本次负缓存（正确性只影响下次是否回查 store）。
+            negative.retain(|_, at| at.elapsed() < NOT_PROMOTED_NEGATIVE_TTL);
+            if negative.len() < SESSION_SET_CACHE_MAX {
+                negative.insert(session_id.to_string(), Instant::now());
+            } else {
+                tracing::warn!(target = "orchestration", session = %session_id,
+                    "未 promoted 负缓存容量已满，本次不回填负缓存");
+            }
         }
         promoted
     }
@@ -510,6 +518,34 @@ impl OrchestrationController {
         }
     }
 
+    /// 异步包装：把同步 SQLite 冷路径移出 tokio worker（spawn_blocking）。
+    pub async fn is_promoted_async(self: &Arc<Self>, session_id: String) -> bool {
+        let this = Arc::clone(self);
+        tokio::task::spawn_blocking(move || this.is_promoted(&session_id))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// 原子取得 per-session bootstrap 预留，返回 RAII guard。
+    /// guard 在作用域结束（包括 async future 被取消/丢弃、panic unwind）时自动
+    /// 释放预留；调用方在首请求成功后调用 `BootstrapReservation::promote_async`
+    /// 落盘并释放。拿不到预留返回 None（同 session 已有 run 在 bootstrap）。
+    pub async fn acquire_bootstrap_async(
+        self: &Arc<Self>,
+        session_id: String,
+    ) -> Option<BootstrapReservation> {
+        let this = Arc::clone(self);
+        let sid = session_id.clone();
+        let won = tokio::task::spawn_blocking(move || this.try_begin_bootstrap(&sid))
+            .await
+            .unwrap_or(false);
+        won.then(|| BootstrapReservation {
+            controller: Arc::clone(self),
+            session_id,
+            active: true,
+        })
+    }
+
     /// 原子取得 per-session bootstrap 预留，返回 RAII guard。
     /// guard 在作用域结束（包括 async future 被取消/丢弃、panic unwind）时自动
     /// 释放预留；调用方在首请求成功后调用 `BootstrapReservation::promote`
@@ -587,6 +623,19 @@ impl BootstrapReservation {
     pub fn promote(mut self) {
         if self.active {
             self.controller.finish_bootstrap(&self.session_id);
+            self.active = false;
+        }
+    }
+
+    /// 异步首请求成功：promote 的 SQLite 写移出 tokio worker。
+    pub async fn promote_async(mut self) {
+        if self.active {
+            let controller = Arc::clone(&self.controller);
+            let session_id = self.session_id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                controller.finish_bootstrap(&session_id);
+            })
+            .await;
             self.active = false;
         }
     }
@@ -786,6 +835,7 @@ pub fn classify_tool_failure(error: &str) -> FailureClass {
         || e.contains("session timeout")
         || e.contains("token timeout")
         || e.contains("会话超时")
+        || e.contains("登录超时")
         || e.contains("令牌超时")
         || e.contains("token 超时")
         || e.contains("令牌已过期")
@@ -858,6 +908,8 @@ pub struct HookContext<'a> {
     pub attachment: bool,
     /// 快速通道已注入数据（对齐旧补丁的 fast_path_data 判断）
     pub fast_path_data: bool,
+    /// 当前轮是否至少有一个数据查询类工具可用（bootstrap 最小面可能为空/无查询工具）
+    pub query_tool_available: bool,
     /// 当前轮次（0-based，对齐旧补丁的 _round）
     pub round: u32,
     /// 轮数上限语义与旧补丁一致：`self.config.max_tool_rounds`（非 Easy 局部 3 轮上限）
@@ -955,7 +1007,11 @@ impl OrchestrationHook for DataQueryForceToolHook {
         100
     }
     fn run(&self, ctx: &HookContext) -> HookAction {
-        if !ctx.data_query || ctx.attachment || ctx.fast_path_data {
+        if !ctx.data_query
+            || ctx.attachment
+            || ctx.fast_path_data
+            || !ctx.query_tool_available
+        {
             return HookAction::Continue;
         }
         HookAction::Inject {
@@ -1281,6 +1337,7 @@ mod tests {
         assert_eq!(classify_tool_failure("session timeout"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("token timeout"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("会话超时"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("登录超时"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("令牌已过期"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("登录已过期"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("执行超时"), FailureClass::Retryable);
@@ -1321,6 +1378,7 @@ mod tests {
             data_query,
             attachment,
             fast_path_data: fast_path,
+            query_tool_available: true,
             round,
             hard_max_rounds: hard_max,
             candidate_reply: reply,
