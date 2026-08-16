@@ -250,20 +250,19 @@ impl RoutedLlm {
     /// N 路采样与「锚定」目标相悖；工具面为空时的差异属已知权衡（空面时下一轮
     /// promote 后自然恢复常规 chat 语义）。
     ///
-    /// 不重新做难度分类：调用方（agent.rs::llm_loop）进入本路径前已经用
-    /// `RoutedLlm::classify` 判定 Easy（bootstrap 的硬门槛），且 Judge 模式下
-    /// `classify_difficulty` 是一次真实 LLM 往返——再分类会把 ADR-017 承诺的
-    /// 「1024 预算 = 单次便宜调用」变成 3 次往返。这里直接锚定 Easy provider。
-    /// `pub(crate)`：该契约只对 agent 层开放，防止未来外部调用方在未验证
-    /// Easy 前置条件时被静默路由到最便宜的 provider。
+    /// 不重新做难度分类：调用方必须显式传入已判定的 `TaskDifficulty`（agent.rs
+    /// 的 bootstrap 门槛保证为 Easy），且 Judge 模式下 `classify_difficulty` 是
+    /// 一次真实 LLM 往返——再分类会把 ADR-017 承诺的「1024 预算 = 单次便宜调用」
+    /// 变成 3 次往返。`pub(crate)` + 显式参数让契约在 API 层成立，而非仅靠文档。
     pub(crate) async fn chat_budgeted(
         &self,
+        difficulty: TaskDifficulty,
         messages: &[Message],
         tools: &[ToolDef],
         max_tokens: u32,
     ) -> Result<LlmResponse, String> {
-        let selected = self.select(TaskDifficulty::Easy);
-        tracing::info!(difficulty = ?TaskDifficulty::Easy, "difficulty_route_budgeted");
+        let selected = self.select(difficulty);
+        tracing::info!(?difficulty, "difficulty_route_budgeted");
         selected.chat_with_max_tokens(messages, tools, max_tokens).await
     }
 
@@ -1372,6 +1371,14 @@ impl LlmClient {
         LlmClient { client, config }
     }
 
+    /// 返回一个仅覆盖 `max_tokens` 的克隆，不改动原 client 配置。
+    /// bootstrap 的「首轮预算不残留整会话」契约由本方法固化并可单测。
+    pub(crate) fn with_max_tokens_override(&self, max_tokens: u32) -> Self {
+        let mut client = self.clone();
+        client.config.max_tokens = max_tokens;
+        client
+    }
+
     /// ADR-017：运行时覆盖 max_tokens 的单次调用（flash bootstrap 首请求用）。
     /// clone 后覆盖字段，不改动 &self 配置——promote 后下一次调用自动恢复原值，
     /// 杜绝「首轮预算残留整会话」。显式以 budgeted=true 走 chat_impl，
@@ -1383,9 +1390,9 @@ impl LlmClient {
         tools: &[ToolDef],
         max_tokens: u32,
     ) -> Result<LlmResponse, String> {
-        let mut client = self.clone();
-        client.config.max_tokens = max_tokens;
-        client.chat_impl(messages, tools, true).await
+        self.with_max_tokens_override(max_tokens)
+            .chat_impl(messages, tools, true)
+            .await
     }
 
     /// 发送聊天请求，返回响应（带重试 + failover）
@@ -1812,9 +1819,12 @@ impl LlmClient {
 
 /// 预算化截断告警判定（纯函数，单测覆盖）。
 /// 只在 budgeted 调用（bootstrap 首轮）且无工具调用时告警。双信号：
-/// 1) finish_reason == "length"；
-/// 2) 上游 completion_tokens 已达到本次覆盖后的 max_tokens（provider 省略
-///    finish_reason 或使用其他截断标记时仍能识别）。
+/// 1) `finish_reason == "length"`；
+/// 2) `finish_reason` 缺失或非标准（既不是 length/tool_calls，也不是显式 stop）
+///    且 `completion_tokens` 触及本次覆盖后的 `max_tokens`。
+///
+/// 假设：标准 `stop` 视为正常完成，不因 completion_tokens 恰好等于上限而告警——
+/// 推理模型的 thinking/cache token 可能计入 completion_tokens，会造成误报。
 pub(crate) fn budgeted_truncation_warn(
     finish_reason: &str,
     completion_tokens: u64,
@@ -1825,8 +1835,14 @@ pub(crate) fn budgeted_truncation_warn(
     if !budgeted || has_tool_calls {
         return false;
     }
-    finish_reason == "length"
-        || (max_tokens > 0 && completion_tokens >= u64::from(max_tokens))
+    if finish_reason == "length" {
+        return true;
+    }
+    let non_standard_reason = finish_reason.is_empty()
+        || !matches!(finish_reason, "stop" | "tool_calls" | "content_filter");
+    non_standard_reason
+        && max_tokens > 0
+        && completion_tokens >= u64::from(max_tokens)
 }
 
 #[cfg(test)]
@@ -1857,12 +1873,25 @@ mod routing_tests {
     }
 
     #[test]
+    fn budgeted_max_tokens_override_does_not_mutate_original() {
+        let mut cfg = LlmConfig::default();
+        cfg.max_tokens = 4096;
+        let client = LlmClient::new(cfg);
+        let budgeted = client.with_max_tokens_override(1024);
+        // 核心契约：原 client 配置不残留 bootstrap 预算，下一次调用自动恢复
+        assert_eq!(client.config.max_tokens, 4096);
+        assert_eq!(budgeted.config.max_tokens, 1024);
+    }
+
+    #[test]
     fn budgeted_truncation_warn_heuristic() {
         // budgeted + length + 无工具 → 告警
         assert!(budgeted_truncation_warn("length", 10, 1024, false, true));
-        // completion_tokens 触及 max_tokens 时，即使 finish_reason 缺失/非 length 也告警
+        // finish_reason 缺失/非标准且 completion_tokens 触及上限 → 告警
         assert!(budgeted_truncation_warn("", 1024, 1024, false, true));
-        assert!(budgeted_truncation_warn("stop", 1024, 1024, false, true));
+        assert!(budgeted_truncation_warn("max_tokens", 1024, 1024, false, true));
+        // 标准 stop 视为正常完成：completion_tokens 恰好等于上限也不误报
+        assert!(!budgeted_truncation_warn("stop", 1024, 1024, false, true));
         // 未触及 max_tokens 且非 length → 不告警
         assert!(!budgeted_truncation_warn("stop", 1023, 1024, false, true));
         assert!(!budgeted_truncation_warn("", 1024, 0, false, true));

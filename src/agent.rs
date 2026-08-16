@@ -399,7 +399,7 @@ pub struct AgentCore {
     /// HY3 TTC：推理时计算控制器（仅 features.ttc=true 时 Some；否则 None=原路径）
     pub ttc: Option<crate::ttc::TtcController>,
     /// ADR-017：LLM 编排控制器（flash 锚定引导 + session 相位存储；默认全 OFF）
-    pub orchestration: crate::orchestration::OrchestrationController,
+    pub orchestration: std::sync::Arc<crate::orchestration::OrchestrationController>,
     /// HY3 1.3 收口：记忆自进化生产证据审计器（每次 consolidate 演化落盘 JSONL，可复验 G1-G4）
     pub evolution_auditor: crate::evolution_audit::EvolutionAuditor,
     /// 战略罗盘「可观测」：运行指标注册表（零行为变化、默认开启，供 /api/metrics 暴露）
@@ -1119,8 +1119,10 @@ impl AgentCore {
             None
         };
         // ADR-017：编排控制器。开关全 OFF 时不建表、不开库（零文件副作用）。
-        let orchestration =
-            crate::orchestration::OrchestrationController::new(config.orchestration.clone());
+        // Arc 包装：bootstrap 预留用 RAII guard 在 future 取消/panic 时也能自动释放。
+        let orchestration = std::sync::Arc::new(
+            crate::orchestration::OrchestrationController::new(config.orchestration.clone()),
+        );
         let core = AgentCore {
             config,
             mcp,
@@ -6726,8 +6728,14 @@ impl AgentCore {
             && is_easy_query
             && !Self::has_write_intent(raw_message)
             && !self.orchestration.is_promoted(session_id);
-        let bootstrap_active =
-            bootstrap_eligible && self.orchestration.try_begin_bootstrap(session_id);
+        // RAII 预留：拿不到（同 session 并发 run 已持有 / 已 promoted）走常规路径；
+        // 拿到后所有 early-return、future 取消、panic 均由 guard Drop 自动释放。
+        let mut bootstrap_reservation = if bootstrap_eligible {
+            self.orchestration.acquire_bootstrap(session_id)
+        } else {
+            None
+        };
+        let bootstrap_active = bootstrap_reservation.is_some();
         if bootstrap_eligible && !bootstrap_active {
             tracing::info!(target = "orchestration", session = %session_id,
                 "bootstrap 预留未获得（同 session 已有 run 在 bootstrap 或已 promoted），本 run 走常规路径");
@@ -6887,9 +6895,7 @@ impl AgentCore {
                 }
                 crate::orchestration::HookAction::Abort { reply } => {
                     self.metrics.inc_hook_abort();
-                    if bootstrap_active {
-                        self.orchestration.cancel_bootstrap(session_id);
-                    }
+                    // bootstrap 预留由 BootstrapReservation Drop 自动释放
                     self.save_to_history(session_id, raw_message, &reply).await;
                     return reply;
                 }
@@ -6925,9 +6931,7 @@ impl AgentCore {
             let budget_check = budget.check_token(req_est);
             if let Err(e) = budget_check {
                 tracing::warn!("[QUOTA] 命名空间『{}』token 预算不足: {}", quota_ns_llm, e);
-                if bootstrap_round {
-                    self.orchestration.cancel_bootstrap(session_id);
-                }
+                // bootstrap 预留由 BootstrapReservation Drop 自动释放
                 self.audit_logger
                     .log_decision(
                         &self.config.identity.agent_id,
@@ -6946,6 +6950,7 @@ impl AgentCore {
             let response = match if bootstrap_round {
                 self.routed_llm
                     .chat_budgeted(
+                        crate::llm::TaskDifficulty::Easy,
                         &ctx.messages,
                         &tools,
                         self.orchestration.cfg.bootstrap.max_tokens,
@@ -6958,9 +6963,7 @@ impl AgentCore {
                 // P1-5：LLM 主/备 Provider 均失败 → 返回「可重试错误」，而非裸崩
                 Err(e) => {
                     self.metrics.inc_errors();
-                    if bootstrap_round {
-                        self.orchestration.cancel_bootstrap(session_id);
-                    }
+                    // bootstrap 预留由 BootstrapReservation Drop 自动释放
                     tracing::warn!("[DEGRADE] LLM 调用失败（已尝试主用+备用 Provider）: {}", e);
                     return "⚠️ LLM 服务暂时不可用（已尝试主用与备用 Provider 均失败）。请稍后重试，或检查网络与 API 密钥配置。".to_string();
                 }
@@ -6970,9 +6973,14 @@ impl AgentCore {
             // 原始 system prompt（ocr 修复：此前仅恢复预算，后续轮次仍被困在 3 工具面）。
             if bootstrap_round {
                 bootstrap_round = false;
-                // 先 promote 再释放 per-session 预留（顺序在控制器内保证），
-                // 然后 move 回全量目录——非 bootstrap 路径与 promote 路径都零克隆。
-                self.orchestration.finish_bootstrap(session_id);
+                // guard.promote：append-only promote + 释放 per-session 预留；
+                // 之后 move 回全量目录——非 bootstrap 路径与 promote 路径都零克隆。
+                if let Some(reservation) = bootstrap_reservation.take() {
+                    reservation.promote();
+                } else {
+                    tracing::error!(target = "orchestration", session = %session_id,
+                        "bootstrap_reservation 缺失，promote 未执行");
+                }
                 self.metrics.inc_bootstrap_promote();
                 if let Some(full) = bootstrap_full_tools.take() {
                     tools = full;

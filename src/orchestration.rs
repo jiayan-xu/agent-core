@@ -473,6 +473,21 @@ impl OrchestrationController {
         }
     }
 
+    /// 原子取得 per-session bootstrap 预留，返回 RAII guard。
+    /// guard 在作用域结束（包括 async future 被取消/丢弃、panic unwind）时自动
+    /// 释放预留；调用方在首请求成功后调用 `BootstrapReservation::promote`
+    /// 落盘并释放。拿不到预留返回 None（同 session 已有 run 在 bootstrap）。
+    pub fn acquire_bootstrap(self: &Arc<Self>, session_id: &str) -> Option<BootstrapReservation> {
+        if !self.try_begin_bootstrap(session_id) {
+            return None;
+        }
+        Some(BootstrapReservation {
+            controller: Arc::clone(self),
+            session_id: session_id.to_string(),
+            active: true,
+        })
+    }
+
     /// 构造 bootstrap 工具面：只保留「权威边界判定为只读」的工具（`is_safe` 谓词
     /// 由调用方用 `boundary` 的 ToolClassifier/启发式实现），再按意图相关性取前
     /// `max_tools` 个。`max_tools=0` 表示「不给任何工具」（操作者显式意图，不静默改成 1）。
@@ -518,6 +533,33 @@ impl OrchestrationController {
             .take(max)
             .map(|(_, _, tool)| tool.clone())
             .collect()
+    }
+}
+
+/// bootstrap per-session 预留的 RAII guard。
+/// 正常成功路径调用 `promote`；其余所有路径（early-return、async future 被取消、
+/// panic unwind）由 `Drop` 自动释放预留，杜绝 in-flight 泄漏。
+pub struct BootstrapReservation {
+    controller: Arc<OrchestrationController>,
+    session_id: String,
+    active: bool,
+}
+
+impl BootstrapReservation {
+    /// 首请求成功：append-only promote + 释放 per-session 预留。
+    pub fn promote(mut self) {
+        if self.active {
+            self.controller.finish_bootstrap(&self.session_id);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for BootstrapReservation {
+    fn drop(&mut self) {
+        if self.active {
+            self.controller.cancel_bootstrap(&self.session_id);
+        }
     }
 }
 
@@ -790,6 +832,11 @@ impl HookRegistry {
 
     /// 按 priority 升序执行同挂载点的 hooks，合并裁决：
     /// Abort 优先；否则首个 Retry；否则合并 Inject；否则 Continue。
+    ///
+    /// ⚠️ 多个 Abort 的语义：升序遍历时**第一个** Abort 立即短路返回（先执行、
+    /// 先 Abort 先赢）。若需要「更高 priority 的 Abort 覆盖更低 priority」，
+    /// 注册方应把安全裁决 hook 放到更小 priority（先执行），或在注册前自行协调；
+    /// 本注册表不做二次比较。
     pub fn run(&self, point: HookPoint, ctx: &HookContext) -> HookAction {
         let snapshot: Vec<std::sync::Arc<dyn OrchestrationHook>> = {
             let Ok(guard) = self.hooks.lock() else {
@@ -1097,6 +1144,26 @@ mod tests {
         assert!(ctrl.try_begin_bootstrap("s1"));
         // 成功后 promote 并释放预留；已 promoted 的 session 不再能预留
         ctrl.finish_bootstrap("s1");
+        assert!(ctrl.is_promoted("s1"));
+        assert!(!ctrl.try_begin_bootstrap("s1"));
+    }
+
+    #[test]
+    fn bootstrap_reservation_guard_autoreleases_on_drop() {
+        let cfg = bootstrap_on_cfg();
+        let ctrl = Arc::new(OrchestrationController::new_with_store(
+            cfg,
+            SessionPhaseStore::new_in_memory(),
+        ));
+        let guard = ctrl.acquire_bootstrap("s1").expect("预留应成功");
+        assert!(!ctrl.try_begin_bootstrap("s1"));
+        // 模拟 async future 取消 / panic unwind：drop guard 自动释放预留
+        drop(guard);
+        assert!(ctrl.try_begin_bootstrap("s1"));
+        // 上面 try_begin 是手动探测，它留下的预留要清掉，再走 RAII acquire
+        ctrl.cancel_bootstrap("s1");
+        let guard = ctrl.acquire_bootstrap("s1").expect("释放后应可重新预留");
+        guard.promote();
         assert!(ctrl.is_promoted("s1"));
         assert!(!ctrl.try_begin_bootstrap("s1"));
     }

@@ -1520,8 +1520,10 @@ fn classify_memoria_tool(name: &str) -> Option<&'static str> {
 ///
 /// 与 `ToolClassifier::register_from_tools` 的只读判定保持一致的前缀逻辑：
 /// 仅 `query_` / `search_` / `get_` / `check_` / `read_` / `list_` / `fuzzy_match_` /
-/// `match_` / `review_` / `diagnose_` / `explain_` / `validate_` / `cross_` 前缀，
+/// `match_` / `review_` / `diagnose_` / `explain_` / `validate_` 前缀，
 /// 以及仅 SELECT 的 SQL 工具判为只读；另含具名 Memoria 只读工具。
+/// **`cross_*` 不按前缀自动归只读**：该前缀历史上过宽（cross_agent_query 实际可写），
+/// 仅显式列入只读白名单的 `cross_validate` 放行，其余 cross 工具 fail-closed。
 ///
 /// 命中写/危险前缀（`delete_` / `batch_delete` / `shutdown_` / `update_` / `insert_` /
 /// `create_`）或无法判定为只读的工具一律返回 `false`，走确认闸 / 黄线确认，
@@ -1547,6 +1549,9 @@ pub fn is_read_only_tool(name: &str) -> bool {
     {
         return false;
     }
+    if lower == "cross_validate" {
+        return true;
+    }
     lower.starts_with("query_")
         || lower.starts_with("search_")
         || lower.starts_with("get_")
@@ -1559,7 +1564,6 @@ pub fn is_read_only_tool(name: &str) -> bool {
         || lower.starts_with("diagnose_")
         || lower.starts_with("explain_")
         || lower.starts_with("validate_")
-        || lower.starts_with("cross_")
         || (lower.contains("sql")
             && !lower.starts_with("update")
             && !lower.starts_with("insert")
@@ -1609,6 +1613,9 @@ mod read_only_tests {
         assert!(!is_read_only_tool("cross_agent_query"));
         assert!(!is_read_only_tool("memory_remember"));
         assert!(!is_read_only_tool("memory_merge"));
+        // cross_* 不再按前缀自动归只读；仅显式只读白名单 cross_validate 放行
+        assert!(is_read_only_tool("cross_validate"));
+        assert!(!is_read_only_tool("cross_unknown_thing"));
     }
 
     #[test]
