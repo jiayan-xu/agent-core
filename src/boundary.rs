@@ -1086,6 +1086,10 @@ pub enum ToolClass {
     Unknown,
 }
 
+/// 显式允许为只读的 `cross_*` 工具。
+/// 这是 classifier 与 `is_read_only_tool` 共用的唯一白名单，避免两个安全门漂移。
+pub(crate) const EXPLICIT_READ_CROSS_TOOLS: &[&str] = &["cross_validate"];
+
 /// 工具分类器（P1-7 修复：配置驱动 + 自动学习）
 ///
 /// 保留内置默认分类，同时支持运行时动态注册和从 MCP tools/list 自动学习。
@@ -1147,7 +1151,6 @@ impl ToolClassifier {
             "get_schema",
             "render_query_chart",
             // 只读诊断/分析/报告类（P0 权限评审同批补全，均不写生产）
-            "cross_validate",
             "data_analysis",
             "explain_anomaly",
             "diagnose_data_gap",
@@ -1184,6 +1187,10 @@ impl ToolClassifier {
             "find_files",
             "file_info",
         ] {
+            c.read_tools.insert(t.to_string());
+        }
+        // cross_* 的只读白名单唯一来源（与 is_read_only_tool 共用 const）
+        for t in EXPLICIT_READ_CROSS_TOOLS {
             c.read_tools.insert(t.to_string());
         }
         for t in [
@@ -1551,7 +1558,7 @@ pub fn is_read_only_tool(name: &str) -> bool {
     {
         return false;
     }
-    if lower == "cross_validate" {
+    if EXPLICIT_READ_CROSS_TOOLS.iter().any(|t| lower == *t) {
         return true;
     }
     lower.starts_with("query_")

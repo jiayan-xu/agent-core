@@ -1824,12 +1824,12 @@ impl LlmClient {
 
 /// 预算化截断告警判定（纯函数，单测覆盖）。
 /// 只在 budgeted 调用（bootstrap 首轮）且无工具调用时告警。双信号：
-/// 1) `finish_reason == "length"`；
-/// 2) `finish_reason` 缺失或非标准（既不是 length/tool_calls，也不是显式 stop）
-///    且 `completion_tokens` 触及本次覆盖后的 `max_tokens`。
+/// 1) `finish_reason == "length"`（以及明确的 `max_tokens` 截断标记）；
+/// 2) `finish_reason` 缺失且 `completion_tokens` 触及本次覆盖后的 `max_tokens`。
 ///
-/// 假设：标准 `stop` 视为正常完成，不因 completion_tokens 恰好等于上限而告警——
-/// 推理模型的 thinking/cache token 可能计入 completion_tokens，会造成误报。
+/// 假设：标准 `stop` 与非标准成功标记（`end_turn` / `function_call` 等）视为正常
+/// 完成，不因 completion_tokens 恰好等于上限而告警——推理模型的 thinking/cache
+/// token 可能计入 completion_tokens，长回答也可能恰好填满 1024，会造成误报。
 pub(crate) fn budgeted_truncation_warn(
     finish_reason: &str,
     completion_tokens: u64,
@@ -1843,9 +1843,8 @@ pub(crate) fn budgeted_truncation_warn(
     if finish_reason == "length" {
         return true;
     }
-    let non_standard_reason = finish_reason.is_empty()
-        || !matches!(finish_reason, "stop" | "tool_calls" | "content_filter");
-    non_standard_reason
+    let truncation_marker = matches!(finish_reason, "length" | "max_tokens");
+    (finish_reason.is_empty() || truncation_marker)
         && max_tokens > 0
         && completion_tokens >= u64::from(max_tokens)
 }
@@ -1892,11 +1891,15 @@ mod routing_tests {
     fn budgeted_truncation_warn_heuristic() {
         // budgeted + length + 无工具 → 告警
         assert!(budgeted_truncation_warn("length", 10, 1024, false, true));
-        // finish_reason 缺失/非标准且 completion_tokens 触及上限 → 告警
+        // finish_reason 缺失或明确截断标记且 completion_tokens 触及上限 → 告警
         assert!(budgeted_truncation_warn("", 1024, 1024, false, true));
         assert!(budgeted_truncation_warn("max_tokens", 1024, 1024, false, true));
-        // 标准 stop 视为正常完成：completion_tokens 恰好等于上限也不误报
+        // 标准 stop 与非标准成功标记均视为正常完成，不误报
         assert!(!budgeted_truncation_warn("stop", 1024, 1024, false, true));
+        assert!(!budgeted_truncation_warn("tool_calls", 1024, 1024, false, true));
+        assert!(!budgeted_truncation_warn("content_filter", 1024, 1024, false, true));
+        assert!(!budgeted_truncation_warn("end_turn", 1024, 1024, false, true));
+        assert!(!budgeted_truncation_warn("function_call", 1024, 1024, false, true));
         // 未触及 max_tokens 且非 length → 不告警
         assert!(!budgeted_truncation_warn("stop", 1023, 1024, false, true));
         assert!(!budgeted_truncation_warn("", 1024, 0, false, true));

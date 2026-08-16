@@ -242,13 +242,14 @@ impl SessionPhaseStore {
             return false;
         };
         // 每次请求最多走到这里一次（promoted_cache 命中后短路）；busy_timeout 上限 2s。
-        // SQLite 查询错误必须与「未 promoted」区分留痕，不能静默吞掉。
-        match guard.query_row(
+        // QueryReturnedNoRows 是「未 promoted」的正常负结果，不告警；仅真实 DB 错误告警。
+        match rusqlite::OptionalExtension::optional(guard.query_row(
             "SELECT phase FROM orchestration_phase WHERE session_id=?1",
             rusqlite::params![session_id],
             |row| row.get::<_, String>(0),
-        ) {
-            Ok(phase) => phase == "promoted",
+        )) {
+            Ok(Some(phase)) => phase == "promoted",
+            Ok(None) => false,
             Err(e) => {
                 tracing::warn!(target = "orchestration", session = %session_id, err = %e,
                     "phase 查询失败，按未 promoted 处理（该会话可能重新 bootstrap）");
@@ -692,16 +693,21 @@ fn bootstrap_tool_score(name: &str, raw_message: &str) -> i32 {
     score
 }
 
-/// YES/NO 评审解析（ADR-017 Reflect 用）：只认首 token 的严格 YES/NO；
-/// 任何歧义（如 "NOT SURE" / 自由文本）返回 None，由调用方按 fail-open 处理。
+/// YES/NO 评审解析（ADR-017 Reflect 用）：严格只认**以 YES/NO 开头**的答复；
+/// `已达成NO`、`请继续执行YES`、自由文本等一律 None，由调用方按 fail-open 处理。
 pub fn parse_yes_no(text: &str) -> Option<bool> {
+    fn prefix_ok(t: &str, prefix: &str) -> bool {
+        t.starts_with(prefix)
+            && t[prefix.len()..]
+                .chars()
+                .next()
+                .map(|c| !c.is_ascii_alphanumeric())
+                .unwrap_or(true)
+    }
     let t = text.trim().to_ascii_uppercase();
-    let first = t
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .find(|s| !s.is_empty())?;
-    if first == "YES" {
+    if prefix_ok(&t, "YES") {
         Some(true)
-    } else if first == "NO" {
+    } else if prefix_ok(&t, "NO") {
         Some(false)
     } else {
         None
@@ -738,12 +744,17 @@ pub fn classify_tool_failure(error: &str) -> FailureClass {
         || e.contains("拒绝访问")
         || e.contains("权限拒绝")
         || e.contains("拒绝执行")
-        || e.contains("denied")
+        || e.contains("access denied")
+        || e.contains("permission denied")
         || e.contains("unauthorized")
         || e.contains("forbidden")
         || e.contains("invalid token")
         || e.contains("invalid credentials")
         || e.contains("invalid session")
+        || e.contains("session expired")
+        || e.contains("token expired")
+        || e.contains("session timeout")
+        || e.contains("token timeout")
         || e.contains("无权限")
         || e.contains("无权")
         || e.contains("权限不足")
@@ -1223,6 +1234,10 @@ mod tests {
         assert_eq!(classify_tool_failure("禁止操作"), FailureClass::Fatal);
         // 网络层「连接被拒绝」是瞬时故障，不得被宽泛「拒绝」误判为 Fatal
         assert_eq!(classify_tool_failure("连接被拒绝"), FailureClass::Recoverable);
+        assert_eq!(classify_tool_failure("connection denied"), FailureClass::Recoverable);
+        // 会话/token 过期是认证终态，即使文本含 timeout 也必须 Fatal
+        assert_eq!(classify_tool_failure("session timeout"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("token timeout"), FailureClass::Fatal);
         // 认证/会话类 invalid 属于 Fatal，不因宽泛 invalid 误判为可重试
         assert_eq!(classify_tool_failure("invalid token"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("invalid session"), FailureClass::Fatal);
@@ -1237,6 +1252,9 @@ mod tests {
         // 歧义 → None（调用方 fail-open）
         assert_eq!(parse_yes_no("NOT SURE"), None);
         assert_eq!(parse_yes_no("The answer needs work"), None);
+        // 首 token 不是 YES/NO 的一律 None（含 CJK 前缀）
+        assert_eq!(parse_yes_no("已达成NO"), None);
+        assert_eq!(parse_yes_no("请继续执行YES"), None);
     }
 
     fn hook_ctx<'a>(
