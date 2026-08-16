@@ -47,6 +47,7 @@ fn test_agent() -> AgentCore {
         ttc: agent_core::ttc::TtcConfig::default(),
         intake_filter: agent_core::intake_filter::IntakeFilterConfig::default(),
         orchestration: agent_core::orchestration::OrchestrationConfig::default(),
+        tool_overrides: vec![],
     };
     let harness = HarnessStore::open_memory().unwrap();
     let cp = CheckpointStore::open_memory().unwrap();
@@ -169,6 +170,7 @@ async fn eval_e07_mcp_down_degrade() {
         ttc: agent_core::ttc::TtcConfig::default(),
         intake_filter: agent_core::intake_filter::IntakeFilterConfig::default(),
         orchestration: agent_core::orchestration::OrchestrationConfig::default(),
+        tool_overrides: vec![],
     };
     let harness = HarnessStore::open_memory().unwrap();
     let cp = CheckpointStore::open_memory().unwrap();

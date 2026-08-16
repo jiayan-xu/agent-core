@@ -1625,6 +1625,25 @@ impl LlmClient {
                                 "budgeted 输出疑似被截断（finish_reason=length 或 completion_tokens 触及 max_tokens）且 tool_calls 为空");
                         } else if budgeted
                             && response.tool_calls.is_empty()
+                            && !finish_reason.is_empty()
+                            // 与 budgeted_truncation_warn 的成功标记口径一致：
+                            // stop / end_turn / function_call / tool_calls 都是正常完成，
+                            // 恰好填满 max_tokens 也不留误导性日志（ocr maintainability·low 修复）。
+                            && !matches!(
+                                finish_reason,
+                                "stop" | "end_turn" | "function_call" | "tool_calls"
+                            )
+                            && self.config.max_tokens > 0
+                            && completion_tokens >= u64::from(self.config.max_tokens)
+                        {
+                            // content_filter 等非成功 finish_reason + tokens 触及上限：
+                            // 保持「不告警、防推理模型误报」的既有策略，但补一条 debug
+                            // 留痕，避免该盲区完全不可观测（ocr other·low 修复）。
+                            tracing::debug!(target = "agent.llm", model = %model,
+                                finish_reason, completion_tokens, max_tokens = self.config.max_tokens,
+                                "budgeted 输出以非成功 finish_reason 结束且 tokens 触及上限，仅留痕不告警");
+                        } else if budgeted
+                            && response.tool_calls.is_empty()
                             && finish_reason.is_empty()
                             && usage.is_none()
                         {

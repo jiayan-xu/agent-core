@@ -93,3 +93,12 @@ args = ["examples/skills/echo/server.py"]
 #   [orchestration.read_parallel]
 #   enabled = false
 #   max_concurrent = 4
+
+# ──── 工具分类手动收紧（operator override）────
+# 与运行时 register_tool 同语义：learn_tools 刷新不覆盖；
+# 进程启动时自动重放，使 pin 跨重启生效（否则重启后按前缀启发式重新分类）。
+# 级别仅接受 read / write / dangerous / unknown，非法值启动时告警并跳过。
+# [boundary]
+#   [[boundary.tool_overrides]]
+#   tool = "query_secret"
+#   level = "dangerous"

@@ -210,6 +210,10 @@ pub struct AgentConfig {
     pub intake_filter: crate::intake_filter::IntakeFilterConfig,
     /// ADR-017：LLM 编排层 v2 配置（全默认 OFF；flag-off 零行为变化）
     pub orchestration: crate::orchestration::OrchestrationConfig,
+    /// 工具分类手动收紧（operator override，来自 [boundary.tool_overrides]）。
+    /// 与 register_tool 同语义：learn_tools 刷新不覆盖；启动时由 AgentCore::new 重放，
+    /// 使 pin 跨重启生效（(tool, level) 对，level 仅 read/write/dangerous/unknown）。
+    pub tool_overrides: Vec<(String, String)>,
 }
 
 /// HY3 1.3 热路径接线开关。全部默认 false。
@@ -975,6 +979,18 @@ impl AgentCore {
         }
         let llm = LlmClient::new(config.llm.clone());
         let boundary = ComplianceBoundary::new(config.skill_whitelist.clone());
+        // ADR-017：启动即重放 [boundary.tool_overrides] 的手动收紧，使 operator pin
+        // 跨重启生效——否则进程重启后 learn_tools 刷新会按前缀启发式静默撤销
+        //（如 query_* → dangerous 回退 read，ocr security·medium 修复）。
+        if !config.tool_overrides.is_empty() {
+            let applied = boundary.replay_tool_overrides(&config.tool_overrides);
+            tracing::info!(
+                target = "boundary",
+                total = config.tool_overrides.len(),
+                applied,
+                "启动重放工具分类手动收紧"
+            );
+        }
         // 注册 agent 自身到权限链（锁中毒时跳过）
         match boundary.perm_chain.lock() {
             Ok(mut chain) => {

@@ -778,12 +778,39 @@ impl ComplianceBoundary {
             == ToolClass::Read
     }
 
-    /// 注册工具分类（运行时动态添加）
-    pub fn register_tool(&self, tool_name: &str, level: &str) {
+    /// 注册工具分类（运行时动态添加）。返回是否注册成功
+    ///（false = 权限级别非法被拒绝，调用方应告警/回滚，避免静默放宽——ocr security·low 修复）。
+    /// ⚠️ pin 仅进程内生效：重启后失效，需经 `replay_tool_overrides` 从配置重放，
+    /// 否则下一次 learn_tools 刷新会按内置表/前缀启发式重新分类。
+    pub fn register_tool(&self, tool_name: &str, level: &str) -> bool {
         match self.classifier.lock() {
             Ok(mut c) => c.register(tool_name, level),
-            Err(_) => tracing::error!("ToolClassifier Mutex 中毒，跳过注册"),
+            Err(_) => {
+                tracing::error!("ToolClassifier Mutex 中毒，跳过注册");
+                false
+            }
         }
+    }
+
+    /// 启动路径重放配置中的手动收紧（与 register_tool 同语义）。
+    /// 使 operator 的 pin 跨重启持续，learn_tools 刷新不会静默撤销
+    ///（ocr security·medium 修复）。返回成功注册条数。
+    pub fn replay_tool_overrides(&self, overrides: &[(String, String)]) -> usize {
+        let mut applied = 0usize;
+        for (tool, level) in overrides {
+            if self.register_tool(tool, level) {
+                applied += 1;
+            }
+        }
+        if applied != overrides.len() {
+            tracing::warn!(
+                target = "boundary",
+                total = overrides.len(),
+                applied,
+                "replay_tool_overrides: 部分手动收紧被拒绝（非法 level）"
+            );
+        }
+        applied
     }
 
     /// 从 MCP 工具列表批量学习分类
@@ -1099,6 +1126,15 @@ pub struct ToolClassifier {
     write_tools: std::collections::HashSet<String>,
     dangerous_tools: std::collections::HashSet<String>,
     unknown_tools: std::collections::HashSet<String>,
+    /// operator 经 `register_tool` 手动指定的分类（canonical 小写 key）。
+    /// `register_from_tools`（learn_tools）刷新时跳过这些 key，避免手动的
+    /// 收紧（如 query_* → dangerous）被前缀启发式重新降级为 read。
+    ///
+    /// ⚠️ 进程内生命周期：仅存于内存，进程重启后清空。若 operator 的收紧需要
+    /// 跨重启生效，调用方必须在启动时经 `register_tool` 重放（如从 agent.toml
+    /// 等配置读取），否则下一次 learn_tools 刷新会按内置表/前缀启发式重新
+    /// 分类，静默回到未收紧状态（ocr security·low 修复：显式文档化语义）。
+    manual_overrides: std::collections::HashSet<String>,
 }
 
 impl ToolClassifier {
@@ -1108,6 +1144,7 @@ impl ToolClassifier {
             write_tools: std::collections::HashSet::new(),
             dangerous_tools: std::collections::HashSet::new(),
             unknown_tools: std::collections::HashSet::new(),
+            manual_overrides: std::collections::HashSet::new(),
         };
         // 内置默认分类（保留原有列表）
         for t in [
@@ -1264,10 +1301,52 @@ impl ToolClassifier {
         c
     }
 
-    /// 注册工具到指定权限级别
-    pub fn register(&mut self, tool_name: &str, level: &str) {
+    /// 注册工具到指定权限级别。返回是否注册成功（false = 权限级别非法被拒绝）。
+    pub fn register(&mut self, tool_name: &str, level: &str) -> bool {
+        // 只接受明确的安全级别；非法/拼写错误的 level 直接拒绝并告警，否则会被
+        // insert_classification 静默归入 unknown 且永久 pin 住、阻断自动学习
+        //（ocr bug·medium 修复：'READ'/'danagerous' 这类输入不再钉死工具）。
+        if !matches!(level, "read" | "write" | "dangerous" | "unknown") {
+            tracing::warn!(
+                target = "boundary",
+                tool = %tool_name,
+                level,
+                "register: 非法权限级别，忽略注册（仅接受 read/write/dangerous/unknown）"
+            );
+            return false;
+        }
         // 存储侧统一小写：classify 用 lowercase lookup，避免动态注册的大小写漂移
         let key = tool_name.to_lowercase();
+        // 手动注册记为 operator override：后续 learn_tools 刷新不得覆盖。
+        self.manual_overrides.insert(key.clone());
+        self.insert_classification(key, level);
+        true
+    }
+
+    /// 撤销 operator 手动 override：工具改名/下架/误注册后恢复自动学习通道。
+    /// 解除后**立即生效**：同时清除分类集合中的 pin，classify 即刻回退到
+    /// 内置表/unknown，不残留旧级别到下次 register_from_tools 刷新
+    ///（ocr bug·medium 修复：否则放松型 pin（如 delete_record → read）撤销后
+    /// 仍持续生效；ocr maintainability·medium 修复：文档与实际行为一致）。
+    /// 对不存在或大小写变体的 key 幂等。
+    pub fn unregister_override(&mut self, tool_name: &str) {
+        let key = tool_name.to_lowercase();
+        self.manual_overrides.remove(&key);
+        self.read_tools.remove(&key);
+        self.write_tools.remove(&key);
+        self.dangerous_tools.remove(&key);
+        self.unknown_tools.remove(&key);
+    }
+
+    /// 分类写入唯一入口（register 与 register_from_tools 共用）：
+    /// 先按 canonical key 从所有集合移除，再插入目标集合，保证最后一次分类生效。
+    /// classify 按 read→write→dangerous 优先级查询，不先移除旧集合会让
+    /// 「旧 read 注册」吞掉后到的 write/dangerous 注册（ocr security·high 修复）。
+    fn insert_classification(&mut self, key: String, level: &str) {
+        self.read_tools.remove(&key);
+        self.write_tools.remove(&key);
+        self.dangerous_tools.remove(&key);
+        self.unknown_tools.remove(&key);
         match level {
             "read" => {
                 self.read_tools.insert(key);
@@ -1284,126 +1363,156 @@ impl ToolClassifier {
         }
     }
 
-    /// 批量注册（从 MCP tools/list 结果中自动学习分类）
+    /// 批量注册（从 MCP tools/list 结果中自动学习分类）。
+    ///
+    /// 残留语义（有意为之）：override key 在工具下架/改名后**保留**在
+    /// manual_overrides 中，防止 tools 列表暂时缺项（如 MCP 源断开）时误丢
+    /// operator 的 pin；因此同名工具未来复用时不会继承过期 pin 的自动学习
+    /// 豁免——废弃/改名的 pin 请显式 `unregister_override`（ocr maintainability·low
+    /// 修复：文档化，避免无界增长误判）。
     pub fn register_from_tools(&mut self, tools: &[(String, String)]) {
         for (name, _desc) in tools {
-            // Memoria 具名工具：优先精确分类，避免 memory_* 落入 unknown 黄线
-            if let Some(level) = classify_memoria_tool(&name.to_lowercase()) {
-                self.register(name, level);
+            // operator override 优先：learn_tools 刷新不得覆盖手动分类
+            // （如 operator 把 query_* 收紧为 dangerous，刷新后仍保持 dangerous）。
+            // 判定一律用 canonical 小写 key：全小写名零分配直接命中快路径，
+            // 混合大小写名在慢路径 lowercase 后命中，两条路径同一语义
+            //（raw 名检查对混合大小写无效，ocr maintainability·low 修复）。
+            let lower;
+            let key: &str = if name.chars().all(|c| !c.is_uppercase()) {
+                name.as_str()
+            } else {
+                lower = name.to_lowercase();
+                &lower
+            };
+            if self.manual_overrides.contains(key) {
+                continue;
+            }
+            // Memoria 具名工具：优先精确匹配（key 已 canonical）；
+            // 自动学习走 insert_classification，不写 manual_overrides。
+            if let Some(level) = classify_memoria_tool(key) {
+                self.insert_classification(key.to_string(), level);
                 continue;
             }
             // 运维状态查询工具：纯只读，直接归 read，避免被 unknown 黄线触发「执行」确认闸
-            if name == "system_ops" {
-                self.register(name, "read");
+            if key == "system_ops" {
+                self.insert_classification(key.to_string(), "read");
                 continue;
             }
-            if name == "verify_code" || name == "code_reader" {
-                self.register(name, "read");
+            if key == "verify_code" || key == "code_reader" {
+                self.insert_classification(key.to_string(), "read");
                 continue;
             }
-            if name == "edit_code" {
-                self.register(name, "write");
+            if key == "edit_code" {
+                self.insert_classification(key.to_string(), "write");
                 continue;
             }
-            if name == "sync_exception_correction" {
-                self.register(name, "dangerous");
+            if key == "sync_exception_correction" {
+                self.insert_classification(key.to_string(), "dangerous");
                 continue;
             }
-            if name == "manage_samples" {
+            if key == "manage_samples" {
                 // sync 写由 needs_dept_ops_write_approval 按 action 黄线；list/stats 可走 write 分类后被 action 放行
-                self.register(name, "write");
+                self.insert_classification(key.to_string(), "write");
                 continue;
             }
-            if name == "local_fs_read" || name == "local_fs_list" || name == "local_fs_stat" {
-                self.register(name, "read");
+            if key == "local_fs_read" || key == "local_fs_list" || key == "local_fs_stat" {
+                self.insert_classification(key.to_string(), "read");
                 continue;
             }
-            if name == "local_fs_write" {
-                self.register(name, "dangerous");
+            if key == "local_fs_write" {
+                self.insert_classification(key.to_string(), "dangerous");
                 continue;
             }
             // 双轨工具：显式归类，避免落 unknown 黄线
-            if name == "cw_select" {
-                self.register(name, "read");
+            if key == "cw_select" {
+                self.insert_classification(key.to_string(), "read");
                 continue;
             }
-            if name == "repo_ws_read" || name == "repo_ws_list" || name == "repo_ws_stat" {
-                self.register(name, "read");
+            if key == "repo_ws_read" || key == "repo_ws_list" || key == "repo_ws_stat" {
+                self.insert_classification(key.to_string(), "read");
                 continue;
             }
-            if name == "repo_ws_diff" {
-                self.register(name, "write");
+            if key == "repo_ws_diff" {
+                self.insert_classification(key.to_string(), "write");
                 continue;
             }
-            let lower = name.to_lowercase();
             // SQL 查询类工具（execute_sql / query_* 等，仅 SELECT）一律按只读处理，
             // 排除明显的写操作前缀（update_/insert_/delete_/create_）
             // ⚠️ `cross_*` **不再**按前缀自动归 read：该前缀在历史上过宽
             // （cross_agent_query 实际可写，由 classify_memoria_tool 显式归 write）。
             // 只读 cross 工具（如 cross_validate）必须走内置/显式注册白名单。
-            let is_sql_read = lower.contains("sql")
-                && !lower.starts_with("update")
-                && !lower.starts_with("insert")
-                && !lower.starts_with("delete")
-                && !lower.starts_with("create")
-                && !lower.starts_with("cross_");
-            if lower.starts_with("query_")
-                || lower.starts_with("search_")
-                || lower.starts_with("get_")
-                || lower.starts_with("check_")
-                || lower.starts_with("read_")
-                || lower.starts_with("list_")
-                || lower.starts_with("fuzzy_match_")
-                || lower.starts_with("match_")
-                || lower.starts_with("review_")
-                || lower.starts_with("diagnose_")
-                || lower.starts_with("explain_")
-                || lower.starts_with("validate_")
+            let is_sql_read = key.contains("sql")
+                && !key.starts_with("update")
+                && !key.starts_with("insert")
+                && !key.starts_with("delete")
+                && !key.starts_with("create")
+                && !key.starts_with("cross_");
+            if key.starts_with("query_")
+                || key.starts_with("search_")
+                || key.starts_with("get_")
+                || key.starts_with("check_")
+                || key.starts_with("read_")
+                || key.starts_with("list_")
+                || key.starts_with("fuzzy_match_")
+                || key.starts_with("match_")
+                || key.starts_with("review_")
+                || key.starts_with("diagnose_")
+                || key.starts_with("explain_")
+                || key.starts_with("validate_")
                 || is_sql_read
             {
-                self.read_tools.insert(lower);
-            } else if lower.starts_with("delete_")
-                || lower.starts_with("batch_delete")
-                || lower.starts_with("shutdown_")
+                self.insert_classification(key.to_string(), "read");
+            } else if key.starts_with("delete_")
+                || key.starts_with("batch_delete")
+                || key.starts_with("shutdown_")
             {
-                self.dangerous_tools.insert(lower);
-            } else if !self.read_tools.contains(&lower)
-                && !self.write_tools.contains(&lower)
-                && !self.dangerous_tools.contains(&lower)
+                self.insert_classification(key.to_string(), "dangerous");
+            } else if !self.read_tools.contains(key)
+                && !self.write_tools.contains(key)
+                && !self.dangerous_tools.contains(key)
             {
                 // P0-4：未知工具不再默认当 write 放行，先标记为 unknown，由 check_tool 走黄线确认
-                self.unknown_tools.insert(lower);
+                self.insert_classification(key.to_string(), "unknown");
             }
         }
     }
 
     pub fn classify(&self, tool_name: &str) -> &'static str {
-        // 快路径：存储侧已 canonical 小写，常见小写工具名直接精确命中，零额外分配。
-        if let Some(level) = classify_memoria_tool(tool_name) {
-            return level;
-        }
-        if self.read_tools.contains(tool_name) {
-            return "read";
-        }
-        if self.write_tools.contains(tool_name) {
-            return "write";
-        }
-        if self.dangerous_tools.contains(tool_name) {
-            return "dangerous";
-        }
-        if self.unknown_tools.contains(tool_name) {
-            return "unknown";
-        }
-        // 慢路径：大小写与 canonical 存储不一致的 MCP 工具名，lowercase 后对齐查找。
-        // 常见全小写 unknown 工具在快路径未命中后直接返回，避免重复 lookups/alloc。
+        // operator 手动 override 优先于内置 Memoria 精确分类：
+        // 否则 register("memory_recall","dangerous") 会永远被内置 read 表遮蔽。
+        // 快路径只对全小写名称生效（存储侧与内置表均 canonical 小写），且
+        // override 判定按 raw 名直接命中——raw 名即 canonical key，内置表
+        // 将来若大小写不敏感化，'MEMORY_RECALL' 变体仍会走慢路径的 canonical
+        // override 判定，不会被内置 read 分类遮蔽（ocr maintainability·low 修复）。
         // 大小写判定必须 Unicode-aware（存储侧 to_lowercase 会折叠 'É' 等非 ASCII
         // 大写），否则带重音大写的工具名会被 ASCII 快路径误判为全小写、永久漏分类。
         if tool_name.chars().all(|c| !c.is_uppercase()) {
+            if !self.manual_overrides.contains(tool_name) {
+                // 快路径：常见小写工具名直接精确命中，零额外分配。
+                if let Some(level) = classify_memoria_tool(tool_name) {
+                    return level;
+                }
+            }
+            if self.read_tools.contains(tool_name) {
+                return "read";
+            }
+            if self.write_tools.contains(tool_name) {
+                return "write";
+            }
+            if self.dangerous_tools.contains(tool_name) {
+                return "dangerous";
+            }
+            if self.unknown_tools.contains(tool_name) {
+                return "unknown";
+            }
             return "unknown";
         }
+        // 慢路径：名称含大写，lowercase 后按 canonical key 对齐查找，override 同样命中。
         let key = tool_name.to_lowercase();
-        if let Some(level) = classify_memoria_tool(&key) {
-            return level;
+        if !self.manual_overrides.contains(&key) {
+            if let Some(level) = classify_memoria_tool(&key) {
+                return level;
+            }
         }
         if self.read_tools.contains(&key) {
             return "read";
@@ -1694,6 +1803,89 @@ mod read_only_tests {
         assert_eq!(c.classify("Écrire"), "write");
         assert_eq!(c.classify("écrire"), "write");
         assert_eq!(c.classify("ÉCRIRE"), "write");
+    }
+
+    #[test]
+    fn register_last_wins_across_classification_sets() {
+        // 回归锁：classify 按 read→write→dangerous 优先级查询，register 若不先
+        // 从旧集合移除，工具已登记 read 后就再也无法重新登记为 write/dangerous。
+        let mut c = ToolClassifier::new();
+        assert_eq!(c.classify("cross_validate"), "read");
+        c.register("cross_validate", "dangerous");
+        assert_eq!(c.classify("cross_validate"), "dangerous");
+        c.register("cross_validate", "write");
+        assert_eq!(c.classify("cross_validate"), "write");
+        c.register("cross_validate", "unknown");
+        assert_eq!(c.classify("cross_validate"), "unknown");
+        // 大写到小写都按 canonical key 生效
+        c.register("CROSS_VALIDATE", "read");
+        assert_eq!(c.classify("cross_validate"), "read");
+    }
+
+    #[test]
+    fn manual_override_survives_register_from_tools() {
+        // 回归锁：operator 手动收紧（query_* → dangerous）后，learn_tools 刷新
+        // 不得被前缀启发式重新降级为 read（ocr security·medium 修复）。
+        let mut c = ToolClassifier::new();
+        c.register("query_secret", "dangerous");
+        assert_eq!(c.classify("query_secret"), "dangerous");
+        c.register_from_tools(&[("query_secret".to_string(), String::new())]);
+        assert_eq!(c.classify("query_secret"), "dangerous");
+        assert!(!c.read_tools.contains("query_secret"));
+        // 混合大小写的 override key 也按 canonical 跳过自动学习
+        c.register("MEMORY_RECALL", "dangerous");
+        c.register_from_tools(&[("memory_recall".to_string(), String::new())]);
+        assert_eq!(c.classify("memory_recall"), "dangerous");
+        // 大小写变体调用同样命中 override（快路径 guard 按 canonical key 判定，
+        // 内置表将来大小写不敏感化也不会遮蔽手动收紧）
+        assert_eq!(c.classify("MEMORY_RECALL"), "dangerous");
+        assert_eq!(c.classify("Memory_Recall"), "dangerous");
+    }
+
+    #[test]
+    fn unregister_override_restores_auto_learning() {
+        // 回归锁：unregister_override 解除 pin 后，learn_tools 刷新可重新分类
+        //（工具改名/下架/误注册时 operator 需要恢复自动学习的通道，不能永久钉住）。
+        let mut c = ToolClassifier::new();
+        c.register("query_secret", "dangerous");
+        assert_eq!(c.classify("query_secret"), "dangerous");
+        c.unregister_override("query_secret");
+        // 立即生效：无需等待刷新，分类即刻回退（不残留 pin 的旧级别）
+        assert_eq!(c.classify("query_secret"), "unknown");
+        c.register_from_tools(&[("query_secret".to_string(), String::new())]);
+        assert_eq!(c.classify("query_secret"), "read");
+        // 幂等：不存在/大小写变体的 key 撤销无副作用
+        c.unregister_override("QUERY_SECRET");
+        c.unregister_override("not_registered_tool");
+    }
+
+    #[test]
+    fn register_rejects_invalid_level_without_pinning() {
+        // 回归锁：非法 level（拼写/大小写错误）不落库也不 pin override，
+        // 工具仍可被后续 learn_tools 自动学习，不会永久卡在 unknown
+        //（ocr bug·medium 修复）。
+        let mut c = ToolClassifier::new();
+        assert!(!c.register("query_secret", "READ"));
+        assert_eq!(c.classify("query_secret"), "unknown");
+        assert!(!c.manual_overrides.contains("query_secret"));
+        c.register_from_tools(&[("query_secret".to_string(), String::new())]);
+        assert_eq!(c.classify("query_secret"), "read");
+    }
+
+    #[test]
+    fn replay_tool_overrides_pins_across_learn_refresh() {
+        // 回归锁：启动重放的手动收紧与运行时 register_tool 同语义，
+        // learn_tools 刷新不得撤销；非法 level 条数被拒并计入返回值
+        //（ocr security·medium 修复：pin 跨重启经配置重放生效）。
+        let b = ComplianceBoundary::new(None);
+        let applied = b.replay_tool_overrides(&[
+            ("query_secret".to_string(), "dangerous".to_string()),
+            ("query_bad".to_string(), "READ".to_string()), // 非法 level → 拒绝
+        ]);
+        assert_eq!(applied, 1);
+        assert!(!b.classifier_says_read("query_secret"));
+        b.learn_tools(&[("query_secret".to_string(), String::new())]);
+        assert!(!b.classifier_says_read("query_secret"));
     }
 
     #[test]
@@ -2398,7 +2590,7 @@ mod tests {
             .lock()
             .unwrap()
             .register("test-agent", None, PermissionLevel::Admin);
-        boundary.register_tool("delete_record", "write");
+        assert!(boundary.register_tool("delete_record", "write"));
 
         let r = boundary.check_tool(
             "delete_record",
@@ -2444,8 +2636,8 @@ mod tests {
         // 不依赖默认分类表把 manage_whitelist 标为 write（该值是检查顺序 read→write→dangerous
         // 的产物，未来分类表调整不使本测试脆失败）。地板被移除则 check_tool 对 read 放行，
         // 断言失败（已实证移出 HARD_DANGEROUS → FAILED，非空通过）。
-        boundary.register_tool("manage_whitelist", "read");
-        boundary.register_tool("sync_whitelist_plates", "read");
+        assert!(boundary.register_tool("manage_whitelist", "read"));
+        assert!(boundary.register_tool("sync_whitelist_plates", "read"));
 
         // ①-⑯ 十六个 near-identical check_tool+Yellow 块折叠为统一表驱动（含纯查询/写动作/
         // 嵌套/缺参/空值/越界代表形状），单一保证「HARD_DANGEROUS 工具一律审批（与参数内容
