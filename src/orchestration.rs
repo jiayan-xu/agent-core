@@ -526,14 +526,20 @@ impl OrchestrationController {
     /// 异步包装：把同步 SQLite 冷路径移出 tokio worker（spawn_blocking）。
     pub async fn is_promoted_async(self: &Arc<Self>, session_id: String) -> bool {
         let this = Arc::clone(self);
-        let log_sid = session_id.clone();
-        match tokio::task::spawn_blocking(move || this.is_promoted(&session_id)).await {
-            Ok(v) => v,
+        // session_id 随闭包移入，成功路径零克隆（ocr perf·low 修复）：
+        // join 失败时 id 随任务丢失，错误日志不携带 session（不阻塞诊断）。
+        match tokio::task::spawn_blocking(move || {
+            let promoted = this.is_promoted(&session_id);
+            (promoted, session_id)
+        })
+        .await
+        {
+            Ok((promoted, _sid)) => promoted,
             Err(e) => {
                 // join 失败（任务未执行/panic）与「未 promoted」不可混为一谈：
                 // 前者会导致已 promoted 会话被重复 bootstrap，必须可诊断
                 //（ocr other·low 修复：不暴露 panic payload）。
-                tracing::error!(target = "orchestration", session = %log_sid,
+                tracing::error!(target = "orchestration",
                     err = %e, "is_promoted_async spawn_blocking join 失败，按未 promoted 处理");
                 false
             }
@@ -589,11 +595,13 @@ impl OrchestrationController {
     /// 无安全候选时返回空（LLM 先诚实作答；promote 后同请求即恢复全量目录）。
     ///
     /// ⚠️ 开关语义与模块头一致（flag-off 零行为变化）：`bootstrap.enabled=false`
-    /// 时**原样返回** `full_tools`（本函数只服务 bootstrap 面，而 bootstrap 面
-    /// 仅在 enabled 路径存在；agent.rs 也只在 bootstrap_active 时调用本函数）。
-    /// 安全过滤/相关性排序/截断只作用于 enabled 路径，避免未来新增调用点
-    /// 在开关关闭时被本函数静默裁剪工具目录（ocr maintainability·low 修复）。
-    pub fn bootstrap_tools(
+    /// 时**原样返回** `full_tools`——本函数只服务 bootstrap 面，而 bootstrap 面
+    /// 仅在 enabled 路径存在（agent.rs 也只在 bootstrap_active 时调用本函数）。
+    /// 安全过滤/相关性排序/截断只作用于 enabled 路径。调用方不得在开关关闭时
+    /// 用本函数做通用工具面过滤，否则会拿到未过滤的全量目录
+    ///（ocr maintainability·low 修复：pass-through 语义显式化，`pub(crate)` 限制
+    /// 外部误用面）。
+    pub(crate) fn bootstrap_tools(
         &self,
         raw_message: &str,
         full_tools: &[ToolDef],
@@ -1256,6 +1264,13 @@ mod tests {
             c.classify_typed(n) == crate::boundary::ToolClass::Read
         });
         assert!(!picked.is_empty());
+        // execute_sql 必须经 SELECT-only 能力标签被选中：若 is_select_only_sql_tool
+        // 被移除/改坏，execute 动作段在 DENY_ACTIONS 中会把它挡在面外，
+        // 本断言直接失败（ocr test·medium 修复：锁定能力标签路径而非只查只读性）。
+        assert!(
+            picked.iter().any(|t| t.function.name == "execute_sql"),
+            "execute_sql 未进入 bootstrap 面（SELECT-only 能力标签失效？）"
+        );
         for t in &picked {
             assert_eq!(
                 c.classify_typed(&t.function.name),

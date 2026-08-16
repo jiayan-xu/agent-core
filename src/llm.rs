@@ -1867,16 +1867,16 @@ impl LlmClient {
 }
 
 /// 纯完成类成功标记（与截断无关）：标准 `stop` + 主流 provider 的完成类
-/// 非标准标记（Anthropic `stop_sequence`、Gemini `end_turn`、`tool_use`）。
-/// 工具调用类标记（`function_call` / `tool_calls`）**不在此列**：截断留痕分支
-/// 只在「tool_calls 为空」时运行，带工具标记却无工具调用恰是异常信号，
-/// 需要可观测（ocr maintainability·low 修复：标记集合与使用场景一致，
-/// 且 budgeted_truncation_warn 的截断集是独立的 length/max_tokens，不需要本表）。
+/// 非标准标记（Anthropic `stop_sequence`、Gemini `end_turn`）。
+/// 工具调用类标记（`function_call` / `tool_calls` / Anthropic `tool_use`）
+/// **不在此列**：截断留痕分支只在「tool_calls 为空」时运行，带工具标记却无
+/// 工具调用恰是异常信号，需要可观测（ocr maintainability·low 修复：标记集合
+/// 与使用场景一致，`tool_use` 是 Anthropic 的工具调用 stop_reason 而非完成
+/// 标记，ocr bug·medium 修复）。
+/// 匹配大小写不敏感：Gemini 等 provider 可能上报大写（"STOP"）（ocr bug·low 修复）。
 fn is_normal_finish_reason(finish_reason: &str) -> bool {
-    matches!(
-        finish_reason,
-        "stop" | "end_turn" | "stop_sequence" | "tool_use"
-    )
+    let fr = finish_reason.to_ascii_lowercase();
+    matches!(fr.as_str(), "stop" | "end_turn" | "stop_sequence")
 }
 
 /// 预算化截断告警判定（纯函数，单测覆盖）。
@@ -1970,6 +1970,22 @@ mod routing_tests {
         assert!(!budgeted_truncation_warn("length", 1024, 1024, true, true));
         // 其他 finish_reason 不告警
         assert!(!budgeted_truncation_warn("stop", 10, 1024, false, true));
+    }
+
+    #[test]
+    fn is_normal_finish_reason_markers() {
+        // 回归锁（ocr test·low 修复）：纯完成类标记才属正常完成；
+        // 工具调用类标记（function_call / tool_calls / tool_use）不算——
+        // 留痕分支在 tool_calls 为空时运行，带工具标记却无工具调用是异常信号。
+        for normal in ["stop", "end_turn", "stop_sequence"] {
+            assert!(is_normal_finish_reason(normal), "{normal} 应属正常完成");
+        }
+        // 大小写不敏感（Gemini 可能上报 "STOP"）
+        assert!(is_normal_finish_reason("STOP"));
+        assert!(is_normal_finish_reason("Stop"));
+        for abnormal in ["", "length", "max_tokens", "content_filter", "function_call", "tool_calls", "tool_use"] {
+            assert!(!is_normal_finish_reason(abnormal), "{abnormal:?} 不应属正常完成");
+        }
     }
 
     #[test]

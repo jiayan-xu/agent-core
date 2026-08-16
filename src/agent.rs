@@ -4900,7 +4900,7 @@ impl AgentCore {
                 if let Some(plan) = plan_opt {
                     // 全只读计划（仅 query_/get_/explain_ 等读工具）→ 无需确认，直接执行。
                     // 只有含写/危险步骤的多步计划才走「执行/取消」确认闸，避免对只读咨询凭空制造摩擦。
-                    let needs_confirm = Self::plan_requires_confirmation(&plan);
+                    let needs_confirm = self.plan_requires_confirmation(&plan).await;
                     // P1-2: 预览优先（非续跑 + 开启 preview + 多步 + 含写/危险步骤）→ 先返回计划，不执行
                     let is_resume = self.in_progress_plan.lock().await.is_some();
                     if self.config.compositional_preview && !is_resume && plan.steps.len() > 1 && needs_confirm {
@@ -5824,13 +5824,29 @@ impl AgentCore {
 
     // ── P1-2 组合计划 HITL 辅助方法 ──
 
+    /// 生效只读判定：静态前缀启发式 **与** 权威分类器（含 operator manual
+    /// override）都判 read 才算只读。register_tool 收紧（如 query_secret →
+    /// dangerous）后，静态启发式仍可能按 query_ 前缀放行，必须用分类器
+    /// 兜底，否则收紧对确认闸/快照路径失效（ocr security·high 修复）。
+    /// 分类器锁不可用/未学习时 fail-closed（按非只读处理，更保守）。
+    async fn is_effectively_read(&self, name: &str) -> bool {
+        let classifier_read = match self.boundary.try_lock() {
+            Ok(b) => b.classifier_says_read(name),
+            Err(_) => false,
+        };
+        crate::boundary::is_read_only_tool(name) && classifier_read
+    }
+
     /// 计划是否含写/危险步骤（需要用户确认闸）。
-    /// 仅当任一步骤的工具不是纯只读（见 `boundary::is_read_only_tool`）时返回 true。
+    /// 仅当任一步骤的工具不是纯只读（见 `is_effectively_read`）时返回 true。
     /// 全只读计划（如「查今日/昨日进厂 + 异常检测」）无需确认，应直接执行。
-    fn plan_requires_confirmation(plan: &crate::composer::ExecutionPlan) -> bool {
-        plan.steps
-            .iter()
-            .any(|s| !crate::boundary::is_read_only_tool(&s.tool))
+    async fn plan_requires_confirmation(&self, plan: &crate::composer::ExecutionPlan) -> bool {
+        for s in &plan.steps {
+            if !self.is_effectively_read(&s.tool).await {
+                return true;
+            }
+        }
+        false
     }
 
     /// 进入计划预览态：记录 plan 但不执行（等待用户确认）
@@ -8158,10 +8174,14 @@ impl AgentCore {
         self.metrics.inc_read_parallel();
         // 保守快照兜底：分类器判 read 但前缀启发式判非 read 的工具（可能被误标为
         // 写/确认类）在并发执行前先捕获变更前快照，避免跳过顺序路径的 Phase B 语义。
-        if tool_calls
-            .iter()
-            .any(|tc| !crate::boundary::is_read_only_tool(&tc.name))
-        {
+        // 先收集生效非只读名单（含 operator override，ocr security·high 修复）。
+        let mut write_like: Vec<&String> = Vec::new();
+        for tc in tool_calls.iter() {
+            if !self.is_effectively_read(&tc.name).await {
+                write_like.push(&tc.name);
+            }
+        }
+        if !write_like.is_empty() {
             let snap_key = snapshot_key(session_id, trace_id);
             let mut m = self.mutation_snapshot.lock().await;
             if !m.contains_key(&snap_key) {
@@ -8172,11 +8192,7 @@ impl AgentCore {
                 let seq = self
                     .snapshot_seq
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let first_write_like = tool_calls
-                    .iter()
-                    .find(|tc| !crate::boundary::is_read_only_tool(&tc.name))
-                    .map(|tc| tc.name.clone())
-                    .unwrap_or_else(|| tool_calls[0].name.clone());
+                let first_write_like = write_like[0].clone();
                 let snap = MutationSnapshot {
                     tool_name: first_write_like.clone(),
                     messages_before: messages.clone(),
@@ -8682,7 +8698,7 @@ impl AgentCore {
             // 丢失「首个写工具前」语义）。
             // 捕获语义：无本 run 键 → 捕获；已有本 run 键 → 已捕获跳过。
             // 旧 run 残留（不同 trace 键）自然共存，由容量淘汰按 seq 清理。
-            if !crate::boundary::is_read_only_tool(&tc.name) {
+            if !self.is_effectively_read(&tc.name).await {
                 let snap_key = snapshot_key(session_id, trace_id);
                 let mut m = self.mutation_snapshot.lock().await;
                 if !m.contains_key(&snap_key) {

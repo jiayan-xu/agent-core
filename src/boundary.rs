@@ -818,12 +818,21 @@ impl ComplianceBoundary {
     }
 
     /// 撤销工具分类 pin（operator 误注册/工具改名/下架时解除，恢复自动学习）。
-    /// 与 register_tool 对称的边界层 API；内层即 ToolClassifier::unregister_override
-    ///（ocr maintainability·low 修复：文档化的补救通道在边界层可达）。
-    pub fn unregister_tool_override(&self, tool_name: &str) {
+    /// 与 register_tool 对称的边界层 API；返回是否成功（false = 分类器锁中毒，
+    /// 撤销失败——静默失败会让工具长期停留在被 pin 的级别，调用方应告警）。
+    /// 内层即 ToolClassifier::unregister_override（ocr maintainability·low 修复：
+    /// 补救通道在边界层可达；ocr other·medium 修复：失败可感知）。
+    #[must_use = "false = 分类器锁中毒撤销失败，调用方应告警"]
+    pub fn unregister_tool_override(&self, tool_name: &str) -> bool {
         match self.classifier.lock() {
-            Ok(mut c) => c.unregister_override(tool_name),
-            Err(_) => tracing::error!("ToolClassifier Mutex 中毒，跳过撤销"),
+            Ok(mut c) => {
+                c.unregister_override(tool_name);
+                true
+            }
+            Err(_) => {
+                tracing::error!("ToolClassifier Mutex 中毒，跳过撤销");
+                false
+            }
         }
     }
 
@@ -1129,10 +1138,11 @@ pub enum ToolClass {
 
 impl ToolClass {
     /// 从配置/运行时字符串解析注册级别；非法值返回 None。
+    /// 容忍大小写与首尾空白（配置侧 'Read' / ' dangerous ' 均接受）。
     /// 注册入口（register/register_tool）只接受类型化级别，非法 level 在
     /// 字符串→ToolClass 转换层被拒绝，编译期不可表示（ocr maintainability·low 修复）。
     pub fn from_str(s: &str) -> Option<ToolClass> {
-        match s {
+        match s.trim().to_ascii_lowercase().as_str() {
             "read" => Some(ToolClass::Read),
             "write" => Some(ToolClass::Write),
             "dangerous" => Some(ToolClass::Dangerous),
@@ -1148,6 +1158,16 @@ impl ToolClass {
             ToolClass::Dangerous => "dangerous",
             ToolClass::Unknown => "unknown",
         }
+    }
+}
+
+/// 标准 FromStr 桥接（`"dangerous".parse::<ToolClass>()` 可用，
+/// 避免命名误导——ocr security·low 修复）。
+impl std::str::FromStr for ToolClass {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ToolClass::from_str(s).ok_or(())
     }
 }
 
@@ -1345,11 +1365,10 @@ impl ToolClassifier {
         // 存储侧统一小写：classify 用 lowercase lookup，避免动态注册的大小写漂移
         let key = tool_name.to_lowercase();
         // 手动注册记为 operator override：后续 learn_tools 刷新不得覆盖。
-        // 同时记录 pin 前的分类快照，unregister 时恢复——否则撤销 pin 会连
-        // 内置默认分类（如 cross_validate 经 EXPLICIT_READ_CROSS_TOOLS 登记的
-        // read）一起抹掉（ocr bug·medium 修复）。
+        // 只在首次 pin 时记录 prior 快照——重复 pin 不覆盖原快照，否则
+        // 撤销时恢复的是「上一次 pin 的级别」而非内置默认（ocr bug·medium 修复）。
         let prior = self.classify_without_override(&key);
-        self.manual_overrides.insert(key.clone(), prior);
+        self.manual_overrides.entry(key.clone()).or_insert(prior);
         self.insert_classification(key, level.as_str());
     }
 
@@ -1920,19 +1939,38 @@ mod read_only_tests {
 
     #[test]
     fn tool_class_from_str_rejects_invalid_levels() {
-        // 回归锁：level 在字符串→ToolClass 转换层被严格校验，拼写/大小写错误
-        // 返回 None（配置层跳过并告警），不可能被静默 pin 到 unknown
-        //（ocr bug·medium 修复：'READ'/'danagerous' 编译期不可达 register）。
+        // 回归锁：level 在字符串→ToolClass 转换层被严格校验，拼写错误返回
+        // None（配置层跳过并告警），不可能被静默 pin 到 unknown
+        //（ocr bug·medium 修复：'danagerous' 编译期不可达 register）。
+        // 大小写与首尾空白容忍（'Read' / ' dangerous ' 均接受，ocr security·low 修复）。
         assert_eq!(ToolClass::from_str("read"), Some(ToolClass::Read));
         assert_eq!(ToolClass::from_str("write"), Some(ToolClass::Write));
         assert_eq!(ToolClass::from_str("dangerous"), Some(ToolClass::Dangerous));
         assert_eq!(ToolClass::from_str("unknown"), Some(ToolClass::Unknown));
-        assert_eq!(ToolClass::from_str("READ"), None);
+        assert_eq!(ToolClass::from_str("READ"), Some(ToolClass::Read));
+        assert_eq!(ToolClass::from_str("Read"), Some(ToolClass::Read));
+        assert_eq!(ToolClass::from_str(" dangerous "), Some(ToolClass::Dangerous));
         assert_eq!(ToolClass::from_str("danagerous"), None);
         assert_eq!(ToolClass::from_str(""), None);
-        assert_eq!(ToolClass::from_str("Read"), None);
+        assert_eq!(ToolClass::from_str("  "), None);
+        // 标准 FromStr 桥接可用（str::parse）
+        assert_eq!("write".parse::<ToolClass>(), Ok(ToolClass::Write));
         // as_str 与 from_str 互逆
         assert_eq!(ToolClass::from_str(ToolClass::Dangerous.as_str()), Some(ToolClass::Dangerous));
+    }
+
+    #[test]
+    fn repeated_pin_keeps_original_snapshot() {
+        // 回归锁：重复 pin 不覆盖 prior 快照——cross_validate 内置 read →
+        // pin Dangerous（prior=read）→ 再 pin Write 时 prior 仍应是 read；
+        // 撤销后恢复内置 read 而非上一次 pin 的级别（ocr bug·medium 修复）。
+        let mut c = ToolClassifier::new();
+        c.register("cross_validate", ToolClass::Dangerous);
+        assert_eq!(c.classify("cross_validate"), "dangerous");
+        c.register("cross_validate", ToolClass::Write);
+        assert_eq!(c.classify("cross_validate"), "write");
+        c.unregister_override("cross_validate");
+        assert_eq!(c.classify("cross_validate"), "read");
     }
 
     #[test]
@@ -1968,9 +2006,9 @@ mod read_only_tests {
         assert!(!b.classifier_says_read("query_secret"));
         b.learn_tools(&[("query_secret".to_string(), String::new())]);
         assert!(!b.classifier_says_read("query_secret"));
-        // 边界层撤销通道可达（与 register_tool 对称）：立即回退 unknown（fail-closed），
-        // 刷新后恢复自动学习
-        b.unregister_tool_override("query_secret");
+        // 边界层撤销通道可达（与 register_tool 对称，失败可感知）：立即回退
+        // unknown（fail-closed），刷新后恢复自动学习
+        assert!(b.unregister_tool_override("query_secret"));
         assert!(!b.classifier_says_read("query_secret"));
         b.learn_tools(&[("query_secret".to_string(), String::new())]);
         assert!(b.classifier_says_read("query_secret"));

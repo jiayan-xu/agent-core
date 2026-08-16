@@ -994,11 +994,11 @@ pub(crate) async fn build_agent(
                 for i in &b.tool_overrides {
                     match agent_core::boundary::ToolClass::from_str(&i.level) {
                         Some(level) => pairs.push((i.tool.clone(), level)),
-                        None => tracing::warn!(
+                        None => tracing::error!(
                             target = "boundary",
                             tool = %i.tool,
                             level = %i.level,
-                            "agent.toml [boundary.tool_overrides] 非法级别，跳过该条（仅接受 read/write/dangerous/unknown）"
+                            "agent.toml [boundary.tool_overrides] 非法级别，跳过该条——operator 的收紧被丢弃，工具保持默认启发式级别（仅接受 read/write/dangerous/unknown）"
                         ),
                     }
                 }
