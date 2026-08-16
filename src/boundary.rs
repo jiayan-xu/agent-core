@@ -1612,6 +1612,28 @@ mod read_only_tests {
     }
 
     #[test]
+    fn generic_cross_prefix_is_not_auto_read() {
+        // 回归锁：register_from_tools 不得把未知 cross_* 按前缀自动归 read；
+        // 已知只读 cross_validate 走内置显式白名单，跨 agent 写能力走 classify_memoria_tool。
+        let mut c = ToolClassifier::new();
+        c.register_from_tools(&[
+            ("cross_unknown_thing".to_string(), String::new()),
+            ("cross_validate".to_string(), String::new()),
+        ]);
+        assert_eq!(c.classify_typed("cross_unknown_thing"), ToolClass::Unknown);
+        assert_eq!(c.classify_typed("cross_validate"), ToolClass::Read);
+        assert_eq!(c.classify_typed("cross_agent_query"), ToolClass::Write);
+    }
+
+    #[test]
+    fn classifier_says_read_is_fail_closed_for_unknown() {
+        let boundary = ComplianceBoundary::new(None);
+        boundary.learn_tools(&[("cross_unknown_thing".to_string(), String::new())]);
+        assert!(!boundary.classifier_says_read("cross_unknown_thing"));
+        assert!(boundary.classifier_says_read("cross_validate"));
+    }
+
+    #[test]
     fn repo_ws_and_cw_tools_classified() {
         let c = ToolClassifier::new();
         // 轨一只读

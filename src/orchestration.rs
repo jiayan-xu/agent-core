@@ -219,7 +219,11 @@ impl SessionPhaseStore {
                     Self { conn: None }
                 }
             },
-            Err(_) => Self { conn: None },
+            Err(e) => {
+                tracing::warn!(target = "orchestration", err = %e,
+                    "内存 SQLite 打开失败，phase 存储降级为无存储");
+                Self { conn: None }
+            }
         }
     }
 
@@ -388,6 +392,9 @@ impl OrchestrationController {
     /// 原子 compare-and-set：首次标记者返回 true，后续调用返回 false。
     /// 与 `promote` 一样 append-only；用于消除同 session 并发 run 的
     /// check-then-promote 窗口。
+    ///
+    /// ⚠️ 返回值语义：**仅表示本进程内存 CAS 是否赢**，不表示落盘持久化成功。
+    /// 落盘失败由 `store.promote` 内部告警并降级为「重启后该 session 重新 bootstrap」。
     pub fn try_promote(&self, session_id: &str) -> bool {
         let won = {
             let Ok(mut cache) = self.promoted_cache.lock() else {
@@ -416,21 +423,28 @@ impl OrchestrationController {
     /// 仅当 session 未 promoted、也没有其他 run 正在 bootstrap 时成功。
     /// 调用方必须在首个 LLM 响应后 `finish_bootstrap`（成功）或
     /// `cancel_bootstrap`（失败/提前返回），防止预留泄漏。
+    ///
+    /// 锁策略：只把 in-flight 集合的查重+插入放在临界区，**不持锁查 SQLite**——
+    /// 否则单 session 的 promoted 落盘查询（busy_timeout 最多 2s）会阻塞全部
+    /// session 的 bootstrap 决策。先拿下预留，再到锁外复核 promoted；若复核为
+    /// 已 promoted（例如其他进程刚写入），释放预留并返回 false。
     pub fn try_begin_bootstrap(&self, session_id: &str) -> bool {
-        let Ok(mut in_flight) = self.bootstrap_in_flight.lock() else {
-            tracing::warn!(target = "orchestration", session = %session_id,
-                "bootstrap_in_flight Mutex 中毒，本次不进入 bootstrap");
-            return false;
-        };
-        if in_flight.contains(session_id) {
-            return false;
+        {
+            let Ok(mut in_flight) = self.bootstrap_in_flight.lock() else {
+                tracing::warn!(target = "orchestration", session = %session_id,
+                    "bootstrap_in_flight Mutex 中毒，本次不进入 bootstrap");
+                return false;
+            };
+            if in_flight.contains(session_id) {
+                return false;
+            }
+            in_flight.insert(session_id.to_string());
         }
-        // 锁内复核 promoted：把「is_promoted + 预留」压缩为同一临界区，
-        // 两个并发 run 只有一个能看到 not-promoted 并拿到预留。
+        // 锁外复核 promoted：预留已原子持有，同 session 并发 run 已拿不到第二张票。
         if self.is_promoted(session_id) {
+            self.cancel_bootstrap(session_id);
             return false;
         }
-        in_flight.insert(session_id.to_string());
         true
     }
 
@@ -531,24 +545,30 @@ fn bootstrap_action_segments_ok(name: &str) -> bool {
         .any(|segment| DENY_ACTIONS.iter().any(|a| segment == *a))
 }
 
-/// 把工具名切成动作段：`_`、`-` 和 camelCase 边界都是分隔符。
+/// 把工具名切成动作段：`_`、`-`、camelCase 与「缩写/数字 + 大写」边界都是分隔符。
+/// 兼容 `updateState`、`getOSUpdate`、`OSSendMessage`、`get2Update` 这类命名，
+/// 避免 write 动词粘在缩写/数字后面绕过分段检查。
 fn action_segments(name: &str) -> Vec<String> {
+    let chars: Vec<char> = name.chars().collect();
     let mut segments: Vec<String> = Vec::new();
     let mut current = String::new();
-    let mut prev_was_lower = false;
-    for ch in name.chars() {
+    for (i, &ch) in chars.iter().enumerate() {
         if ch == '_' || ch == '-' {
             if !current.is_empty() {
                 segments.push(std::mem::take(&mut current));
             }
-            prev_was_lower = false;
             continue;
         }
-        if ch.is_ascii_uppercase() && prev_was_lower && !current.is_empty() {
+        let prev = i.checked_sub(1).and_then(|j| chars.get(j)).copied();
+        let next = chars.get(i + 1).copied();
+        let boundary = ch.is_ascii_uppercase()
+            && !current.is_empty()
+            && (matches!(prev, Some(p) if p.is_ascii_lowercase() || p.is_ascii_digit())
+                || matches!(next, Some(n) if n.is_ascii_lowercase()));
+        if boundary {
             segments.push(std::mem::take(&mut current));
         }
         current.push(ch.to_ascii_lowercase());
-        prev_was_lower = ch.is_ascii_lowercase();
     }
     if !current.is_empty() {
         segments.push(current);
@@ -673,6 +693,11 @@ pub fn classify_tool_failure(error: &str) -> FailureClass {
         || e.contains("invalid token")
         || e.contains("invalid credentials")
         || e.contains("invalid session")
+        || e.contains("无权限")
+        || e.contains("无权")
+        || e.contains("权限不足")
+        || e.contains("未授权")
+        || e.contains("禁止")
     {
         FailureClass::Fatal
     } else if e.contains("schema")
@@ -755,8 +780,11 @@ impl Default for HookRegistry {
 
 impl HookRegistry {
     pub fn register(&self, hook: std::sync::Arc<dyn OrchestrationHook>) {
-        if let Ok(mut hooks) = self.hooks.lock() {
-            hooks.push(hook);
+        match self.hooks.lock() {
+            Ok(mut hooks) => hooks.push(hook),
+            Err(_) => tracing::warn!(target = "orchestration.hooks",
+                point = ?hook.point(), priority = hook.priority(),
+                "hooks Mutex 中毒，guardrail hook 注册被丢弃（安全钩可能静默失效）"),
         }
     }
 
@@ -1042,6 +1070,10 @@ mod tests {
         // camelCase / 连字符命名也不能绕过动作段扫描
         assert!(!bootstrap_action_segments_ok("updateState"));
         assert!(!bootstrap_action_segments_ok("send-message"));
+        // 缩写/数字 + 大写边界也不能把写动词粘进同一段
+        assert!(!bootstrap_action_segments_ok("getOSUpdate"));
+        assert!(!bootstrap_action_segments_ok("OSSendMessage"));
+        assert!(!bootstrap_action_segments_ok("get2Update"));
         // DDL/危险动词兜底（execute_sql 本身由白名单放行，见下）
         assert!(!bootstrap_action_segments_ok("alter_table"));
         assert!(!bootstrap_action_segments_ok("drop_table"));
@@ -1107,6 +1139,10 @@ mod tests {
         // Fatal 关键词优先于 Retryable 关键词（ocr 修复：混合错误文本不得误判为可重试）
         assert_eq!(classify_tool_failure("参数错误：审批拒绝"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("invalid: forbidden"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("参数错误：无权限"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("权限不足"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("未授权"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("禁止操作"), FailureClass::Fatal);
         // 认证/会话类 invalid 属于 Fatal，不因宽泛 invalid 误判为可重试
         assert_eq!(classify_tool_failure("invalid token"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("invalid session"), FailureClass::Fatal);
