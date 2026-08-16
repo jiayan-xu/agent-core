@@ -4900,7 +4900,7 @@ impl AgentCore {
                 if let Some(plan) = plan_opt {
                     // 全只读计划（仅 query_/get_/explain_ 等读工具）→ 无需确认，直接执行。
                     // 只有含写/危险步骤的多步计划才走「执行/取消」确认闸，避免对只读咨询凭空制造摩擦。
-                    let needs_confirm = self.plan_requires_confirmation(&plan).await;
+                    let needs_confirm = self.plan_requires_confirmation(&plan);
                     // P1-2: 预览优先（非续跑 + 开启 preview + 多步 + 含写/危险步骤）→ 先返回计划，不执行
                     let is_resume = self.in_progress_plan.lock().await.is_some();
                     if self.config.compositional_preview && !is_resume && plan.steps.len() > 1 && needs_confirm {
@@ -5829,7 +5829,8 @@ impl AgentCore {
     /// dangerous）后，静态启发式仍可能按 query_ 前缀放行，必须用分类器
     /// 兜底，否则收紧对确认闸/快照路径失效（ocr security·high 修复）。
     /// 分类器锁不可用/未学习时 fail-closed（按非只读处理，更保守）。
-    async fn is_effectively_read(&self, name: &str) -> bool {
+    /// 纯同步（try_lock + 静态谓词），零 future 分配（ocr maintainability·low 修复）。
+    fn is_effectively_read(&self, name: &str) -> bool {
         let classifier_read = match self.boundary.try_lock() {
             Ok(b) => b.classifier_says_read(name),
             Err(_) => false,
@@ -5840,9 +5841,9 @@ impl AgentCore {
     /// 计划是否含写/危险步骤（需要用户确认闸）。
     /// 仅当任一步骤的工具不是纯只读（见 `is_effectively_read`）时返回 true。
     /// 全只读计划（如「查今日/昨日进厂 + 异常检测」）无需确认，应直接执行。
-    async fn plan_requires_confirmation(&self, plan: &crate::composer::ExecutionPlan) -> bool {
+    fn plan_requires_confirmation(&self, plan: &crate::composer::ExecutionPlan) -> bool {
         for s in &plan.steps {
-            if !self.is_effectively_read(&s.tool).await {
+            if !self.is_effectively_read(&s.tool) {
                 return true;
             }
         }
@@ -7903,7 +7904,10 @@ impl AgentCore {
             let Some(content) = m.content.as_ref() else {
                 continue;
             };
-            if content.starts_with(MARKER) || content.chars().count() <= cfg.threshold_chars {
+            // 单次字符计数复用：跳过判定/截断标记/日志都用同一值，避免对超长
+            // 输出重复全量扫描（ocr perf·low 修复）。
+            let chars = content.chars().count();
+            if content.starts_with(MARKER) || chars <= cfg.threshold_chars {
                 continue;
             }
             // 上下文窗口保护：超长 tool 输出先截断到有界前缀再进 prompt——
@@ -7912,7 +7916,7 @@ impl AgentCore {
             // 造成 API 失败与浪费（ocr bug·medium 修复）。
             const SUMMARY_INPUT_CAP_CHARS: usize = 16_000;
             let input_head: String = content.chars().take(SUMMARY_INPUT_CAP_CHARS).collect();
-            let input_truncated = content.chars().count() > SUMMARY_INPUT_CAP_CHARS;
+            let input_truncated = chars > SUMMARY_INPUT_CAP_CHARS;
             let prompt = format!(
                 "请把下面的工具输出压缩成不超过 800 字的要点摘要。必须保留：数值、日期、\
                  人名/车牌/企业名等实体、结论性语句。禁止添加原输出中不存在的信息。\n\n工具输出：\n{}{}",
@@ -7948,7 +7952,7 @@ impl AgentCore {
                     summarized_this_round += 1;
                     tracing::info!(target = "orchestration.summary",
                         tool_call_id = ?m.tool_call_id,
-                        chars_before = content.chars().count(),
+                        chars_before = chars,
                         chars_after = r.text.chars().count(),
                         "工具结果已 LLM 摘要");
                     // opt-in 摘要：保留 bounded 原文头部，防止后续轮次需要的关键事实
@@ -8177,7 +8181,7 @@ impl AgentCore {
         // 先收集生效非只读名单（含 operator override，ocr security·high 修复）。
         let mut write_like: Vec<&String> = Vec::new();
         for tc in tool_calls.iter() {
-            if !self.is_effectively_read(&tc.name).await {
+            if !self.is_effectively_read(&tc.name) {
                 write_like.push(&tc.name);
             }
         }
@@ -8698,7 +8702,7 @@ impl AgentCore {
             // 丢失「首个写工具前」语义）。
             // 捕获语义：无本 run 键 → 捕获；已有本 run 键 → 已捕获跳过。
             // 旧 run 残留（不同 trace 键）自然共存，由容量淘汰按 seq 清理。
-            if !self.is_effectively_read(&tc.name).await {
+            if !self.is_effectively_read(&tc.name) {
                 let snap_key = snapshot_key(session_id, trace_id);
                 let mut m = self.mutation_snapshot.lock().await;
                 if !m.contains_key(&snap_key) {

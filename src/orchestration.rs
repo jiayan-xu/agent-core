@@ -526,20 +526,17 @@ impl OrchestrationController {
     /// 异步包装：把同步 SQLite 冷路径移出 tokio worker（spawn_blocking）。
     pub async fn is_promoted_async(self: &Arc<Self>, session_id: String) -> bool {
         let this = Arc::clone(self);
-        // session_id 随闭包移入，成功路径零克隆（ocr perf·low 修复）：
-        // join 失败时 id 随任务丢失，错误日志不携带 session（不阻塞诊断）。
-        match tokio::task::spawn_blocking(move || {
-            let promoted = this.is_promoted(&session_id);
-            (promoted, session_id)
-        })
-        .await
-        {
-            Ok((promoted, _sid)) => promoted,
+        // 与 acquire_bootstrap_async 同模式：闭包取 clone，原值留作错误日志
+        //（join 失败时任务丢失，只有外部副本能记录 session——冷路径一次
+        // 小分配换取可诊断性，ocr maintainability·low 修复）。
+        let sid = session_id.clone();
+        match tokio::task::spawn_blocking(move || this.is_promoted(&sid)).await {
+            Ok(v) => v,
             Err(e) => {
                 // join 失败（任务未执行/panic）与「未 promoted」不可混为一谈：
                 // 前者会导致已 promoted 会话被重复 bootstrap，必须可诊断
                 //（ocr other·low 修复：不暴露 panic payload）。
-                tracing::error!(target = "orchestration",
+                tracing::error!(target = "orchestration", session = %session_id,
                     err = %e, "is_promoted_async spawn_blocking join 失败，按未 promoted 处理");
                 false
             }
@@ -608,6 +605,8 @@ impl OrchestrationController {
         is_safe: &dyn Fn(&str) -> bool,
     ) -> Vec<ToolDef> {
         if !self.cfg.bootstrap.enabled {
+            tracing::debug!(target = "orchestration", tools = full_tools.len(),
+                "bootstrap_tools: 开关关闭，原样返回全量目录（pass-through，flag-off 零行为变化；本函数不是通用安全过滤器）");
             return full_tools.to_vec();
         }
         let max = self.cfg.bootstrap.max_tools;

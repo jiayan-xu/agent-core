@@ -1419,11 +1419,13 @@ impl LlmClient {
         self.chat_impl(messages, tools, None).await
     }
 
-    /// chat 的实现体；`budget: Option<u32>` 把「预算化模式」与「本次覆盖的
-    /// max_tokens」绑定在类型层：Some(cap) = 预算化调用（bootstrap 首轮），
-    /// 截断告警按 cap 判定；None = 常规调用。二者不可能漂移——未来若有人
-    /// 传 Some 却不覆盖 max_tokens，告警也按传入的 cap 计算，不会误用
-    /// 全局默认 8192（ocr maintainability·low 修复）。
+    /// chat 的实现体；`budget: Option<u32>` 把「预算化模式」与「截断告警判定
+    /// 上限」绑定：Some(cap) = 预算化调用（bootstrap 首轮），告警按 cap 判定，
+    /// 不会误用全局默认 8192；None = 常规调用。
+    /// 注意：cap 与请求 max_tokens 的**约定式**一致性由调用方保证——
+    /// chat_with_max_tokens 是唯一传入 Some 的入口，其内部用同一 cap 覆盖
+    /// 配置（with_max_tokens_override），两者不可能漂移（ocr maintainability·low
+    /// 修复：文档如实描述，不夸大为类型级保证）。
     async fn chat_impl(
         &self,
         messages: &[Message],
@@ -1873,10 +1875,13 @@ impl LlmClient {
 /// 工具调用恰是异常信号，需要可观测（ocr maintainability·low 修复：标记集合
 /// 与使用场景一致，`tool_use` 是 Anthropic 的工具调用 stop_reason 而非完成
 /// 标记，ocr bug·medium 修复）。
-/// 匹配大小写不敏感：Gemini 等 provider 可能上报大写（"STOP"）（ocr bug·low 修复）。
+/// 大小写不敏感（Gemini 可能上报 "STOP"），零分配（ocr perf·low 修复：
+/// eq_ignore_ascii_case 不建 String；budgeted_truncation_warn 的截断标记
+/// 同口径处理）。
 fn is_normal_finish_reason(finish_reason: &str) -> bool {
-    let fr = finish_reason.to_ascii_lowercase();
-    matches!(fr.as_str(), "stop" | "end_turn" | "stop_sequence")
+    finish_reason.eq_ignore_ascii_case("stop")
+        || finish_reason.eq_ignore_ascii_case("end_turn")
+        || finish_reason.eq_ignore_ascii_case("stop_sequence")
 }
 
 /// 预算化截断告警判定（纯函数，单测覆盖）。
@@ -1899,7 +1904,11 @@ pub(crate) fn budgeted_truncation_warn(
     if !budgeted || has_tool_calls {
         return false;
     }
-    if matches!(finish_reason, "length" | "max_tokens") {
+    // 截断标记大小写不敏感（与 is_normal_finish_reason 同口径，Gemini 可能
+    // 上报 "LENGTH"/"MAX_TOKENS"，ocr bug·medium 修复），零分配。
+    if finish_reason.eq_ignore_ascii_case("length")
+        || finish_reason.eq_ignore_ascii_case("max_tokens")
+    {
         return true;
     }
     // finish_reason 缺失时用 completion_tokens 触及上限兜底判定；

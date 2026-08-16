@@ -1139,16 +1139,12 @@ pub enum ToolClass {
 impl ToolClass {
     /// 从配置/运行时字符串解析注册级别；非法值返回 None。
     /// 容忍大小写与首尾空白（配置侧 'Read' / ' dangerous ' 均接受）。
-    /// 注册入口（register/register_tool）只接受类型化级别，非法 level 在
-    /// 字符串→ToolClass 转换层被拒绝，编译期不可表示（ocr maintainability·low 修复）。
-    pub fn from_str(s: &str) -> Option<ToolClass> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "read" => Some(ToolClass::Read),
-            "write" => Some(ToolClass::Write),
-            "dangerous" => Some(ToolClass::Dangerous),
-            "unknown" => Some(ToolClass::Unknown),
-            _ => None,
-        }
+    /// 注意：实现位于 `std::str::FromStr`（Result 版本），此处不提供同名
+    /// inherent 方法，避免遮蔽 trait 方法造成调用歧义（ocr maintainability·medium
+    /// 修复：`ToolClass::from_str(x)` 即 trait 方法，需要 `use std::str::FromStr`）。
+    #[allow(clippy::should_implement_trait)]
+    pub fn parse(s: &str) -> Option<ToolClass> {
+        s.parse().ok()
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -1167,7 +1163,13 @@ impl std::str::FromStr for ToolClass {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        ToolClass::from_str(s).ok_or(())
+        match s.trim().to_ascii_lowercase().as_str() {
+            "read" => Ok(ToolClass::Read),
+            "write" => Ok(ToolClass::Write),
+            "dangerous" => Ok(ToolClass::Dangerous),
+            "unknown" => Ok(ToolClass::Unknown),
+            _ => Err(()),
+        }
     }
 }
 
@@ -1425,7 +1427,12 @@ impl ToolClassifier {
             "dangerous" => {
                 self.dangerous_tools.insert(key);
             }
-            _ => {
+            other => {
+                // 未知级别不应到达（所有调用方传 ToolClass::as_str 结果或已知字面量）；
+                // 兜底 unknown 时显式留痕，避免未来未校验字符串静默 fail-open
+                //（ocr maintainability·low 修复）。
+                tracing::warn!(target = "boundary", key = %key, level = other,
+                    "insert_classification: 未知级别，按 unknown 处理（调用方应传 ToolClass::as_str 结果）");
                 self.unknown_tools.insert(key);
             }
         }
@@ -1745,6 +1752,11 @@ fn classify_memoria_tool(name: &str) -> Option<&'static str> {
 ///
 /// 注意：这里用前缀启发式而非 `ToolClassifier::new()` 实例——后者是空分类器，
 /// 不含 `register_from_tools` 学到的前缀，会把 `query_today` 之类误判为 unknown。
+///
+/// ⚠️ 本函数是**纯静态启发式**，不感知 `manual_overrides`（operator 经
+/// register_tool 的收紧不会影响本函数返回值）。需要叠加 override 的调用方
+/// 必须同时查权威分类器（见 agent.rs::is_effectively_read，ocr security·high
+/// 修复：确认闸/快照路径已双门叠加；本函数保持纯函数语义供无分类器场景使用）。
 pub fn is_read_only_tool(name: &str) -> bool {
     // 快路径：全小写名称零分配直接判定（授权热路径逐工具调用，避免无条件
     // to_lowercase 分配——ocr perf·low 修复，与 classify 的 canonical 快路径同构）。
@@ -1943,20 +1955,22 @@ mod read_only_tests {
         // None（配置层跳过并告警），不可能被静默 pin 到 unknown
         //（ocr bug·medium 修复：'danagerous' 编译期不可达 register）。
         // 大小写与首尾空白容忍（'Read' / ' dangerous ' 均接受，ocr security·low 修复）。
-        assert_eq!(ToolClass::from_str("read"), Some(ToolClass::Read));
-        assert_eq!(ToolClass::from_str("write"), Some(ToolClass::Write));
-        assert_eq!(ToolClass::from_str("dangerous"), Some(ToolClass::Dangerous));
-        assert_eq!(ToolClass::from_str("unknown"), Some(ToolClass::Unknown));
-        assert_eq!(ToolClass::from_str("READ"), Some(ToolClass::Read));
-        assert_eq!(ToolClass::from_str("Read"), Some(ToolClass::Read));
-        assert_eq!(ToolClass::from_str(" dangerous "), Some(ToolClass::Dangerous));
-        assert_eq!(ToolClass::from_str("danagerous"), None);
-        assert_eq!(ToolClass::from_str(""), None);
-        assert_eq!(ToolClass::from_str("  "), None);
-        // 标准 FromStr 桥接可用（str::parse）
+        assert_eq!(ToolClass::parse("read"), Some(ToolClass::Read));
+        assert_eq!(ToolClass::parse("write"), Some(ToolClass::Write));
+        assert_eq!(ToolClass::parse("dangerous"), Some(ToolClass::Dangerous));
+        assert_eq!(ToolClass::parse("unknown"), Some(ToolClass::Unknown));
+        assert_eq!(ToolClass::parse("READ"), Some(ToolClass::Read));
+        assert_eq!(ToolClass::parse("Read"), Some(ToolClass::Read));
+        assert_eq!(ToolClass::parse(" dangerous "), Some(ToolClass::Dangerous));
+        assert_eq!(ToolClass::parse("danagerous"), None);
+        assert_eq!(ToolClass::parse(""), None);
+        assert_eq!(ToolClass::parse("  "), None);
+        // 标准 FromStr 桥接可用（str::parse），无 inherent shadowing
         assert_eq!("write".parse::<ToolClass>(), Ok(ToolClass::Write));
-        // as_str 与 from_str 互逆
-        assert_eq!(ToolClass::from_str(ToolClass::Dangerous.as_str()), Some(ToolClass::Dangerous));
+        assert_eq!("READ".parse::<ToolClass>(), Ok(ToolClass::Read));
+        assert_eq!("danagerous".parse::<ToolClass>(), Err(()));
+        // as_str 与 parse 互逆
+        assert_eq!(ToolClass::parse(ToolClass::Dangerous.as_str()), Some(ToolClass::Dangerous));
     }
 
     #[test]

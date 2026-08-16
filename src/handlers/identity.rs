@@ -992,7 +992,7 @@ pub(crate) async fn build_agent(
             .map(|b| {
                 let mut pairs = Vec::new();
                 for i in &b.tool_overrides {
-                    match agent_core::boundary::ToolClass::from_str(&i.level) {
+                    match agent_core::boundary::ToolClass::parse(&i.level) {
                         Some(level) => pairs.push((i.tool.clone(), level)),
                         None => tracing::error!(
                             target = "boundary",
