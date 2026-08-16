@@ -202,7 +202,9 @@ impl RoutedLlm {
         classify_difficulty(&self.policy, messages).await
     }
 
-    /// 统一路由：分类 → 日志 → 选 provider（chat / chat_budgeted 共用，防两处漂移）。
+    /// 统一路由：分类 → 日志 → 选 provider（仅 `chat` 使用）。
+    /// 辅助调用走 `chat_single`（显式 base，不分类），bootstrap 走
+    /// `chat_budgeted`（显式 Easy），都有各自防漂移注释。
     async fn route_select(&self, messages: &[Message]) -> (TaskDifficulty, &LlmClient) {
         let d = classify_difficulty(&self.policy, messages).await;
         tracing::info!(difficulty = ?d, "difficulty_route");
@@ -230,17 +232,17 @@ impl RoutedLlm {
         }
     }
 
-    /// 单次路由调用（不做 Best-of-N）。
-    /// 供摘要/评审等辅助调用使用：这些路径按**单次调用**估算 TurnBudget，
-    /// 若复用 `chat` 且用户开启 best_of_n，会被静默放大为 N 次真实 LLM 调用，
-    /// 破坏预算语义；路由与 provider failover/retry 仍与主循环同一套。
+    /// 辅助调用专用：base provider 单次调用（不做 Best-of-N、不做难度分类）。
+    /// 供摘要/评审等路径使用：这些路径按**单次调用**估算 TurnBudget 与 LLM 计数，
+    /// 而 `route_select` 在 `ClassifyMode::Judge` 下本身会额外发起一次真实 LLM
+    /// 往返，会把声明的「单次调用」变成隐藏的 2 次。base 客户端仍具备 provider
+    /// fallback/retry，辅助调用保持与主循环同一套传输可靠性。
     pub async fn chat_single(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
     ) -> Result<LlmResponse, String> {
-        let (_d, selected) = self.route_select(messages).await;
-        selected.chat(messages, tools).await
+        self.base.chat(messages, tools).await
     }
 
     /// ADR-017：bootstrap 首请求的预算化调用（首轮输出预算覆盖）。
@@ -252,7 +254,9 @@ impl RoutedLlm {
     /// `RoutedLlm::classify` 判定 Easy（bootstrap 的硬门槛），且 Judge 模式下
     /// `classify_difficulty` 是一次真实 LLM 往返——再分类会把 ADR-017 承诺的
     /// 「1024 预算 = 单次便宜调用」变成 3 次往返。这里直接锚定 Easy provider。
-    pub async fn chat_budgeted(
+    /// `pub(crate)`：该契约只对 agent 层开放，防止未来外部调用方在未验证
+    /// Easy 前置条件时被静默路由到最便宜的 provider。
+    pub(crate) async fn chat_budgeted(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
@@ -1372,6 +1376,7 @@ impl LlmClient {
     /// clone 后覆盖字段，不改动 &self 配置——promote 后下一次调用自动恢复原值，
     /// 杜绝「首轮预算残留整会话」。显式以 budgeted=true 走 chat_impl，
     /// 截断告警只在本路径生效（不再用魔法阈值推断调用性质）。
+    #[tracing::instrument(skip_all, fields(model = %self.config.model, provider = %self.config.base_url, tool_count = tools.len()))]
     pub async fn chat_with_max_tokens(
         &self,
         messages: &[Message],
@@ -1569,6 +1574,12 @@ impl LlmClient {
                                     > 0
                             });
 
+                        // task 650：DeepSeek DSML 文本泄露 → 回填 structured tool_calls。
+                        // 先做 fallback 再判截断告警：DSML 响应在 fallback 前 tool_calls
+                        // 为空，若先判告警会把「带工具调用的截断响应」误报为
+                        // 「空文本截断」（ocr bug·low）。
+                        let response = apply_dsml_fallback(LlmResponse { text, tool_calls, usage });
+
                         // 预算化调用（bootstrap 首轮）截断留痕：显式 budgeted 判定，
                         // 不依赖可配置的 max_tokens 魔法阈值（ocr 修复）。
                         // 双信号：finish_reason=length 之外，`completion_tokens`
@@ -1578,7 +1589,8 @@ impl LlmClient {
                             .get("finish_reason")
                             .and_then(|f| f.as_str())
                             .unwrap_or("");
-                        let completion_tokens = usage
+                        let completion_tokens = response
+                            .usage
                             .as_ref()
                             .map(|u| u.completion_tokens)
                             .unwrap_or(0);
@@ -1586,7 +1598,7 @@ impl LlmClient {
                             finish_reason,
                             completion_tokens,
                             self.config.max_tokens,
-                            !tool_calls.is_empty(),
+                            !response.tool_calls.is_empty(),
                             budgeted,
                         ) {
                             tracing::warn!(target = "agent.llm", model = %model,
@@ -1594,8 +1606,7 @@ impl LlmClient {
                                 "budgeted 输出疑似被截断（finish_reason=length 或 completion_tokens 触及 max_tokens）且 tool_calls 为空");
                         }
 
-                        // task 650：DeepSeek DSML 文本泄露 → 回填 structured tool_calls
-                        return Ok(apply_dsml_fallback(LlmResponse { text, tool_calls, usage }));
+                        return Ok(response);
                     }
                     Err(e) => {
                         let msg = format!("连接失败: {}", e);
