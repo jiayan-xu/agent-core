@@ -241,14 +241,15 @@ pub(crate) fn spawn_server(
                         };
                         if (2..=4).contains(&hour) && !already {
                             let default_ns = format!("agent/{}", agent.config.identity.agent_id);
-            let ns_list = std::env::var("CONSOLIDATE_NAMESPACES")
-                .unwrap_or(default_ns.clone());
-                            let mut results = Vec::new();
-                            for ns in ns_list
+                            let ns_list = std::env::var("CONSOLIDATE_NAMESPACES")
+                                .unwrap_or(default_ns.clone());
+                            let ns_vec: Vec<String> = ns_list
                                 .split(',')
-                                .map(|s| s.trim())
+                                .map(|s| s.trim().to_string())
                                 .filter(|s| !s.is_empty())
-                            {
+                                .collect();
+                            let mut results = Vec::new();
+                            for ns in &ns_vec {
                                 let res = agent.consolidate(ns).await;
                                 tracing::info!("[consolidate] {}", res);
                                 results.push(serde_json::json!({"ns": ns, "result": res}));
@@ -258,8 +259,9 @@ pub(crate) fn spawn_server(
                             let me_val = agent.run_meta_evolution(&default_ns).await;
                             tracing::info!(target: "consciousness", "meta_evolution(nightly): {}", me_val);
                             results.push(serde_json::json!({"ns": default_ns, "meta_evolution": me_val}));
-                            // 记忆库维护：衰减循环 + GFS 轮转备份（每日一次，与 consolidate 同周期）
-                            let maint = agent.memoria_maintenance().await;
+                            // 记忆库维护：衰减循环 + GFS 轮转备份（每日一次，与 consolidate 同周期；
+                            // decay 需逐 ns 显式传 namespace，见 agent.rs::memoria_maintenance）
+                            let maint = agent.memoria_maintenance(&ns_vec).await;
                             if maint.contains("failed") {
                                 tracing::warn!(target: "consciousness", "nightly maintenance reported failure: {}", maint);
                             }

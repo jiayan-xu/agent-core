@@ -12274,22 +12274,40 @@ impl AgentCore {
     /// 记忆库系统维护：衰减循环（memory_decay）+ GFS 轮转备份（memory_backup）。
     /// 与 consolidate 同用维护身份（MEMORIA_ADMIN_KEY → admin / MEMORIA_JARVIS_BADGE → jarvis），
     /// 由夜间 patrol（bootstrap.rs 02:00-04:59 块）每日调用一次，补齐 consolidate 之外的维护环节。
-    pub async fn memoria_maintenance(&self) -> String {
+    ///
+    /// `ns_list`：与 consolidate 同批的命名空间列表，逐 ns 执行 decay（memoria NsPolicy
+    /// 门控要求显式传 namespace；admin 维护身份授权为 `*` 时缺参会被 -32002 直接拒绝，
+    /// 空参 `{}` 的旧调用因此常年失败）。空列表时保持旧行为（不带 namespace 调一次）。
+    pub async fn memoria_maintenance(&self, ns_list: &[String]) -> String {
         let mem_client = memoria_maintenance_client(&self.config.memoria_url, &self.mcp);
         let parse = |raw: String| -> serde_json::Value {
             serde_json::from_str::<serde_json::Value>(&raw)
                 .unwrap_or_else(|_| serde_json::Value::String(raw))
         };
-        let decay_raw = mem_client
-            .call("memory_decay", &serde_json::json!({}))
-            .await
-            .unwrap_or_else(|e| format!("decay failed: {}", e));
+        let decay = if ns_list.is_empty() {
+            parse(
+                mem_client
+                    .call("memory_decay", &serde_json::json!({}))
+                    .await
+                    .unwrap_or_else(|e| format!("decay failed: {}", e)),
+            )
+        } else {
+            let mut out = Vec::new();
+            for ns in ns_list {
+                let raw = mem_client
+                    .call("memory_decay", &serde_json::json!({"namespace": ns}))
+                    .await
+                    .unwrap_or_else(|e| format!("decay failed: {}", e));
+                out.push(serde_json::json!({"ns": ns, "result": parse(raw)}));
+            }
+            serde_json::Value::Array(out)
+        };
         let backup_raw = mem_client
             .call("memory_backup", &serde_json::json!({}))
             .await
             .unwrap_or_else(|e| format!("backup failed: {}", e));
         let summary = serde_json::json!({
-            "decay": parse(decay_raw),
+            "decay": decay,
             "backup": parse(backup_raw),
         })
         .to_string();
