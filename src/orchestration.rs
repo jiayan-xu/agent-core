@@ -9,7 +9,7 @@
 //!
 //! 本模块只放纯逻辑与状态；热路径接线在 `agent.rs::llm_loop`。
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -269,11 +269,51 @@ impl SessionPhaseStore {
 
 // ── 控制器 ──────────────────────────────────────────────────────────────
 
+/// 进程内 session 集合的 LRU 上限：防止长驻服务中缓存随会话数无限增长。
+/// 淘汰只丢缓存（真相在 SessionPhaseStore / 幂等重算），不影响正确性。
+const SESSION_SET_CACHE_MAX: usize = 4096;
+
+/// 有界 LRU session 集合：`contains` 命中不刷新顺序（promote 是 append-only，
+/// 无热/冷再排序语义），只保证容量上界。
+#[derive(Default)]
+struct BoundedSessionSet {
+    order: VecDeque<String>,
+    set: HashSet<String>,
+}
+
+impl BoundedSessionSet {
+    fn contains(&self, session_id: &str) -> bool {
+        self.set.contains(session_id)
+    }
+
+    fn insert(&mut self, session_id: &str) {
+        if self.set.contains(session_id) {
+            return;
+        }
+        if self.order.len() >= SESSION_SET_CACHE_MAX {
+            if let Some(evicted) = self.order.pop_front() {
+                self.set.remove(&evicted);
+            }
+        }
+        self.order.push_back(session_id.to_string());
+        self.set.insert(session_id.to_string());
+    }
+
+    fn remove(&mut self, session_id: &str) {
+        if self.set.remove(session_id) {
+            self.order.retain(|s| s != session_id);
+        }
+    }
+}
+
 pub struct OrchestrationController {
     pub cfg: OrchestrationConfig,
     store: SessionPhaseStore,
     /// 进程内缓存：promote 是 append-only，缓存命中即真。
-    promoted_cache: Mutex<HashSet<String>>,
+    promoted_cache: Mutex<BoundedSessionSet>,
+    /// bootstrap 首请求的 per-session 原子预留：同一 session 的并发 run
+    /// 只有一个能进入最小工具面，其余 run 直接走常规路径。
+    bootstrap_in_flight: Mutex<BoundedSessionSet>,
     /// guardrail hooks（ADR-017 P2）。默认注册旧补丁的等价内置 hooks。
     hooks: HookRegistry,
 }
@@ -292,7 +332,8 @@ impl OrchestrationController {
         OrchestrationController {
             cfg,
             store,
-            promoted_cache: Mutex::new(HashSet::new()),
+            promoted_cache: Mutex::new(BoundedSessionSet::default()),
+            bootstrap_in_flight: Mutex::new(BoundedSessionSet::default()),
             hooks,
         }
     }
@@ -304,7 +345,8 @@ impl OrchestrationController {
         OrchestrationController {
             cfg,
             store,
-            promoted_cache: Mutex::new(HashSet::new()),
+            promoted_cache: Mutex::new(BoundedSessionSet::default()),
+            bootstrap_in_flight: Mutex::new(BoundedSessionSet::default()),
             hooks,
         }
     }
@@ -331,17 +373,72 @@ impl OrchestrationController {
         let promoted = self.store.is_promoted(session_id);
         if promoted {
             if let Ok(mut cache) = self.promoted_cache.lock() {
-                cache.insert(session_id.to_string());
+                cache.insert(session_id);
             }
         }
         promoted
     }
 
-    pub fn promote(&self, session_id: &str) {
-        if let Ok(mut cache) = self.promoted_cache.lock() {
-            cache.insert(session_id.to_string());
+    /// 原子 compare-and-set：首次标记者返回 true，后续调用返回 false。
+    /// 与 `promote` 一样 append-only；用于消除同 session 并发 run 的
+    /// check-then-promote 窗口。
+    pub fn try_promote(&self, session_id: &str) -> bool {
+        let won = {
+            let Ok(mut cache) = self.promoted_cache.lock() else {
+                return false;
+            };
+            if cache.contains(session_id) {
+                false
+            } else {
+                cache.insert(session_id);
+                true
+            }
+        };
+        if won {
+            self.store.promote(session_id);
         }
-        self.store.promote(session_id);
+        won
+    }
+
+    pub fn promote(&self, session_id: &str) {
+        self.try_promote(session_id);
+    }
+
+    /// 尝试预留本 session 的 bootstrap 首请求（per-session 原子闸）。
+    /// 仅当 session 未 promoted、也没有其他 run 正在 bootstrap 时成功。
+    /// 调用方必须在首个 LLM 响应后 `finish_bootstrap`（成功）或
+    /// `cancel_bootstrap`（失败/提前返回），防止预留泄漏。
+    pub fn try_begin_bootstrap(&self, session_id: &str) -> bool {
+        let Ok(mut in_flight) = self.bootstrap_in_flight.lock() else {
+            return false;
+        };
+        if in_flight.contains(session_id) {
+            return false;
+        }
+        // 锁内复核 promoted：把「is_promoted + 预留」压缩为同一临界区，
+        // 两个并发 run 只有一个能看到 not-promoted 并拿到预留。
+        if self.is_promoted(session_id) {
+            return false;
+        }
+        in_flight.insert(session_id);
+        true
+    }
+
+    /// bootstrap 首请求成功：先 promote（append-only），再释放 per-session 预留。
+    /// 顺序不能反——先释放会重新打开并发窗口，其他 run 可能看到未 promoted
+    /// 而再次进入 bootstrap。
+    pub fn finish_bootstrap(&self, session_id: &str) {
+        self.promote(session_id);
+        if let Ok(mut in_flight) = self.bootstrap_in_flight.lock() {
+            in_flight.remove(session_id);
+        }
+    }
+
+    /// bootstrap 首请求失败/提前返回：只释放预留，不 promote。
+    pub fn cancel_bootstrap(&self, session_id: &str) {
+        if let Ok(mut in_flight) = self.bootstrap_in_flight.lock() {
+            in_flight.remove(session_id);
+        }
     }
 
     /// 构造 bootstrap 工具面：只保留「权威边界判定为只读」的工具（`is_safe` 谓词
@@ -384,10 +481,13 @@ impl OrchestrationController {
     }
 }
 
-/// 动作段拒绝集：只匹配下划线分段后的**首段或尾段**（动作词），不匹配宾语名词，
-/// 避免 `query_archive_log` 这类只读工具因中间含 `archive` 被误杀。
-/// 危险/写工具的第一道闸由 `boundary::is_read_only_tool` 承担；本表兜底覆盖
-/// 常见写动词段（update/insert/create/fill/manage/save/add/put/post/remember/dispatch 等）。
+/// 动作段拒绝集：扫描下划线分段后的**全部**段，任一段命中写动词即拒绝。
+/// 首段/尾段规则会漏掉 `query_batch_update_log`、`cross_agent_register_user`
+/// 这类中间段带写动词的工具；`query_archive_log` 是唯一的已知误伤项，
+/// 已放入 `BOOTSTRAP_EXPLICIT_ALLOW`（且 allow 不再越过 safe 门）。
+/// 危险/写工具的第一道闸由 `boundary::is_read_only_tool` / ToolClassifier 承担；
+/// 本表兜底覆盖常见写动词段（update/insert/create/fill/manage/save/add/put/post/
+/// remember/dispatch 等）。
 fn bootstrap_action_segments_ok(name: &str) -> bool {
     const DENY_ACTIONS: &[&str] = &[
         "write", "delete", "remove", "sync", "commit", "archive", "register", "login",
@@ -399,26 +499,34 @@ fn bootstrap_action_segments_ok(name: &str) -> bool {
         "trigger", "forward",
     ];
     let lower = name.to_ascii_lowercase();
-    let segments: Vec<&str> = lower.split('_').filter(|s| !s.is_empty()).collect();
-    if segments.is_empty() {
-        return true;
-    }
-    let first = segments[0];
-    let last = segments[segments.len() - 1];
-    !DENY_ACTIONS.iter().any(|a| first == *a || last == *a)
+    !lower
+        .split('_')
+        .filter(|s| !s.is_empty())
+        .any(|segment| DENY_ACTIONS.iter().any(|a| segment == *a))
 }
 
-/// 显式允许名（白名单优先）：经边界审查的已知只读工具，即使动作段表有歧义也放行。
-const BOOTSTRAP_EXPLICIT_ALLOW: &[&str] = &["execute_sql", "fuzzy_match_plate"];
+/// 显式允许名：只覆盖动作段兜底检查的**已知只读工具**（`query_archive_log` 的
+/// 中间段 `archive` 是名词，不是写动作）。白名单不再越过 `safe` 门，也不越过
+/// `bootstrap_explicit_deny`：边界分类为写/危险的工具永远进不了 bootstrap 面。
+const BOOTSTRAP_EXPLICIT_ALLOW: &[&str] =
+    &["execute_sql", "fuzzy_match_plate", "query_archive_log"];
 
 fn bootstrap_tool_allowed(name: &str, safe: bool) -> bool {
+    // 权威边界判定优先：safe=false 一律拒绝，白名单只豁免动作段启发式，
+    // 不能把边界判为写/危险的工具重新放进 bootstrap（ADR-017 不变量）。
+    if !safe {
+        return false;
+    }
+    if bootstrap_explicit_deny(name) {
+        return false;
+    }
     if BOOTSTRAP_EXPLICIT_ALLOW
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
     {
         return true;
     }
-    safe && bootstrap_action_segments_ok(name) && !bootstrap_explicit_deny(name)
+    bootstrap_action_segments_ok(name)
 }
 
 /// 显式拒绝名：`boundary::is_read_only_tool` 的前缀启发式存在已知宽放项
@@ -848,6 +956,64 @@ mod tests {
         let names: Vec<&str> = picked.iter().map(|t| t.function.name.as_str()).collect();
         assert!(!names.contains(&"cross_agent_query"));
         assert!(names.contains(&"query_entrance"));
+    }
+
+    #[test]
+    fn bootstrap_whitelist_does_not_override_safe_or_explicit_deny() {
+        let cfg = bootstrap_on_cfg();
+        let ctrl = OrchestrationController::new_with_store(cfg, SessionPhaseStore::new_in_memory());
+        let full = vec![tool("execute_sql"), tool("cross_agent_query")];
+        // safe=false 时白名单必须失效（权威边界判定优先）
+        assert!(ctrl.bootstrap_tools("x", &full, &|_| false).is_empty());
+        // safe=true 但显式拒绝名单命中时，白名单也不得放行
+        let picked =
+            ctrl.bootstrap_tools("x", &full, &|n| n == "execute_sql" || n == "cross_agent_query");
+        assert!(picked.iter().all(|t| t.function.name == "execute_sql"));
+    }
+
+    #[test]
+    fn bootstrap_action_deny_scans_all_segments() {
+        // 写动词位于中间段也必须被动作段兜底拦截
+        assert!(!bootstrap_action_segments_ok("cross_agent_register_user"));
+        assert!(!bootstrap_action_segments_ok("query_batch_update_log"));
+        // 已知只读误伤项：名词 archive 在中间段，经显式允许放行
+        assert!(!bootstrap_action_segments_ok("query_archive_log"));
+        assert!(bootstrap_tool_allowed("query_archive_log", true));
+        assert!(!bootstrap_tool_allowed("execute_sql", false));
+    }
+
+    #[test]
+    fn bootstrap_reservation_is_atomic_and_releasable() {
+        let cfg = bootstrap_on_cfg();
+        let ctrl = OrchestrationController::new_with_store(cfg, SessionPhaseStore::new_in_memory());
+        assert!(ctrl.try_begin_bootstrap("s1"));
+        // 同 session 并发第二个 run 拿不到预留
+        assert!(!ctrl.try_begin_bootstrap("s1"));
+        // 不同 session 互不影响
+        assert!(ctrl.try_begin_bootstrap("s2"));
+        ctrl.cancel_bootstrap("s1");
+        assert!(ctrl.try_begin_bootstrap("s1"));
+        // 成功后 promote 并释放预留；已 promoted 的 session 不再能预留
+        ctrl.finish_bootstrap("s1");
+        assert!(ctrl.is_promoted("s1"));
+        assert!(!ctrl.try_begin_bootstrap("s1"));
+    }
+
+    #[test]
+    fn promoted_cache_is_bounded() {
+        let cfg = bootstrap_on_cfg();
+        let ctrl = OrchestrationController::new_with_store(cfg, SessionPhaseStore::disabled());
+        for i in 0..(SESSION_SET_CACHE_MAX + 16) {
+            ctrl.promote(&format!("s{i}"));
+        }
+        // 直接观察缓存容器：容量不能超过上限（LRU 淘汰，DB 仍可回查）
+        {
+            let cache = ctrl.promoted_cache.lock().unwrap();
+            assert!(cache.order.len() <= SESSION_SET_CACHE_MAX);
+            assert!(cache.set.len() <= SESSION_SET_CACHE_MAX);
+        }
+        // 仍在缓存中的最近 session 命中不受影响
+        assert!(ctrl.is_promoted(&format!("s{}", SESSION_SET_CACHE_MAX + 15)));
     }
 
     #[test]

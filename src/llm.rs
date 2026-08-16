@@ -230,17 +230,36 @@ impl RoutedLlm {
         }
     }
 
+    /// 单次路由调用（不做 Best-of-N）。
+    /// 供摘要/评审等辅助调用使用：这些路径按**单次调用**估算 TurnBudget，
+    /// 若复用 `chat` 且用户开启 best_of_n，会被静默放大为 N 次真实 LLM 调用，
+    /// 破坏预算语义；路由与 provider failover/retry 仍与主循环同一套。
+    pub async fn chat_single(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+    ) -> Result<LlmResponse, String> {
+        let (_d, selected) = self.route_select(messages).await;
+        selected.chat(messages, tools).await
+    }
+
     /// ADR-017：bootstrap 首请求的预算化调用（首轮输出预算覆盖）。
     /// 跳过 Best-of-N 的真实理由：bootstrap 的 1024 预算只适合**单次便宜调用**，
     /// N 路采样与「锚定」目标相悖；工具面为空时的差异属已知权衡（空面时下一轮
-    /// promote 后自然恢复常规 chat 语义）。路由轨迹与 `chat` 一致，保持可观测。
+    /// promote 后自然恢复常规 chat 语义）。
+    ///
+    /// 不重新做难度分类：调用方（agent.rs::llm_loop）进入本路径前已经用
+    /// `RoutedLlm::classify` 判定 Easy（bootstrap 的硬门槛），且 Judge 模式下
+    /// `classify_difficulty` 是一次真实 LLM 往返——再分类会把 ADR-017 承诺的
+    /// 「1024 预算 = 单次便宜调用」变成 3 次往返。这里直接锚定 Easy provider。
     pub async fn chat_budgeted(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
         max_tokens: u32,
     ) -> Result<LlmResponse, String> {
-        let (_d, selected) = self.route_select(messages).await;
+        let selected = self.select(TaskDifficulty::Easy);
+        tracing::info!(difficulty = ?TaskDifficulty::Easy, "difficulty_route_budgeted");
         selected.chat_with_max_tokens(messages, tools, max_tokens).await
     }
 
@@ -1508,18 +1527,6 @@ impl LlmClient {
                             })
                             .unwrap_or_default();
 
-                        // 预算化调用（bootstrap 首轮）截断留痕：显式 budgeted 判定，
-                        // 不依赖可配置的 max_tokens 魔法阈值（ocr 修复）。
-                        let finish_reason = choice
-                            .get("finish_reason")
-                            .and_then(|f| f.as_str())
-                            .unwrap_or("");
-                        if budgeted_truncation_warn(finish_reason, !tool_calls.is_empty(), budgeted)
-                        {
-                            tracing::warn!(target = "agent.llm", model = %model,
-                                "finish_reason=length 且 tool_calls 为空：输出可能被 max_tokens 截断");
-                        }
-
                         // 备用 Provider 调用成功时记录日志
                         if idx > 0 {
                             tracing::info!(failover_to = %model, provider_index = idx, "LLM provider failover（主 Provider 失败）");
@@ -1561,6 +1568,31 @@ impl LlmClient {
                                     .saturating_add(u.total_tokens)
                                     > 0
                             });
+
+                        // 预算化调用（bootstrap 首轮）截断留痕：显式 budgeted 判定，
+                        // 不依赖可配置的 max_tokens 魔法阈值（ocr 修复）。
+                        // 双信号：finish_reason=length 之外，`completion_tokens`
+                        // 触到被覆盖的 max_tokens 也判为截断——provider 省略或改用
+                        // 其他 finish_reason 标记时仍能留痕。
+                        let finish_reason = choice
+                            .get("finish_reason")
+                            .and_then(|f| f.as_str())
+                            .unwrap_or("");
+                        let completion_tokens = usage
+                            .as_ref()
+                            .map(|u| u.completion_tokens)
+                            .unwrap_or(0);
+                        if budgeted_truncation_warn(
+                            finish_reason,
+                            completion_tokens,
+                            self.config.max_tokens,
+                            !tool_calls.is_empty(),
+                            budgeted,
+                        ) {
+                            tracing::warn!(target = "agent.llm", model = %model,
+                                finish_reason, completion_tokens, max_tokens = self.config.max_tokens,
+                                "budgeted 输出疑似被截断（finish_reason=length 或 completion_tokens 触及 max_tokens）且 tool_calls 为空");
+                        }
 
                         // task 650：DeepSeek DSML 文本泄露 → 回填 structured tool_calls
                         return Ok(apply_dsml_fallback(LlmResponse { text, tool_calls, usage }));
@@ -1768,14 +1800,22 @@ impl LlmClient {
 }
 
 /// 预算化截断告警判定（纯函数，单测覆盖）。
-/// 只在 budgeted 调用（bootstrap 首轮）且 finish_reason=length 且无工具调用时告警；
-/// 不依赖可配置的 max_tokens 魔法阈值。
+/// 只在 budgeted 调用（bootstrap 首轮）且无工具调用时告警。双信号：
+/// 1) finish_reason == "length"；
+/// 2) 上游 completion_tokens 已达到本次覆盖后的 max_tokens（provider 省略
+///    finish_reason 或使用其他截断标记时仍能识别）。
 pub(crate) fn budgeted_truncation_warn(
     finish_reason: &str,
+    completion_tokens: u64,
+    max_tokens: u32,
     has_tool_calls: bool,
     budgeted: bool,
 ) -> bool {
-    budgeted && finish_reason == "length" && !has_tool_calls
+    if !budgeted || has_tool_calls {
+        return false;
+    }
+    finish_reason == "length"
+        || (max_tokens > 0 && completion_tokens >= u64::from(max_tokens))
 }
 
 #[cfg(test)]
@@ -1808,13 +1848,19 @@ mod routing_tests {
     #[test]
     fn budgeted_truncation_warn_heuristic() {
         // budgeted + length + 无工具 → 告警
-        assert!(budgeted_truncation_warn("length", false, true));
+        assert!(budgeted_truncation_warn("length", 10, 1024, false, true));
+        // completion_tokens 触及 max_tokens 时，即使 finish_reason 缺失/非 length 也告警
+        assert!(budgeted_truncation_warn("", 1024, 1024, false, true));
+        assert!(budgeted_truncation_warn("stop", 1024, 1024, false, true));
+        // 未触及 max_tokens 且非 length → 不告警
+        assert!(!budgeted_truncation_warn("stop", 1023, 1024, false, true));
+        assert!(!budgeted_truncation_warn("", 1024, 0, false, true));
         // 普通调用即使 length 也不告警
-        assert!(!budgeted_truncation_warn("length", false, false));
+        assert!(!budgeted_truncation_warn("length", 10, 1024, false, false));
         // 有工具调用（哪怕被截断）不告警
-        assert!(!budgeted_truncation_warn("length", true, true));
+        assert!(!budgeted_truncation_warn("length", 1024, 1024, true, true));
         // 其他 finish_reason 不告警
-        assert!(!budgeted_truncation_warn("stop", false, true));
+        assert!(!budgeted_truncation_warn("stop", 10, 1024, false, true));
     }
 
     #[test]

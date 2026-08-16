@@ -6720,24 +6720,36 @@ impl AgentCore {
         let full_tools = self.select_exposed_tools(raw_message, allowed_ns, expose_cap).await;
         // ADR-017 P1：flash 锚定引导。仅 bootstrap 开启 + easy 路由 + 非写意图 + 未 promoted 触发；
         // flag-off / 其他条件不满足时 `bootstrap_active=false`，以下所有分支与原路径逐字等价。
-        let bootstrap_active = self.orchestration.cfg.bootstrap.enabled
+        // per-session 原子预留：同 session 并发 run 只有一个能拿最小工具面，
+        // 其余 run 直接走常规路径（拿不到预留不算错误，也不取消其他 run 的预留）。
+        let bootstrap_eligible = self.orchestration.cfg.bootstrap.enabled
             && is_easy_query
             && !Self::has_write_intent(raw_message)
             && !self.orchestration.is_promoted(session_id);
+        let bootstrap_active =
+            bootstrap_eligible && self.orchestration.try_begin_bootstrap(session_id);
+        if bootstrap_eligible && !bootstrap_active {
+            tracing::info!(target = "orchestration", session = %session_id,
+                "bootstrap 预留未获得（同 session 已有 run 在 bootstrap 或已 promoted），本 run 走常规路径");
+        }
         // 保存原始 system prompt：bootstrap 替换为中性人设后，promote 时（同请求内）恢复。
         let original_system_content: Option<String> = ctx
             .messages
             .first()
             .filter(|m| m.role == "system")
             .and_then(|m| m.content.clone());
-        let mut tools = if bootstrap_active {
+        // 工具所有权：非 bootstrap 路径直接 move `full_tools`，避免每轮入口深克隆；
+        // bootstrap 路径把全量目录暂存到 Option，promote 时 move 回来（零克隆）。
+        let mut tools;
+        let mut bootstrap_full_tools: Option<Vec<ToolDef>> = None;
+        if bootstrap_active {
             // 权威安全谓词：优先用边界 ToolClassifier（已从注册工具学习）判 read；
             // 锁不可用时回退 boundary::is_read_only_tool 前缀启发式。
             let boundary_ref = self.boundary.clone();
             let is_safe = move |name: &str| -> bool {
                 match boundary_ref.try_lock() {
                     Ok(b) => match b.classifier.lock() {
-                        Ok(c) => c.classify(name) == "read",
+                        Ok(c) => c.classify_typed(name) == crate::boundary::ToolClass::Read,
                         Err(_) => crate::boundary::is_read_only_tool(name),
                     },
                     Err(_) => crate::boundary::is_read_only_tool(name),
@@ -6749,10 +6761,11 @@ impl AgentCore {
             tracing::info!(target = "orchestration", session = %session_id,
                 full_tools = full_tools.len(), bootstrap_tools = picked.len(),
                 "bootstrap 首请求最小工具面");
-            picked
+            bootstrap_full_tools = Some(full_tools);
+            tools = picked;
         } else {
-            full_tools.clone()
-        };
+            tools = full_tools;
+        }
         // P1-4: 构建工具名 → JSON Schema 映射，用于参数校验
         ctx.tool_schemas = tools
             .iter()
@@ -6858,6 +6871,9 @@ impl AgentCore {
                 }
                 crate::orchestration::HookAction::Abort { reply } => {
                     self.metrics.inc_hook_abort();
+                    if bootstrap_active {
+                        self.orchestration.cancel_bootstrap(session_id);
+                    }
                     self.save_to_history(session_id, raw_message, &reply).await;
                     return reply;
                 }
@@ -6892,6 +6908,9 @@ impl AgentCore {
             let budget_check = budget.check_token(req_est);
             if let Err(e) = budget_check {
                 tracing::warn!("[QUOTA] 命名空间『{}』token 预算不足: {}", quota_ns_llm, e);
+                if bootstrap_round {
+                    self.orchestration.cancel_bootstrap(session_id);
+                }
                 self.audit_logger
                     .log_decision(
                         &self.config.identity.agent_id,
@@ -6922,6 +6941,9 @@ impl AgentCore {
                 // P1-5：LLM 主/备 Provider 均失败 → 返回「可重试错误」，而非裸崩
                 Err(e) => {
                     self.metrics.inc_errors();
+                    if bootstrap_round {
+                        self.orchestration.cancel_bootstrap(session_id);
+                    }
                     tracing::warn!("[DEGRADE] LLM 调用失败（已尝试主用+备用 Provider）: {}", e);
                     return "⚠️ LLM 服务暂时不可用（已尝试主用与备用 Provider 均失败）。请稍后重试，或检查网络与 API 密钥配置。".to_string();
                 }
@@ -6931,9 +6953,18 @@ impl AgentCore {
             // 原始 system prompt（ocr 修复：此前仅恢复预算，后续轮次仍被困在 3 工具面）。
             if bootstrap_round {
                 bootstrap_round = false;
-                self.orchestration.promote(session_id);
+                // 先 promote 再释放 per-session 预留（顺序在控制器内保证），
+                // 然后 move 回全量目录——非 bootstrap 路径与 promote 路径都零克隆。
+                self.orchestration.finish_bootstrap(session_id);
                 self.metrics.inc_bootstrap_promote();
-                tools = full_tools.clone();
+                if let Some(full) = bootstrap_full_tools.take() {
+                    tools = full;
+                } else {
+                    // 不变量：bootstrap_round=true 时一定在本方法入口存过全量目录；
+                    // 保留日志防未来重构破坏该不变量，仍用最小面继续（不 panic）。
+                    tracing::error!(target = "orchestration", session = %session_id,
+                        "bootstrap_full_tools 缺失，promote 后未恢复全量工具目录");
+                }
                 ctx.tool_schemas = tools
                     .iter()
                     .map(|t| (t.function.name.clone(), t.function.parameters.clone()))
@@ -7707,7 +7738,10 @@ impl AgentCore {
                 tool_calls: None,
                 tool_call_id: None,
             }];
-            match self.llm.chat(&req, &[]).await {
+            // 辅助 LLM 调用走 routed_llm（与主循环同一套难度路由 + provider failover/retry），
+            // 并计入 LLM 调用计数；chat_single 保证按预算估算执行单次调用（不进 Best-of-N）。
+            self.metrics.inc_llm_calls();
+            match self.routed_llm.chat_single(&req, &[]).await {
                 Ok(r) if !r.text.trim().is_empty() => {
                     let resp_est = (r.text.chars().count() as u64) / 4;
                     budget.record_token(req_est + resp_est);
@@ -7749,7 +7783,10 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         }];
-        match self.llm.chat(&req, &[]).await {
+        // 与主循环同一套 routed_llm（难度路由 + provider failover/retry）+ LLM 计数；
+        // chat_single 不进入 Best-of-N，评审预算与真实调用次数一致。
+        self.metrics.inc_llm_calls();
+        match self.routed_llm.chat_single(&req, &[]).await {
             Ok(r) => {
                 let resp_est = (r.text.chars().count() as u64) / 4;
                 budget.record_token(req_est + resp_est);
@@ -7800,12 +7837,9 @@ impl AgentCore {
         intent: &crate::intent::Intent,
         fast_path_data: bool,
     ) -> ToolExecOutcome {
-        if self.orchestration.cfg.read_parallel.enabled
-            && tool_calls.len() > 1
-            && tool_calls
-                .iter()
-                .all(|tc| crate::boundary::is_read_only_tool(&tc.name))
-        {
+        // 只读判定不在此处用前缀启发式短路：统一进 parallel 预检，
+        // 由 ToolClassifier 的 read 标签裁决（cross_* 等启发式过宽项 fail-closed）。
+        if self.orchestration.cfg.read_parallel.enabled && tool_calls.len() > 1 {
             return self
                 .execute_tool_calls_parallel(
                     messages,
@@ -7855,6 +7889,9 @@ impl AgentCore {
         fast_path_data: bool,
     ) -> ToolExecOutcome {
         // 预检 1：边界全绿（任一拒绝 → 回退顺序路径，保留既有拒绝/审批分支）。
+        // 只读判定用权威 ToolClassifier（与 bootstrap is_safe 同一口径）：
+        // 前缀启发式 `is_read_only_tool` 对 cross_* 等过宽，写能力工具可能被
+        // 并发执行破坏顺序副作用；分类器不可用/unknown 时 fail-closed 回退顺序。
         // 关键：预检完成后先 drop boundary 锁再回退——tokio Mutex 非重入，
         // 若持锁调用 execute_tool_calls_sequential 会自锁挂死（ocr critical 修复）。
         let mut boundary_precheck_ok = true;
@@ -7862,7 +7899,7 @@ impl AgentCore {
             let boundary = self.boundary.lock().await;
             let ns = self.current_ns_paths();
             for tc in tool_calls {
-                if !crate::boundary::is_read_only_tool(&tc.name) {
+                if !boundary.classifier_says_read(&tc.name) {
                     boundary_precheck_ok = false;
                     break;
                 }

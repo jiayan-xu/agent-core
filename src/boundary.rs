@@ -768,6 +768,14 @@ impl ComplianceBoundary {
         self.safe_mode.load(Ordering::SeqCst)
     }
 
+    /// 权威分类器是否把工具判为 read。
+    /// 与 bootstrap 的 `is_safe` 谓词同一口径；分类器不可用/返回 unknown 时
+    /// 一律 false（fail-closed），不回退前缀启发式。
+    pub fn classifier_says_read(&self, tool_name: &str) -> bool {
+        with_classifier(&self.classifier, ToolClass::Unknown, |c| c.classify_typed(tool_name))
+            == ToolClass::Read
+    }
+
     /// 注册工具分类（运行时动态添加）
     pub fn register_tool(&self, tool_name: &str, level: &str) {
         match self.classifier.lock() {
@@ -1066,6 +1074,15 @@ impl ComplianceBoundary {
     }
 }
 
+/// 工具权限分类（类型化标签，避免调用方与字符串字面量比较）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolClass {
+    Read,
+    Write,
+    Dangerous,
+    Unknown,
+}
+
 /// 工具分类器（P1-7 修复：配置驱动 + 自动学习）
 ///
 /// 保留内置默认分类，同时支持运行时动态注册和从 MCP tools/list 自动学习。
@@ -1360,6 +1377,23 @@ impl ToolClassifier {
             return "unknown";
         }
         "unknown"
+    }
+
+    /// 类型化分类：把字符串标签收敛为 `ToolClass`。
+    /// 遇到未知标签显式告警并按 Unknown 处理——调用方不会静默回退到更宽的
+    /// 启发式，bootstrap/并行只读门只会更严格（fail-closed）。
+    pub fn classify_typed(&self, tool_name: &str) -> ToolClass {
+        match self.classify(tool_name) {
+            "read" => ToolClass::Read,
+            "write" => ToolClass::Write,
+            "dangerous" => ToolClass::Dangerous,
+            "unknown" => ToolClass::Unknown,
+            other => {
+                tracing::warn!(target = "boundary.classifier", tool = %tool_name,
+                    label = %other, "ToolClassifier 返回未知标签，按 Unknown 处理");
+                ToolClass::Unknown
+            }
+        }
     }
 }
 
