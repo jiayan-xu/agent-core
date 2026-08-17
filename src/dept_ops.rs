@@ -202,6 +202,10 @@ pub fn ops_playbook_prompt() -> &'static str {
 4. 必要时 `code_reader` 读整理相关 skill 源码定位逻辑
 5. 真实整理（`organize_folders` 无 dry_run）须经用户确认 / HumanInLoop 审批后再执行
 
+### NVR 录像下载
+- 用户要求「下载录像 / 某日录像 / 补下录像 / NVR 历史录像」时：必须调用 `download_nvr_videos`（date / company / only_plate）
+- **禁止**用 `system_ops`（只查进程/端口，不会下载）或 `check_media_files`（只对账磁盘与库）代替下载
+
 ### 失败纪律
 - 调不通工具 ≠ 可以空嘴交差
 - 没有 tool 结果就说「可能 OCR 错了」属于违规
@@ -238,9 +242,10 @@ pub fn composer_ops_rules() -> &'static str {
     r#"
 - 【固废运维强制】用户提到联单/整理/文件夹/归档/放入/理文时：
   - 禁止整单只用 auto_route / cross_agent_query / a2a_*
-  - 必须优先使用 dashboard 固废技能：organize_folders、check_media_files、query_entrance、query_today、archive_ops、ocr_manifest 等（以可用工具列表为准）
+  - 必须优先使用 dashboard 固废技能：organize_folders、check_media_files、query_entrance、query_today、archive_ops、ocr_manifest、download_nvr_videos 等（以可用工具列表为准）
   - 第一步必须是取证（查目录或查进厂），不能先「路由到某个 Agent」
   - 若列表里没有整理类工具，返回单步说明「当前身份看不到部门整理技能」，不要编造计划
+- 【NVR 录像下载】用户要求下载/补下历史录像时：步骤必须用 `download_nvr_videos`，禁止用 `system_ops` / `check_media_files` 代替
 - 【固废工程师强制】用户提到改代码/修bug/报错/源码时：
   - 步骤必须含 code_reader → edit_code(dry_run=true) →（确认后）edit_code → verify_code
   - 禁止整单只用 auto_route / cross_agent_query

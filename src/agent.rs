@@ -6672,6 +6672,9 @@ impl AgentCore {
         // LLM 有查询工具（nl_query/query_today）却无写工具 → 任务无法完成。
         "fill_excel_log",
         "feishui_reconcile_backfill",
+        // 2026-08-17：NVR 历史录像下载。Easy 只暴露 12 工具且 bootstrap 只留 3 个
+        // Read；本工具不在常驻时，「某日录像帮我下载」会落到 system_ops(status)。
+        "download_nvr_videos",
     ];
 
     fn prefetch_tokens(s: &str) -> Vec<String> {
@@ -6713,6 +6716,8 @@ impl AgentCore {
             "重填", "补录", "回填", "补写", "重跑", "重算",
             "修正", "修改", "纠正", "更新", "修复", "对账",
             "写入", "录入", "导入", "同步", "删除", "新增",
+            // 2026-08-17：录像下载会落盘，须抬 cap 并跳过 bootstrap 最小工具面
+            "下载", "录像",
         ];
         WRITE_KEYS.iter().any(|k| q.contains(k))
     }
@@ -6807,7 +6812,7 @@ impl AgentCore {
         let allowed_ns = ns_owned.as_slice();
 
         // 从 Memoria 取可用工具列表（A1: 白龙马 ACI 请求前按 task_context 选暴露子集）
-        // 2026-08-05 提速：Easy 查询只暴露 12 工具（8 常驻 + 4 相关性），Hard 30
+        // 2026-08-05 提速：Easy 查询只暴露 12 工具（常驻 + 少量相关性），Hard 30
         // 2026-08-07：写/补录意图（重新拉取/重新填写/补录/修正…）即使判 Easy 也提 cap 到 30，
         // 否则写类工具（fill_excel_log 等已常驻，但 sync_exception_correction/execute_sql/diagnose_*
         // 仍靠相关性）被 12 上限裁掉，写任务无法完成（08-05 曾因 30 不够慢、现 30 是 Hard 档，
@@ -11471,7 +11476,8 @@ impl AgentCore {
              - 当用户要求\"恢复 / 重启 / 启动 X 系统 / 服务\"时，先调用 system_ops 的 status 查实情；你【没有】重启类工具，无法真正执行重启，应据实说明\"我能查状态但无法重启，请通过服务管理器或运维脚本重启\"，严禁给出 systemctl / service / net start / sc 等任何具体重启命令（尤其禁止 Linux 的 systemctl 与 /var/log 路径，本机是 Windows 环境），绝不空谈或编造。\n\
              - 当工具调用因配额限制无法执行时，必须明确告知用户\"当前工具调用配额已用尽，以下为记忆中的历史信息，可能非最新\"，严禁把记忆里的旧日期数据谎称为\"今日/昨日\"最新数据。\n\
              - 你是固废智能运营台助手。用户问\"系统最近有什么问题 / 服务运行状态 / 是否正常 / 有什么异常\"时，默认指【固废运营系统】（dashboard/snmis/联单识别/manifest/视频服务/nvr 等），直接用 `system_ops` 查实情并据实回答；不要把它理解成\"agent 框架/各 Agent 连接状态\"，也不要去查 `audit_query`（那是操作审计日志，不是业务系统运行状态，除非用户明确要查审计）；简单状态查询直接调工具回答，不要进入多步规划、不要甩「执行计划」等 JSON 让用户确认。\n\
-             - 系统服务状态【只以 system_ops 工具实时返回为准】。若用户质疑某服务状态（如说\"X 明明在跑\"），必须重新调用 system_ops 核实后再回答，不得仅凭用户语气、记忆或猜测改写工具返回的事实——工具说在跑就是在跑，工具说停止就是停止。\n",
+             - 系统服务状态【只以 system_ops 工具实时返回为准】。若用户质疑某服务状态（如说\"X 明明在跑\"），必须重新调用 system_ops 核实后再回答，不得仅凭用户语气、记忆或猜测改写工具返回的事实——工具说在跑就是在跑，工具说停止就是停止。\n\
+             - 【NVR 录像下载】用户要求「下载录像 / 某日录像 / 补下录像 / NVR 历史录像」时，必须调用 `download_nvr_videos`（参数：date=YYYY-MM-DD，可选 company / only_plate）；禁止用 `system_ops`（只查进程与端口，不会下载），也不要用 `check_media_files`（只对账磁盘与库是否一致）。\n",
         );
 
         // RC2 修复（2026-07-29）：写操作执行纪律 + 会话内实体沿用，杜绝「print bash 不执行 / 重复索要」
@@ -12535,6 +12541,18 @@ mod tool_fix_tests {
             "查询车辆入厂记录。业务关键词：入厂/进厂/车次/重量/吨/车牌/固废/垃圾/装修",
         );
         assert!(score > 0.0, "中文查询应对查询工具打正分, got {score}");
+    }
+
+    #[test]
+    fn test_nvr_download_always_exposed_and_write_intent() {
+        assert!(
+            AgentCore::ALWAYS_EXPOSE_TOOLS.contains(&"download_nvr_videos"),
+            "录像下载必须常驻，否则 Easy/bootstrap 会裁掉"
+        );
+        assert!(AgentCore::has_write_intent("8月1日的录像帮我下载"));
+        assert!(AgentCore::has_write_intent("帮我下载理文昨天的录像"));
+        assert!(!AgentCore::has_write_intent("今天称重多少吨"));
+        assert!(!AgentCore::has_write_intent("系统最近有什么问题"));
     }
 
     #[test]
