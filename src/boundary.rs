@@ -1293,6 +1293,7 @@ impl ToolClassifier {
         }
         for t in [
             "fill_excel_log",
+            "download_nvr_videos",
             "update_whitelist",
             "archive_manifest",
             "manage_whitelist",
@@ -1478,6 +1479,11 @@ impl ToolClassifier {
                 continue;
             }
             if key == "edit_code" {
+                self.insert_classification(key.to_string(), "write");
+                continue;
+            }
+            if key == "download_nvr_videos" {
+                // 落盘写文件，不能当 unknown（黄线）或 read（bootstrap 会放行却仍被裁）
                 self.insert_classification(key.to_string(), "write");
                 continue;
             }
@@ -2061,10 +2067,28 @@ mod read_only_tests {
             "batch_delete_memories",
             "shutdown_agent",
             "fill_excel_log",
+            "download_nvr_videos",
             "memory_remember",
         ] {
             assert!(!is_read_only_tool(t), "不应为只读: {}", t);
         }
+    }
+
+    #[test]
+    fn download_nvr_videos_classified_write() {
+        let c = ToolClassifier::new();
+        assert_eq!(
+            c.classify("download_nvr_videos"),
+            "write",
+            "NVR 录像下载会落盘，不能 unknown/read"
+        );
+        let mut learned = ToolClassifier::new();
+        learned.register_from_tools(&[("download_nvr_videos".to_string(), String::new())]);
+        assert_eq!(
+            learned.classify("download_nvr_videos"),
+            "write",
+            "learn_tools 刷新后仍须保持 write"
+        );
     }
 }
 

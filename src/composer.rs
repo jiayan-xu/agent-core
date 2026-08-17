@@ -58,6 +58,7 @@ pub async fn decompose(
 - 如果请求很简单只需要一步，返回一个 step 即可
 - 如果用户的请求是一个简单的状态查询/信息获取（一个工具就能回答），务必只返回【单步】计划，不要拆成多步去查「Agent 连接状态 / 审计日志」等无关步骤
 - 关于『系统 / 服务 / 运行状态 / 有什么问题』这类【业务系统】问题，使用 `system_ops`（查 dashboard/snmis/联单/manifest/视频/nvr 的进程与端口状态）或 `query_system_status`（查数据库与指标概览）。不要使用 `audit_query`（那是操作审计日志，不是业务系统运行状态），除非用户明确要查审计日志
+- 用户要求下载/补下历史录像（某日录像、NVR 录像）时，必须用 `download_nvr_videos`；禁止用 `system_ops`（不下录像）或 `check_media_files`（只对账磁盘）
 - 确保 JSON 合法，不要有多余文字"#,
     );
 
