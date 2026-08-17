@@ -350,8 +350,9 @@ impl ExecutionSandbox {
         "officecli_pdf",
         "officecli_merge",
         "officecli_create",
-        // office-basic MCP（A/B 双轨试点）：读写路径必须与其他路径类工具一样过
-        // 敏感目录 deny 与沙箱根越界检查
+        // office-basic MCP（A/B 双轨试点）：参数名均为 `path`，已被 extract_path_arg 的 KEYS 覆盖，
+        // 因此这里列出的四个工具会走敏感目录 deny 与沙箱根越界检查；office_basic_mcp.py 自身
+        // 也按 AGENT_SANDBOX_ROOT 做二次锚定（双保险，不依赖单边）。
         "read_text",
         "write_text",
         "append_text",
@@ -1329,10 +1330,6 @@ impl ToolClassifier {
             "scenario_add_change",
             "scenario_commit",
             "scenario_discard",
-            // office-basic MCP（A/B 双轨试点）：文本写入为普通写操作，
-            // 不进入危险工具审批；路径穿越等参数检查仍由 check_tool 统一执行
-            "write_text",
-            "append_text",
         ] {
             c.write_tools.insert(t.to_string());
         }
@@ -1370,6 +1367,10 @@ impl ToolClassifier {
             // fsutil 源破坏性操作（office-tools/skills/）：移动/改名可覆盖，删除破坏数据，均明确归危险触发审批
             "move_file",
             "delete_path",
+            // office-basic MCP（A/B 双轨试点）：与 local_fs_write 同级——写文件必须审批，
+            // 不允许普通 write 直接落盘，避免降低文件写入的 HITL 门槛
+            "write_text",
+            "append_text",
         ] {
             c.dangerous_tools.insert(t.to_string());
         }
@@ -2466,6 +2467,19 @@ mod tests {
         let r = ExecutionSandbox::check("find_files", &paths);
         assert!(!r.allow, "paths 数组中的敏感路径应触发沙箱门闸");
         assert_eq!(r.level, Some(BlockLevel::Red));
+    }
+
+    #[test]
+    fn test_office_basic_path_args_hit_sandbox_gate() {
+        // office-basic MCP 四个工具的参数名都是 `path`，必须被 extract_path_arg 的 KEYS 覆盖，
+        // 否则 REQUIRES_SANDBOX 登记只是空转。
+        for tool in ["read_text", "write_text", "append_text", "excel_group_sum"] {
+            let paths = extract_path_arg(tool, &serde_json::json!({"path": "C:/test/.ssh/id_ed25519"}));
+            assert_eq!(paths.len(), 1, "{tool} 的 path 参数应被提取");
+            let r = ExecutionSandbox::check(tool, &paths);
+            assert!(!r.allow, "{tool} 的敏感路径应触发沙箱门闸");
+            assert_eq!(r.level, Some(BlockLevel::Red));
+        }
     }
 
     #[test]
