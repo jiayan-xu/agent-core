@@ -50,6 +50,10 @@ const HARD_DANGEROUS: &[&str] = &[
     "shutdown_server",
     // 本仓沙箱写文件：必须走黄线/审批，禁止当普通 write 静默落盘
     "local_fs_write",
+    // office-basic MCP 写文件（A/B 双轨试点）：与 local_fs_write 同级强制审批，
+    // 不依赖分类器表，learn_tools/前缀启发式未来变动也绕不过去
+    "write_text",
+    "append_text",
     // 白名单/改码写：无论分类器如何，强制危险地板 → L2 黄线
     "sync_whitelist_plates",
     "manage_whitelist",
