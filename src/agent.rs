@@ -4016,21 +4016,25 @@ impl AgentCore {
         }
 
         fn find_days(chars: &[char]) -> Option<i64> {
-            let text: String = chars.iter().collect();
             for token in ["最近", "近", "这", "过去"] {
-                if let Some(pos) = text.find(token) {
-                    let rest = &text[pos + token.len()..];
-                    let digits: String = rest
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit())
-                        .collect();
-                    if !digits.is_empty() {
-                        let after = rest[digits.len()..].chars().next().unwrap_or(' ');
-                        if after == '天' {
-                            if let Ok(d) = digits.parse::<i64>() {
-                                if (1..=365).contains(&d) {
-                                    return Some(d);
-                                }
+                let t: Vec<char> = token.chars().collect();
+                for i in 0..chars.len().saturating_sub(t.len() - 1) {
+                    if i + t.len() > chars.len() {
+                        break;
+                    }
+                    if chars[i..i + t.len()] != t[..] {
+                        continue;
+                    }
+                    let mut j = i + t.len();
+                    let start = j;
+                    while j < chars.len() && chars[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j > start && j < chars.len() && chars[j] == '天' {
+                        let digits: String = chars[start..j].iter().collect();
+                        if let Ok(d) = digits.parse::<i64>() {
+                            if (1..=365).contains(&d) {
+                                return Some(d);
                             }
                         }
                     }
@@ -4088,10 +4092,10 @@ impl AgentCore {
                     idx += 1;
                 }
                 if idx < chars.len() && chars[idx] == '天' {
-                    let before: String = chars[..start].iter().collect();
-                    let has_window_token = ["最近", "近", "这", "过去"]
-                        .iter()
-                        .any(|t| before.ends_with(t));
+                    let has_window_token = ["最近", "近", "这", "过去"].iter().any(|t| {
+                        let tv: Vec<char> = t.chars().collect();
+                        start >= tv.len() && chars[start - tv.len()..start] == tv[..]
+                    });
                     if has_window_token {
                         count += 1;
                     }
@@ -4254,14 +4258,18 @@ impl AgentCore {
         // 车牌 + 明确的日范围/月范围/多车牌：没有单工具语义，回退 nl_query，
         // 避免把「苏EBS569昨天」「苏EBS5697月」「两辆车」错路由成 30 天窗口。
         if let Some((plate_name, _tail)) = plate {
-            // 车牌查询不承载任何月/年上下文（工具只有 days 参数），
-            // 见到「7月」「2026年」等一律回退 nl_query。
+            // 车牌查询不承载任何月/年/ISO 日期上下文（工具只有 days 参数），
+            // 见到「7月」「2026年」「2026-08-16」等一律回退 nl_query。
+            // 同时出现白名单/异常/统计汇总等第二意图时也回退，避免只答一半。
+            let has_conflicting_intent = has(&["白名单", "异常", "统计", "汇总", "总车次", "总重量", "排名"]);
             if day_tokens >= 1
                 || month_tokens >= 1
+                || iso_dates >= 1
                 || message.contains('月')
                 || message.contains('年')
                 || plates.len() > 1
                 || plate_like_count > 1
+                || has_conflicting_intent
             {
                 return None;
             }
@@ -4289,12 +4297,16 @@ impl AgentCore {
             return None;
         }
 
-        // 指定月份统计汇总：月工具不承载天窗口/中文窗口/开放范围语义，带这些上下文回退。
+        // 指定月份统计汇总：月工具不承载日粒度/天窗口/中文窗口/开放范围语义，带这些上下文回退。
+        let has_day_of_month = chars
+            .windows(2)
+            .any(|w| w[0].is_ascii_digit() && (w[1] == '日' || w[1] == '号'));
         if has(&["统计", "汇总", "总车次", "总重量", "排名"])
             && day_window_tokens == 0
             && day_tokens == 0
             && !has_chinese_window
             && !has_open_range
+            && !has_day_of_month
         {
             if let Some((year, month)) = find_month(&chars, message) {
                 return Some((
@@ -4325,7 +4337,10 @@ impl AgentCore {
         let Some(obj) = parsed.as_object() else { return false };
         let has_failure_marker = parsed.get("success").and_then(|s| s.as_bool()) == Some(false)
             || parsed.get("error").map(|e| !e.is_null()).unwrap_or(false);
-        let has_required = required_keys.is_empty() || required_keys.iter().all(|k| obj.contains_key(*k));
+        let has_required = required_keys.is_empty()
+            || required_keys.iter().all(|k| {
+                obj.get(*k).is_some_and(|v| !v.is_null())
+            });
         has_required && !has_failure_marker
     }
 
@@ -13580,6 +13595,10 @@ mod whitelist_preroute_tests {
         assert!(AgentCore::direct_fast_tool("最近7天到最近15天进厂记录").is_none());
         assert!(AgentCore::direct_fast_tool("2026-08-01至今的数据异常").is_none());
         assert!(AgentCore::direct_fast_tool("ID苏EBS569进厂记录").is_none());
+        // 第二意图 / ISO 日期 / 日粒度必须回退，不能只答一半
+        assert!(AgentCore::direct_fast_tool("苏EBS569近30天进厂记录和总重量排名").is_none());
+        assert!(AgentCore::direct_fast_tool("苏EBS569的2026-08-16进厂记录").is_none());
+        assert!(AgentCore::direct_fast_tool("统计7月5日总车次").is_none());
         // 成功载荷判定：必须齐全 + 无 truthy 错误标记
         assert!(AgentCore::direct_fast_success_like(
             "query_today",
@@ -13600,6 +13619,10 @@ mod whitelist_preroute_tests {
         assert!(!AgentCore::direct_fast_success_like(
             "query_today",
             r#"{"success":false,"date":"2026-08-17","total_vehicles":1}"#,
+        ));
+        assert!(!AgentCore::direct_fast_success_like(
+            "query_today",
+            r#"{"date":"2026-08-17","total_vehicles":null}"#,
         ));
     }
 

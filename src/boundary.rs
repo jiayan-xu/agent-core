@@ -492,11 +492,11 @@ fn has_path_traversal(s: &str) -> bool {
     dec.contains("../") || dec.contains("..\\") || dec.contains("%2e%2e")
 }
 
-/// repo_ws 写/改工具的文件内容（`content`）与路径（`path`）由 `resolve_safe_path` 负责路径安全，
+/// repo_ws / office-basic 写工具的文件内容（`content`）与路径（`path`）由各自的安全路径逻辑负责，
 /// 不应在通用参数安检中按 SQL 注入 / 路径穿越拦截（否则写入含 "../" 或 "UPDATE ... SET" 的文件内容会被误杀）。
 fn is_repo_ws_payload(tool_name: &str, key: &str) -> bool {
-    matches!(tool_name, "repo_ws_write" | "repo_ws_diff")
-        && (key == "content" || key == "path")
+    (matches!(tool_name, "repo_ws_write" | "repo_ws_diff" | "write_text" | "append_text")
+        && (key == "content" || key == "path"))
 }
 
 /// 从工具参数中抽取显式文件路径参数做门闸（命令型参数 command/code/sql 不含路径，不抽）
@@ -1811,6 +1811,11 @@ fn is_read_only_tool_lower(lower: &str) -> bool {
         return false;
     }
     if EXPLICIT_READ_CROSS_TOOLS.iter().any(|t| lower == *t) {
+        return true;
+    }
+    // office-basic 聚合读取：名称不含 read_/query_ 前缀，必须显式归入只读，
+    // 否则 plan_requires_confirmation 会把它当成非只读而弹确认。
+    if lower == "excel_group_sum" {
         return true;
     }
     lower.starts_with("query_")

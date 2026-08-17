@@ -29,9 +29,11 @@ def safe_path(raw: str) -> Path:
     # 先做符号链接解析（与 Rust 侧 normalize 一致），再做敏感段匹配，
     # 否则 /tmp/link -> ~/.ssh 这类链接路径会绕过 deny 列表。
     p = p.resolve(strict=False)
-    joined = "/".join(part.lower() for part in p.parts)
-    if any(c in joined for c in DENY_COMPONENTS):
-        raise ValueError(f"path hits a sensitive directory: {raw}")
+    parts = [part.lower() for part in p.parts if part]
+    for comp in DENY_COMPONENTS:
+        segs = comp.split("/")
+        if any(parts[i:i + len(segs)] == segs for i in range(len(parts) - len(segs) + 1)):
+            raise ValueError(f"path hits a sensitive directory: {raw}")
     if p.name.lower() in DENY_FILENAMES or p.name.lower().endswith((".pem", ".key")):
         raise ValueError(f"path hits a sensitive file: {raw}")
     root = os.environ.get("AGENT_SANDBOX_ROOT")
@@ -110,9 +112,13 @@ TOOLS = [
 
 
 def handle(req):
+    if not isinstance(req, dict):
+        return {"jsonrpc": "2.0", "id": None,
+                "error": {"code": -32600, "message": "invalid request: expected a JSON object"}}
     rid = req.get("id", 1)
     method = req.get("method", "")
-    params = req.get("params", {})
+    raw_params = req.get("params")
+    params = raw_params if isinstance(raw_params, dict) else {}
     if method == "initialize":
         return {"jsonrpc": "2.0", "id": rid, "result": {
             "protocolVersion": "2026-07-28", "capabilities": {"tools": {}},
@@ -126,7 +132,7 @@ def handle(req):
             if name == "read_text":
                 path = safe_path(args["path"])
                 text = path.read_text(encoding="utf-8", errors="replace")
-                cap = int(args.get("max_chars", 8000))
+                cap = max(0, int(args.get("max_chars", 8000)))
                 if len(text) > cap:
                     text = text[:cap] + "\n...[truncated]"
                 return {"jsonrpc": "2.0", "id": rid, "result": {
@@ -148,17 +154,18 @@ def handle(req):
                 wb = load_workbook(path, read_only=True, data_only=True)
                 try:
                     ws = wb.active
-                    rows = list(ws.iter_rows(values_only=True))
-                    if not rows:
+                    rows = ws.iter_rows(values_only=True)
+                    header_row = next(rows, None)
+                    if header_row is None:
                         return {"jsonrpc": "2.0", "id": rid, "result": {
                             "content": [{"type": "text", "text": json.dumps({"ranking": []}, ensure_ascii=False)}]}}
-                    header = [str(c) for c in rows[0]]
+                    header = [str(c) for c in header_row]
                     gc = args.get("group_col", "product")
                     vc = args.get("value_col", "qty")
                     gi = header.index(gc)
                     vi = header.index(vc)
                     agg = {}
-                    for row in rows[1:]:
+                    for row in rows:
                         key = str(row[gi])
                         try:
                             val = float(row[vi] or 0)
