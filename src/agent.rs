@@ -4055,6 +4055,24 @@ impl AgentCore {
             None
         }
 
+        fn count_plate_like(chars: &[char]) -> usize {
+            // 省份字 + 字母数字开头（且左边界非字母数字）都算“车牌样片段”，
+            // 用于多实体回退：一个合法车牌 + 一个残缺车牌也要交回 nl_query。
+            let mut count = 0usize;
+            for i in 0..chars.len() {
+                if !PLATE_PROVINCES.contains(chars[i]) {
+                    continue;
+                }
+                if i > 0 && chars[i - 1].is_ascii_alphanumeric() {
+                    continue;
+                }
+                if i + 1 < chars.len() && chars[i + 1].is_ascii_alphanumeric() {
+                    count += 1;
+                }
+            }
+            count
+        }
+
         fn count_day_window_tokens(chars: &[char]) -> usize {
             // 统计「N天」窗口个数：向前找最近/近/这/过去，向后必须是数字+天。
             // 按每个「N天」只计一次，避免 最近30天 同时命中 最近 和 近 而重复计数。
@@ -4184,6 +4202,7 @@ impl AgentCore {
         let plate_like = chars.windows(2).any(|w| {
             PLATE_PROVINCES.contains(w[0]) && w[1].is_ascii_uppercase()
         });
+        let plate_like_count = count_plate_like(&chars);
 
         // 复合/开放时间范围（「昨天和今天」「7月到8月」「2026年1月以后」「近一年」）
         // 单工具路由会丢一半或取错窗口，直接回退 nl_query。
@@ -4209,6 +4228,17 @@ impl AgentCore {
         // 白名单清单：白名单 + 恰好一个企业简称；多企业问法回退 nl_query，
         // 避免只查第一家而丢另一半。
         if message.contains("白名单") {
+            // 白名单工具只有 company 一个维度，任何时间约束（月/天/开放范围）
+            // 都不能表达，直接回退 nl_query，避免静默丢弃约束。
+            if month_tokens >= 1
+                || day_tokens >= 1
+                || day_window_tokens >= 1
+                || has_open_range
+                || has_chinese_window
+                || message.contains('月')
+            {
+                return None;
+            }
             let matched: Vec<&&str> = COMPANIES.iter().filter(|c| message.contains(**c)).collect();
             if matched.len() == 1 {
                 return Some((
@@ -4231,15 +4261,17 @@ impl AgentCore {
                 || message.contains('月')
                 || message.contains('年')
                 || plates.len() > 1
+                || plate_like_count > 1
             {
                 return None;
             }
-            // 无显式「N天」窗口时按 30 天默认；有开放范围词或中文窗口（一周/一个月等）
-            // 时交给 nl_query，避免静默用 30 天窗口答非所问。
-            let days = find_days(&chars);
-            if days.is_none() && (has_open_range || has_chinese_window) {
+            // 开放范围（至今/以来）和中文窗口（一周/一个月）没有单工具语义，
+            // 即使解析出 N 天窗口也一律回退，不能静默截断范围。
+            if has_open_range || has_chinese_window {
                 return None;
             }
+            // 无显式「N天」窗口时按 30 天默认。
+            let days = find_days(&chars);
             return Some((
                 "query_vehicle".into(),
                 serde_json::json!({"plate": plate_name, "days": days.unwrap_or(30)}),
@@ -4257,8 +4289,13 @@ impl AgentCore {
             return None;
         }
 
-        // 指定月份统计汇总
-        if has(&["统计", "汇总", "总车次", "总重量", "排名"]) {
+        // 指定月份统计汇总：月工具不承载天窗口/中文窗口/开放范围语义，带这些上下文回退。
+        if has(&["统计", "汇总", "总车次", "总重量", "排名"])
+            && day_window_tokens == 0
+            && day_tokens == 0
+            && !has_chinese_window
+            && !has_open_range
+        {
             if let Some((year, month)) = find_month(&chars, message) {
                 return Some((
                     "query_monthly_stats".into(),
@@ -4268,6 +4305,28 @@ impl AgentCore {
         }
 
         None
+    }
+
+    /// 确定性工具成功载荷判定：只认“该工具自己的成功数据形状”。
+    /// 必备字段全部存在 + 没有 truthy 失败标记才注入，防止错误/空载荷被当数据。
+    fn direct_fast_success_like(tool: &str, raw: &str) -> bool {
+        let parsed = match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let required_keys: &[&str] = match tool {
+            "query_today" | "query_yesterday" => &["date", "total_vehicles"],
+            "query_monthly_stats" => &["year", "month", "total_vehicles"],
+            "query_vehicle" => &["plate", "total_records"],
+            "query_whitelist" => &["total", "vehicles"],
+            "explain_anomaly" => &["anomalies"],
+            _ => &[],
+        };
+        let Some(obj) = parsed.as_object() else { return false };
+        let has_failure_marker = parsed.get("success").and_then(|s| s.as_bool()) == Some(false)
+            || parsed.get("error").map(|e| !e.is_null()).unwrap_or(false);
+        let has_required = required_keys.is_empty() || required_keys.iter().all(|k| obj.contains_key(*k));
+        has_required && !has_failure_marker
     }
 
     /// 2026-08-06：确定性表格渲染——解析 nl_query 返回 JSON 的 columns/rows，rows≥2 生成
@@ -5437,28 +5496,7 @@ impl AgentCore {
                         // 确定性工具返回 JSON 数据。只接受"看起来像成功数据"的载荷：
                         // 带 success:false / error 字段的失败载荷必须回退，绝不能当数据注入。
                         Ok(t) if !t.is_empty() => {
-                            let parsed = serde_json::from_str::<serde_json::Value>(&t);
-                            // 只接受"工具自己的成功数据形状"：该工具必备字段至少出现一个，
-                            // 且没有失败标记。空对象/数组/裸字符串不会被当成查询结果注入。
-                            let required_keys: &[&str] = match tool.as_str() {
-                                "query_today" | "query_yesterday" => &["date", "total_vehicles"],
-                                "query_monthly_stats" => &["year", "month", "total_vehicles"],
-                                "query_vehicle" => &["plate", "total_records"],
-                                "query_whitelist" => &["total", "vehicles"],
-                                "explain_anomaly" => &["anomalies"],
-                                _ => &[],
-                            };
-                            let looks_success = parsed.as_ref().ok().is_some_and(|v| {
-                                let obj = v.as_object();
-                                // error:null 不是失败标记；只有 truthy error / success:false 才是。
-                                let has_failure_marker = v.get("success").and_then(|s| s.as_bool()) == Some(false)
-                                    || v.get("error").map(|e| !e.is_null()).unwrap_or(false);
-                                // 该工具的所有必备字段必须齐全，缺一个都不把部分数据当最终答案注入。
-                                let has_required = obj.is_some_and(|o| {
-                                    required_keys.is_empty() || required_keys.iter().all(|k| o.contains_key(*k))
-                                });
-                                has_required && !has_failure_marker
-                            });
+                            let looks_success = Self::direct_fast_success_like(&tool, &t);
                             if looks_success {
                                 fast_query_result = Some(t);
                                 tracing::info!(target = "agent.fastpath", tool = %tool, "确定性工具快速通道命中");
@@ -13542,6 +13580,27 @@ mod whitelist_preroute_tests {
         assert!(AgentCore::direct_fast_tool("最近7天到最近15天进厂记录").is_none());
         assert!(AgentCore::direct_fast_tool("2026-08-01至今的数据异常").is_none());
         assert!(AgentCore::direct_fast_tool("ID苏EBS569进厂记录").is_none());
+        // 成功载荷判定：必须齐全 + 无 truthy 错误标记
+        assert!(AgentCore::direct_fast_success_like(
+            "query_today",
+            r#"{"date":"2026-08-17","total_vehicles":1}"#,
+        ));
+        assert!(!AgentCore::direct_fast_success_like(
+            "query_today",
+            r#"{"date":"2026-08-17"}"#,
+        ));
+        assert!(!AgentCore::direct_fast_success_like(
+            "query_today",
+            r#"{"date":"2026-08-17","total_vehicles":1,"error":"boom"}"#,
+        ));
+        assert!(AgentCore::direct_fast_success_like(
+            "query_today",
+            r#"{"date":"2026-08-17","total_vehicles":1,"error":null}"#,
+        ));
+        assert!(!AgentCore::direct_fast_success_like(
+            "query_today",
+            r#"{"success":false,"date":"2026-08-17","total_vehicles":1}"#,
+        ));
     }
 
     #[test]
