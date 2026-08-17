@@ -3959,6 +3959,177 @@ impl AgentCore {
             && QUERY_VERBS.iter().any(|v| message.contains(v))
     }
 
+    /// 确定性业务工具路由（2026-08-17 A/B pilot 修复）：
+    /// 快速通道原先把所有数据查询都交给 `nl_query`，而 QueryAgent 对
+    /// 「按公司排名/指定车牌/白名单/异常检查」经常答错维度（全部回退成
+    /// 「按固废种类统计」）。这里先把语义明确的问法直接映射到对应的
+    /// 确定性工具，命中才走快速通道，未命中回退原 nl_query 路径。
+    fn direct_fast_tool(message: &str) -> Option<(String, serde_json::Value)> {
+        const PLATE_PROVINCES: &str = "京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼";
+        const COMPANIES: &[&str] = &[
+            "天越", "理文", "克劳丽", "利合", "苏新", "华衍", "金源", "雷博尔",
+            "佳士能", "东升", "达裕", "苏水中法", "城西",
+        ];
+
+        fn find_plate(message: &str) -> Option<(String, String)> {
+            let chars: Vec<char> = message.chars().collect();
+            for i in 0..chars.len() {
+                if !PLATE_PROVINCES.contains(chars[i]) {
+                    continue;
+                }
+                let mut j = i + 1;
+                while j < chars.len()
+                    && chars[j].is_ascii_alphanumeric()
+                    && j - i <= 7
+                {
+                    j += 1;
+                }
+                let len = j - i;
+                if len >= 6 && len <= 8 {
+                    let plate: String = chars[i..j].iter().collect();
+                    let tail: String = chars[i + 1..j].iter().collect();
+                    if tail.len() >= 5 {
+                        return Some((plate, tail));
+                    }
+                }
+            }
+            None
+        }
+
+        fn find_days(message: &str) -> i64 {
+            for token in ["最近", "近", "这", "过去"] {
+                if let Some(pos) = message.find(token) {
+                    let rest = &message[pos + token.len()..];
+                    let digits: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect();
+                    if !digits.is_empty() {
+                        let after = rest[digits.len()..].chars().next().unwrap_or(' ');
+                        if after == '天' {
+                            if let Ok(d) = digits.parse::<i64>() {
+                                if (1..=365).contains(&d) {
+                                    return d;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            30
+        }
+
+        fn find_iso_date(message: &str) -> Option<String> {
+            let chars: Vec<char> = message.chars().collect();
+            for i in 0..chars.len().saturating_sub(9) {
+                if chars[i..i + 4].iter().all(|c| c.is_ascii_digit())
+                    && chars[i + 4] == '-'
+                    && chars[i + 5..i + 7].iter().all(|c| c.is_ascii_digit())
+                    && chars[i + 7] == '-'
+                    && chars[i + 8..i + 10].iter().all(|c| c.is_ascii_digit())
+                {
+                    return Some(chars[i..i + 10].iter().collect());
+                }
+            }
+            None
+        }
+
+        fn find_month(message: &str) -> Option<(i64, i64)> {
+            let chars: Vec<char> = message.chars().collect();
+            for i in 0..chars.len().saturating_sub(4) {
+                if chars[i..i + 4].iter().all(|c| c.is_ascii_digit())
+                    && chars.get(i + 4) == Some(&'年')
+                {
+                    let year: i64 = chars[i..i + 4].iter().collect::<String>().parse().ok()?;
+                    let rest: String = chars[i + 5..].iter().collect();
+                    let month_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if !month_str.is_empty()
+                        && rest[month_str.len()..].chars().next() == Some('月')
+                    {
+                        if let Ok(month) = month_str.parse::<i64>() {
+                            if (1..=12).contains(&month) {
+                                return Some((year, month));
+                            }
+                        }
+                    }
+                }
+            }
+            // 无年份的「7月」用当前年份
+            if let Some(pos) = message.find('月') {
+                let before: Vec<char> = message[..pos].chars().collect();
+                let mut digits = String::new();
+                for c in before.iter().rev() {
+                    if c.is_ascii_digit() {
+                        digits.insert(0, *c);
+                    } else {
+                        break;
+                    }
+                }
+                if let Ok(month) = digits.parse::<i64>() {
+                    if (1..=12).contains(&month) {
+                        let year = chrono::Local::now().year() as i64;
+                        return Some((year, month));
+                    }
+                }
+            }
+            None
+        }
+
+        let has = |words: &[&str]| words.iter().any(|w| message.contains(w));
+
+        // 异常检查：明确日期 + 异常语义
+        if has(&["异常", "零重量", "重复记录"]) {
+            if let Some(date) = find_iso_date(message) {
+                return Some((
+                    "explain_anomaly".into(),
+                    serde_json::json!({"date_str": date}),
+                ));
+            }
+        }
+
+        // 白名单清单：白名单 + 企业简称
+        if message.contains("白名单") {
+            for company in COMPANIES {
+                if message.contains(company) {
+                    return Some((
+                        "query_whitelist".into(),
+                        serde_json::json!({"company": company}),
+                    ));
+                }
+            }
+        }
+
+        // 指定车牌近 N 天记录
+        if has(&["近", "最近", "进厂记录", "入厂记录", "这辆车", "该车"]) {
+            if let Some((plate, _tail)) = find_plate(message) {
+                return Some((
+                    "query_vehicle".into(),
+                    serde_json::json!({"plate": plate, "days": find_days(message)}),
+                ));
+            }
+        }
+
+        // 昨天/今日概况
+        if has(&["昨天", "昨日"]) && has(&["进厂", "入厂", "概况", "车次"]) {
+            return Some(("query_yesterday".into(), serde_json::json!({})));
+        }
+        if has(&["今天", "今日"]) && has(&["进厂", "入厂", "概况", "车次"]) {
+            return Some(("query_today".into(), serde_json::json!({})));
+        }
+
+        // 指定月份统计汇总
+        if has(&["统计", "汇总", "总车次", "总重量", "排名"]) {
+            if let Some((year, month)) = find_month(message) {
+                return Some((
+                    "query_monthly_stats".into(),
+                    serde_json::json!({"year": year, "month": month}),
+                ));
+            }
+        }
+
+        None
+    }
+
     /// 2026-08-06：确定性表格渲染——解析 nl_query 返回 JSON 的 columns/rows，rows≥2 生成
     /// Markdown 表格（绕开 LLM 风格：deepseek-flash 列表惯性极强，prompt 手段实测全无效）。
     /// 数字直接来自数据库（LLM 零抄录）。行数上限 50 防撑爆 prompt；列/行结构不匹配跳过。
@@ -5117,34 +5288,56 @@ impl AgentCore {
         if is_easy_query || Self::is_analysis_query(message) {
             let fast_intent = Self::classify_intent(message);
             if fast_intent.data_query && !fast_intent.attachment {
-                let args = serde_json::json!({
-                    "question": message,
-                    "period": "",
-                });
-                match self
-                    .call_tool_routed("nl_query", &self.persona_for_session(session_id), &args, allowed_ns, trace_id)
-                    .await
-                {
-                    Ok(t) => {
-                        // 结构化成功判定（ocr 修复，七轮）：只认 success==true 为成功——
-                        // success==false、缺 success 字段、非 JSON 一律保守失败回退 LLM 工具循环。
-                        // nl_query 正常路径始终返回 success 字段；缺失即视为未知/异常，不猜成功。
-                        let ok = match serde_json::from_str::<serde_json::Value>(&t) {
-                            Ok(v) => v.get("success").and_then(|s| s.as_bool()).unwrap_or(false),
-                            Err(e) => {
-                                tracing::warn!(target = "agent.fastpath", err = %e, "快速通道 nl_query 返回非 JSON，保守回退 LLM 工具循环");
-                                false
-                            }
-                        };
-                        if ok {
+                let direct = Self::direct_fast_tool(message);
+                if let Some((tool, tool_args)) = direct {
+                    match self
+                        .call_tool_routed(&tool, &self.persona_for_session(session_id), &tool_args, allowed_ns, trace_id)
+                        .await
+                    {
+                        // 确定性工具返回的是 JSON 数据（如 query_today/query_vehicle），
+                        // 只要可解析为 JSON 就注入；非 JSON/错误回退 nl_query。
+                        Ok(t) if !t.is_empty() && serde_json::from_str::<serde_json::Value>(&t).is_ok() => {
                             fast_query_result = Some(t);
-                            tracing::info!(target = "agent.fastpath", "nl_query 快速通道命中");
-                        } else {
-                            tracing::warn!(target = "agent.fastpath", "快速通道 nl_query 返回失败，回退 LLM 工具循环");
+                            tracing::info!(target = "agent.fastpath", tool = %tool, "确定性工具快速通道命中");
+                        }
+                        Ok(t) => {
+                            tracing::warn!(target = "agent.fastpath", tool = %tool, result = %t.chars().take(200).collect::<String>(), "确定性工具快速通道返回非 JSON，回退 nl_query");
+                        }
+                        Err(e) => {
+                            tracing::warn!(target = "agent.fastpath", tool = %tool, err = %e, "确定性工具快速通道调用失败，回退 nl_query");
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(target = "agent.fastpath", err = %e, "快速通道 nl_query 调用失败，回退 LLM 工具循环");
+                }
+                if fast_query_result.is_none() {
+                    let args = serde_json::json!({
+                        "question": message,
+                        "period": "",
+                    });
+                    match self
+                        .call_tool_routed("nl_query", &self.persona_for_session(session_id), &args, allowed_ns, trace_id)
+                        .await
+                    {
+                        Ok(t) => {
+                            // 结构化成功判定（ocr 修复，七轮）：只认 success==true 为成功——
+                            // success==false、缺 success 字段、非 JSON 一律保守失败回退 LLM 工具循环。
+                            // nl_query 正常路径始终返回 success 字段；缺失即视为未知/异常，不猜成功。
+                            let ok = match serde_json::from_str::<serde_json::Value>(&t) {
+                                Ok(v) => v.get("success").and_then(|s| s.as_bool()).unwrap_or(false),
+                                Err(e) => {
+                                    tracing::warn!(target = "agent.fastpath", err = %e, "快速通道 nl_query 返回非 JSON，保守回退 LLM 工具循环");
+                                    false
+                                }
+                            };
+                            if ok {
+                                fast_query_result = Some(t);
+                                tracing::info!(target = "agent.fastpath", "nl_query 快速通道命中");
+                            } else {
+                                tracing::warn!(target = "agent.fastpath", "快速通道 nl_query 返回失败，回退 LLM 工具循环");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(target = "agent.fastpath", err = %e, "快速通道 nl_query 调用失败，回退 LLM 工具循环");
+                        }
                     }
                 }
         }
@@ -5201,7 +5394,7 @@ impl AgentCore {
             format!(
                 "{}
 
-[系统已完成数据查询（nl_query 实时执行）。请直接基于下方数据作答{}
+[系统已完成数据查询（实时执行）。请直接基于下方数据作答{}
 
 输出格式要求（必须严格遵守，违反即为不合格回答）：
 1. 首句必须严格按模板输出（数字从下方数据中准确抄录，禁止改动/漏位）：「X年X月，[公司简称]进厂 X 车次，总重 X 吨」
@@ -13121,6 +13314,39 @@ mod whitelist_preroute_tests {
         assert!(!AgentCore::is_data_query_intent("今天天气怎么样"));
         assert!(!AgentCore::is_data_query_intent("统计一下"));
         assert!(!AgentCore::is_data_query_intent("好的，就按这个方案执行"));
+    }
+
+    #[test]
+    fn direct_fast_tool_routing() {
+        // 指定车牌 → query_vehicle（默认 30 天 / 解析 15 天）
+        let (tool, args) = AgentCore::direct_fast_tool("查询车牌 苏EBS569 最近30天的进厂记录：总条数和最近一次进厂日期。").expect("应命中");
+        assert_eq!(tool, "query_vehicle");
+        assert_eq!(args["plate"], "苏EBS569");
+        assert_eq!(args["days"], 30);
+        let (tool, args) = AgentCore::direct_fast_tool("查苏MF7272近15天进厂记录").expect("应命中");
+        assert_eq!(tool, "query_vehicle");
+        assert_eq!(args["days"], 15);
+        // 月度汇总 → query_monthly_stats（带年份 / 不带年份用当前年）
+        let (tool, args) = AgentCore::direct_fast_tool("查询2026年7月固废运营台进厂统计汇总：总车次、总重量，以及各公司车次排名前三。").expect("应命中");
+        assert_eq!(tool, "query_monthly_stats");
+        assert_eq!(args["year"], 2026);
+        assert_eq!(args["month"], 7);
+        let (tool, args) = AgentCore::direct_fast_tool("统计7月总车次和总重量").expect("应命中");
+        assert_eq!(tool, "query_monthly_stats");
+        assert_eq!(args["month"], 7);
+        // 白名单清单 → query_whitelist
+        let (tool, args) = AgentCore::direct_fast_tool("列出天越公司的白名单车辆：总数量，以及前5辆车牌和固废种类。").expect("应命中");
+        assert_eq!(tool, "query_whitelist");
+        assert_eq!(args["company"], "天越");
+        // 昨日概况 → query_yesterday
+        let (tool, _) = AgentCore::direct_fast_tool("用 query_yesterday 工具查询昨天(2026-08-16)固废运营台的进厂概况").expect("应命中");
+        assert_eq!(tool, "query_yesterday");
+        // 异常检查 → explain_anomaly
+        let (tool, args) = AgentCore::direct_fast_tool("用 explain_anomaly 工具检查2026-08-16 这一天固废运营台的数据异常").expect("应命中");
+        assert_eq!(tool, "explain_anomaly");
+        assert_eq!(args["date_str"], "2026-08-16");
+        // 未命中：模糊分析问法回退 nl_query
+        assert!(AgentCore::direct_fast_tool("分析最近固废数据的异常趋势").is_none());
     }
 
     #[test]
