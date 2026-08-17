@@ -6674,6 +6674,8 @@ impl AgentCore {
         "feishui_reconcile_backfill",
         // 2026-08-17：NVR 历史录像下载。Easy 只暴露 12 工具且 bootstrap 只留 3 个
         // Read；本工具不在常驻时，「某日录像帮我下载」会落到 system_ops(status)。
+        // 首轮 Easy 仍靠 has_write_intent 跳过 bootstrap（写工具进不了 bootstrap 面）；
+        // 常驻覆盖 Hard / 写意图 / promote 之后。
         "download_nvr_videos",
     ];
 
@@ -6721,9 +6723,12 @@ impl AgentCore {
             return true;
         }
         // 2026-08-17：NVR 录像下载会落盘，须抬 cap 并跳过 bootstrap。
-        // 「下载」与「录像」不能单独当写意图（「下载报表」「录像还在不在」会误伤）。
-        let download = q.contains("下载") || q.contains("补下");
-        let video = q.contains("录像") || q.to_ascii_lowercase().contains("nvr");
+        // 两侧都要命中：下载类动词 × 录像/视频类名词。单字「下载」「录像」不单独当写意图。
+        let download = q.contains("下载") || q.contains("补下") || q.contains("重下");
+        let video = q.contains("录像")
+            || q.contains("视频")
+            || q.contains("监控")
+            || q.to_ascii_lowercase().contains("nvr");
         download && video
     }
 
@@ -12557,10 +12562,14 @@ mod tool_fix_tests {
         assert!(AgentCore::has_write_intent("8月1日的录像帮我下载"));
         assert!(AgentCore::has_write_intent("帮我下载理文昨天的录像"));
         assert!(AgentCore::has_write_intent("补下 nvr 录像"));
+        assert!(AgentCore::has_write_intent("重下录像"));
+        assert!(AgentCore::has_write_intent("下载昨天的视频"));
+        assert!(AgentCore::has_write_intent("把今天的监控视频下载下来"));
         assert!(!AgentCore::has_write_intent("今天称重多少吨"));
         assert!(!AgentCore::has_write_intent("系统最近有什么问题"));
         assert!(!AgentCore::has_write_intent("怎么下载报表"));
         assert!(!AgentCore::has_write_intent("帮我查一下昨天的录像还在不在"));
+        assert!(!AgentCore::has_write_intent("视频服务有没有问题"));
     }
 
     #[test]
