@@ -495,7 +495,11 @@ fn has_path_traversal(s: &str) -> bool {
 /// 文件写类工具的内容/路径参数豁免规则：
 /// - repo_ws_write/repo_ws_diff：`content` 与 `path` 都由 resolve_safe_path 负责；
 /// - office-basic write_text/append_text：`content` 是文件正文（可含 SQL/../ 等正常文本），
-///   跳过通用参数扫描；`path` 不豁免，仍走 path traversal 检查与沙箱门闸。
+///   跳过通用参数扫描；`path` 只跳过 SQL 启发式，仍走 path traversal 检查与沙箱门闸。
+///
+/// 顺序约束：本函数只豁免**已进入危险分类**的工具；新增写类工具必须先落在
+/// dangerous 分类/HARD_DANGEROUS 地板，再用 read_* 之类会命中只读启发式的名字
+/// 会绕过该豁免路径并触发通用扫描误报。
 fn is_file_write_payload(tool_name: &str, key: &str) -> bool {
     (matches!(tool_name, "repo_ws_write" | "repo_ws_diff")
         && (key == "content" || key == "path"))
@@ -929,20 +933,26 @@ impl ComplianceBoundary {
             for (key, val) in obj {
                 if let Some(s) = val.as_str() {
                     let s_upper = s.to_uppercase();
-                    // 文件写工具的 content（repo_ws 还包括 path）跳过通用 SQL/穿越扫描：
-                    // repo_ws 路径由 resolve_safe_path 负责；office-basic 的 path 不豁免。
-                    if !is_file_write_payload(tool_name, key) {
-                        if s.contains("' --")
-                            || s.contains("';")
-                            || s_upper.contains(" UNION ")
-                            || s_upper.contains(" OR 1=1")
-                            || s_upper.contains(" AND 1=1")
-                            || s_upper.contains("DROP TABLE")
-                            || s_upper.contains("INSERT INTO")
-                            || s_upper.contains("DELETE FROM")
-                            || (s_upper.contains("UPDATE ") && s_upper.contains("SET "))
-                        {
-                            return Some(ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key)));
+                    // 文件写工具的 content（repo_ws 还包括 path）跳过通用 SQL/穿越扫描。
+                    // office-basic 的 path 只跳过 SQL 启发式（路径可能合法包含 SQL 字样），
+                    // 仍保留路径穿越检查；沙箱门闸另行校验真实路径。
+                    let skip_all = is_file_write_payload(tool_name, key);
+                    let skip_sql_only = key == "path"
+                        && matches!(tool_name, "write_text" | "append_text");
+                    if !skip_all {
+                        if !skip_sql_only {
+                            if s.contains("' --")
+                                || s.contains("';")
+                                || s_upper.contains(" UNION ")
+                                || s_upper.contains(" OR 1=1")
+                                || s_upper.contains(" AND 1=1")
+                                || s_upper.contains("DROP TABLE")
+                                || s_upper.contains("INSERT INTO")
+                                || s_upper.contains("DELETE FROM")
+                                || (s_upper.contains("UPDATE ") && s_upper.contains("SET "))
+                            {
+                                return Some(ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key)));
+                            }
                         }
                         if has_path_traversal(s) {
                             return Some(ToolCheck::red(&format!("参数安全检查：{} 含路径穿越", key)));

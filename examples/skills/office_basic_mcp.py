@@ -74,9 +74,11 @@ def open_text(path: Path, mode: str):
     try:
         if sys.platform.startswith("linux"):
             fd_path = Path(f"/proc/self/fd/{fd}").resolve(strict=False)
-            joined = "/".join(part.lower() for part in fd_path.parts if part)
-            if any(seg in joined for comp in DENY_COMPONENTS for seg in (comp,)):
-                raise ValueError(f"opened path resolves into a sensitive directory: {fd_path}")
+            fd_parts = [part.lower() for part in fd_path.parts if part]
+            for comp in DENY_COMPONENTS:
+                segs = comp.split("/")
+                if any(fd_parts[i:i + len(segs)] == segs for i in range(len(fd_parts) - len(segs) + 1)):
+                    raise ValueError(f"opened path resolves into a sensitive directory: {fd_path}")
             root = os.environ.get("AGENT_SANDBOX_ROOT")
             if root and not fd_path.is_relative_to(Path(root).resolve(strict=False)):
                 raise ValueError(f"opened path escapes sandbox root {root}: {fd_path}")
@@ -217,7 +219,7 @@ def handle(req):
                     for row in rows:
                         key = str(row[gi])
                         raw_val = row[vi]
-                        if raw_val is None:
+                        if raw_val is None or isinstance(raw_val, bool):
                             continue
                         try:
                             val = float(raw_val)
