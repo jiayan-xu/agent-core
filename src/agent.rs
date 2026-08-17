@@ -6716,10 +6716,15 @@ impl AgentCore {
             "重填", "补录", "回填", "补写", "重跑", "重算",
             "修正", "修改", "纠正", "更新", "修复", "对账",
             "写入", "录入", "导入", "同步", "删除", "新增",
-            // 2026-08-17：录像下载会落盘，须抬 cap 并跳过 bootstrap 最小工具面
-            "下载", "录像",
         ];
-        WRITE_KEYS.iter().any(|k| q.contains(k))
+        if WRITE_KEYS.iter().any(|k| q.contains(k)) {
+            return true;
+        }
+        // 2026-08-17：NVR 录像下载会落盘，须抬 cap 并跳过 bootstrap。
+        // 「下载」与「录像」不能单独当写意图（「下载报表」「录像还在不在」会误伤）。
+        let download = q.contains("下载") || q.contains("补下");
+        let video = q.contains("录像") || q.to_ascii_lowercase().contains("nvr");
+        download && video
     }
 
     /// 当前工具面是否至少含一个数据查询类工具（HookContext.query_tool_available）。
@@ -12551,8 +12556,11 @@ mod tool_fix_tests {
         );
         assert!(AgentCore::has_write_intent("8月1日的录像帮我下载"));
         assert!(AgentCore::has_write_intent("帮我下载理文昨天的录像"));
+        assert!(AgentCore::has_write_intent("补下 nvr 录像"));
         assert!(!AgentCore::has_write_intent("今天称重多少吨"));
         assert!(!AgentCore::has_write_intent("系统最近有什么问题"));
+        assert!(!AgentCore::has_write_intent("怎么下载报表"));
+        assert!(!AgentCore::has_write_intent("帮我查一下昨天的录像还在不在"));
     }
 
     #[test]
