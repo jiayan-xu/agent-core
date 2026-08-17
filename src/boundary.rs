@@ -1323,6 +1323,10 @@ impl ToolClassifier {
             "scenario_add_change",
             "scenario_commit",
             "scenario_discard",
+            // office-basic MCP（A/B 双轨试点）：文本写入为普通写操作，
+            // 不进入危险工具审批；路径穿越等参数检查仍由 check_tool 统一执行
+            "write_text",
+            "append_text",
         ] {
             c.write_tools.insert(t.to_string());
         }
@@ -1333,6 +1337,9 @@ impl ToolClassifier {
             "repo_ws_read",  // 轨二：白名单仓只读
             "repo_ws_list",  // 轨二：白名单仓列目录（只读）
             "repo_ws_stat",  // 轨二：白名单仓文件元数据（只读）
+            // office-basic MCP（A/B 双轨试点）：文本读取与表格聚合为只读
+            "read_text",
+            "excel_group_sum",
             // P0-1 场景沙箱：只读推演（基线+影子叠加，绝不写生产）
             "scenario_list",
             "scenario_get",
