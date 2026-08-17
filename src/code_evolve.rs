@@ -391,13 +391,16 @@ pub fn git_commit(repo: &Path, file: &Path, msg: &str) -> Result<String, String>
     }
     let msg_path = repo.join(".evo_commit_msg");
     std::fs::write(&msg_path, msg).map_err(|e| format!("写 commit 消息失败: {}", e))?;
+    // -F 用相对路径（相对 -C 目录）：repo 是 canonicalize 后的 Windows verbatim 路径（\\?\ 前缀），
+    // git 对 `git commit -F <verbatim 绝对路径>` 会转成 //?/ 形式而打开失败（could not read log file）。
+    // 相对路径经 -C chdir 后解析，完全规避该问题。
     let s2 = Command::new("git")
         .args([
             "-C",
             &repo.to_string_lossy(),
             "commit",
             "-F",
-            &msg_path.to_string_lossy(),
+            ".evo_commit_msg",
         ])
         .output()
         .map_err(|e| e.to_string());
@@ -408,7 +411,9 @@ pub fn git_commit(repo: &Path, file: &Path, msg: &str) -> Result<String, String>
     };
     if !s2.status.success() {
         return Err(format!(
-            "git commit 失败: {}",
+            "git commit 失败: exit={:?} out={:?} err={:?}",
+            s2.status.code(),
+            String::from_utf8_lossy(&s2.stdout),
             String::from_utf8_lossy(&s2.stderr)
         ));
     }
