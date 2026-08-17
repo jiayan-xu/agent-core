@@ -131,8 +131,10 @@ def handle(req):
         try:
             if name == "read_text":
                 path = safe_path(args["path"])
-                text = path.read_text(encoding="utf-8", errors="replace")
                 cap = max(0, int(args.get("max_chars", 8000)))
+                # 只读取 cap+64 字符，cap 同时约束 I/O 与返回内容，避免大文件整读进内存。
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read(cap + 64)
                 if len(text) > cap:
                     text = text[:cap] + "\n...[truncated]"
                 return {"jsonrpc": "2.0", "id": rid, "result": {
@@ -167,10 +169,14 @@ def handle(req):
                     agg = {}
                     for row in rows:
                         key = str(row[gi])
+                        raw_val = row[vi]
+                        if raw_val is None:
+                            continue
                         try:
-                            val = float(row[vi] or 0)
+                            val = float(raw_val)
                         except (TypeError, ValueError):
-                            val = 0
+                            # 非数字单元格不静默当 0，跳过并继续聚合可解释的数据
+                            continue
                         agg[key] = agg.get(key, 0) + val
                     ranking = [{"group": k, "total": v} for k, v in
                                sorted(agg.items(), key=lambda kv: kv[1], reverse=True)]

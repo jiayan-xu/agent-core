@@ -492,11 +492,14 @@ fn has_path_traversal(s: &str) -> bool {
     dec.contains("../") || dec.contains("..\\") || dec.contains("%2e%2e")
 }
 
-/// repo_ws / office-basic 写工具的文件内容（`content`）与路径（`path`）由各自的安全路径逻辑负责，
-/// 不应在通用参数安检中按 SQL 注入 / 路径穿越拦截（否则写入含 "../" 或 "UPDATE ... SET" 的文件内容会被误杀）。
-fn is_repo_ws_payload(tool_name: &str, key: &str) -> bool {
-    (matches!(tool_name, "repo_ws_write" | "repo_ws_diff" | "write_text" | "append_text")
+/// 文件写类工具的内容/路径参数豁免规则：
+/// - repo_ws_write/repo_ws_diff：`content` 与 `path` 都由 resolve_safe_path 负责；
+/// - office-basic write_text/append_text：`content` 是文件正文（可含 SQL/../ 等正常文本），
+///   跳过通用参数扫描；`path` 不豁免，仍走 path traversal 检查与沙箱门闸。
+fn is_file_write_payload(tool_name: &str, key: &str) -> bool {
+    (matches!(tool_name, "repo_ws_write" | "repo_ws_diff")
         && (key == "content" || key == "path"))
+        || (matches!(tool_name, "write_text" | "append_text") && key == "content")
 }
 
 /// 从工具参数中抽取显式文件路径参数做门闸（命令型参数 command/code/sql 不含路径，不抽）
@@ -926,9 +929,9 @@ impl ComplianceBoundary {
             for (key, val) in obj {
                 if let Some(s) = val.as_str() {
                     let s_upper = s.to_uppercase();
-                    // repo_ws 写/改工具的 content/path：路径安全由 resolve_safe_path 负责，
-                    // 不按 SQL 注入 / 路径穿越拦截，避免误杀含 "../" 或 "UPDATE SET" 的文件内容。
-                    if !is_repo_ws_payload(tool_name, key) {
+                    // 文件写工具的 content（repo_ws 还包括 path）跳过通用 SQL/穿越扫描：
+                    // repo_ws 路径由 resolve_safe_path 负责；office-basic 的 path 不豁免。
+                    if !is_file_write_payload(tool_name, key) {
                         if s.contains("' --")
                             || s.contains("';")
                             || s_upper.contains(" UNION ")
@@ -1076,9 +1079,9 @@ impl ComplianceBoundary {
                 if val.is_string() {
                     let s = val.as_str().unwrap_or("");
                     let s_upper = s.to_uppercase();
-                    // repo_ws 写/改工具的 content/path：路径安全由 resolve_safe_path 负责，
-                    // 不按 SQL 注入 / 路径穿越拦截，避免误杀含 "../" 或 "UPDATE SET" 的文件内容。
-                    if !is_repo_ws_payload(tool_name, key) {
+                    // 文件写工具的 content（repo_ws 还包括 path）跳过通用 SQL/穿越扫描：
+                    // repo_ws 路径由 resolve_safe_path 负责；office-basic 的 path 不豁免。
+                    if !is_file_write_payload(tool_name, key) {
                         // SQL 注入检测（P2-7 增强）
                         if s.contains("' --")
                             || s.contains("';")
