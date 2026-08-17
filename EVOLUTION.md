@@ -8,7 +8,7 @@
 夜间低峰维护（bootstrap 02:00-04:59 块）每日调用 `memoria_maintenance()`，其中 `memory_decay` 以空参 `{}` 调用。memoria 的 NsPolicy 门控对 admin 维护身份（授权 `*`）缺参直接返回 `-32002 Namespace argument required`，导致 **decay 每晚必挂**（备份正常、衰减零执行），且伴随观察落点错配，梦境巩固（consolidate）长期空转。
 
 ### 变更
-- **`src/agent.rs`**：`memoria_maintenance(&self)` → `memoria_maintenance(&self, ns_list: &[String])`，`memory_decay` 改为逐 ns 显式传 `{"namespace": ns}`（与 consolidate 同批 ns_list；空列表时保持旧行为）。
+- **`src/agent.rs`**：`memoria_maintenance(&self)` → `memoria_maintenance(&self, ns_list: &[String])`，`memory_decay` 改为逐 ns 显式传 `{"namespace": ns}`（与 consolidate 同批 ns_list；空列表时跳过 decay，避免复现 -32002）。
 - **`src/bootstrap.rs`**：夜间块将 consolidate 同源的 `ns_vec`（`CONSOLIDATE_NAMESPACES` 解析结果）传给维护函数，decay 与巩固同范围。
 
 ### 部署

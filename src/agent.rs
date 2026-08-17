@@ -12277,7 +12277,8 @@ impl AgentCore {
     ///
     /// `ns_list`：与 consolidate 同批的命名空间列表，逐 ns 执行 decay（memoria NsPolicy
     /// 门控要求显式传 namespace；admin 维护身份授权为 `*` 时缺参会被 -32002 直接拒绝，
-    /// 空参 `{}` 的旧调用因此常年失败）。空列表时保持旧行为（不带 namespace 调一次）。
+    /// 空参 `{}` 的旧调用因此常年失败）。空列表（如 CONSOLIDATE_NAMESPACES 为空串）时
+    /// 跳过 decay，避免复现 -32002 失败形态。
     pub async fn memoria_maintenance(&self, ns_list: &[String]) -> String {
         let mem_client = memoria_maintenance_client(&self.config.memoria_url, &self.mcp);
         let parse = |raw: String| -> serde_json::Value {
@@ -12285,12 +12286,7 @@ impl AgentCore {
                 .unwrap_or_else(|_| serde_json::Value::String(raw))
         };
         let decay = if ns_list.is_empty() {
-            parse(
-                mem_client
-                    .call("memory_decay", &serde_json::json!({}))
-                    .await
-                    .unwrap_or_else(|e| format!("decay failed: {}", e)),
-            )
+            serde_json::json!({"skipped": true, "reason": "ns_list empty (CONSOLIDATE_NAMESPACES 未配置)"})
         } else {
             let mut out = Vec::new();
             for ns in ns_list {
