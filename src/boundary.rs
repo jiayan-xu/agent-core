@@ -355,8 +355,9 @@ impl ExecutionSandbox {
         "officecli_merge",
         "officecli_create",
         // office-basic MCP（A/B 双轨试点）：参数名均为 `path`，已被 extract_path_arg 的 KEYS 覆盖，
-        // 因此这里列出的四个工具会走敏感目录 deny 与沙箱根越界检查；office_basic_mcp.py 自身
-        // 也按 AGENT_SANDBOX_ROOT 做二次锚定（双保险，不依赖单边）。
+        // 因此这里列出的四个工具会走敏感目录 deny 与沙箱根越界检查。server 侧
+        // （examples/skills/office_basic_mcp.py）要求绝对路径并按 AGENT_SANDBOX_ROOT 锚定；
+        // 相对路径在 server 侧直接拒绝，边界层按 cwd 归一化只作为第一道保守检查。
         "read_text",
         "write_text",
         "append_text",
@@ -2475,6 +2476,9 @@ mod tests {
 
     #[test]
     fn test_office_basic_path_args_hit_sandbox_gate() {
+        // 显式复位沙箱开关：test_execution_sandbox 若中途失败可能把全局标志留在 false，
+        // 否则本测试的 Red 断言会因“沙箱未启用”这一无关原因通过。
+        ExecutionSandbox::set_enabled(true);
         // office-basic MCP 四个工具的参数名都是 `path`，必须被 extract_path_arg 的 KEYS 覆盖，
         // 否则 REQUIRES_SANDBOX 登记只是空转。
         for tool in ["read_text", "write_text", "append_text", "excel_group_sum"] {
@@ -2484,6 +2488,10 @@ mod tests {
             assert!(!r.allow, "{tool} 的敏感路径应触发沙箱门闸");
             assert_eq!(r.level, Some(BlockLevel::Red));
         }
+        // 写工具的核心意图是审批地板：必须落在 HARD_DANGEROUS，
+        // 即便未来分类器表把它们挪出 dangerous 也不会变成普通 write 直通。
+        assert!(super::HARD_DANGEROUS.contains(&"write_text"));
+        assert!(super::HARD_DANGEROUS.contains(&"append_text"));
     }
 
     #[test]

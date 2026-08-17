@@ -3976,6 +3976,7 @@ impl AgentCore {
             "以来", "以后", "至今", "到", "至", "今年", "去年", "上半年", "下半年",
             "本月", "这个月", "这月", "季度", "本周", "这周", "一年", "半年", "全年",
         ];
+        const CHINESE_WINDOWS: &[&str] = &["一周", "两周", "三周", "一个月", "两个月", "三个月", "上周", "下周"];
 
         // 整个路由只分配一次字符向量，避免每个 helper 重复 collect。
         let chars: Vec<char> = message.chars().collect();
@@ -3984,6 +3985,10 @@ impl AgentCore {
             let mut plates = Vec::new();
             for i in 0..chars.len() {
                 if !PLATE_PROVINCES.contains(chars[i]) {
+                    continue;
+                }
+                // 左边界：省份字前面不能紧跟字母数字，否则是拼接标识符（如 ID苏EBS569）。
+                if i > 0 && chars[i - 1].is_ascii_alphanumeric() {
                     continue;
                 }
                 // 标准车牌结构：省份汉字 + 1 位英文字母 + 5~6 位字母数字。
@@ -4048,6 +4053,49 @@ impl AgentCore {
                 }
             }
             None
+        }
+
+        fn count_day_window_tokens(chars: &[char]) -> usize {
+            // 统计「N天」窗口个数：向前找最近/近/这/过去，向后必须是数字+天。
+            // 按每个「N天」只计一次，避免 最近30天 同时命中 最近 和 近 而重复计数。
+            let mut count = 0usize;
+            let mut idx = 0;
+            while idx < chars.len() {
+                if !chars[idx].is_ascii_digit() {
+                    idx += 1;
+                    continue;
+                }
+                let start = idx;
+                while idx < chars.len() && chars[idx].is_ascii_digit() {
+                    idx += 1;
+                }
+                if idx < chars.len() && chars[idx] == '天' {
+                    let before: String = chars[..start].iter().collect();
+                    let has_window_token = ["最近", "近", "这", "过去"]
+                        .iter()
+                        .any(|t| before.ends_with(t));
+                    if has_window_token {
+                        count += 1;
+                    }
+                }
+                idx += 1;
+            }
+            count
+        }
+
+        fn count_iso_dates(chars: &[char]) -> usize {
+            let mut count = 0usize;
+            for i in 0..chars.len().saturating_sub(9) {
+                if chars[i..i + 4].iter().all(|c| c.is_ascii_digit())
+                    && chars[i + 4] == '-'
+                    && chars[i + 5..i + 7].iter().all(|c| c.is_ascii_digit())
+                    && chars[i + 7] == '-'
+                    && chars[i + 8..i + 10].iter().all(|c| c.is_ascii_digit())
+                {
+                    count += 1;
+                }
+            }
+            count
         }
 
         fn count_month_tokens(chars: &[char]) -> usize {
@@ -4125,7 +4173,10 @@ impl AgentCore {
         let has = |words: &[&str]| words.iter().any(|w| message.contains(w));
         let day_tokens = DAY_TOKENS.iter().filter(|t| message.contains(**t)).count();
         let month_tokens = count_month_tokens(&chars);
+        let day_window_tokens = count_day_window_tokens(&chars);
+        let iso_dates = count_iso_dates(&chars);
         let has_open_range = OPEN_RANGES.iter().any(|w| message.contains(w));
+        let has_chinese_window = CHINESE_WINDOWS.iter().any(|w| message.contains(w));
         let plates = find_plates(&chars);
         let plate = plates.first();
         // 省份字 + 大写字母：即便后面粘着日期/其他数字导致 find_plates 拒绝整串，
@@ -4138,6 +4189,7 @@ impl AgentCore {
         // 单工具路由会丢一半或取错窗口，直接回退 nl_query。
         if day_tokens >= 2
             || month_tokens >= 2
+            || day_window_tokens >= 2
             || (has_open_range && (day_tokens >= 1 || month_tokens >= 1))
         {
             return None;
@@ -4146,7 +4198,7 @@ impl AgentCore {
         // 异常检查：只接受「异常语义 + 明确 ISO 日期」的确定性路由；
         // 没有可解析日期、或同时带车牌（车辆级异常工具不支持）都回退 nl_query。
         if has(&["异常", "零重量", "重复记录"]) {
-            if plate.is_some() || plate_like {
+            if plate.is_some() || plate_like || has_open_range || iso_dates >= 2 {
                 return None;
             }
             return find_iso_date(&chars).map(|date| {
@@ -4164,6 +4216,9 @@ impl AgentCore {
                     serde_json::json!({"company": matched[0]}),
                 ));
             }
+            // 0 家或多家匹配：不能把「车牌是否在白名单」路由成车辆进厂查询，
+            // 也不能把「多公司白名单+月统计」路由成月度汇总，统一回退 nl_query。
+            return None;
         }
 
         // 车牌 + 明确的日范围/月范围/多车牌：没有单工具语义，回退 nl_query，
@@ -4179,9 +4234,10 @@ impl AgentCore {
             {
                 return None;
             }
-            // 无显式「N天」窗口时按 30 天默认；有开放范围词时交给 nl_query。
+            // 无显式「N天」窗口时按 30 天默认；有开放范围词或中文窗口（一周/一个月等）
+            // 时交给 nl_query，避免静默用 30 天窗口答非所问。
             let days = find_days(&chars);
-            if days.is_none() && has_open_range {
+            if days.is_none() && (has_open_range || has_chinese_window) {
                 return None;
             }
             return Some((
@@ -13479,6 +13535,13 @@ mod whitelist_preroute_tests {
         // 非法日历日期 / 越界年份不得路由
         assert!(AgentCore::direct_fast_tool("检查2026-13-45的数据异常").is_none());
         assert!(AgentCore::direct_fast_tool("1999年7月统计汇总").is_none());
+        // 白名单 0/多企业、中文窗口、复合数字窗口、开放范围、拼接标识符 全部回退
+        assert!(AgentCore::direct_fast_tool("苏EBS569是否在白名单").is_none());
+        assert!(AgentCore::direct_fast_tool("天越和理文的白名单7月统计汇总").is_none());
+        assert!(AgentCore::direct_fast_tool("苏EBS569过去一周进厂记录").is_none());
+        assert!(AgentCore::direct_fast_tool("最近7天到最近15天进厂记录").is_none());
+        assert!(AgentCore::direct_fast_tool("2026-08-01至今的数据异常").is_none());
+        assert!(AgentCore::direct_fast_tool("ID苏EBS569进厂记录").is_none());
     }
 
     #[test]
