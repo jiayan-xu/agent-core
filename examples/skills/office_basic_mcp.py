@@ -7,7 +7,6 @@ server (protocol 2026-07-28, OpenAI-style tools/list). Tools:
   - append_text append a line to a UTF-8 text file
   - excel_group_sum  openpyxl group-by aggregation
 """
-import io
 import json
 import os
 import sys
@@ -20,6 +19,7 @@ DENY_FILENAMES = {
     "id_ed25519", "id_rsa", "id_dsa", "id_ecdsa",
     "id_ed25519.pub", "credentials", "gserviceaccount.json",
 }
+MAX_XLSX_BYTES = 20 * 1024 * 1024
 
 
 def safe_path(raw: str) -> Path:
@@ -56,7 +56,12 @@ def _flags(*names):
 
 
 def open_text(path: Path, mode: str):
-    """Open a checked path with O_NOFOLLOW so a post-check symlink swap cannot redirect I/O."""
+    """Open a checked path with O_NOFOLLOW and re-verify the opened fd.
+
+    O_NOFOLLOW only stops the final component from being a symlink; on Linux
+    we additionally resolve /proc/self/fd and re-run the same component checks
+    so an intermediate directory swapped after safe_path() cannot redirect I/O.
+    """
     if mode == "r":
         flags = _flags("O_RDONLY", "O_NOFOLLOW", "O_CLOEXEC")
     elif mode == "w":
@@ -66,7 +71,19 @@ def open_text(path: Path, mode: str):
     else:
         raise ValueError(f"unsupported mode {mode}")
     fd = os.open(str(path), flags, 0o666)
-    return open(fd, mode, encoding="utf-8", errors="replace", closefd=True)
+    try:
+        if sys.platform.startswith("linux"):
+            fd_path = Path(f"/proc/self/fd/{fd}").resolve(strict=False)
+            joined = "/".join(part.lower() for part in fd_path.parts if part)
+            if any(seg in joined for comp in DENY_COMPONENTS for seg in (comp,)):
+                raise ValueError(f"opened path resolves into a sensitive directory: {fd_path}")
+            root = os.environ.get("AGENT_SANDBOX_ROOT")
+            if root and not fd_path.is_relative_to(Path(root).resolve(strict=False)):
+                raise ValueError(f"opened path escapes sandbox root {root}: {fd_path}")
+        return open(fd, mode, encoding="utf-8", errors="replace", closefd=True)
+    except Exception:
+        os.close(fd)
+        raise
 
 TOOLS = [
     {
@@ -176,6 +193,9 @@ def handle(req):
                     "content": [{"type": "text", "text": json.dumps({"ok": True, "path": str(path)}, ensure_ascii=False)}]}}
             if name == "excel_group_sum":
                 path = safe_path(args["path"])
+                if path.stat().st_size > MAX_XLSX_BYTES:
+                    return {"jsonrpc": "2.0", "id": rid, "error": {
+                        "code": -32602, "message": f"xlsx too large (max {MAX_XLSX_BYTES} bytes)"}}
                 wb = load_workbook(path, read_only=True, data_only=True)
                 try:
                     ws = wb.active
@@ -212,7 +232,8 @@ def handle(req):
                 finally:
                     wb.close()
             return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": f"unknown tool {name}"}}
-        except (KeyError, IndexError) as e:
+        except (KeyError, IndexError, ValueError) as e:
+            # 客户端参数错误（缺参数 / 非整数 / 非法路径 / 列不存在）→ -32602
             return {"jsonrpc": "2.0", "id": rid,
                     "error": {"code": -32602, "message": f"invalid params: {e}"}}
         except Exception as e:

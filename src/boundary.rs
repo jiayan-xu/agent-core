@@ -1188,9 +1188,9 @@ impl std::str::FromStr for ToolClass {
     }
 }
 
-/// 显式允许为只读的 `cross_*` 工具。
+/// 显式只读白名单（名称不含 query_/read_/get_ 等前缀的跨域只读工具）。
 /// 这是 classifier 与 `is_read_only_tool` 共用的唯一白名单，避免两个安全门漂移。
-pub(crate) const EXPLICIT_READ_CROSS_TOOLS: &[&str] = &["cross_validate", "excel_group_sum"];
+pub(crate) const EXPLICIT_READ_CROSS_TOOLS: &[&str] = &["cross_validate", "excel_group_sum", "read_text"];
 
 /// 工具分类器（P1-7 修复：配置驱动 + 自动学习）
 ///
@@ -1348,9 +1348,8 @@ impl ToolClassifier {
             "repo_ws_read",  // 轨二：白名单仓只读
             "repo_ws_list",  // 轨二：白名单仓列目录（只读）
             "repo_ws_stat",  // 轨二：白名单仓文件元数据（只读）
-            // office-basic MCP（A/B 双轨试点）：文本读取与表格聚合为只读
-            "read_text",
-            "excel_group_sum",
+            // office-basic MCP 只读工具统一经 EXPLICIT_READ_CROSS_TOOLS 注册，
+            // 不在此处重复登记，避免两个白名单漂移。
             // P0-1 场景沙箱：只读推演（基线+影子叠加，绝不写生产）
             "scenario_list",
             "scenario_get",
@@ -2479,9 +2478,16 @@ mod tests {
 
     #[test]
     fn test_office_basic_path_args_hit_sandbox_gate() {
-        // 快照并恢复全局沙箱开关：test_execution_sandbox 可能把它改成 false，
-        // 并行/失败路径下不能把状态留给其他用例。
-        let prior = ExecutionSandbox::is_enabled();
+        // RAII 守卫：断言 panic 也保证恢复全局沙箱开关，不污染并行运行的其他用例。
+        struct SandboxFlagGuard {
+            prior: bool,
+        }
+        impl Drop for SandboxFlagGuard {
+            fn drop(&mut self) {
+                ExecutionSandbox::set_enabled(self.prior);
+            }
+        }
+        let _guard = SandboxFlagGuard { prior: ExecutionSandbox::is_enabled() };
         ExecutionSandbox::set_enabled(true);
         // office-basic MCP 四个工具的参数名都是 `path`，必须被 extract_path_arg 的 KEYS 覆盖，
         // 否则 REQUIRES_SANDBOX 登记只是空转。
@@ -2496,7 +2502,6 @@ mod tests {
         // 即便未来分类器表把它们挪出 dangerous 也不会变成普通 write 直通。
         assert!(super::HARD_DANGEROUS.contains(&"write_text"));
         assert!(super::HARD_DANGEROUS.contains(&"append_text"));
-        ExecutionSandbox::set_enabled(prior);
     }
 
     #[test]
