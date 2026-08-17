@@ -3977,21 +3977,26 @@ impl AgentCore {
                 if !PLATE_PROVINCES.contains(chars[i]) {
                     continue;
                 }
+                // 标准车牌结构：省份汉字 + 1 位英文字母 + 5~6 位字母数字。
+                // 只接受恰好 5~6 位的尾部；更长字母数字串（如 苏EBS569123）
+                // 视为拼接标识符，不作为车牌，避免把不存在的牌号发给工具。
                 let mut j = i + 1;
-                while j < chars.len()
-                    && chars[j].is_ascii_alphanumeric()
-                    && j - i <= 7
-                {
+                while j < chars.len() && chars[j].is_ascii_alphanumeric() && j - i <= 8 {
                     j += 1;
                 }
-                let len = j - i;
-                if len >= 6 && len <= 8 {
-                    let plate: String = chars[i..j].iter().collect();
-                    let tail: String = chars[i + 1..j].iter().collect();
-                    if tail.len() >= 5 {
-                        return Some((plate, tail));
-                    }
+                let tail: Vec<char> = chars[i + 1..j].to_vec();
+                if tail.len() < 5 || tail.len() > 6 {
+                    continue;
                 }
+                if !tail[0].is_ascii_uppercase() {
+                    continue;
+                }
+                // 尾部之后不能再紧跟字母数字（拒绝更长拼接串）
+                if j < chars.len() && chars[j].is_ascii_alphanumeric() {
+                    continue;
+                }
+                let plate: String = chars[i..j].iter().collect();
+                return Some((plate, tail.iter().collect()));
             }
             None
         }
@@ -4028,7 +4033,9 @@ impl AgentCore {
                     && chars[i + 7] == '-'
                     && chars[i + 8..i + 10].iter().all(|c| c.is_ascii_digit())
                 {
-                    return Some(chars[i..i + 10].iter().collect());
+                    let date: String = chars[i..i + 10].iter().collect();
+                    // 格式 + 日历有效性同时校验，拒绝 2026-13-45 这类输入
+                    return chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok().map(|_| date);
                 }
             }
             None
@@ -4041,6 +4048,9 @@ impl AgentCore {
                     && chars.get(i + 4) == Some(&'年')
                 {
                     let year: i64 = chars[i..i + 4].iter().collect::<String>().parse().ok()?;
+                    if !(2000..=2100).contains(&year) {
+                        continue;
+                    }
                     let rest: String = chars[i + 5..].iter().collect();
                     let month_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                     if !month_str.is_empty()
@@ -4076,6 +4086,39 @@ impl AgentCore {
         }
 
         let has = |words: &[&str]| words.iter().any(|w| message.contains(w));
+
+        // 复合时间范围（「昨天和今天」「7月到8月」）确定性单工具路由会丢一半，
+        // 直接回退 nl_query，避免注入不完整数据让 LLM 按错误口径作答。
+        let day_tokens = ["昨天", "昨日", "今天", "今日"]
+            .iter()
+            .filter(|t| message.contains(**t))
+            .count();
+        let chars_for_month: Vec<char> = message.chars().collect();
+        let mut month_tokens = 0usize;
+        let mut mi = 0;
+        while mi < chars_for_month.len() {
+            if chars_for_month[mi].is_ascii_digit() {
+                let start = mi;
+                while mi < chars_for_month.len() && chars_for_month[mi].is_ascii_digit() {
+                    mi += 1;
+                }
+                if mi < chars_for_month.len() && chars_for_month[mi] == '月' {
+                    let digits: String = chars_for_month[start..mi].iter().collect();
+                    if digits.parse::<u8>().ok().is_some_and(|m| (1..=12).contains(&m)) {
+                        month_tokens += 1;
+                    }
+                }
+            } else {
+                mi += 1;
+            }
+        }
+        if day_tokens >= 2
+            || month_tokens >= 2
+            || ((message.contains('到') || message.contains('至'))
+                && (day_tokens >= 1 || month_tokens >= 1))
+        {
+            return None;
+        }
 
         // 异常检查：明确日期 + 异常语义
         if has(&["异常", "零重量", "重复记录"]) {
@@ -5294,14 +5337,25 @@ impl AgentCore {
                         .call_tool_routed(&tool, &self.persona_for_session(session_id), &tool_args, allowed_ns, trace_id)
                         .await
                     {
-                        // 确定性工具返回的是 JSON 数据（如 query_today/query_vehicle），
-                        // 只要可解析为 JSON 就注入；非 JSON/错误回退 nl_query。
-                        Ok(t) if !t.is_empty() && serde_json::from_str::<serde_json::Value>(&t).is_ok() => {
-                            fast_query_result = Some(t);
-                            tracing::info!(target = "agent.fastpath", tool = %tool, "确定性工具快速通道命中");
+                        // 确定性工具返回 JSON 数据。只接受"看起来像成功数据"的载荷：
+                        // 带 success:false / error 字段的失败载荷必须回退，绝不能当数据注入。
+                        Ok(t) if !t.is_empty() => {
+                            let parsed = serde_json::from_str::<serde_json::Value>(&t);
+                            let is_error_payload = parsed.as_ref().ok().is_some_and(|v| {
+                                v.get("success").and_then(|s| s.as_bool()) == Some(false)
+                                    || v.get("error").is_some()
+                                    || (v.get("code").is_some() && v.get("message").is_some())
+                            });
+                            if parsed.is_ok() && !is_error_payload {
+                                fast_query_result = Some(t);
+                                tracing::info!(target = "agent.fastpath", tool = %tool, "确定性工具快速通道命中");
+                            } else {
+                                tracing::warn!(target = "agent.fastpath", tool = %tool, result_len = t.chars().count(), "确定性工具快速通道返回失败载荷，回退 nl_query");
+                            }
                         }
                         Ok(t) => {
-                            tracing::warn!(target = "agent.fastpath", tool = %tool, result = %t.chars().take(200).collect::<String>(), "确定性工具快速通道返回非 JSON，回退 nl_query");
+                            tracing::warn!(target = "agent.fastpath", tool = %tool, "确定性工具快速通道返回空结果，回退 nl_query");
+                            let _ = t;
                         }
                         Err(e) => {
                             tracing::warn!(target = "agent.fastpath", tool = %tool, err = %e, "确定性工具快速通道调用失败，回退 nl_query");
@@ -13347,6 +13401,14 @@ mod whitelist_preroute_tests {
         assert_eq!(args["date_str"], "2026-08-16");
         // 未命中：模糊分析问法回退 nl_query
         assert!(AgentCore::direct_fast_tool("分析最近固废数据的异常趋势").is_none());
+        // 非法车牌（数字开头 / 尾部过长拼接串）不得当作车牌路由
+        assert!(AgentCore::direct_fast_tool("查苏12345近30天进厂记录").is_none());
+        assert!(AgentCore::direct_fast_tool("查苏EBS569123近30天进厂记录").is_none());
+        // 复合时间范围回退 nl_query，避免只查一半
+        assert!(AgentCore::direct_fast_tool("昨天和今天的进厂概况").is_none());
+        assert!(AgentCore::direct_fast_tool("统计7月到8月总车次").is_none());
+        // 非法日历日期不得路由到 explain_anomaly
+        assert!(AgentCore::direct_fast_tool("检查2026-13-45的数据异常").is_none());
     }
 
     #[test]

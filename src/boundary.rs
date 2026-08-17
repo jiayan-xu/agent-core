@@ -350,6 +350,12 @@ impl ExecutionSandbox {
         "officecli_pdf",
         "officecli_merge",
         "officecli_create",
+        // office-basic MCP（A/B 双轨试点）：读写路径必须与其他路径类工具一样过
+        // 敏感目录 deny 与沙箱根越界检查
+        "read_text",
+        "write_text",
+        "append_text",
+        "excel_group_sum",
     ];
     const REQUIRES_REVIEW: &'static [&'static str] = &["delete_", "batch_", "shutdown_"];
 
