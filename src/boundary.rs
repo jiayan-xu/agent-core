@@ -1190,7 +1190,7 @@ impl std::str::FromStr for ToolClass {
 
 /// 显式允许为只读的 `cross_*` 工具。
 /// 这是 classifier 与 `is_read_only_tool` 共用的唯一白名单，避免两个安全门漂移。
-pub(crate) const EXPLICIT_READ_CROSS_TOOLS: &[&str] = &["cross_validate"];
+pub(crate) const EXPLICIT_READ_CROSS_TOOLS: &[&str] = &["cross_validate", "excel_group_sum"];
 
 /// 工具分类器（P1-7 修复：配置驱动 + 自动学习）
 ///
@@ -1814,11 +1814,6 @@ fn is_read_only_tool_lower(lower: &str) -> bool {
         return false;
     }
     if EXPLICIT_READ_CROSS_TOOLS.iter().any(|t| lower == *t) {
-        return true;
-    }
-    // office-basic 聚合读取：名称不含 read_/query_ 前缀，必须显式归入只读，
-    // 否则 plan_requires_confirmation 会把它当成非只读而弹确认。
-    if lower == "excel_group_sum" {
         return true;
     }
     lower.starts_with("query_")
@@ -2484,8 +2479,9 @@ mod tests {
 
     #[test]
     fn test_office_basic_path_args_hit_sandbox_gate() {
-        // 显式复位沙箱开关：test_execution_sandbox 若中途失败可能把全局标志留在 false，
-        // 否则本测试的 Red 断言会因“沙箱未启用”这一无关原因通过。
+        // 快照并恢复全局沙箱开关：test_execution_sandbox 可能把它改成 false，
+        // 并行/失败路径下不能把状态留给其他用例。
+        let prior = ExecutionSandbox::is_enabled();
         ExecutionSandbox::set_enabled(true);
         // office-basic MCP 四个工具的参数名都是 `path`，必须被 extract_path_arg 的 KEYS 覆盖，
         // 否则 REQUIRES_SANDBOX 登记只是空转。
@@ -2500,6 +2496,7 @@ mod tests {
         // 即便未来分类器表把它们挪出 dangerous 也不会变成普通 write 直通。
         assert!(super::HARD_DANGEROUS.contains(&"write_text"));
         assert!(super::HARD_DANGEROUS.contains(&"append_text"));
+        ExecutionSandbox::set_enabled(prior);
     }
 
     #[test]

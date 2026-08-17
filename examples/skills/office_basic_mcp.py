@@ -7,6 +7,7 @@ server (protocol 2026-07-28, OpenAI-style tools/list). Tools:
   - append_text append a line to a UTF-8 text file
   - excel_group_sum  openpyxl group-by aggregation
 """
+import io
 import json
 import os
 import sys
@@ -45,6 +46,27 @@ def safe_path(raw: str) -> Path:
         except OSError:
             raise
     return p
+
+
+def _flags(*names):
+    value = 0
+    for name in names:
+        value |= getattr(os, name, 0)
+    return value
+
+
+def open_text(path: Path, mode: str):
+    """Open a checked path with O_NOFOLLOW so a post-check symlink swap cannot redirect I/O."""
+    if mode == "r":
+        flags = _flags("O_RDONLY", "O_NOFOLLOW", "O_CLOEXEC")
+    elif mode == "w":
+        flags = _flags("O_WRONLY", "O_CREAT", "O_TRUNC", "O_NOFOLLOW", "O_CLOEXEC")
+    elif mode == "a":
+        flags = _flags("O_WRONLY", "O_CREAT", "O_APPEND", "O_NOFOLLOW", "O_CLOEXEC")
+    else:
+        raise ValueError(f"unsupported mode {mode}")
+    fd = os.open(str(path), flags, 0o666)
+    return open(fd, mode, encoding="utf-8", errors="replace", closefd=True)
 
 TOOLS = [
     {
@@ -131,9 +153,9 @@ def handle(req):
         try:
             if name == "read_text":
                 path = safe_path(args["path"])
-                cap = max(0, int(args.get("max_chars", 8000)))
+                cap = min(1_000_000, max(0, int(args.get("max_chars", 8000))))
                 # 只读取 cap+64 字符，cap 同时约束 I/O 与返回内容，避免大文件整读进内存。
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                with open_text(path, "r") as f:
                     text = f.read(cap + 64)
                 if len(text) > cap:
                     text = text[:cap] + "\n...[truncated]"
@@ -142,12 +164,13 @@ def handle(req):
             if name == "write_text":
                 path = safe_path(args["path"])
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(args["content"], encoding="utf-8")
+                with open_text(path, "w") as f:
+                    f.write(args["content"])
                 return {"jsonrpc": "2.0", "id": rid, "result": {
                     "content": [{"type": "text", "text": json.dumps({"ok": True, "path": str(path)}, ensure_ascii=False)}]}}
             if name == "append_text":
                 path = safe_path(args["path"])
-                with open(path, "a", encoding="utf-8") as f:
+                with open_text(path, "a") as f:
                     f.write(args["content"] + "\n")
                 return {"jsonrpc": "2.0", "id": rid, "result": {
                     "content": [{"type": "text", "text": json.dumps({"ok": True, "path": str(path)}, ensure_ascii=False)}]}}
@@ -164,8 +187,12 @@ def handle(req):
                     header = [str(c) for c in header_row]
                     gc = args.get("group_col", "product")
                     vc = args.get("value_col", "qty")
-                    gi = header.index(gc)
-                    vi = header.index(vc)
+                    try:
+                        gi = header.index(gc)
+                        vi = header.index(vc)
+                    except ValueError as e:
+                        return {"jsonrpc": "2.0", "id": rid,
+                                "error": {"code": -32602, "message": f"invalid params: {e}"}}
                     agg = {}
                     for row in rows:
                         key = str(row[gi])
@@ -185,12 +212,19 @@ def handle(req):
                 finally:
                     wb.close()
             return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": f"unknown tool {name}"}}
+        except (KeyError, IndexError) as e:
+            return {"jsonrpc": "2.0", "id": rid,
+                    "error": {"code": -32602, "message": f"invalid params: {e}"}}
         except Exception as e:
             return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": str(e)}}
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"unknown method {method}"}}
 
 
 def main():
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     print(json.dumps({"jsonrpc": "2.0", "type": "ready", "tools": len(TOOLS)}), flush=True)
     for line in sys.stdin:
         line = line.strip()
