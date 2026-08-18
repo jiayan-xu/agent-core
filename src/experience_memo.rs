@@ -303,17 +303,16 @@ pub async fn collect_memo_samples(
             all_results.extend(arr.iter().cloned());
         }
     }
-    // all_ns=true 时：保留本 agent 前缀（agent/{id}* 或 *）的条目，
-    // 排除其他 agent 的 ns（如 agent/jarvis、agent/workbuddy 等）
-    let agent_prefix = format!("agent/{}", ns.split('/').next().unwrap_or(""));
+    // all_ns=true 时：保留当前 agent 的 ns（精确前缀匹配 agent/{id}/*）
+    // 和 ns="*"（全局备忘），排除其他 agent（agent/jarvis、agent/workbuddy 等）
+    let agent_id = ns.split('/').nth(1).unwrap_or(ns); // "agent/xujiayan" → "xujiayan"
+    let ns_prefix = format!("{}/", ns); // "agent/xujiayan/"
     let results = if all_ns {
         all_results
             .into_iter()
-            .filter(|it| {
-                it.get("namespace")
-                    .and_then(|n| n.as_str())
-                    .map(|n| n.starts_with("agent/") || n == "*")
-                    .unwrap_or(true)
+            .filter(|it| match it.get("namespace").and_then(|n| n.as_str()) {
+                Some(n) => n.starts_with(&ns_prefix) || n == ns || n == "*",
+                None => false, // 无 namespace 的条目在 all_ns 模式下排除
             })
             .collect()
     } else {
