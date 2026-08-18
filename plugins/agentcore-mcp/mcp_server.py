@@ -319,7 +319,12 @@ def tool_approval_respond(args: dict) -> dict:
     approval_id = (args.get("id") or "").strip()
     if not approval_id:
         raise ToolError("id 必填（审批项 id）")
-    approved = bool(args.get("approved"))
+    approved = False
+    raw_approved = args.get("approved")
+    if isinstance(raw_approved, str):
+        approved = raw_approved.strip().lower() in ("1", "true", "yes", "approve", "批准", "是")
+    else:
+        approved = bool(raw_approved)
     required_confirm = "APPROVE" if approved else "REJECT"
     confirm_gate(args, required_confirm)
     operation_hash = (args.get("operation_hash") or "").strip()
@@ -847,7 +852,9 @@ def handle_tools_list(req_id):
 
 
 def handle_tools_call(req_id, params):
-    params = params or {}
+    # params 可能是任意 JSON 值（array/string/...），非 object 时按空处理避免 .get 崩溃
+    if not isinstance(params, dict):
+        params = {}
     name = params.get("name")
     arguments = params.get("arguments") or {}
     if not isinstance(arguments, dict):
@@ -881,6 +888,10 @@ def handle_tools_call(req_id, params):
 
 
 def dispatch(req):
+    # JSON-RPC 帧必须是 JSON object；合法 JSON 可能是数组/标量 → 拒绝而非崩溃
+    # （review 指正：json.loads 成功 ≠ dict，main() 只 try 了 loads 没包 dispatch）
+    if not isinstance(req, dict):
+        return rpc_error(None, -32600, "invalid request: JSON-RPC frame must be an object")
     method = req.get("method")
     req_id = req.get("id")
     params = req.get("params")

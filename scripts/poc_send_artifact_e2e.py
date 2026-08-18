@@ -37,7 +37,12 @@ def load_dotenv() -> None:
 def http(method: str, path: str, headers: dict, body=None) -> dict:
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(AC + path, data=data, headers=headers, method=method)
-    return json.loads(urllib.request.urlopen(req, timeout=180).read().decode())
+    raw = urllib.request.urlopen(req, timeout=180).read().decode("utf-8", "replace")
+    # 非 JSON body（401/HTML 502 等）不硬崩，返回可读诊断（review 指正）
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"status": "error", "raw": raw[:300]}
 
 
 def main() -> None:
@@ -116,6 +121,8 @@ def main() -> None:
     else:
         print("FAIL: 回复中未出现 Delivered 证据；检查 send-artifact 是否注册或 LLM 是否调用")
         print("raw:", json.dumps({"r1": reply1[:150], "r2": reply[:150]}, ensure_ascii=False))
+        # 失败必须以非零码退出，否则 CI/调用方误判成功（review 指正）
+        sys.exit(1)
 
 
 if __name__ == "__main__":
