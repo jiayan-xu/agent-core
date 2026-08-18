@@ -303,7 +303,11 @@ pub async fn collect_memo_samples(
                 .unwrap_or("")
                 .to_string();
             if content.is_empty()
-                || (!content.contains("experience_memo") && !content.contains("lesson"))
+                || (!content.contains("experience_memo")
+                    && !(content.contains("lesson")
+                        && (content.contains("失败")
+                            || content.contains("error")
+                            || content.contains("fail"))))
             {
                 return None;
             }
