@@ -506,6 +506,17 @@ fn is_file_write_payload(tool_name: &str, key: &str) -> bool {
         || (matches!(tool_name, "write_text" | "append_text") && key == "content")
 }
 
+/// 参数扫描策略：(skip_all, skip_sql_only)。
+/// - skip_all：完全跳过 SQL 与路径穿越扫描（repo_ws content/path、office content）；
+/// - skip_sql_only：只跳过 SQL 启发式，仍保留路径穿越（office-basic 的 path）。
+fn file_write_scan_policy(tool_name: &str, key: &str) -> (bool, bool) {
+    let skip_all = is_file_write_payload(tool_name, key);
+    let skip_sql_only = !skip_all
+        && key == "path"
+        && matches!(tool_name, "write_text" | "append_text");
+    (skip_all, skip_sql_only)
+}
+
 /// 从工具参数中抽取显式文件路径参数做门闸（命令型参数 command/code/sql 不含路径，不抽）
 /// 提取 args 中所有路径类参数（path/file/file_path/filepath/dir/directory/target/src/dst/paths）。
 /// 返回全部匹配路径，使 move_file 的 src+dst 都能过沙箱门闸（而非只查第一个）；数组值（如
@@ -936,9 +947,7 @@ impl ComplianceBoundary {
                     // 文件写工具的 content（repo_ws 还包括 path）跳过通用 SQL/穿越扫描。
                     // office-basic 的 path 只跳过 SQL 启发式（路径可能合法包含 SQL 字样），
                     // 仍保留路径穿越检查；沙箱门闸另行校验真实路径。
-                    let skip_all = is_file_write_payload(tool_name, key);
-                    let skip_sql_only = key == "path"
-                        && matches!(tool_name, "write_text" | "append_text");
+                    let (skip_all, skip_sql_only) = file_write_scan_policy(tool_name, key);
                     if !skip_all {
                         if !skip_sql_only {
                             if s.contains("' --")
@@ -1091,9 +1100,7 @@ impl ComplianceBoundary {
                     let s_upper = s.to_uppercase();
                     // 文件写工具的 content（repo_ws 还包括 path）跳过通用 SQL/穿越扫描；
                     // office-basic 的 path 仅豁免 SQL 启发式，仍保留路径穿越检查。
-                    let skip_all = is_file_write_payload(tool_name, key);
-                    let skip_sql_only = key == "path"
-                        && matches!(tool_name, "write_text" | "append_text");
+                    let (skip_all, skip_sql_only) = file_write_scan_policy(tool_name, key);
                     if !skip_all {
                         if !skip_sql_only {
                             // SQL 注入检测（P2-7 增强）
@@ -2383,7 +2390,7 @@ mod tests {
     #[test]
     fn test_execution_sandbox() {
         use std::path::PathBuf;
-        let _guard = SANDBOX_TEST_LOCK.lock().unwrap();
+        let _guard = SANDBOX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         // 沙箱默认启用
         ExecutionSandbox::set_enabled(true);
@@ -2499,7 +2506,7 @@ mod tests {
 
     #[test]
     fn test_office_basic_path_args_hit_sandbox_gate() {
-        let _serial = SANDBOX_TEST_LOCK.lock().unwrap();
+        let _serial = SANDBOX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // RAII 守卫：断言 panic 也保证恢复全局沙箱开关，不污染并行运行的其他用例。
         struct SandboxFlagGuard {
             prior: bool,

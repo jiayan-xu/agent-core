@@ -27,10 +27,10 @@ MAX_XLSX_ROWS = 100_000
 MAX_GROUPS = 10_000
 
 
-def check_xlsx_zip(path: Path):
+def check_xlsx_zip(source):
     """Reject zip bombs and oversized workbooks before openpyxl decompresses them."""
     try:
-        with zipfile.ZipFile(path) as zf:
+        with zipfile.ZipFile(source) as zf:
             infos = zf.infolist()
             if len(infos) > MAX_XLSX_FILES:
                 raise ValueError(f"xlsx has too many entries ({len(infos)} > {MAX_XLSX_FILES})")
@@ -244,12 +244,13 @@ def handle(req):
                 if not hasattr(os, "O_NOFOLLOW"):
                     raise RuntimeError("platform lacks O_NOFOLLOW; refusing to open xlsx files")
                 path = safe_path(args["path"])
-                if path.stat().st_size > MAX_XLSX_BYTES:
-                    return {"jsonrpc": "2.0", "id": rid, "error": {
-                        "code": -32602, "message": f"xlsx too large (max {MAX_XLSX_BYTES} bytes)"}}
-                check_xlsx_zip(path)
                 fh = open_binary_nofollow(path)
                 try:
+                    if os.fstat(fh.fileno()).st_size > MAX_XLSX_BYTES:
+                        return {"jsonrpc": "2.0", "id": rid, "error": {
+                            "code": -32602, "message": f"xlsx too large (max {MAX_XLSX_BYTES} bytes)"}}
+                    check_xlsx_zip(fh)
+                    fh.seek(0)
                     wb = load_workbook(fh, read_only=True, data_only=True)
                     try:
                         ws = wb.active
