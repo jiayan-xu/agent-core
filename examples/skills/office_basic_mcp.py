@@ -111,6 +111,29 @@ def open_text(path: Path, mode: str):
         os.close(fd)
         raise
 
+def open_binary_nofollow(path: Path):
+    """Open a checked path in binary mode with O_NOFOLLOW for openpyxl."""
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("platform lacks O_NOFOLLOW; refusing to open xlsx files")
+    flags = _flags("O_RDONLY", "O_NOFOLLOW", "O_CLOEXEC")
+    fd = os.open(str(path), flags)
+    try:
+        if sys.platform.startswith("linux"):
+            fd_path = Path(f"/proc/self/fd/{fd}").resolve(strict=False)
+            fd_parts = [part.lower() for part in fd_path.parts if part]
+            for comp in DENY_COMPONENTS:
+                segs = comp.split("/")
+                if any(fd_parts[i:i + len(segs)] == segs for i in range(len(fd_parts) - len(segs) + 1)):
+                    raise ValueError(f"opened path resolves into a sensitive directory: {fd_path}")
+            root = os.environ.get("AGENT_SANDBOX_ROOT")
+            if root and not fd_path.is_relative_to(Path(root).resolve(strict=False)):
+                raise ValueError(f"opened path escapes sandbox root {root}: {fd_path}")
+        return os.fdopen(fd, "rb")
+    except Exception:
+        os.close(fd)
+        raise
+
+
 TOOLS = [
     {
         "type": "function",
@@ -225,56 +248,63 @@ def handle(req):
                     return {"jsonrpc": "2.0", "id": rid, "error": {
                         "code": -32602, "message": f"xlsx too large (max {MAX_XLSX_BYTES} bytes)"}}
                 check_xlsx_zip(path)
-                wb = load_workbook(path, read_only=True, data_only=True)
+                fh = open_binary_nofollow(path)
                 try:
-                    ws = wb.active
-                    rows = ws.iter_rows(values_only=True)
-                    header_row = next(rows, None)
-                    if header_row is None:
-                        return {"jsonrpc": "2.0", "id": rid, "result": {
-                            "content": [{"type": "text", "text": json.dumps({"ranking": []}, ensure_ascii=False)}]}}
-                    header = [str(c) for c in header_row]
-                    gc = args.get("group_col", "product")
-                    vc = args.get("value_col", "qty")
+                    wb = load_workbook(fh, read_only=True, data_only=True)
                     try:
-                        gi = header.index(gc)
-                        vi = header.index(vc)
-                    except ValueError as e:
-                        return {"jsonrpc": "2.0", "id": rid,
-                                "error": {"code": -32602, "message": f"invalid params: {e}"}}
-                    agg = {}
-                    row_count = 0
-                    for row in rows:
-                        row_count += 1
-                        if row_count > MAX_XLSX_ROWS:
-                            return {"jsonrpc": "2.0", "id": rid, "error": {
-                                "code": -32602, "message": f"xlsx has too many rows (> {MAX_XLSX_ROWS})"}}
-                        key = str(row[gi])
-                        raw_val = row[vi]
-                        if raw_val is None or isinstance(raw_val, bool):
-                            continue
+                        ws = wb.active
+                        rows = ws.iter_rows(values_only=True)
+                        header_row = next(rows, None)
+                        if header_row is None:
+                            return {"jsonrpc": "2.0", "id": rid, "result": {
+                                "content": [{"type": "text", "text": json.dumps({"ranking": []}, ensure_ascii=False)}]}}
+                        header = [str(c) for c in header_row]
+                        gc = args.get("group_col", "product")
+                        vc = args.get("value_col", "qty")
                         try:
-                            val = float(raw_val)
-                        except (TypeError, ValueError):
-                            # 非数字单元格不静默当 0，跳过并继续聚合可解释的数据
-                            continue
-                        if key not in agg and len(agg) >= MAX_GROUPS:
-                            return {"jsonrpc": "2.0", "id": rid, "error": {
-                                "code": -32602, "message": f"too many distinct groups (> {MAX_GROUPS})"}}
-                        agg[key] = agg.get(key, 0) + val
-                    ranking = [{"group": k, "total": v} for k, v in
-                               sorted(agg.items(), key=lambda kv: kv[1], reverse=True)]
-                    return {"jsonrpc": "2.0", "id": rid, "result": {
-                        "content": [{"type": "text", "text": json.dumps({"ranking": ranking}, ensure_ascii=False)}]}}
+                            gi = header.index(gc)
+                            vi = header.index(vc)
+                        except ValueError as e:
+                            return {"jsonrpc": "2.0", "id": rid,
+                                    "error": {"code": -32602, "message": f"invalid params: {e}"}}
+                        agg = {}
+                        row_count = 0
+                        for row in rows:
+                            row_count += 1
+                            if row_count > MAX_XLSX_ROWS:
+                                return {"jsonrpc": "2.0", "id": rid, "error": {
+                                    "code": -32602, "message": f"xlsx has too many rows (> {MAX_XLSX_ROWS})"}}
+                            key = str(row[gi])
+                            raw_val = row[vi]
+                            if raw_val is None or isinstance(raw_val, bool):
+                                continue
+                            try:
+                                val = float(raw_val)
+                            except (TypeError, ValueError):
+                                # 非数字单元格不静默当 0，跳过并继续聚合可解释的数据
+                                continue
+                            if key not in agg and len(agg) >= MAX_GROUPS:
+                                return {"jsonrpc": "2.0", "id": rid, "error": {
+                                    "code": -32602, "message": f"too many distinct groups (> {MAX_GROUPS})"}}
+                            agg[key] = agg.get(key, 0) + val
+                        ranking = [{"group": k, "total": v} for k, v in
+                                   sorted(agg.items(), key=lambda kv: kv[1], reverse=True)]
+                        return {"jsonrpc": "2.0", "id": rid, "result": {
+                            "content": [{"type": "text", "text": json.dumps({"ranking": ranking}, ensure_ascii=False)}]}}
+                    finally:
+                        wb.close()
                 finally:
-                    wb.close()
+                    fh.close()
             return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": f"unknown tool {name}"}}
-        except (KeyError, IndexError, ValueError) as e:
-            # 客户端参数错误（缺参数 / 非整数 / 非法路径 / 列不存在）→ -32602
+        except (KeyError, IndexError, ValueError, TypeError) as e:
+            # 客户端参数错误（缺参数 / 非整数 / 非法路径 / 列不存在 / 类型错误）→ -32602
             return {"jsonrpc": "2.0", "id": rid,
                     "error": {"code": -32602, "message": f"invalid params: {e}"}}
         except Exception as e:
-            return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": str(e)}}
+            # 只记日志，不回显内部细节；给调用方一个通用 -32603。
+            print(f"[office-basic] internal error: {e}", file=sys.stderr, flush=True)
+            return {"jsonrpc": "2.0", "id": rid,
+                    "error": {"code": -32603, "message": "internal error"}}
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"unknown method {method}"}}
 
 
@@ -290,7 +320,10 @@ def main():
             continue
         try:
             req = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            print(json.dumps({"jsonrpc": "2.0", "id": None,
+                              "error": {"code": -32700, "message": f"parse error: {e}"}},
+                             ensure_ascii=False), flush=True)
             continue
         resp = handle(req)
         print(json.dumps(resp, ensure_ascii=False), flush=True)

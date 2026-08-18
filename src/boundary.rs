@@ -2296,6 +2296,9 @@ impl TaskConfirmationGate {
 mod tests {
     use super::*;
 
+    /// 序列化会翻转全局 SANDBOX_ENABLED 的测试，避免并行竞态污染。
+    static SANDBOX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_permission_chain() {
         let mut chain = PermissionChain::new();
@@ -2380,6 +2383,7 @@ mod tests {
     #[test]
     fn test_execution_sandbox() {
         use std::path::PathBuf;
+        let _guard = SANDBOX_TEST_LOCK.lock().unwrap();
 
         // 沙箱默认启用
         ExecutionSandbox::set_enabled(true);
@@ -2495,6 +2499,7 @@ mod tests {
 
     #[test]
     fn test_office_basic_path_args_hit_sandbox_gate() {
+        let _serial = SANDBOX_TEST_LOCK.lock().unwrap();
         // RAII 守卫：断言 panic 也保证恢复全局沙箱开关，不污染并行运行的其他用例。
         struct SandboxFlagGuard {
             prior: bool,
