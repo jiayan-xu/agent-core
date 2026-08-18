@@ -211,7 +211,7 @@ pub async fn sediment_to_root(mcp: &McpClient, root_ns: &str) {
         return;
     }
     // 根 ns 已有 content（去重基准）
-    let mut existing: std::collections::HashSet<String> = collect_memo_samples(mcp, root_ns, 200)
+    let mut existing: std::collections::HashSet<String> = collect_memo_samples(mcp, root_ns, 200, false)
         .await
         .into_iter()
         .map(|s| s.old_value)
@@ -220,7 +220,7 @@ pub async fn sediment_to_root(mcp: &McpClient, root_ns: &str) {
         if ns == root_ns {
             continue;
         }
-        let memos = collect_memo_samples(mcp, ns, 200).await; // cap 与去重基准对齐（bug·medium 第三轮）
+        let memos = collect_memo_samples(mcp, ns, 200, false).await; // cap 与去重基准对齐（bug·medium 第三轮）
         for m in memos {
             if existing.contains(&m.old_value) {
                 continue; // 根 ns 已有，跳过
@@ -269,30 +269,68 @@ pub fn parse_tool_from_memo(content: &str) -> String {
 /// 召回经验 memo 样本（第二样本源）：按标签 `experience_memo` + `lesson` 检索，
 /// 取窗口内最近 `limit` 条，映射为 `NegSample`（change_type 语义：
 /// 用工具名近似「易错操作」，old/new 承载错误上下文，供元优化器学习禁忌）。
+///
+/// `all_ns=true`：分两批搜索（agent 自身 ns → ns="*"），各自独立限制 limit，
+/// 避免 search-all-then-filter 被其他 agent 挤占 top-N。
+/// `all_ns=false`：按 namespace 过滤——供 `sediment_to_root` 去重使用。
 pub async fn collect_memo_samples(
     mcp: &McpClient,
     ns: &str,
     limit: usize,
+    all_ns: bool,
 ) -> Vec<crate::meta_evolve::NegSample> {
-    let args = serde_json::json!({
-        "query": "experience_memo 工具执行失败 lesson",
-        "namespace": ns,
-        "category": "experience_memo",
-        "max_results": limit.min(200),
-    });
-    let raw = mcp
-        .call_json("memory_search_v2", &args)
-        .await
-        .unwrap_or_else(|e| {
-            // other·medium：MCP 错误不能静默变空结果（否则样本源故障无迹可查）
-            tracing::warn!(target: "agent.meta_evolve", ns = %ns, "experience_memo 召回失败: {}", e);
-            serde_json::json!({})
-        });
-    let results = raw
-        .get("results")
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let per_limit = limit.min(200);
+    let mut seen = std::collections::HashSet::new();
+    let mut all_results: Vec<serde_json::Value> = Vec::new();
+
+    // 搜命名空间列表：all_ns=true → [ns, "*"]；all_ns=false → [ns]
+    let namespaces: Vec<&str> = if all_ns {
+        vec![ns, "*"]
+    } else {
+        vec![ns]
+    };
+
+    for nss in &namespaces {
+        for category in &["experience_memo", "lesson"] {
+            let args = serde_json::json!({
+                "query": "experience_memo 工具执行失败 lesson",
+                "namespace": nss,
+                "category": category,
+                "max_results": per_limit,
+            });
+            let raw = mcp
+                .call_json("memory_search_v2", &args)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(target: "agent.meta_evolve",
+                        "experience_memo 召回失败 (ns={}, cat={}): {}", nss, category, e);
+                    serde_json::json!({})
+                });
+            if let Some(arr) = raw.get("results").and_then(|r| r.as_array()) {
+                for item in arr {
+                    let id = item.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    if seen.insert(id.to_string()) {
+                        all_results.push(item.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // all_ns=true 时：进一步过滤，排除其他 agent 的 ns
+    let ns_prefix = format!("{}/", ns);
+    let results = if all_ns {
+        all_results
+            .into_iter()
+            .filter(|it| match it.get("namespace").and_then(|n| n.as_str()) {
+                Some(n) => n.starts_with(&ns_prefix) || n == ns || n == "*",
+                None => false,
+            })
+            .collect()
+    } else {
+        all_results
+    };
+
     results
         .into_iter()
         .filter_map(|it| {
@@ -301,7 +339,21 @@ pub async fn collect_memo_samples(
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
-            if content.is_empty() || !content.contains("experience_memo") {
+            if content.is_empty() {
+                return None;
+            }
+            // experience_memo 条目必须遵循格式约定
+            // （[experience_memo] 工具 X 执行失败：...），防止无关条目通过
+            let category = it.get("category").and_then(|c| c.as_str()).unwrap_or("");
+            if category == "experience_memo" && !content.contains("experience_memo") {
+                return None;
+            }
+            // lesson 条目必须含工具失败关键词才纳入（防噪音）
+            if category == "lesson"
+                && !content.contains("失败")
+                && !content.contains("error")
+                && !content.contains("fail")
+            {
                 return None;
             }
             // 从 content 提取工具名（"[experience_memo] 工具 X 执行失败：..."）。
