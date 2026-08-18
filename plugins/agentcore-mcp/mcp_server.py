@@ -193,9 +193,14 @@ def sse_events(
         nonlocal event_name, data_lines
         if data_lines:
             raw_data = "\n".join(data_lines)
-            try:
-                parsed = json.loads(raw_data)
-            except Exception:  # noqa: BLE001
+            # 仅当块明显是 JSON（{ 或 [ 开头）才尝试结构化；纯文本原样保留
+            # （review 指正：无条件 json.loads 会把纯文本块误处理）
+            if raw_data.lstrip().startswith(("{", "[")):
+                try:
+                    parsed = json.loads(raw_data)
+                except Exception:  # noqa: BLE001
+                    parsed = raw_data
+            else:
                 parsed = raw_data
             events.append({"event": event_name, "data": parsed})
         event_name = "message"
@@ -213,7 +218,9 @@ def sse_events(
                 elif line.startswith("event:"):
                     event_name = line[len("event:"):].strip()
                 elif line.startswith("data:"):
-                    data_lines.append(line[len("data:"):].strip())
+                    # SSE 规范：`data:` 后单个前导空格是分隔符，只去前导空格，
+                    # 保留尾部内容（.strip() 会误删有意义的首/尾空白，review 指正）
+                    data_lines.append(line[len("data:"):].lstrip(" "))
             flush()
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", "replace")
