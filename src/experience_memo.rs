@@ -270,8 +270,8 @@ pub fn parse_tool_from_memo(content: &str) -> String {
 /// 取窗口内最近 `limit` 条，映射为 `NegSample`（change_type 语义：
 /// 用工具名近似「易错操作」，old/new 承载错误上下文，供元优化器学习禁忌）。
 ///
-/// `all_ns=true`：搜本 agent 前缀的所有 ns（`agent/{id}*` + `*`），
-/// 仍排除其他 agent 的 ns，防止跨 agent 污染。
+/// `all_ns=true`：分两批搜索（agent 自身 ns → ns="*"），各自独立限制 limit，
+/// 避免 search-all-then-filter 被其他 agent 挤占 top-N。
 /// `all_ns=false`：按 namespace 过滤——供 `sediment_to_root` 去重使用。
 pub async fn collect_memo_samples(
     mcp: &McpClient,
@@ -279,45 +279,58 @@ pub async fn collect_memo_samples(
     limit: usize,
     all_ns: bool,
 ) -> Vec<crate::meta_evolve::NegSample> {
-    // 分两次搜：experience_memo + lesson，合并去重
+    let per_limit = limit.min(200);
+    let mut seen = std::collections::HashSet::new();
     let mut all_results: Vec<serde_json::Value> = Vec::new();
-    for category in &["experience_memo", "lesson"] {
-        let mut args = serde_json::json!({
-            "query": "experience_memo 工具执行失败 lesson",
-            "category": category,
-            "max_results": limit.min(200),
-        });
-        if !all_ns {
-            args["namespace"] = serde_json::json!(ns);
-        }
-        // all_ns=true 时：不传 namespace，搜全库；
-        // 但后续过滤只保留本 agent 前缀（ns 起始为 "agent/{id}" 或 "*"），排除其他 agent
-        let raw = mcp
-            .call_json("memory_search_v2", &args)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(target: "agent.meta_evolve", "experience_memo 召回失败 ({}): {}", category, e);
-                serde_json::json!({})
+
+    // 搜命名空间列表：all_ns=true → [ns, "*"]；all_ns=false → [ns]
+    let namespaces: Vec<&str> = if all_ns {
+        vec![ns, "*"]
+    } else {
+        vec![ns]
+    };
+
+    for nss in &namespaces {
+        for category in &["experience_memo", "lesson"] {
+            let args = serde_json::json!({
+                "query": "experience_memo 工具执行失败 lesson",
+                "namespace": nss,
+                "category": category,
+                "max_results": per_limit,
             });
-        if let Some(arr) = raw.get("results").and_then(|r| r.as_array()) {
-            all_results.extend(arr.iter().cloned());
+            let raw = mcp
+                .call_json("memory_search_v2", &args)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(target: "agent.meta_evolve",
+                        "experience_memo 召回失败 (ns={}, cat={}): {}", nss, category, e);
+                    serde_json::json!({})
+                });
+            if let Some(arr) = raw.get("results").and_then(|r| r.as_array()) {
+                for item in arr {
+                    let id = item.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    if seen.insert(id.to_string()) {
+                        all_results.push(item.clone());
+                    }
+                }
+            }
         }
     }
-    // all_ns=true 时：保留当前 agent 的 ns（精确前缀匹配 agent/{id}/*）
-    // 和 ns="*"（全局备忘），排除其他 agent（agent/jarvis、agent/workbuddy 等）
-    let agent_id = ns.split('/').nth(1).unwrap_or(ns); // "agent/xujiayan" → "xujiayan"
-    let ns_prefix = format!("{}/", ns); // "agent/xujiayan/"
+
+    // all_ns=true 时：进一步过滤，排除其他 agent 的 ns
+    let ns_prefix = format!("{}/", ns);
     let results = if all_ns {
         all_results
             .into_iter()
             .filter(|it| match it.get("namespace").and_then(|n| n.as_str()) {
                 Some(n) => n.starts_with(&ns_prefix) || n == ns || n == "*",
-                None => false, // 无 namespace 的条目在 all_ns 模式下排除
+                None => false,
             })
             .collect()
     } else {
         all_results
     };
+
     results
         .into_iter()
         .filter_map(|it| {
@@ -329,8 +342,13 @@ pub async fn collect_memo_samples(
             if content.is_empty() {
                 return None;
             }
-            // lesson 条目必须含工具失败关键词才纳入（防噪音）
+            // experience_memo 条目必须遵循格式约定
+            // （[experience_memo] 工具 X 执行失败：...），防止无关条目通过
             let category = it.get("category").and_then(|c| c.as_str()).unwrap_or("");
+            if category == "experience_memo" && !content.contains("experience_memo") {
+                return None;
+            }
+            // lesson 条目必须含工具失败关键词才纳入（防噪音）
             if category == "lesson"
                 && !content.contains("失败")
                 && !content.contains("error")
