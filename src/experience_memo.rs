@@ -270,35 +270,55 @@ pub fn parse_tool_from_memo(content: &str) -> String {
 /// 取窗口内最近 `limit` 条，映射为 `NegSample`（change_type 语义：
 /// 用工具名近似「易错操作」，old/new 承载错误上下文，供元优化器学习禁忌）。
 ///
-/// `all_ns=true`：搜全库（不限 namespace）——experience_memo 分散在会话 ns / 根 ns / `*`
-/// 等不同命名空间，按 namespace 过滤会导致漏召回。
-/// `all_ns=false`：按 namespace 过滤——供 `sediment_to_root` 去重使用（需要 namespace 语义）。
+/// `all_ns=true`：搜本 agent 前缀的所有 ns（`agent/{id}*` + `*`），
+/// 仍排除其他 agent 的 ns，防止跨 agent 污染。
+/// `all_ns=false`：按 namespace 过滤——供 `sediment_to_root` 去重使用。
 pub async fn collect_memo_samples(
     mcp: &McpClient,
     ns: &str,
     limit: usize,
     all_ns: bool,
 ) -> Vec<crate::meta_evolve::NegSample> {
-    let mut args = serde_json::json!({
-        "query": "experience_memo 工具执行失败 lesson",
-        "max_results": limit.min(200),
-    });
-    if !all_ns {
-        args["namespace"] = serde_json::json!(ns);
-    }
-    let raw = mcp
-        .call_json("memory_search_v2", &args)
-        .await
-        .unwrap_or_else(|e| {
-            // other·medium：MCP 错误不能静默变空结果（否则样本源故障无迹可查）
-            tracing::warn!(target: "agent.meta_evolve", "experience_memo 召回失败: {}", e);
-            serde_json::json!({})
+    // 分两次搜：experience_memo + lesson，合并去重
+    let mut all_results: Vec<serde_json::Value> = Vec::new();
+    for category in &["experience_memo", "lesson"] {
+        let mut args = serde_json::json!({
+            "query": "experience_memo 工具执行失败 lesson",
+            "category": category,
+            "max_results": limit.min(200),
         });
-    let results = raw
-        .get("results")
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
+        if !all_ns {
+            args["namespace"] = serde_json::json!(ns);
+        }
+        // all_ns=true 时：不传 namespace，搜全库；
+        // 但后续过滤只保留本 agent 前缀（ns 起始为 "agent/{id}" 或 "*"），排除其他 agent
+        let raw = mcp
+            .call_json("memory_search_v2", &args)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(target: "agent.meta_evolve", "experience_memo 召回失败 ({}): {}", category, e);
+                serde_json::json!({})
+            });
+        if let Some(arr) = raw.get("results").and_then(|r| r.as_array()) {
+            all_results.extend(arr.iter().cloned());
+        }
+    }
+    // all_ns=true 时：保留本 agent 前缀（agent/{id}* 或 *）的条目，
+    // 排除其他 agent 的 ns（如 agent/jarvis、agent/workbuddy 等）
+    let agent_prefix = format!("agent/{}", ns.split('/').next().unwrap_or(""));
+    let results = if all_ns {
+        all_results
+            .into_iter()
+            .filter(|it| {
+                it.get("namespace")
+                    .and_then(|n| n.as_str())
+                    .map(|n| n.starts_with("agent/") || n == "*")
+                    .unwrap_or(true)
+            })
+            .collect()
+    } else {
+        all_results
+    };
     results
         .into_iter()
         .filter_map(|it| {
@@ -307,12 +327,15 @@ pub async fn collect_memo_samples(
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
-            if content.is_empty()
-                || (!content.contains("experience_memo")
-                    && !(content.contains("lesson")
-                        && (content.contains("失败")
-                            || content.contains("error")
-                            || content.contains("fail"))))
+            if content.is_empty() {
+                return None;
+            }
+            // lesson 条目必须含工具失败关键词才纳入（防噪音）
+            let category = it.get("category").and_then(|c| c.as_str()).unwrap_or("");
+            if category == "lesson"
+                && !content.contains("失败")
+                && !content.contains("error")
+                && !content.contains("fail")
             {
                 return None;
             }
