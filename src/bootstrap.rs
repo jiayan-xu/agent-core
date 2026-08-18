@@ -188,6 +188,7 @@ pub(crate) fn spawn_server(
                 timer.tick().await;
                 let mut fail_count = 0u32;
                 let mut insight_cycle = 0u32;
+                let mut last_nvr_ymd = String::new();
                 loop {
                     timer.tick().await;
                     insight_cycle += 1;
@@ -225,6 +226,29 @@ pub(crate) fn spawn_server(
                                     }
                                 }
                             }
+                        }
+                        // 每日 23:30 后自动下载理文/金源/苏新当天 NVR 录像（每天一次）
+                        let nvr_now = chrono::Local::now();
+                        let nvr_ymd = nvr_now.format("%Y-%m-%d").to_string();
+                        let nvr_hour = nvr_now.hour();
+                        let nvr_minute = nvr_now.minute();
+                        if (nvr_hour == 23 && nvr_minute >= 30) && last_nvr_ymd != nvr_ymd {
+                            for company in ["理文", "金源", "苏新"] {
+                                let nvr_args = serde_json::json!({
+                                    "date": nvr_ymd,
+                                    "company": company,
+                                    "workers": 1
+                                });
+                                match agent.call_tool_routed("download_nvr_videos", "default", &nvr_args, &agent_ns, "").await {
+                                    Ok(reply) => {
+                                        tracing::info!("NVR定时下载 {}: {}", company, &reply.chars().take(120).collect::<String>());
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("NVR定时下载 {} 失败: {}", company, e);
+                                    }
+                                }
+                            }
+                            last_nvr_ymd = nvr_ymd;
                         }
                         // 每 4 轮（约 2 小时）执行一次洞见发现
                         if insight_cycle % 4 == 0 {
