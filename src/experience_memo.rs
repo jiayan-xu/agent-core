@@ -211,7 +211,7 @@ pub async fn sediment_to_root(mcp: &McpClient, root_ns: &str) {
         return;
     }
     // 根 ns 已有 content（去重基准）
-    let mut existing: std::collections::HashSet<String> = collect_memo_samples(mcp, root_ns, 200)
+    let mut existing: std::collections::HashSet<String> = collect_memo_samples(mcp, root_ns, 200, false)
         .await
         .into_iter()
         .map(|s| s.old_value)
@@ -220,7 +220,7 @@ pub async fn sediment_to_root(mcp: &McpClient, root_ns: &str) {
         if ns == root_ns {
             continue;
         }
-        let memos = collect_memo_samples(mcp, ns, 200).await; // cap 与去重基准对齐（bug·medium 第三轮）
+        let memos = collect_memo_samples(mcp, ns, 200, false).await; // cap 与去重基准对齐（bug·medium 第三轮）
         for m in memos {
             if existing.contains(&m.old_value) {
                 continue; // 根 ns 已有，跳过
@@ -269,18 +269,23 @@ pub fn parse_tool_from_memo(content: &str) -> String {
 /// 召回经验 memo 样本（第二样本源）：按标签 `experience_memo` + `lesson` 检索，
 /// 取窗口内最近 `limit` 条，映射为 `NegSample`（change_type 语义：
 /// 用工具名近似「易错操作」，old/new 承载错误上下文，供元优化器学习禁忌）。
-/// 搜全库（不限 namespace）：experience_memo 分散在会话 ns / 根 ns / `*` 等不同
-/// 命名空间（record_experience_memo 写入会话 ns，sediment_to_root 沉淀到根 ns，
-/// 但 ns=`*` 的异常条目也会出现），按 namespace 过滤会导致大量漏召回。
+///
+/// `all_ns=true`：搜全库（不限 namespace）——experience_memo 分散在会话 ns / 根 ns / `*`
+/// 等不同命名空间，按 namespace 过滤会导致漏召回。
+/// `all_ns=false`：按 namespace 过滤——供 `sediment_to_root` 去重使用（需要 namespace 语义）。
 pub async fn collect_memo_samples(
     mcp: &McpClient,
-    _ns: &str,
+    ns: &str,
     limit: usize,
+    all_ns: bool,
 ) -> Vec<crate::meta_evolve::NegSample> {
-    let args = serde_json::json!({
+    let mut args = serde_json::json!({
         "query": "experience_memo 工具执行失败 lesson",
         "max_results": limit.min(200),
     });
+    if !all_ns {
+        args["namespace"] = serde_json::json!(ns);
+    }
     let raw = mcp
         .call_json("memory_search_v2", &args)
         .await
