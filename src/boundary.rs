@@ -50,6 +50,10 @@ const HARD_DANGEROUS: &[&str] = &[
     "shutdown_server",
     // 本仓沙箱写文件：必须走黄线/审批，禁止当普通 write 静默落盘
     "local_fs_write",
+    // office-basic MCP 写文件（A/B 双轨试点）：与 local_fs_write 同级强制审批，
+    // 不依赖分类器表，learn_tools/前缀启发式未来变动也绕不过去
+    "write_text",
+    "append_text",
     // 白名单/改码写：无论分类器如何，强制危险地板 → L2 黄线
     "sync_whitelist_plates",
     "manage_whitelist",
@@ -350,6 +354,14 @@ impl ExecutionSandbox {
         "officecli_pdf",
         "officecli_merge",
         "officecli_create",
+        // office-basic MCP（A/B 双轨试点）：参数名均为 `path`，已被 extract_path_arg 的 KEYS 覆盖，
+        // 因此这里列出的四个工具会走敏感目录 deny 与沙箱根越界检查。server 侧
+        // （examples/skills/office_basic_mcp.py）要求绝对路径并按 AGENT_SANDBOX_ROOT 锚定；
+        // 相对路径在 server 侧直接拒绝，边界层按 cwd 归一化只作为第一道保守检查。
+        "read_text",
+        "write_text",
+        "append_text",
+        "excel_group_sum",
     ];
     const REQUIRES_REVIEW: &'static [&'static str] = &["delete_", "batch_", "shutdown_"];
 
@@ -480,11 +492,32 @@ fn has_path_traversal(s: &str) -> bool {
     dec.contains("../") || dec.contains("..\\") || dec.contains("%2e%2e")
 }
 
-/// repo_ws 写/改工具的文件内容（`content`）与路径（`path`）由 `resolve_safe_path` 负责路径安全，
-/// 不应在通用参数安检中按 SQL 注入 / 路径穿越拦截（否则写入含 "../" 或 "UPDATE ... SET" 的文件内容会被误杀）。
-fn is_repo_ws_payload(tool_name: &str, key: &str) -> bool {
-    matches!(tool_name, "repo_ws_write" | "repo_ws_diff")
-        && (key == "content" || key == "path")
+/// 文件写类工具的内容/路径参数豁免规则：
+/// - repo_ws_write/repo_ws_diff：`content` 与 `path` 都由 resolve_safe_path 负责；
+/// - office-basic write_text/append_text：`content` 是文件正文（可含 SQL/../ 等正常文本），
+///   跳过通用参数扫描；`path` 只跳过 SQL 启发式，仍走 path traversal 检查与沙箱门闸。
+///
+/// 顺序约束：本函数只豁免**已进入危险分类**的工具；新增写类工具必须先落在
+/// dangerous 分类/HARD_DANGEROUS 地板，再用 read_* 之类会命中只读启发式的名字
+/// 会绕过该豁免路径并触发通用扫描误报。
+fn is_file_write_payload(tool_name: &str, key: &str) -> bool {
+    (matches!(tool_name, "repo_ws_write" | "repo_ws_diff")
+        && (key == "content" || key == "path"))
+        || (matches!(tool_name, "write_text" | "append_text") && key == "content")
+}
+
+/// 参数扫描策略：(skip_all, skip_sql_only)。
+/// - skip_all：完全跳过 SQL 与路径穿越扫描（repo_ws content/path、office content）；
+/// - skip_sql_only：只跳过 SQL 启发式，仍保留路径穿越（office-basic 的 path）。
+fn file_write_scan_policy(tool_name: &str, key: &str) -> (bool, bool) {
+    let skip_all = is_file_write_payload(tool_name, key);
+    let skip_sql_only = !skip_all
+        && key == "path"
+        && matches!(
+            tool_name,
+            "write_text" | "append_text" | "read_text" | "excel_group_sum"
+        );
+    (skip_all, skip_sql_only)
 }
 
 /// 从工具参数中抽取显式文件路径参数做门闸（命令型参数 command/code/sql 不含路径，不抽）
@@ -914,20 +947,24 @@ impl ComplianceBoundary {
             for (key, val) in obj {
                 if let Some(s) = val.as_str() {
                     let s_upper = s.to_uppercase();
-                    // repo_ws 写/改工具的 content/path：路径安全由 resolve_safe_path 负责，
-                    // 不按 SQL 注入 / 路径穿越拦截，避免误杀含 "../" 或 "UPDATE SET" 的文件内容。
-                    if !is_repo_ws_payload(tool_name, key) {
-                        if s.contains("' --")
-                            || s.contains("';")
-                            || s_upper.contains(" UNION ")
-                            || s_upper.contains(" OR 1=1")
-                            || s_upper.contains(" AND 1=1")
-                            || s_upper.contains("DROP TABLE")
-                            || s_upper.contains("INSERT INTO")
-                            || s_upper.contains("DELETE FROM")
-                            || (s_upper.contains("UPDATE ") && s_upper.contains("SET "))
-                        {
-                            return Some(ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key)));
+                    // 文件写工具的 content（repo_ws 还包括 path）跳过通用 SQL/穿越扫描。
+                    // office-basic 的 path 只跳过 SQL 启发式（路径可能合法包含 SQL 字样），
+                    // 仍保留路径穿越检查；沙箱门闸另行校验真实路径。
+                    let (skip_all, skip_sql_only) = file_write_scan_policy(tool_name, key);
+                    if !skip_all {
+                        if !skip_sql_only {
+                            if s.contains("' --")
+                                || s.contains("';")
+                                || s_upper.contains(" UNION ")
+                                || s_upper.contains(" OR 1=1")
+                                || s_upper.contains(" AND 1=1")
+                                || s_upper.contains("DROP TABLE")
+                                || s_upper.contains("INSERT INTO")
+                                || s_upper.contains("DELETE FROM")
+                                || (s_upper.contains("UPDATE ") && s_upper.contains("SET "))
+                            {
+                                return Some(ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key)));
+                            }
                         }
                         if has_path_traversal(s) {
                             return Some(ToolCheck::red(&format!("参数安全检查：{} 含路径穿越", key)));
@@ -1064,21 +1101,24 @@ impl ComplianceBoundary {
                 if val.is_string() {
                     let s = val.as_str().unwrap_or("");
                     let s_upper = s.to_uppercase();
-                    // repo_ws 写/改工具的 content/path：路径安全由 resolve_safe_path 负责，
-                    // 不按 SQL 注入 / 路径穿越拦截，避免误杀含 "../" 或 "UPDATE SET" 的文件内容。
-                    if !is_repo_ws_payload(tool_name, key) {
-                        // SQL 注入检测（P2-7 增强）
-                        if s.contains("' --")
-                            || s.contains("';")
-                            || s_upper.contains(" UNION ")
-                            || s_upper.contains(" OR 1=1")
-                            || s_upper.contains(" AND 1=1")
-                            || s_upper.contains("DROP TABLE")
-                            || s_upper.contains("INSERT INTO")
-                            || s_upper.contains("DELETE FROM")
-                            || (s_upper.contains("UPDATE ") && s_upper.contains("SET "))
-                        {
-                            return ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key));
+                    // 文件写工具的 content（repo_ws 还包括 path）跳过通用 SQL/穿越扫描；
+                    // office-basic 的 path 仅豁免 SQL 启发式，仍保留路径穿越检查。
+                    let (skip_all, skip_sql_only) = file_write_scan_policy(tool_name, key);
+                    if !skip_all {
+                        if !skip_sql_only {
+                            // SQL 注入检测（P2-7 增强）
+                            if s.contains("' --")
+                                || s.contains("';")
+                                || s_upper.contains(" UNION ")
+                                || s_upper.contains(" OR 1=1")
+                                || s_upper.contains(" AND 1=1")
+                                || s_upper.contains("DROP TABLE")
+                                || s_upper.contains("INSERT INTO")
+                                || s_upper.contains("DELETE FROM")
+                                || (s_upper.contains("UPDATE ") && s_upper.contains("SET "))
+                            {
+                                return ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key));
+                            }
                         }
                         // 路径穿越检测
                         if has_path_traversal(s) {
@@ -1173,9 +1213,11 @@ impl std::str::FromStr for ToolClass {
     }
 }
 
-/// 显式允许为只读的 `cross_*` 工具。
-/// 这是 classifier 与 `is_read_only_tool` 共用的唯一白名单，避免两个安全门漂移。
-pub(crate) const EXPLICIT_READ_CROSS_TOOLS: &[&str] = &["cross_validate"];
+/// classifier 精确集合与 `is_read_only_tool` 共用的只读白名单。
+/// 这里登记的名称是「classifier 没有前缀启发式、需要显式 bootstrap」的工具；
+/// 即便某个名称（如 read_text）同时被 is_read_only_tool 的 read_ 前缀覆盖，
+/// 也必须保留在此处，否则 classifier 一侧会漏分类。
+pub(crate) const EXPLICIT_READ_CROSS_TOOLS: &[&str] = &["cross_validate", "excel_group_sum", "read_text"];
 
 /// 工具分类器（P1-7 修复：配置驱动 + 自动学习）
 ///
@@ -1333,6 +1375,8 @@ impl ToolClassifier {
             "repo_ws_read",  // 轨二：白名单仓只读
             "repo_ws_list",  // 轨二：白名单仓列目录（只读）
             "repo_ws_stat",  // 轨二：白名单仓文件元数据（只读）
+            // office-basic MCP 只读工具统一经 EXPLICIT_READ_CROSS_TOOLS 注册，
+            // 不在此处重复登记，避免两个白名单漂移。
             // P0-1 场景沙箱：只读推演（基线+影子叠加，绝不写生产）
             "scenario_list",
             "scenario_get",
@@ -1357,6 +1401,10 @@ impl ToolClassifier {
             // fsutil 源破坏性操作（office-tools/skills/）：移动/改名可覆盖，删除破坏数据，均明确归危险触发审批
             "move_file",
             "delete_path",
+            // office-basic MCP（A/B 双轨试点）：与 local_fs_write 同级——写文件必须审批，
+            // 不允许普通 write 直接落盘，避免降低文件写入的 HITL 门槛
+            "write_text",
+            "append_text",
         ] {
             c.dangerous_tools.insert(t.to_string());
         }
@@ -2258,6 +2306,9 @@ impl TaskConfirmationGate {
 mod tests {
     use super::*;
 
+    /// 序列化会翻转全局 SANDBOX_ENABLED 的测试，避免并行竞态污染。
+    static SANDBOX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_permission_chain() {
         let mut chain = PermissionChain::new();
@@ -2342,6 +2393,7 @@ mod tests {
     #[test]
     fn test_execution_sandbox() {
         use std::path::PathBuf;
+        let _guard = SANDBOX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         // 沙箱默认启用
         ExecutionSandbox::set_enabled(true);
@@ -2453,6 +2505,35 @@ mod tests {
         let r = ExecutionSandbox::check("find_files", &paths);
         assert!(!r.allow, "paths 数组中的敏感路径应触发沙箱门闸");
         assert_eq!(r.level, Some(BlockLevel::Red));
+    }
+
+    #[test]
+    fn test_office_basic_path_args_hit_sandbox_gate() {
+        let _serial = SANDBOX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // RAII 守卫：断言 panic 也保证恢复全局沙箱开关，不污染并行运行的其他用例。
+        struct SandboxFlagGuard {
+            prior: bool,
+        }
+        impl Drop for SandboxFlagGuard {
+            fn drop(&mut self) {
+                ExecutionSandbox::set_enabled(self.prior);
+            }
+        }
+        let _guard = SandboxFlagGuard { prior: ExecutionSandbox::is_enabled() };
+        ExecutionSandbox::set_enabled(true);
+        // office-basic MCP 四个工具的参数名都是 `path`，必须被 extract_path_arg 的 KEYS 覆盖，
+        // 否则 REQUIRES_SANDBOX 登记只是空转。
+        for tool in ["read_text", "write_text", "append_text", "excel_group_sum"] {
+            let paths = extract_path_arg(tool, &serde_json::json!({"path": "C:/test/.ssh/id_ed25519"}));
+            assert_eq!(paths.len(), 1, "{tool} 的 path 参数应被提取");
+            let r = ExecutionSandbox::check(tool, &paths);
+            assert!(!r.allow, "{tool} 的敏感路径应触发沙箱门闸");
+            assert_eq!(r.level, Some(BlockLevel::Red));
+        }
+        // 写工具的核心意图是审批地板：必须落在 HARD_DANGEROUS，
+        // 即便未来分类器表把它们挪出 dangerous 也不会变成普通 write 直通。
+        assert!(super::HARD_DANGEROUS.contains(&"write_text"));
+        assert!(super::HARD_DANGEROUS.contains(&"append_text"));
     }
 
     #[test]

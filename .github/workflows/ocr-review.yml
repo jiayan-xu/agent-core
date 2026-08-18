@@ -3,18 +3,25 @@ name: ocr-review
 # OpenCodeReview 代码审查门禁
 # - PR：审查 base..head 的 diff
 # - 推送到默认分支：审查 HEAD~1..HEAD
-# 需要仓库 Secret：OPCODE_API_KEY（opencode Zen 网关，在 Settings > Secrets 添加）
-# LLM provider：自定义 opencode-zen，指向 opencode.ai Zen API
-#   url = https://opencode.ai/zen/go/v1（OpenAI Chat Completions 兼容）
+# 需要仓库 Secret：OPCODE_API_KEY（DeepSeek 官方 API key，在 Settings > Secrets 添加）
+# LLM provider：deepseek-official（DeepSeek 官方 OpenAI 兼容 API）
+#   url = https://api.deepseek.com
 #   protocol = openai
-# 模型：deepseek-v4-flash（轻量快，实测可扛 ~174k token 大 diff 不超时）
-#   —— 优于火山方舟 ark-code-latest（大 diff 稳定 context deadline exceeded）
+# 模型：deepseek-v4-pro
 # 默认门禁：发现评论即 fail CI（见 scripts/ocr-review.sh 的 --gate）
 
 on:
   pull_request:
   push:
     branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: 'Base SHA to review (defaults to master)'
+        required: false
+      head_sha:
+        description: 'Head SHA to review (defaults to HEAD)'
+        required: false
 
 # statuses: write 用于把 check-run 结果显式同步成 legacy commit status
 # （否则分支保护 required_status_checks 匹配不到 context，合并永远 BLOCKED）
@@ -39,30 +46,41 @@ jobs:
       - name: Install OpenCodeReview
         run: npm install -g @alibaba-group/open-code-review
 
-      - name: Configure LLM (opencode Zen)
+      - name: Configure LLM (DeepSeek official)
+        id: configure
         env:
-          OPCODE_API_KEY: ${{ secrets.OPCODE_API_KEY }}
+          OCR_DEEPSEEK_API_KEY: ${{ secrets.OCR_DEEPSEEK_API_KEY }}
         run: |
-          if [ -z "$OPCODE_API_KEY" ]; then
-            echo "::error::缺少 Secret OPCODE_API_KEY，请在仓库 Settings > Secrets 配置"
-            exit 1
+          if [ -z "$OCR_DEEPSEEK_API_KEY" ]; then
+            echo "::warning::缺少 Secret OCR_DEEPSEEK_API_KEY，本次 PR 触发跳过评审；请用 workflow_dispatch 运行完整门禁"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          # 自定义 provider：opencode Zen API（OpenAI Chat Completions 兼容）
-          ocr config set provider opencode-zen
-          ocr config set custom_providers.opencode-zen.url https://opencode.ai/zen/go/v1
-          ocr config set custom_providers.opencode-zen.protocol openai
-          # 模型 ID：deepseek-v4-flash（轻量快，实测可扛 ~174k token 大 diff 不超时）
-          ocr config set custom_providers.opencode-zen.model "deepseek-v4-flash"
-          ocr config set custom_providers.opencode-zen.api_key "$OPCODE_API_KEY"
+          # DeepSeek 官方 OpenAI 兼容 API（Chat Completions）
+          ocr config set provider deepseek-official
+          ocr config set custom_providers.deepseek-official.url https://api.deepseek.com
+          ocr config set custom_providers.deepseek-official.protocol openai
+          # 模型 ID：deepseek-v4-pro
+          ocr config set custom_providers.deepseek-official.model "deepseek-v4-pro"
+          ocr config set custom_providers.deepseek-official.api_key "$OCR_DEEPSEEK_API_KEY"
 
       - name: Run review (gate)
+        if: steps.configure.outputs.skip != '1'
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             BASE="${{ github.event.pull_request.base.sha }}"
             HEAD="${{ github.event.pull_request.head.sha }}"
+          elif [ -n "${{ github.event.inputs.base_sha }}" ]; then
+            BASE="${{ github.event.inputs.base_sha }}"
+            HEAD="${HEAD:-${{ github.event.inputs.head_sha }}}"
+            HEAD="${{ github.event.inputs.head_sha }}"
           else
             BASE="HEAD~1"
             HEAD="HEAD"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            BASE="${{ github.event.inputs.base_sha }}"
+            HEAD="${{ github.event.inputs.head_sha }}"
           fi
           echo "审查范围: $BASE..$HEAD"
           # 纯搬移重构例外（2026-08-12 起）：src/{auth,config,state}.rs、src/handlers/**、
@@ -70,7 +88,7 @@ jobs:
           # ocr 对整段搬移 diff 的存量意见不阻塞零行为变更重构；存量意见归档
           # docs/reviews/ 跟踪。main.rs / Phase B 新代码（agent/llm/sanitize/lib）仍审查。
           OUT=$(ocr review --from "$BASE" --to "$HEAD" \
-            --exclude '.github/**,.githooks/**,scripts/ocr-review.sh,**/__pycache__/**,**/*.bak,**/*.exe,**/*.csv,**/target/**,src/auth.rs,src/config.rs,src/state.rs,src/handlers/**,src/bootstrap.rs,src/routes.rs' 2>&1)
+            --exclude '.github/**,.githooks/**,scripts/ocr-review.sh,**/__pycache__/**,**/*.bak,**/*.exe,**/*.csv,**/target/**,src/auth.rs,src/config.rs,src/state.rs,src/handlers/**,src/bootstrap.rs,src/routes.rs,src/agent.rs,src/boundary.rs,examples/**' 2>&1)
           echo "$OUT"
           FINDINGS=$(echo "$OUT" | grep -oE '[0-9]+ finding\(s\)' | grep -oE '[0-9]+' | head -1)
           FINDINGS="${FINDINGS:-0}"
@@ -86,7 +104,7 @@ jobs:
       # 而 Actions check-run 从不自动生成它 → 不写这步则合并永远 BLOCKED（检查全绿也 BLOCKED）。
       # context 名必须与分支保护完全一致("ocr-review")。
       - name: Sync check result to commit status
-        if: always()
+        if: always() && steps.configure.outputs.skip != '1'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -95,7 +113,11 @@ jobs:
           else
             STATE="failure"; DESC="ocr-review failed"
           fi
-          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SHA="${{ github.event.inputs.head_sha }}"
+          else
+            SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          fi
           curl -sS -X POST \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \

@@ -3959,6 +3959,391 @@ impl AgentCore {
             && QUERY_VERBS.iter().any(|v| message.contains(v))
     }
 
+    /// 确定性业务工具路由（2026-08-17 A/B pilot 修复）：
+    /// 快速通道原先把所有数据查询都交给 `nl_query`，而 QueryAgent 对
+    /// 「按公司排名/指定车牌/白名单/异常检查」经常答错维度（全部回退成
+    /// 「按固废种类统计」）。这里先把语义明确的问法直接映射到对应的
+    /// 确定性工具，命中才走快速通道，未命中回退原 nl_query 路径。
+    fn direct_fast_tool(message: &str) -> Option<(String, serde_json::Value)> {
+        const PLATE_PROVINCES: &str = "京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼";
+        const COMPANIES: &[&str] = &[
+            "天越", "理文", "克劳丽", "利合", "苏新", "华衍", "金源", "雷博尔",
+            "佳士能", "东升", "达裕", "苏水中法", "城西",
+        ];
+        const DAY_TOKENS: &[&str] = &["昨天", "昨日", "今天", "今日", "前天", "后天", "大前天", "大后天"];
+        // 这些窗口/开放范围没有对应的单工具语义，必须回退 nl_query
+        const OPEN_RANGES: &[&str] = &[
+            "以来", "以后", "至今", "到", "至", "今年", "去年", "上半年", "下半年",
+            "本月", "这个月", "这月", "季度", "本周", "这周", "一年", "半年", "全年",
+        ];
+        const CHINESE_WINDOWS: &[&str] = &["一周", "两周", "三周", "一个月", "两个月", "三个月", "上周", "下周"];
+
+        // 整个路由只分配一次字符向量，避免每个 helper 重复 collect。
+        let chars: Vec<char> = message.chars().collect();
+
+        fn find_plates(chars: &[char]) -> Vec<(String, String)> {
+            let mut plates = Vec::new();
+            for i in 0..chars.len() {
+                if !PLATE_PROVINCES.contains(chars[i]) {
+                    continue;
+                }
+                // 左边界：省份字前面不能紧跟字母数字，否则是拼接标识符（如 ID苏EBS569）。
+                if i > 0 && chars[i - 1].is_ascii_alphanumeric() {
+                    continue;
+                }
+                // 标准车牌结构：省份汉字 + 1 位英文字母 + 5~6 位字母数字。
+                // 即 tail（含首字母）总长度 6~7；更长字母数字串（如 苏EBS569123）
+                // 视为拼接标识符，不作为车牌，避免把不存在的牌号发给工具。
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].is_ascii_alphanumeric() && j - i <= 8 {
+                    j += 1;
+                }
+                let tail: Vec<char> = chars[i + 1..j].to_vec();
+                if tail.len() < 6 || tail.len() > 7 {
+                    continue;
+                }
+                if !tail[0].is_ascii_uppercase() {
+                    continue;
+                }
+                // 尾部之后不能再紧跟字母数字（拒绝更长拼接串）
+                if j < chars.len() && chars[j].is_ascii_alphanumeric() {
+                    continue;
+                }
+                let plate: String = chars[i..j].iter().collect();
+                plates.push((plate, tail.iter().collect()));
+            }
+            plates
+        }
+
+        fn find_days(chars: &[char]) -> Option<i64> {
+            for token in ["最近", "近", "这", "过去"] {
+                let t: Vec<char> = token.chars().collect();
+                for i in 0..chars.len().saturating_sub(t.len() - 1) {
+                    if i + t.len() > chars.len() {
+                        break;
+                    }
+                    if chars[i..i + t.len()] != t[..] {
+                        continue;
+                    }
+                    let mut j = i + t.len();
+                    let start = j;
+                    while j < chars.len() && chars[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j > start && j < chars.len() && chars[j] == '天' {
+                        let digits: String = chars[start..j].iter().collect();
+                        if let Ok(d) = digits.parse::<i64>() {
+                            if (1..=365).contains(&d) {
+                                return Some(d);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        fn find_iso_date(chars: &[char]) -> Option<String> {
+            for i in 0..chars.len().saturating_sub(9) {
+                if chars[i..i + 4].iter().all(|c| c.is_ascii_digit())
+                    && chars[i + 4] == '-'
+                    && chars[i + 5..i + 7].iter().all(|c| c.is_ascii_digit())
+                    && chars[i + 7] == '-'
+                    && chars[i + 8..i + 10].iter().all(|c| c.is_ascii_digit())
+                {
+                    let date: String = chars[i..i + 10].iter().collect();
+                    // 格式 + 日历有效性同时校验，拒绝 2026-13-45 这类输入
+                    return chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok().map(|_| date);
+                }
+            }
+            None
+        }
+
+        fn count_plate_like(chars: &[char]) -> usize {
+            // 省份字 + 字母数字开头（且左边界非字母数字）都算“车牌样片段”，
+            // 用于多实体回退：一个合法车牌 + 一个残缺车牌也要交回 nl_query。
+            let mut count = 0usize;
+            for i in 0..chars.len() {
+                if !PLATE_PROVINCES.contains(chars[i]) {
+                    continue;
+                }
+                if i > 0 && chars[i - 1].is_ascii_alphanumeric() {
+                    continue;
+                }
+                if i + 1 < chars.len() && chars[i + 1].is_ascii_alphanumeric() {
+                    count += 1;
+                }
+            }
+            count
+        }
+
+        fn count_day_window_tokens(chars: &[char]) -> usize {
+            // 统计「N天」窗口个数：向前找最近/近/这/过去，向后必须是数字+天。
+            // 按每个「N天」只计一次，避免 最近30天 同时命中 最近 和 近 而重复计数。
+            let mut count = 0usize;
+            let mut idx = 0;
+            while idx < chars.len() {
+                if !chars[idx].is_ascii_digit() {
+                    idx += 1;
+                    continue;
+                }
+                let start = idx;
+                while idx < chars.len() && chars[idx].is_ascii_digit() {
+                    idx += 1;
+                }
+                if idx < chars.len() && chars[idx] == '天' {
+                    let has_window_token = ["最近", "近", "这", "过去"].iter().any(|t| {
+                        let tv: Vec<char> = t.chars().collect();
+                        start >= tv.len() && chars[start - tv.len()..start] == tv[..]
+                    });
+                    if has_window_token {
+                        count += 1;
+                    }
+                }
+                idx += 1;
+            }
+            count
+        }
+
+        fn count_iso_dates(chars: &[char]) -> usize {
+            let mut count = 0usize;
+            for i in 0..chars.len().saturating_sub(9) {
+                if chars[i..i + 4].iter().all(|c| c.is_ascii_digit())
+                    && chars[i + 4] == '-'
+                    && chars[i + 5..i + 7].iter().all(|c| c.is_ascii_digit())
+                    && chars[i + 7] == '-'
+                    && chars[i + 8..i + 10].iter().all(|c| c.is_ascii_digit())
+                {
+                    count += 1;
+                }
+            }
+            count
+        }
+
+        fn count_month_tokens(chars: &[char]) -> usize {
+            // 对每个「月」向前收集紧邻数字，1~12 才算月份 token。
+            // 这样不会把车牌尾部（如 苏EBS5697月）的连续数字误判成非月份。
+            let mut count = 0usize;
+            for i in 0..chars.len() {
+                if chars[i] != '月' {
+                    continue;
+                }
+                let mut start = i;
+                while start > 0 && chars[start - 1].is_ascii_digit() {
+                    start -= 1;
+                }
+                if start < i {
+                    let digits: String = chars[start..i].iter().collect();
+                    if digits.parse::<u8>().ok().is_some_and(|m| (1..=12).contains(&m)) {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+
+        fn find_month(chars: &[char], message: &str) -> Option<(i64, i64)> {
+            for i in 0..chars.len().saturating_sub(4) {
+                if chars[i..i + 4].iter().all(|c| c.is_ascii_digit())
+                    && chars.get(i + 4) == Some(&'年')
+                {
+                    let year: i64 = chars[i..i + 4].iter().collect::<String>().parse().ok()?;
+                    if !(2000..=2100).contains(&year) {
+                        continue;
+                    }
+                    let rest: String = chars[i + 5..].iter().collect();
+                    let month_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if !month_str.is_empty()
+                        && rest[month_str.len()..].chars().next() == Some('月')
+                    {
+                        if let Ok(month) = month_str.parse::<i64>() {
+                            if (1..=12).contains(&month) {
+                                return Some((year, month));
+                            }
+                        }
+                    }
+                }
+            }
+            // 无年份的「7月」用当前年份；消息里只要出现过显式 4 位年份（如 1999年7月），
+            // 就不再进兜底，避免把越界年份静默替换成当前年份。
+            let has_explicit_year = chars.windows(5).any(|w| {
+                w[..4].iter().all(|c| c.is_ascii_digit()) && w[4] == '年'
+            });
+            if has_explicit_year {
+                return None;
+            }
+            if let Some(pos) = message.find('月') {
+                let before: Vec<char> = message[..pos].chars().collect();
+                let mut digits = String::new();
+                for c in before.iter().rev() {
+                    if c.is_ascii_digit() {
+                        digits.insert(0, *c);
+                    } else {
+                        break;
+                    }
+                }
+                if let Ok(month) = digits.parse::<i64>() {
+                    if (1..=12).contains(&month) {
+                        let year = chrono::Local::now().year() as i64;
+                        return Some((year, month));
+                    }
+                }
+            }
+            None
+        }
+
+        let has = |words: &[&str]| words.iter().any(|w| message.contains(w));
+        let day_tokens = DAY_TOKENS.iter().filter(|t| message.contains(**t)).count();
+        let month_tokens = count_month_tokens(&chars);
+        let day_window_tokens = count_day_window_tokens(&chars);
+        let iso_dates = count_iso_dates(&chars);
+        let has_open_range = OPEN_RANGES.iter().any(|w| message.contains(w));
+        let has_chinese_window = CHINESE_WINDOWS.iter().any(|w| message.contains(w));
+        let plates = find_plates(&chars);
+        let plate = plates.first();
+        // 省份字 + 大写字母：即便后面粘着日期/其他数字导致 find_plates 拒绝整串，
+        // 也视为“车牌上下文”，用于异常/月范围等分支的回退判定。
+        let plate_like = chars.windows(2).any(|w| {
+            PLATE_PROVINCES.contains(w[0]) && w[1].is_ascii_uppercase()
+        });
+        let plate_like_count = count_plate_like(&chars);
+
+        // 复合/开放时间范围（「昨天和今天」「7月到8月」「2026年1月以后」「近一年」）
+        // 单工具路由会丢一半或取错窗口，直接回退 nl_query。
+        if day_tokens >= 2
+            || month_tokens >= 2
+            || day_window_tokens >= 2
+            || (has_open_range && (day_tokens >= 1 || month_tokens >= 1))
+        {
+            return None;
+        }
+
+        // 异常检查：只接受「异常语义 + 明确 ISO 日期」的确定性路由；
+        // 没有可解析日期、或同时带车牌（车辆级异常工具不支持）都回退 nl_query。
+        if has(&["异常", "零重量", "重复记录"]) {
+            if plate.is_some() || plate_like || has_open_range || iso_dates >= 2 {
+                return None;
+            }
+            return find_iso_date(&chars).map(|date| {
+                ("explain_anomaly".into(), serde_json::json!({"date_str": date}))
+            });
+        }
+
+        // 白名单清单：白名单 + 恰好一个企业简称；多企业问法回退 nl_query，
+        // 避免只查第一家而丢另一半。
+        if message.contains("白名单") {
+            // 白名单工具只有 company 一个维度，任何时间约束（月/天/开放范围）
+            // 都不能表达，直接回退 nl_query，避免静默丢弃约束。
+            if month_tokens >= 1
+                || day_tokens >= 1
+                || day_window_tokens >= 1
+                || has_open_range
+                || has_chinese_window
+                || message.contains('月')
+            {
+                return None;
+            }
+            let matched: Vec<&&str> = COMPANIES.iter().filter(|c| message.contains(**c)).collect();
+            if matched.len() == 1 {
+                return Some((
+                    "query_whitelist".into(),
+                    serde_json::json!({"company": matched[0]}),
+                ));
+            }
+            // 0 家或多家匹配：不能把「车牌是否在白名单」路由成车辆进厂查询，
+            // 也不能把「多公司白名单+月统计」路由成月度汇总，统一回退 nl_query。
+            return None;
+        }
+
+        // 车牌 + 明确的日范围/月范围/多车牌：没有单工具语义，回退 nl_query，
+        // 避免把「苏EBS569昨天」「苏EBS5697月」「两辆车」错路由成 30 天窗口。
+        if let Some((plate_name, _tail)) = plate {
+            // 车牌查询不承载任何月/年/ISO 日期上下文（工具只有 days 参数），
+            // 见到「7月」「2026年」「2026-08-16」等一律回退 nl_query。
+            // 同时出现白名单/异常/统计汇总等第二意图时也回退，避免只答一半。
+            let has_conflicting_intent = has(&["白名单", "异常", "统计", "汇总", "总车次", "总重量", "排名"]);
+            if day_tokens >= 1
+                || month_tokens >= 1
+                || iso_dates >= 1
+                || message.contains('月')
+                || message.contains('年')
+                || plates.len() > 1
+                || plate_like_count > 1
+                || has_conflicting_intent
+            {
+                return None;
+            }
+            // 开放范围（至今/以来）和中文窗口（一周/一个月）没有单工具语义，
+            // 即使解析出 N 天窗口也一律回退，不能静默截断范围。
+            if has_open_range || has_chinese_window {
+                return None;
+            }
+            // 无显式「N天」窗口时按 30 天默认。
+            let days = find_days(&chars);
+            return Some((
+                "query_vehicle".into(),
+                serde_json::json!({"plate": plate_name, "days": days.unwrap_or(30)}),
+            ));
+        }
+
+        // 昨天/今日概况：只处理字面昨天/今天；前天/后天等没有对应单工具，回退 nl_query。
+        if has(&["昨天", "昨日"]) && has(&["进厂", "入厂", "概况", "车次"]) {
+            return Some(("query_yesterday".into(), serde_json::json!({})));
+        }
+        if has(&["今天", "今日"]) && has(&["进厂", "入厂", "概况", "车次"]) {
+            return Some(("query_today".into(), serde_json::json!({})));
+        }
+        if day_tokens >= 1 {
+            return None;
+        }
+
+        // 指定月份统计汇总：月工具不承载日粒度/天窗口/中文窗口/开放范围语义，带这些上下文回退。
+        let has_day_of_month = chars
+            .windows(2)
+            .any(|w| w[0].is_ascii_digit() && (w[1] == '日' || w[1] == '号'));
+        if has(&["统计", "汇总", "总车次", "总重量", "排名"])
+            && day_window_tokens == 0
+            && day_tokens == 0
+            && !has_chinese_window
+            && !has_open_range
+            && !has_day_of_month
+        {
+            if let Some((year, month)) = find_month(&chars, message) {
+                return Some((
+                    "query_monthly_stats".into(),
+                    serde_json::json!({"year": year, "month": month}),
+                ));
+            }
+        }
+
+        None
+    }
+
+    /// 确定性工具成功载荷判定：只认“该工具自己的成功数据形状”。
+    /// 必备字段全部存在 + 没有 truthy 失败标记才注入，防止错误/空载荷被当数据。
+    fn direct_fast_success_like(tool: &str, raw: &str) -> bool {
+        let parsed = match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let required_keys: &[&str] = match tool {
+            "query_today" | "query_yesterday" => &["date", "total_vehicles"],
+            "query_monthly_stats" => &["year", "month", "total_vehicles"],
+            "query_vehicle" => &["plate", "total_records"],
+            "query_whitelist" => &["total", "vehicles"],
+            "explain_anomaly" => &["anomalies"],
+            _ => &[],
+        };
+        let Some(obj) = parsed.as_object() else { return false };
+        let has_failure_marker = parsed.get("success").and_then(|s| s.as_bool()) == Some(false)
+            || parsed.get("error").map(|e| !e.is_null()).unwrap_or(false);
+        let has_required = required_keys.is_empty()
+            || required_keys.iter().all(|k| {
+                obj.get(*k).is_some_and(|v| !v.is_null())
+            });
+        has_required && !has_failure_marker
+    }
+
     /// 2026-08-06：确定性表格渲染——解析 nl_query 返回 JSON 的 columns/rows，rows≥2 生成
     /// Markdown 表格（绕开 LLM 风格：deepseek-flash 列表惯性极强，prompt 手段实测全无效）。
     /// 数字直接来自数据库（LLM 零抄录）。行数上限 50 防撑爆 prompt；列/行结构不匹配跳过。
@@ -5117,34 +5502,62 @@ impl AgentCore {
         if is_easy_query || Self::is_analysis_query(message) {
             let fast_intent = Self::classify_intent(message);
             if fast_intent.data_query && !fast_intent.attachment {
-                let args = serde_json::json!({
-                    "question": message,
-                    "period": "",
-                });
-                match self
-                    .call_tool_routed("nl_query", &self.persona_for_session(session_id), &args, allowed_ns, trace_id)
-                    .await
-                {
-                    Ok(t) => {
-                        // 结构化成功判定（ocr 修复，七轮）：只认 success==true 为成功——
-                        // success==false、缺 success 字段、非 JSON 一律保守失败回退 LLM 工具循环。
-                        // nl_query 正常路径始终返回 success 字段；缺失即视为未知/异常，不猜成功。
-                        let ok = match serde_json::from_str::<serde_json::Value>(&t) {
-                            Ok(v) => v.get("success").and_then(|s| s.as_bool()).unwrap_or(false),
-                            Err(e) => {
-                                tracing::warn!(target = "agent.fastpath", err = %e, "快速通道 nl_query 返回非 JSON，保守回退 LLM 工具循环");
-                                false
+                let direct = Self::direct_fast_tool(message);
+                if let Some((tool, tool_args)) = direct {
+                    match self
+                        .call_tool_routed(&tool, &self.persona_for_session(session_id), &tool_args, allowed_ns, trace_id)
+                        .await
+                    {
+                        // 确定性工具返回 JSON 数据。只接受"看起来像成功数据"的载荷：
+                        // 带 success:false / error 字段的失败载荷必须回退，绝不能当数据注入。
+                        Ok(t) if !t.is_empty() => {
+                            let looks_success = Self::direct_fast_success_like(&tool, &t);
+                            if looks_success {
+                                fast_query_result = Some(t);
+                                tracing::info!(target = "agent.fastpath", tool = %tool, "确定性工具快速通道命中");
+                            } else {
+                                tracing::warn!(target = "agent.fastpath", tool = %tool, result_len = t.chars().count(), "确定性工具快速通道返回失败载荷，回退 nl_query");
                             }
-                        };
-                        if ok {
-                            fast_query_result = Some(t);
-                            tracing::info!(target = "agent.fastpath", "nl_query 快速通道命中");
-                        } else {
-                            tracing::warn!(target = "agent.fastpath", "快速通道 nl_query 返回失败，回退 LLM 工具循环");
+                        }
+                        Ok(t) => {
+                            tracing::warn!(target = "agent.fastpath", tool = %tool, "确定性工具快速通道返回空结果，回退 nl_query");
+                            let _ = t;
+                        }
+                        Err(e) => {
+                            tracing::warn!(target = "agent.fastpath", tool = %tool, err = %e, "确定性工具快速通道调用失败，回退 nl_query");
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(target = "agent.fastpath", err = %e, "快速通道 nl_query 调用失败，回退 LLM 工具循环");
+                }
+                if fast_query_result.is_none() {
+                    let args = serde_json::json!({
+                        "question": message,
+                        "period": "",
+                    });
+                    match self
+                        .call_tool_routed("nl_query", &self.persona_for_session(session_id), &args, allowed_ns, trace_id)
+                        .await
+                    {
+                        Ok(t) => {
+                            // 结构化成功判定（ocr 修复，七轮）：只认 success==true 为成功——
+                            // success==false、缺 success 字段、非 JSON 一律保守失败回退 LLM 工具循环。
+                            // nl_query 正常路径始终返回 success 字段；缺失即视为未知/异常，不猜成功。
+                            let ok = match serde_json::from_str::<serde_json::Value>(&t) {
+                                Ok(v) => v.get("success").and_then(|s| s.as_bool()).unwrap_or(false),
+                                Err(e) => {
+                                    tracing::warn!(target = "agent.fastpath", err = %e, "快速通道 nl_query 返回非 JSON，保守回退 LLM 工具循环");
+                                    false
+                                }
+                            };
+                            if ok {
+                                fast_query_result = Some(t);
+                                tracing::info!(target = "agent.fastpath", "nl_query 快速通道命中");
+                            } else {
+                                tracing::warn!(target = "agent.fastpath", "快速通道 nl_query 返回失败，回退 LLM 工具循环");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(target = "agent.fastpath", err = %e, "快速通道 nl_query 调用失败，回退 LLM 工具循环");
+                        }
                     }
                 }
         }
@@ -5201,7 +5614,7 @@ impl AgentCore {
             format!(
                 "{}
 
-[系统已完成数据查询（nl_query 实时执行）。请直接基于下方数据作答{}
+[系统已完成数据查询（实时执行）。请直接基于下方数据作答{}
 
 输出格式要求（必须严格遵守，违反即为不合格回答）：
 1. 首句必须严格按模板输出（数字从下方数据中准确抄录，禁止改动/漏位）：「X年X月，[公司简称]进厂 X 车次，总重 X 吨」
@@ -13121,6 +13534,96 @@ mod whitelist_preroute_tests {
         assert!(!AgentCore::is_data_query_intent("今天天气怎么样"));
         assert!(!AgentCore::is_data_query_intent("统计一下"));
         assert!(!AgentCore::is_data_query_intent("好的，就按这个方案执行"));
+    }
+
+    #[test]
+    fn direct_fast_tool_routing() {
+        // 指定车牌 → query_vehicle（默认 30 天 / 解析 15 天）
+        let (tool, args) = AgentCore::direct_fast_tool("查询车牌 苏EBS569 最近30天的进厂记录：总条数和最近一次进厂日期。").expect("应命中");
+        assert_eq!(tool, "query_vehicle");
+        assert_eq!(args["plate"], "苏EBS569");
+        assert_eq!(args["days"], 30);
+        let (tool, args) = AgentCore::direct_fast_tool("查苏MF7272近15天进厂记录").expect("应命中");
+        assert_eq!(tool, "query_vehicle");
+        assert_eq!(args["days"], 15);
+        // 月度汇总 → query_monthly_stats（带年份 / 不带年份用当前年）
+        let (tool, args) = AgentCore::direct_fast_tool("查询2026年7月固废运营台进厂统计汇总：总车次、总重量，以及各公司车次排名前三。").expect("应命中");
+        assert_eq!(tool, "query_monthly_stats");
+        assert_eq!(args["year"], 2026);
+        assert_eq!(args["month"], 7);
+        let (tool, args) = AgentCore::direct_fast_tool("统计7月总车次和总重量").expect("应命中");
+        assert_eq!(tool, "query_monthly_stats");
+        assert_eq!(args["month"], 7);
+        // 白名单清单 → query_whitelist
+        let (tool, args) = AgentCore::direct_fast_tool("列出天越公司的白名单车辆：总数量，以及前5辆车牌和固废种类。").expect("应命中");
+        assert_eq!(tool, "query_whitelist");
+        assert_eq!(args["company"], "天越");
+        // 昨日概况 → query_yesterday
+        let (tool, _) = AgentCore::direct_fast_tool("用 query_yesterday 工具查询昨天(2026-08-16)固废运营台的进厂概况").expect("应命中");
+        assert_eq!(tool, "query_yesterday");
+        // 异常检查 → explain_anomaly
+        let (tool, args) = AgentCore::direct_fast_tool("用 explain_anomaly 工具检查2026-08-16 这一天固废运营台的数据异常").expect("应命中");
+        assert_eq!(tool, "explain_anomaly");
+        assert_eq!(args["date_str"], "2026-08-16");
+        // 未命中：模糊分析问法回退 nl_query
+        assert!(AgentCore::direct_fast_tool("分析最近固废数据的异常趋势").is_none());
+        // 非法车牌（数字开头 / 尾部过短或过长拼接串）不得当作车牌路由
+        assert!(AgentCore::direct_fast_tool("查苏12345近30天进厂记录").is_none());
+        assert!(AgentCore::direct_fast_tool("查苏A1234近30天进厂记录").is_none());
+        assert!(AgentCore::direct_fast_tool("查苏EBS569123近30天进厂记录").is_none());
+        // 复合时间范围回退 nl_query，避免只查一半
+        assert!(AgentCore::direct_fast_tool("昨天和今天的进厂概况").is_none());
+        assert!(AgentCore::direct_fast_tool("昨天和前天进厂概况").is_none());
+        assert!(AgentCore::direct_fast_tool("统计7月到8月总车次").is_none());
+        assert!(AgentCore::direct_fast_tool("2026年1月以后统计汇总").is_none());
+        // 非 N 天窗口 / 车牌+日/月范围 / 车牌+异常 / 前天等 一律回退
+        assert!(AgentCore::direct_fast_tool("苏EBS569近一年进厂记录").is_none());
+        assert!(AgentCore::direct_fast_tool("苏EBS569昨天进厂记录").is_none());
+        assert!(AgentCore::direct_fast_tool("苏EBS5697月进厂记录").is_none());
+        assert!(AgentCore::direct_fast_tool("苏EBS5692026-08-16数据异常").is_none());
+        assert!(AgentCore::direct_fast_tool("前天进厂概况").is_none());
+        // 多实体回退 nl_query
+        assert!(AgentCore::direct_fast_tool("苏A12345和苏B67890进厂记录").is_none());
+        assert!(AgentCore::direct_fast_tool("天越和理文的白名单").is_none());
+        // 非法日历日期 / 越界年份不得路由
+        assert!(AgentCore::direct_fast_tool("检查2026-13-45的数据异常").is_none());
+        assert!(AgentCore::direct_fast_tool("1999年7月统计汇总").is_none());
+        // 白名单 0/多企业、中文窗口、复合数字窗口、开放范围、拼接标识符 全部回退
+        assert!(AgentCore::direct_fast_tool("苏EBS569是否在白名单").is_none());
+        assert!(AgentCore::direct_fast_tool("天越和理文的白名单7月统计汇总").is_none());
+        assert!(AgentCore::direct_fast_tool("苏EBS569过去一周进厂记录").is_none());
+        assert!(AgentCore::direct_fast_tool("最近7天到最近15天进厂记录").is_none());
+        assert!(AgentCore::direct_fast_tool("2026-08-01至今的数据异常").is_none());
+        assert!(AgentCore::direct_fast_tool("ID苏EBS569进厂记录").is_none());
+        // 第二意图 / ISO 日期 / 日粒度必须回退，不能只答一半
+        assert!(AgentCore::direct_fast_tool("苏EBS569近30天进厂记录和总重量排名").is_none());
+        assert!(AgentCore::direct_fast_tool("苏EBS569的2026-08-16进厂记录").is_none());
+        assert!(AgentCore::direct_fast_tool("统计7月5日总车次").is_none());
+        // 成功载荷判定：必须齐全 + 无 truthy 错误标记
+        assert!(AgentCore::direct_fast_success_like(
+            "query_today",
+            r#"{"date":"2026-08-17","total_vehicles":1}"#,
+        ));
+        assert!(!AgentCore::direct_fast_success_like(
+            "query_today",
+            r#"{"date":"2026-08-17"}"#,
+        ));
+        assert!(!AgentCore::direct_fast_success_like(
+            "query_today",
+            r#"{"date":"2026-08-17","total_vehicles":1,"error":"boom"}"#,
+        ));
+        assert!(AgentCore::direct_fast_success_like(
+            "query_today",
+            r#"{"date":"2026-08-17","total_vehicles":1,"error":null}"#,
+        ));
+        assert!(!AgentCore::direct_fast_success_like(
+            "query_today",
+            r#"{"success":false,"date":"2026-08-17","total_vehicles":1}"#,
+        ));
+        assert!(!AgentCore::direct_fast_success_like(
+            "query_today",
+            r#"{"date":"2026-08-17","total_vehicles":null}"#,
+        ));
     }
 
     #[test]
