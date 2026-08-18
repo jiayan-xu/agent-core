@@ -68,9 +68,9 @@ skill_library.json
 meetings.json
 
 # 备份/本地杂项（含密钥的 config/.env 备份，严禁进公开仓库；2026-08-18 补充）
+# 覆盖 .env.bak / agent.toml.bak 等普通备份名及带日期后缀变体（OCR 评审指正）
+*.bak
 *.bak-*
 *.goodbak
-.env.bak-*
-agent.toml.bak-*
 # 本机 Cursor 本地规则（含 ~/.dsh 路径与本地运维约定，不进公开仓库）
 .cursor/
