@@ -42,8 +42,8 @@ def check_xlsx_zip(source):
         raise ValueError(f"not a valid xlsx: {e}")
 
 
-def safe_path(raw: str, require_root: bool = False) -> Path:
-    """Reject sensitive paths and (when required) paths outside the sandbox root."""
+def safe_path(raw: str) -> Path:
+    """Reject sensitive paths and enforce the sandbox root on every access."""
     p = Path(raw).expanduser()
     if not p.is_absolute():
         raise ValueError(f"path must be absolute: {raw}")
