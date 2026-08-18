@@ -10,6 +10,7 @@ server (protocol 2026-07-28, OpenAI-style tools/list). Tools:
 import json
 import os
 import sys
+import zipfile
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -20,13 +21,35 @@ DENY_FILENAMES = {
     "id_ed25519.pub", "credentials", "gserviceaccount.json",
 }
 MAX_XLSX_BYTES = 20 * 1024 * 1024
+MAX_XLSX_UNCOMPRESSED = 100 * 1024 * 1024
+MAX_XLSX_FILES = 1000
+MAX_XLSX_ROWS = 100_000
+MAX_GROUPS = 10_000
 
 
-def safe_path(raw: str) -> Path:
-    """Reject sensitive paths and (when configured) paths outside the sandbox root."""
+def check_xlsx_zip(path: Path):
+    """Reject zip bombs and oversized workbooks before openpyxl decompresses them."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            infos = zf.infolist()
+            if len(infos) > MAX_XLSX_FILES:
+                raise ValueError(f"xlsx has too many entries ({len(infos)} > {MAX_XLSX_FILES})")
+            total = sum(info.file_size for info in infos)
+            if total > MAX_XLSX_UNCOMPRESSED:
+                raise ValueError(f"xlsx uncompressed size too large ({total} > {MAX_XLSX_UNCOMPRESSED})")
+    except zipfile.BadZipFile as e:
+        raise ValueError(f"not a valid xlsx: {e}")
+
+
+def safe_path(raw: str, require_root: bool = False) -> Path:
+    """Reject sensitive paths and (when required) paths outside the sandbox root."""
     p = Path(raw).expanduser()
     if not p.is_absolute():
         raise ValueError(f"path must be absolute: {raw}")
+    root = os.environ.get("AGENT_SANDBOX_ROOT")
+    # 写类工具必须 fail-closed：没有沙箱根就拒绝启动，不能退化成任意路径写。
+    if require_root and not root:
+        raise RuntimeError("AGENT_SANDBOX_ROOT is required for file-writing tools")
     # 先做符号链接解析（与 Rust 侧 normalize 一致），再做敏感段匹配，
     # 否则 /tmp/link -> ~/.ssh 这类链接路径会绕过 deny 列表。
     p = p.resolve(strict=False)
@@ -37,7 +60,6 @@ def safe_path(raw: str) -> Path:
             raise ValueError(f"path hits a sensitive directory: {raw}")
     if p.name.lower() in DENY_FILENAMES or p.name.lower().endswith((".pem", ".key")):
         raise ValueError(f"path hits a sensitive file: {raw}")
-    root = os.environ.get("AGENT_SANDBOX_ROOT")
     if root:
         try:
             root_resolved = Path(root).resolve(strict=False)
@@ -58,10 +80,12 @@ def _flags(*names):
 def open_text(path: Path, mode: str):
     """Open a checked path with O_NOFOLLOW and re-verify the opened fd.
 
-    O_NOFOLLOW only stops the final component from being a symlink; on Linux
-    we additionally resolve /proc/self/fd and re-run the same component checks
-    so an intermediate directory swapped after safe_path() cannot redirect I/O.
+    Fails closed on platforms without O_NOFOLLOW (no final-component symlink
+    protection). On Linux the opened fd is re-resolved and re-checked so an
+    intermediate directory swapped after safe_path() cannot redirect I/O.
     """
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("platform lacks O_NOFOLLOW; refusing to open files")
     if mode == "r":
         flags = _flags("O_RDONLY", "O_NOFOLLOW", "O_CLOEXEC")
     elif mode == "w":
@@ -181,23 +205,26 @@ def handle(req):
                 return {"jsonrpc": "2.0", "id": rid, "result": {
                     "content": [{"type": "text", "text": text}]}}
             if name == "write_text":
-                path = safe_path(args["path"])
+                path = safe_path(args["path"], require_root=True)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with open_text(path, "w") as f:
                     f.write(args["content"])
                 return {"jsonrpc": "2.0", "id": rid, "result": {
                     "content": [{"type": "text", "text": json.dumps({"ok": True, "path": str(path)}, ensure_ascii=False)}]}}
             if name == "append_text":
-                path = safe_path(args["path"])
+                path = safe_path(args["path"], require_root=True)
                 with open_text(path, "a") as f:
                     f.write(args["content"] + "\n")
                 return {"jsonrpc": "2.0", "id": rid, "result": {
                     "content": [{"type": "text", "text": json.dumps({"ok": True, "path": str(path)}, ensure_ascii=False)}]}}
             if name == "excel_group_sum":
+                if not hasattr(os, "O_NOFOLLOW"):
+                    raise RuntimeError("platform lacks O_NOFOLLOW; refusing to open xlsx files")
                 path = safe_path(args["path"])
                 if path.stat().st_size > MAX_XLSX_BYTES:
                     return {"jsonrpc": "2.0", "id": rid, "error": {
                         "code": -32602, "message": f"xlsx too large (max {MAX_XLSX_BYTES} bytes)"}}
+                check_xlsx_zip(path)
                 wb = load_workbook(path, read_only=True, data_only=True)
                 try:
                     ws = wb.active
@@ -216,7 +243,12 @@ def handle(req):
                         return {"jsonrpc": "2.0", "id": rid,
                                 "error": {"code": -32602, "message": f"invalid params: {e}"}}
                     agg = {}
+                    row_count = 0
                     for row in rows:
+                        row_count += 1
+                        if row_count > MAX_XLSX_ROWS:
+                            return {"jsonrpc": "2.0", "id": rid, "error": {
+                                "code": -32602, "message": f"xlsx has too many rows (> {MAX_XLSX_ROWS})"}}
                         key = str(row[gi])
                         raw_val = row[vi]
                         if raw_val is None or isinstance(raw_val, bool):
@@ -226,6 +258,9 @@ def handle(req):
                         except (TypeError, ValueError):
                             # 非数字单元格不静默当 0，跳过并继续聚合可解释的数据
                             continue
+                        if key not in agg and len(agg) >= MAX_GROUPS:
+                            return {"jsonrpc": "2.0", "id": rid, "error": {
+                                "code": -32602, "message": f"too many distinct groups (> {MAX_GROUPS})"}}
                         agg[key] = agg.get(key, 0) + val
                     ranking = [{"group": k, "total": v} for k, v in
                                sorted(agg.items(), key=lambda kv: kv[1], reverse=True)]

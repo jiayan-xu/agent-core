@@ -1089,21 +1089,26 @@ impl ComplianceBoundary {
                 if val.is_string() {
                     let s = val.as_str().unwrap_or("");
                     let s_upper = s.to_uppercase();
-                    // 文件写工具的 content（repo_ws 还包括 path）跳过通用 SQL/穿越扫描：
-                    // repo_ws 路径由 resolve_safe_path 负责；office-basic 的 path 不豁免。
-                    if !is_file_write_payload(tool_name, key) {
-                        // SQL 注入检测（P2-7 增强）
-                        if s.contains("' --")
-                            || s.contains("';")
-                            || s_upper.contains(" UNION ")
-                            || s_upper.contains(" OR 1=1")
-                            || s_upper.contains(" AND 1=1")
-                            || s_upper.contains("DROP TABLE")
-                            || s_upper.contains("INSERT INTO")
-                            || s_upper.contains("DELETE FROM")
-                            || (s_upper.contains("UPDATE ") && s_upper.contains("SET "))
-                        {
-                            return ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key));
+                    // 文件写工具的 content（repo_ws 还包括 path）跳过通用 SQL/穿越扫描；
+                    // office-basic 的 path 仅豁免 SQL 启发式，仍保留路径穿越检查。
+                    let skip_all = is_file_write_payload(tool_name, key);
+                    let skip_sql_only = key == "path"
+                        && matches!(tool_name, "write_text" | "append_text");
+                    if !skip_all {
+                        if !skip_sql_only {
+                            // SQL 注入检测（P2-7 增强）
+                            if s.contains("' --")
+                                || s.contains("';")
+                                || s_upper.contains(" UNION ")
+                                || s_upper.contains(" OR 1=1")
+                                || s_upper.contains(" AND 1=1")
+                                || s_upper.contains("DROP TABLE")
+                                || s_upper.contains("INSERT INTO")
+                                || s_upper.contains("DELETE FROM")
+                                || (s_upper.contains("UPDATE ") && s_upper.contains("SET "))
+                            {
+                                return ToolCheck::red(&format!("参数安全检查：{} 含可疑 SQL 内容", key));
+                            }
                         }
                         // 路径穿越检测
                         if has_path_traversal(s) {
@@ -1198,8 +1203,10 @@ impl std::str::FromStr for ToolClass {
     }
 }
 
-/// 显式只读白名单（名称不含 query_/read_/get_ 等前缀的跨域只读工具）。
-/// 这是 classifier 与 `is_read_only_tool` 共用的唯一白名单，避免两个安全门漂移。
+/// classifier 精确集合与 `is_read_only_tool` 共用的只读白名单。
+/// 这里登记的名称是「classifier 没有前缀启发式、需要显式 bootstrap」的工具；
+/// 即便某个名称（如 read_text）同时被 is_read_only_tool 的 read_ 前缀覆盖，
+/// 也必须保留在此处，否则 classifier 一侧会漏分类。
 pub(crate) const EXPLICIT_READ_CROSS_TOOLS: &[&str] = &["cross_validate", "excel_group_sum", "read_text"];
 
 /// 工具分类器（P1-7 修复：配置驱动 + 自动学习）
