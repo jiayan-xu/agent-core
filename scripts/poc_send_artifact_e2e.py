@@ -16,8 +16,10 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AC = "http://127.0.0.1:9753"
-# 目标交付文件：从环境变量读（本机绝对路径不进公开仓库）
-TARGET = os.environ.get("POC_DELIVERABLE", "test_deliverable.md")
+
+def target() -> str:
+    # 运行时读取，避免模块导入先于 load_dotenv() 导致读不到 .env 里的值（review 指正）
+    return os.environ.get("POC_DELIVERABLE", "test_deliverable.md")
 
 
 def load_dotenv() -> None:
@@ -54,12 +56,15 @@ def http(method: str, path: str, headers: dict, body=None) -> dict:
 
 def main() -> None:
     load_dotenv()
+    # load_dotenv() 之后才能确定目标路径（评审指正：模块导入时 .env 尚未加载）
+    TARGET = target()
     key = os.environ.get("MEMORIA_ADMIN_KEY") or os.environ.get("AGENT_KEY") or ""
     if not key:
         print("missing MEMORIA_ADMIN_KEY", file=sys.stderr)
         sys.exit(2)
     h = {"Content-Type": "application/json", "x-agent-id": "default", "x-agent-key": key}
-    sid = "poc/send-artifact/" + time.strftime("%H%M%S")
+    # 毫秒级精度，避免同秒并发运行的 session 碰撞（review 指正）
+    sid = "poc/send-artifact/" + time.strftime("%H%M%S") + f"{time.time() % 1:07.6f}"[2:5]
 
     msg = (
         f"请执行写入操作：调用 send_artifact 工具，把已存在的文件 {TARGET} 交付给用户，caption 写 'PoC deliverable'。\n"
