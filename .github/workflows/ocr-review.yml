@@ -14,6 +14,7 @@ on:
   pull_request:
   push:
     branches: [main, master]
+  workflow_dispatch:
 
 # statuses: write 用于把 check-run 结果显式同步成 legacy commit status
 # （否则分支保护 required_status_checks 匹配不到 context，合并永远 BLOCKED）
