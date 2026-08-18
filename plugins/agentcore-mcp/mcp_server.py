@@ -171,12 +171,16 @@ def sse_events(
     headers_extra=None,
     admin: bool = False,
     method: str = "POST",
+    headers_base=None,
 ):
     """消费一个会自然结束的 SSE 流，返回 [{event, data}]。"""
     url = base_url() + path
     if query:
         url += "?" + urllib.parse.urlencode(query)
-    headers = admin_headers() if admin else agent_headers()
+    if headers_base is not None:
+        headers = dict(headers_base)  # 仅用给定基础头（如 evolve 只带 x-evolve-key）
+    else:
+        headers = admin_headers() if admin else agent_headers()
     headers["Accept"] = "text/event-stream"
     if headers_extra:
         headers.update(headers_extra)
@@ -246,6 +250,19 @@ def truncate_text(text: str, limit: int = MAX_EVENT_TEXT_CHARS) -> str:
 # ── 工具实现 ────────────────────────────────────────────────────────────
 
 
+def _redact_badge_token(body, include_token: bool) -> None:
+    """凭据脱敏：register/login 响应含长期 badge_token，默认不送回模型/日志，
+    仅当调用方显式 include_token=true 才原样回显（review 指正：规避凭据泄露）。
+    body 原地修改；返回前调用方无需处理。
+    """
+    if not isinstance(body, dict) or not body.get("badge_token"):
+        return
+    if include_token:
+        body["_warning"] = "badge_token 已按 include_token=true 原样返回，属长期凭据，务必勿写入日志"
+    else:
+        body["badge_token"] = "[REDACTED: 用 include_token=true 重放可获取，但不可记录到日志]"
+
+
 def tool_health(_args: dict) -> dict:
     res = http_json("GET", "/health", public=True, timeout_secs=10)
     return {"ok": True, "health": res["json"]}
@@ -275,8 +292,7 @@ def tool_register_agent(args: dict) -> dict:
     )
     res = http_json("POST", "/api/register", payload, public=True, timeout_secs=60)
     body = res["json"] or {}
-    if body.get("ok"):
-        body["_warning"] = "响应包含 badge_token：这是新 agent 的长期凭据，请勿写入日志或公开记录"
+    _redact_badge_token(body, str(args.get("include_token", "")).strip().lower() in ("1", "true", "yes", "y"))
     return {"ok": bool(body.get("ok")), "result": body}
 
 
@@ -294,8 +310,7 @@ def tool_register_user(args: dict) -> dict:
     )
     res = http_json("POST", "/api/register_user", payload, public=True, timeout_secs=60)
     body = res["json"] or {}
-    if body.get("ok"):
-        body["_warning"] = "响应包含 badge_token，请妥善保管，勿写入日志"
+    _redact_badge_token(body, str(args.get("include_token", "")).strip().lower() in ("1", "true", "yes", "y"))
     return {"ok": bool(body.get("ok")), "result": body}
 
 
@@ -306,8 +321,7 @@ def tool_login(args: dict) -> dict:
     payload = pick_fields(args, [("user_id", "user_id"), ("password", "password")])
     res = http_json("POST", "/api/login", payload, public=True, timeout_secs=60)
     body = res["json"] or {}
-    if body.get("ok"):
-        body["_warning"] = "响应包含 badge_token，请妥善保管，勿写入日志"
+    _redact_badge_token(body, str(args.get("include_token", "")).strip().lower() in ("1", "true", "yes", "y"))
     return {"ok": bool(body.get("ok")), "result": body}
 
 
@@ -439,7 +453,7 @@ def _run_code_evolve(args: dict, apply_flag: bool) -> dict:
     if isinstance(generations, int) and generations > 0:
         payload["generations"] = generations
     headers = {"x-evolve-key": require_credential("AGENTCORE_EVOLVE_KEY")}
-    events = sse_events("/api/evolve", payload, headers_extra=headers)
+    events = sse_events("/api/evolve", payload, headers_extra=headers, headers_base={})
 
     done = next((e for e in events if e["event"] == "done"), None)
     fatal = ("error", "budget_break", "circuit_break", "gate_failed")
@@ -930,6 +944,9 @@ def main():
             req = json.loads(line)
         except Exception as e:  # noqa: BLE001
             log("stdin parse error: %r" % (e,))
+            # 非法帧也要回 JSON-RPC Parse error（-32700），否则客户端会干等（review 指正）
+            sys.stdout.write(json.dumps(rpc_error(None, -32700, "Parse error"), ensure_ascii=False) + "\n")
+            sys.stdout.flush()
             continue
         resp = dispatch(req)
         if resp is None:
