@@ -40,10 +40,10 @@ jobs:
 
       - name: Configure LLM (DeepSeek official)
         env:
-          OPCODE_API_KEY: ${{ secrets.OPCODE_API_KEY }}
+          OCR_DEEPSEEK_API_KEY: ${{ secrets.OCR_DEEPSEEK_API_KEY }}
         run: |
-          if [ -z "$OPCODE_API_KEY" ]; then
-            echo "::error::缺少 Secret OPCODE_API_KEY，请在仓库 Settings > Secrets 配置"
+          if [ -z "$OCR_DEEPSEEK_API_KEY" ]; then
+            echo "::error::缺少 Secret OCR_DEEPSEEK_API_KEY，请在仓库 Settings > Secrets 配置"
             exit 1
           fi
           # DeepSeek 官方 OpenAI 兼容 API（Chat Completions）
@@ -52,7 +52,7 @@ jobs:
           ocr config set custom_providers.deepseek-official.protocol openai
           # 模型 ID：deepseek-v4-pro
           ocr config set custom_providers.deepseek-official.model "deepseek-v4-pro"
-          ocr config set custom_providers.deepseek-official.api_key "$OPCODE_API_KEY"
+          ocr config set custom_providers.deepseek-official.api_key "$OCR_DEEPSEEK_API_KEY"
 
       - name: Run review (gate)
         run: |
