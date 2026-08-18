@@ -513,7 +513,10 @@ fn file_write_scan_policy(tool_name: &str, key: &str) -> (bool, bool) {
     let skip_all = is_file_write_payload(tool_name, key);
     let skip_sql_only = !skip_all
         && key == "path"
-        && matches!(tool_name, "write_text" | "append_text");
+        && matches!(
+            tool_name,
+            "write_text" | "append_text" | "read_text" | "excel_group_sum"
+        );
     (skip_all, skip_sql_only)
 }
 

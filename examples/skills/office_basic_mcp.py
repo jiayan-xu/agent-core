@@ -8,6 +8,7 @@ server (protocol 2026-07-28, OpenAI-style tools/list). Tools:
   - excel_group_sum  openpyxl group-by aggregation
 """
 import json
+import math
 import os
 import sys
 import zipfile
@@ -47,9 +48,9 @@ def safe_path(raw: str, require_root: bool = False) -> Path:
     if not p.is_absolute():
         raise ValueError(f"path must be absolute: {raw}")
     root = os.environ.get("AGENT_SANDBOX_ROOT")
-    # 写类工具必须 fail-closed：没有沙箱根就拒绝启动，不能退化成任意路径写。
-    if require_root and not root:
-        raise RuntimeError("AGENT_SANDBOX_ROOT is required for file-writing tools")
+    # 读/写都要 fail-closed：没有沙箱根就拒绝启动，不能退化成仅 deny-list 的任意路径访问。
+    if not root:
+        raise RuntimeError("AGENT_SANDBOX_ROOT is required for office-basic MCP")
     # 先做符号链接解析（与 Rust 侧 normalize 一致），再做敏感段匹配，
     # 否则 /tmp/link -> ~/.ssh 这类链接路径会绕过 deny 列表。
     p = p.resolve(strict=False)
@@ -89,7 +90,8 @@ def open_text(path: Path, mode: str):
     if mode == "r":
         flags = _flags("O_RDONLY", "O_NOFOLLOW", "O_CLOEXEC")
     elif mode == "w":
-        flags = _flags("O_WRONLY", "O_CREAT", "O_TRUNC", "O_NOFOLLOW", "O_CLOEXEC")
+        # 先不 O_TRUNC：等 fd 重校验通过后再 ftruncate，避免 TOCTOU 先截断目标。
+        flags = _flags("O_WRONLY", "O_CREAT", "O_NOFOLLOW", "O_CLOEXEC")
     elif mode == "a":
         flags = _flags("O_WRONLY", "O_CREAT", "O_APPEND", "O_NOFOLLOW", "O_CLOEXEC")
     else:
@@ -106,6 +108,10 @@ def open_text(path: Path, mode: str):
             root = os.environ.get("AGENT_SANDBOX_ROOT")
             if root and not fd_path.is_relative_to(Path(root).resolve(strict=False)):
                 raise ValueError(f"opened path escapes sandbox root {root}: {fd_path}")
+        if mode == "w":
+            # fd 校验通过后截断，安全副作用只发生在已验证的目标上。
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, 0)
         return open(fd, mode, encoding="utf-8", errors="replace", closefd=True)
     except Exception:
         os.close(fd)
@@ -283,6 +289,9 @@ def handle(req):
                                 val = float(raw_val)
                             except (TypeError, ValueError):
                                 # 非数字单元格不静默当 0，跳过并继续聚合可解释的数据
+                                continue
+                            if not math.isfinite(val):
+                                # NaN/Inf 会让严格 JSON 解析失败，跳过非有限值
                                 continue
                             if key not in agg and len(agg) >= MAX_GROUPS:
                                 return {"jsonrpc": "2.0", "id": rid, "error": {
