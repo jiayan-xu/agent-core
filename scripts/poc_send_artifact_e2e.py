@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,8 +38,14 @@ def load_dotenv() -> None:
 def http(method: str, path: str, headers: dict, body=None) -> dict:
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(AC + path, data=data, headers=headers, method=method)
-    raw = urllib.request.urlopen(req, timeout=180).read().decode("utf-8", "replace")
-    # 非 JSON body（401/HTML 502 等）不硬崩，返回可读诊断（review 指正）
+    try:
+        raw = urllib.request.urlopen(req, timeout=180).read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        # 401/502 等在 .read()/json.loads 之前抛 HTTPError，必须在此捕获（review 指正）
+        return {"_http": e.code, "_body": e.read().decode("utf-8", "replace")[:300]}
+    except Exception as e:  # noqa: BLE001
+        return {"_err": str(e)}
+    # 非 JSON body 不硬崩，返回可读诊断
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
@@ -99,11 +106,17 @@ def main() -> None:
                 item = it
                 break
         if item:
+            # 用 .get() + 校验，stale/legacy 条目缺字段不崩（review 指正）
+            item_aid = item.get("approval_id")
+            item_hash = item.get("operation_hash")
+            if not item_aid or not item_hash:
+                print("FAIL: approval item missing approval_id/operation_hash", item, file=sys.stderr)
+                sys.exit(1)
             http(
                 "POST",
-                f"/api/approval/{item['approval_id']}/respond",
+                f"/api/approval/{item_aid}/respond",
                 ah,
-                {"approved": True, "reason": "PoC verification", "operation_hash": item["operation_hash"]},
+                {"approved": True, "reason": "PoC verification", "operation_hash": item_hash},
             )
             print("=== approved via dashboard API ===")
             # 2) 再「确认」→ pending_action 恢复 → 执行

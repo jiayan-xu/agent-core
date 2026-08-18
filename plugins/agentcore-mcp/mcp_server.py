@@ -838,6 +838,9 @@ def rpc_error(req_id, code, message):
 
 
 def handle_initialize(req_id, params):
+    # params 可能是任意 JSON 值；非 object 按空处理避免 .get 崩溃（review 指正）
+    if not isinstance(params, dict):
+        params = {}
     client_protocol = str((params or {}).get("protocolVersion") or "")
     protocol = client_protocol if client_protocol in SUPPORTED_PROTOCOLS else "2024-11-05"
     return rpc_result(req_id, {
