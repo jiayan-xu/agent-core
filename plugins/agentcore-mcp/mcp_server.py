@@ -134,6 +134,9 @@ def http_json(
     headers = admin_headers() if admin else ({"Accept": "application/json"} if public else agent_headers())
     if headers_extra:
         headers.update(headers_extra)
+    # POST/PUT body 必须带 Content-Type（public=True 时 headers 仅有 Accept，漏了会 415）
+    if data is not None and "Content-Type" not in headers:
+        headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout_secs) as resp:
@@ -199,7 +202,10 @@ def sse_events(
         data_lines = []
 
     try:
-        with urllib.request.urlopen(req) as resp:  # 长任务不设超时
+        # 长任务用「读超时」而非「总超时」：总超时会把长时间空闲的流按已超时杀掉。
+        # 每行读取都复位计时，仅当读操作超过该秒数才判定超时（默认 300s，可用 env 调整）。
+        read_timeout = int(os.environ.get("AGENTCORE_SSE_READ_TIMEOUT_SECS") or "300") or None
+        with urllib.request.urlopen(req, timeout=read_timeout) as resp:  # 长任务不设总超时
             for raw in resp:
                 line = raw.decode("utf-8", "replace").rstrip("\r\n")
                 if line == "":

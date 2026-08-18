@@ -99,7 +99,9 @@ def main() -> None:
     print("=== final reply ===")
     print(reply[:300])
     print("=== verdict ===")
-    if "Delivered test_deliverable.md" in reply:
+    # 交付文件名随 TARGET 动态变化（不硬编码，评审指正）
+    delivered_name = os.path.basename(TARGET)
+    if f"Delivered {delivered_name}" in reply or f"Delivered {TARGET}" in reply:
         print("PASS: agent-core -> LLM -> send_artifact (MCP wrapper) 端到端调用成功")
     else:
         print("FAIL: 回复中未出现 Delivered 证据；检查 send-artifact 是否注册或 LLM 是否调用")
