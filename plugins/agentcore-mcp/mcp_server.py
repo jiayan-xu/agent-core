@@ -866,7 +866,7 @@ def handle_tools_call(req_id, params):
             "isError": True,
         })
     except Exception as e:  # noqa: BLE001
-        log("tool %s unexpected error: %r", name, e)
+        log("tool %s unexpected error: %r" % (name, e))
         return rpc_result(req_id, {
             "content": [{"type": "text", "text": "INTERNAL ERROR: %s" % e}],
             "isError": True,
@@ -901,7 +901,7 @@ def main():
         try:
             req = json.loads(line)
         except Exception as e:  # noqa: BLE001
-            log("stdin parse error: %r", e)
+            log("stdin parse error: %r" % (e,))
             continue
         resp = dispatch(req)
         if resp is None:
