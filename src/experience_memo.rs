@@ -269,15 +269,16 @@ pub fn parse_tool_from_memo(content: &str) -> String {
 /// 召回经验 memo 样本（第二样本源）：按标签 `experience_memo` + `lesson` 检索，
 /// 取窗口内最近 `limit` 条，映射为 `NegSample`（change_type 语义：
 /// 用工具名近似「易错操作」，old/new 承载错误上下文，供元优化器学习禁忌）。
+/// 搜全库（不限 namespace）：experience_memo 分散在会话 ns / 根 ns / `*` 等不同
+/// 命名空间（record_experience_memo 写入会话 ns，sediment_to_root 沉淀到根 ns，
+/// 但 ns=`*` 的异常条目也会出现），按 namespace 过滤会导致大量漏召回。
 pub async fn collect_memo_samples(
     mcp: &McpClient,
-    ns: &str,
+    _ns: &str,
     limit: usize,
 ) -> Vec<crate::meta_evolve::NegSample> {
     let args = serde_json::json!({
         "query": "experience_memo 工具执行失败 lesson",
-        "namespace": ns,
-        "category": "experience_memo",
         "max_results": limit.min(200),
     });
     let raw = mcp
@@ -285,7 +286,7 @@ pub async fn collect_memo_samples(
         .await
         .unwrap_or_else(|e| {
             // other·medium：MCP 错误不能静默变空结果（否则样本源故障无迹可查）
-            tracing::warn!(target: "agent.meta_evolve", ns = %ns, "experience_memo 召回失败: {}", e);
+            tracing::warn!(target: "agent.meta_evolve", "experience_memo 召回失败: {}", e);
             serde_json::json!({})
         });
     let results = raw
@@ -301,7 +302,9 @@ pub async fn collect_memo_samples(
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
-            if content.is_empty() || !content.contains("experience_memo") {
+            if content.is_empty()
+                || (!content.contains("experience_memo") && !content.contains("lesson"))
+            {
                 return None;
             }
             // 从 content 提取工具名（"[experience_memo] 工具 X 执行失败：..."）。
