@@ -126,8 +126,9 @@ def main() -> None:
                 ah,
                 {"approved": True, "reason": "PoC verification", "operation_hash": item_hash},
             )
-            # 批准结果不能丢弃：403/非 2xx 时如实判定（review 指正）
-            if "_http" in resp_approve or "_err" in resp_approve:
+            # 批准结果不能丢弃：传输层 4xx/5xx、异常、或 200 但应用级失败
+            # （如 {"error":"agent not ready"}）都要如实判定（review 指正；参照 sibling）
+            if resp_approve.get("_http") or resp_approve.get("_err") or not resp_approve.get("ok"):
                 print("FAIL: approval respond error: %s" % json.dumps(resp_approve, ensure_ascii=False))
                 sys.exit(1)
             print("=== approved via dashboard API ===")

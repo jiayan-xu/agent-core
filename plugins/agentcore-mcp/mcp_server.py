@@ -188,23 +188,29 @@ def sse_events(
     events = []
     event_name = "message"
     data_lines = []
+    event_seen = False  # 本块内是否出现过显式 event: 行
 
     def flush():
-        nonlocal event_name, data_lines
-        if data_lines:
-            raw_data = "\n".join(data_lines)
-            # 仅当块明显是 JSON（{ 或 [ 开头）才尝试结构化；纯文本原样保留
-            # （review 指正：无条件 json.loads 会把纯文本块误处理）
-            if raw_data.lstrip().startswith(("{", "[")):
-                try:
-                    parsed = json.loads(raw_data)
-                except Exception:  # noqa: BLE001
+        nonlocal event_name, data_lines, event_seen
+        # 只要见到过 event: 行（即使无 data 行）就应产出事件——
+        # termination 用 `event: done` + 空 data 表示，漏掉了会丢 done（review 指正）
+        if event_seen or data_lines:
+            if data_lines:
+                raw_data = "\n".join(data_lines)
+                # 仅当块明显是 JSON（{ 或 [ 开头）才尝试结构化；纯文本原样保留
+                if raw_data.lstrip().startswith(("{", "[")):
+                    try:
+                        parsed = json.loads(raw_data)
+                    except Exception:  # noqa: BLE001
+                        parsed = raw_data
+                else:
                     parsed = raw_data
             else:
-                parsed = raw_data
+                parsed = ""  # 纯 event 标记（如 done）无 data
             events.append({"event": event_name, "data": parsed})
         event_name = "message"
         data_lines = []
+        event_seen = False
 
     try:
         # 长任务用「读超时」而非「总超时」：总超时会把长时间空闲的流按已超时杀掉。
@@ -217,6 +223,7 @@ def sse_events(
                     flush()
                 elif line.startswith("event:"):
                     event_name = line[len("event:"):].strip()
+                    event_seen = True
                 elif line.startswith("data:"):
                     # SSE 规范：`data:` 后单个前导空格是分隔符，只去前导空格，
                     # 保留尾部内容（.strip() 会误删有意义的首/尾空白，review 指正）
