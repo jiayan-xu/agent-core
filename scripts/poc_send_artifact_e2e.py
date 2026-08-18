@@ -80,7 +80,8 @@ def main() -> None:
     print("=== round1 (rephrase gate) ===")
     print(reply1[:200])
     # 第二轮：确认执行（若第一轮已是执行结果则直接判断）
-    if "方向对吗" in reply1 or "确认" in reply1:
+    # rephrase 闸回复以「方向对吗？」等复述确认结尾；用该特征判定，不用过宽的「确认」
+    if "方向对吗" in reply1 or "应该支持" in reply1 or "可以吗" in reply1:
         r2 = http("POST", "/api/chat", h, {"message": "确认执行", "user_id": "poc", "session_id": sid, "stream": False})
         reply = str(r2.get("reply") or "")
     else:
@@ -91,10 +92,12 @@ def main() -> None:
         ah = {"Content-Type": "application/json", "x-agent-key": key}
         pend = http("GET", "/api/approval/pending", ah)
         item = None
-        # 必须与本次操作的参数精确关联（arguments.path == TARGET），避免批错
-        # 队列里其它/遗留的 send_artifact 请求（评审指正；参照 sibling e2e 脚本）
+        # 三重绑定：tool_name + arguments.path + session_id == sid——
+        # 确保批准的是「本次运行」自己的审批项，杜绝 stale/并发项（review 指正）
         for it in (pend.get("items") or []):
             if it.get("tool_name") != "send_artifact":
+                continue
+            if it.get("session_id") != sid:
                 continue
             args = it.get("arguments") or {}
             if isinstance(args, str):
@@ -110,20 +113,29 @@ def main() -> None:
             item_aid = item.get("approval_id")
             item_hash = item.get("operation_hash")
             if not item_aid or not item_hash:
-                print("FAIL: approval item missing approval_id/operation_hash", item, file=sys.stderr)
+                print("FAIL: approval item missing approval_id/operation_hash", file=sys.stderr)
                 sys.exit(1)
-            http(
+            resp_approve = http(
                 "POST",
                 f"/api/approval/{item_aid}/respond",
                 ah,
                 {"approved": True, "reason": "PoC verification", "operation_hash": item_hash},
             )
+            # 批准结果不能丢弃：403/非 2xx 时如实判定（review 指正）
+            if "_http" in resp_approve or "_err" in resp_approve:
+                print("FAIL: approval respond error: %s" % json.dumps(resp_approve, ensure_ascii=False))
+                sys.exit(1)
             print("=== approved via dashboard API ===")
             # 2) 再「确认」→ pending_action 恢复 → 执行
             r4 = http("POST", "/api/chat", h, {"message": "确认", "user_id": "poc", "session_id": sid, "stream": False})
             reply = str(r4.get("reply") or "")
         else:
-            print("no pending approval item found", pend)
+            # 不打印全量 pend（含其它审批项的敏感字段），只打印摘要（review 指正）
+            pend_summary = {
+                "count": len(pend.get("items") or []),
+                "tools": sorted({it.get("tool_name") for it in (pend.get("items") or [])}),
+            }
+            print("no pending approval item found: %s" % json.dumps(pend_summary, ensure_ascii=False))
     print("=== final reply ===")
     print(reply[:300])
     print("=== verdict ===")
