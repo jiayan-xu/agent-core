@@ -79,14 +79,18 @@ def main() -> None:
         ah = {"Content-Type": "application/json", "x-agent-key": key}
         pend = http("GET", "/api/approval/pending", ah)
         item = None
-        # 只批准 send_artifact 且仍处于待批（未 approved）状态的项——
-        # 避免 pending 列表里有同名其它工具/已处理项时批错对象（review 指正）
+        # 必须与本次操作的参数精确关联（arguments.path == TARGET），避免批错
+        # 队列里其它/遗留的 send_artifact 请求（评审指正；参照 sibling e2e 脚本）
         for it in (pend.get("items") or []):
-            if (
-                it.get("tool_name") == "send_artifact"
-                and not it.get("approved")
-                and (it.get("status") or "").lower() in ("", "pending", "awaiting")
-            ):
+            if it.get("tool_name") != "send_artifact":
+                continue
+            args = it.get("arguments") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            if (args or {}).get("path") == TARGET:
                 item = it
                 break
         if item:
