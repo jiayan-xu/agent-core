@@ -3,11 +3,11 @@ name: ocr-review
 # OpenCodeReview 代码审查门禁
 # - PR：审查 base..head 的 diff
 # - 推送到默认分支：审查 HEAD~1..HEAD
-# 需要仓库 Secret：OPCODE_API_KEY（DeepSeek 官方 API key，在 Settings > Secrets 添加）
-# LLM provider：deepseek-official（DeepSeek 官方 OpenAI 兼容 API）
-#   url = https://api.deepseek.com
+# 需要仓库 Secret：AGNES_AI_API_KEY（Agnes AI API key，在 Settings > Secrets 添加）
+# LLM provider：agnes-ai（Agnes AI OpenAI 兼容 API）
+#   url = https://apihub.agnes-ai.cn/v1
 #   protocol = openai
-# 模型：deepseek-v4-pro
+# 模型：agnes-2.5-pro
 # 默认门禁：发现评论即 fail CI（见 scripts/ocr-review.sh 的 --gate）
 
 on:
@@ -46,23 +46,23 @@ jobs:
       - name: Install OpenCodeReview
         run: npm install -g @alibaba-group/open-code-review
 
-      - name: Configure LLM (DeepSeek official)
+      - name: Configure LLM (Agnes AI)
         id: configure
         env:
-          OCR_DEEPSEEK_API_KEY: ${{ secrets.OCR_DEEPSEEK_API_KEY }}
+          AGNES_API_KEY: ${{ secrets.AGNES_AI_API_KEY }}
         run: |
-          if [ -z "$OCR_DEEPSEEK_API_KEY" ]; then
-            echo "::warning::缺少 Secret OCR_DEEPSEEK_API_KEY，本次 PR 触发跳过评审；请用 workflow_dispatch 运行完整门禁"
+          if [ -z "$AGNES_API_KEY" ]; then
+            echo "::warning::缺少 Secret AGNES_AI_API_KEY，本次 PR 触发跳过评审；请用 workflow_dispatch 运行完整门禁"
             echo "skip=1" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # DeepSeek 官方 OpenAI 兼容 API（Chat Completions）
-          ocr config set provider deepseek-official
-          ocr config set custom_providers.deepseek-official.url https://api.deepseek.com
-          ocr config set custom_providers.deepseek-official.protocol openai
-          # 模型 ID：deepseek-v4-pro
-          ocr config set custom_providers.deepseek-official.model "deepseek-v4-pro"
-          ocr config set custom_providers.deepseek-official.api_key "$OCR_DEEPSEEK_API_KEY"
+          # Agnes AI OpenAI 兼容 API（Chat Completions）
+          ocr config set provider agnes-ai
+          ocr config set custom_providers.agnes-ai.url https://apihub.agnes-ai.cn/v1
+          ocr config set custom_providers.agnes-ai.protocol openai
+          # 模型 ID：agnes-2.5-pro
+          ocr config set custom_providers.agnes-ai.model "agnes-2.5-pro"
+          ocr config set custom_providers.agnes-ai.api_key "$AGNES_API_KEY"
 
       - name: Run review (gate)
         if: steps.configure.outputs.skip != '1'
