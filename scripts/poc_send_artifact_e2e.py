@@ -54,6 +54,18 @@ def http(method: str, path: str, headers: dict, body=None) -> dict:
         return {"status": "error", "raw": raw[:300]}
 
 
+def chat_reply(resp: dict, stage: str) -> str:
+    """从 /api/chat 响应提取 reply；传输/HTTP 层失败时显式 FAIL，而非静默当空回复
+    （review 指正：不检查 _http/_err 会遮蔽真实的服务/网络故障）。"""
+    if not isinstance(resp, dict):
+        print("FAIL: %s 非预期响应: %r" % (stage, resp), file=sys.stderr)
+        sys.exit(1)
+    if "_http" in resp or "_err" in resp:
+        print("FAIL: %s 请求失败: %s" % (stage, json.dumps(resp, ensure_ascii=False)), file=sys.stderr)
+        sys.exit(1)
+    return str(resp.get("reply") or "")
+
+
 def main() -> None:
     load_dotenv()
     # load_dotenv() 之后才能确定目标路径（评审指正：模块导入时 .env 尚未加载）
@@ -81,14 +93,14 @@ def main() -> None:
     )
     # 第一轮：可能命中「复述确认闸」→ 拿到复述文本
     r1 = http("POST", "/api/chat", h, {"message": msg, "user_id": "poc", "session_id": sid, "stream": False})
-    reply1 = str(r1.get("reply") or "")
+    reply1 = chat_reply(r1, "round1 chat")
     print("=== round1 (rephrase gate) ===")
     print(reply1[:200])
     # 第二轮：确认执行（若第一轮已是执行结果则直接判断）
     # rephrase 闸回复以「方向对吗？」等复述确认结尾；用该特征判定，不用过宽的「确认」
     if "方向对吗" in reply1 or "应该支持" in reply1 or "可以吗" in reply1:
         r2 = http("POST", "/api/chat", h, {"message": "确认执行", "user_id": "poc", "session_id": sid, "stream": False})
-        reply = str(r2.get("reply") or "")
+        reply = chat_reply(r2, "round2 confirm")
     else:
         reply = reply1
     # 第三轮：危险工具审批流（AWAITING_APPROVAL → dashboard 审批台批准 → 再「确认」执行）
@@ -96,6 +108,10 @@ def main() -> None:
         # 1) admin 审批 API 批准（无 x-agent-id，走 admin 通道）
         ah = {"Content-Type": "application/json", "x-agent-key": key}
         pend = http("GET", "/api/approval/pending", ah)
+        # pending 查询本身失败（传输层）时显式 FAIL，不静默当「无待批项」（review 指正）
+        if "_http" in pend or "_err" in pend:
+            print("FAIL: approval/pending 查询失败: %s" % json.dumps(pend, ensure_ascii=False), file=sys.stderr)
+            sys.exit(1)
         item = None
         # 三重绑定：tool_name + arguments.path + session_id == sid——
         # 确保批准的是「本次运行」自己的审批项，杜绝 stale/并发项（review 指正）
@@ -134,7 +150,7 @@ def main() -> None:
             print("=== approved via dashboard API ===")
             # 2) 再「确认」→ pending_action 恢复 → 执行
             r4 = http("POST", "/api/chat", h, {"message": "确认", "user_id": "poc", "session_id": sid, "stream": False})
-            reply = str(r4.get("reply") or "")
+            reply = chat_reply(r4, "round4 confirm")
         else:
             # 不打印全量 pend（含其它审批项的敏感字段），只打印摘要（review 指正）
             pend_summary = {

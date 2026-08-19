@@ -76,7 +76,7 @@ pub fn needs_redaction(payload: &str) -> bool {
             return false;
         }
         let mut has_version = false;
-        let mut check_seg = |s: &[u8], has_version: &mut bool| -> bool {
+        let check_seg = |s: &[u8], has_version: &mut bool| -> bool {
             if s.iter().all(|&b| b.is_ascii_lowercase()) {
                 true // 纯小写字母单词段（长度不限：configuration=13 也是单词）
             } else if s.len() >= 2
@@ -253,7 +253,7 @@ pub fn sanitize_agent_payload(payload: &str) -> String {
             return false;
         }
         let mut has_version = false;
-        let mut check_seg = |s: &[char], has_version: &mut bool| -> bool {
+        let check_seg = |s: &[char], has_version: &mut bool| -> bool {
             if s.iter().all(|&c| c.is_ascii_lowercase()) {
                 true // 纯小写字母单词段（长度不限）
             } else if s.len() >= 2

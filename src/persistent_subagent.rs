@@ -202,7 +202,8 @@ pub async fn deliver(
 /// 持锁范围（bug·high 第六轮）：序列化到 rename **全程持锁**——锁外写文件期间
 /// 其它线程改注册表会写入旧快照（lost-update）。小文件写微秒级，持锁成本可忽略。
 pub async fn save(registry: &Arc<Mutex<SubAgentRegistry>>, path: &str) -> Result<(), String> {
-    let mut reg = registry.lock().await;
+    // 【reviewer round-26 compiler warning】save() only reads reg.agents，不需要 mut
+    let reg = registry.lock().await;
     let json = serde_json::to_string_pretty(&reg.agents)
         .map_err(|e| format!("序列化子 agent 注册表失败: {}", e))?;
     static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

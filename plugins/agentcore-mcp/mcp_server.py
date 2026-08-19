@@ -187,6 +187,10 @@ def sse_events(
     data = None
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    # body 必带 Content-Type：headers_base 路径（如 /api/evolve 只有 x-evolve-key）
+    # 不补会退化成 form-urlencoded，被 axum Json extractor 拒 415（review 指正）
+    if data is not None and "Content-Type" not in headers:
+        headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
 
     events = []
@@ -229,9 +233,10 @@ def sse_events(
                     event_name = line[len("event:"):].strip()
                     event_seen = True
                 elif line.startswith("data:"):
-                    # SSE 规范：`data:` 后单个前导空格是分隔符，只去前导空格，
-                    # 保留尾部内容（.strip() 会误删有意义的首/尾空白，review 指正）
-                    data_lines.append(line[len("data:"):].lstrip(" "))
+                    # RFC 8202 §3：data: 后仅一个空格是分隔符，多余空格属于 payload。
+                    # .lstrip(' ') 会误删所有前导空格，损坏缩进代码块/格式化 JSON 等有效数据。
+                    raw_data = line[len('data:'):]
+                    data_lines.append(raw_data[1:] if raw_data.startswith(' ') else raw_data)
             flush()
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", "replace")
@@ -700,7 +705,7 @@ TOOL_SPECS = [
          })),
     dict(name="agentcore_admin_consolidate", description="手动触发记忆巩固 Dream（仅 admin）。body 可指定 namespaces，默认按环境变量/自身命名空间；随后可选触发元进化（受 CONSOLIDATE_SKIP_META 控制）。", handler=_json_handler("POST", "/api/admin/consolidate", admin=True, body_fields=[("namespaces", "namespaces")], timeout_secs=600),
          schema=schema({"namespaces": P("array", "要巩固的命名空间数组，可选")})),
-    dict(name="agentcore_admin_harness_activate", description="批准并激活待审批的 Harness 蒸馏模板（仅 admin，含危险工具模板必须人工批准）。", handler=_json_handler("POST", "/api/admin/harness/activate", admin=True, body_fields=[("id", "id")]),
+    dict(name="agentcore_admin_harness_activate", description="批准并激活待审批的 Harness 蒸馏模板（仅 admin，破坏性：含危险工具模板须人工批准，需 confirm=\"ACTIVATE\"）。", handler=_json_handler("POST", "/api/admin/harness/activate", admin=True, body_fields=[("id", "id")], confirm_word="ACTIVATE"),
          schema=schema({"id": P("integer", "Harness 模板 id（必填）")}, ["id"])),
     dict(name="agentcore_agent_repair", description="修复已注册 agent 的协作档案（admin）：更新 display_name / namespace / permission，不更换 badge_token。", handler=_json_handler("POST", "/api/admin/agent/repair", admin=True, body_fields=[("agent_id", "agent_id"), ("department", "department"), ("project", "project"), ("display_name", "display_name"), ("department_display", "department_display"), ("permission", "permission")]),
          schema=schema({

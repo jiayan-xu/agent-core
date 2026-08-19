@@ -234,14 +234,14 @@ def handle(req):
                 return {"jsonrpc": "2.0", "id": rid, "result": {
                     "content": [{"type": "text", "text": text}]}}
             if name == "write_text":
-                path = safe_path(args["path"], require_root=True)
+                path = safe_path(args["path"])
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with open_text(path, "w") as f:
                     f.write(args["content"])
                 return {"jsonrpc": "2.0", "id": rid, "result": {
                     "content": [{"type": "text", "text": json.dumps({"ok": True, "path": str(path)}, ensure_ascii=False)}]}}
             if name == "append_text":
-                path = safe_path(args["path"], require_root=True)
+                path = safe_path(args["path"])
                 with open_text(path, "a") as f:
                     f.write(args["content"] + "\n")
                 return {"jsonrpc": "2.0", "id": rid, "result": {
