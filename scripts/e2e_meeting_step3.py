@@ -234,6 +234,7 @@ def main() -> int:
         {"from": "agent/admin", "content": "第一条真人发言"},
     )
     print(f"   POST message -> {s3} {b3}")
+    ok &= (s3 == 200)
     ok &= wait_for(lambda: "message" in _kinds(), 8, "message 事件")
     msg_ev = next((d for k, d in _snapshot_events() if k == "message"), "")
     try:
@@ -268,6 +269,7 @@ def main() -> int:
     print("5) 删除 → ended 终止广播")
     s4, b4 = req("DELETE", f"/api/meetings/{MID}")
     print(f"   DELETE -> {s4} {b4}")
+    ok &= (s4 == 200)
     ok &= wait_for(lambda: "ended" in _kinds(), 8, "ended 事件")
     end_ev = next((d for k, d in _snapshot_events() if k == "ended"), "")
     print(f"   ended payload = {end_ev}")

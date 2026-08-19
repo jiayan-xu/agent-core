@@ -307,9 +307,15 @@ pub async fn collect_memo_samples(
                     serde_json::json!({})
                 });
             if let Some(arr) = raw.get("results").and_then(|r| r.as_array()) {
-                for item in arr {
-                    let id = item.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                    if seen.insert(id.to_string()) {
+                // 【reviewer round-26 bug·medium】缺失/空 id 会导致所有此类条目碰撞为同一 key ""，
+                // 后续去重静默丢弃。用递增序号 + ns+cat 组合保证唯一性（无需引入额外 crate）。
+                for (idx, item) in arr.iter().enumerate() {
+                    let id_key = item
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("__no_id_{}_{}_{}/{}", idx, std::process::id(), nss.replace('/', "__"), category));
+                    if seen.insert(id_key) {
                         all_results.push(item.clone());
                     }
                 }
@@ -348,13 +354,24 @@ pub async fn collect_memo_samples(
             if category == "experience_memo" && !content.contains("experience_memo") {
                 return None;
             }
-            // lesson 条目必须含工具失败关键词才纳入（防噪音）
-            if category == "lesson"
-                && !content.contains("失败")
-                && !content.contains("error")
-                && !content.contains("fail")
-            {
+            // 【reviewer round-26 low】未知 category 不纳入——当前只搜 experience_memo / lesson，
+            // 但 API 响应可能含意外值（如配置漂移或未来新增类别未更新搜索列表）。
+            // 仅当 category 为预期白名单时才继续处理。
+            if category != "experience_memo" && category != "lesson" {
+                tracing::debug!(target: "agent.meta_evolve", ?category, "经验样本含未知分类，跳过");
                 return None;
+            }
+            // lesson 条目必须含工具失败关键词才纳入（防噪音）。
+            // 【reviewer round-26 bug·medium】大小写不敏感匹配："Error"、"FAILED"、"execution failed"等
+            // 都算有效失败记录，之前严格小写过滤会漏掉这些合法条目。
+            if category == "lesson" {
+                let lower = content.to_lowercase();
+                if !lower.contains("失败")
+                    && !lower.contains("error")
+                    && !lower.contains("fail")
+                {
+                    return None;
+                }
             }
             // 从 content 提取工具名（"[experience_memo] 工具 X 执行失败：..."）。
             // 约定：record_experience_memo 固定写入该格式；若工具名含空格（极罕见），
