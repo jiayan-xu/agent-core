@@ -1,7 +1,7 @@
 # ADR-016: agent-core 收敛为 Tool Gateway，推理主循环移交 dsh
 
 ## Status
-Proposed
+Accepted（2026-08-20 D1–D7 拍板；评审载体不入公开仓）
 
 ## Date
 2026-08-15
@@ -43,7 +43,8 @@ goal 循环），而 agent-core 当前仍是一个自带 LLM 主循环的完整 
 5. **审批批准后自动执行**：复用 ADR-015 的 `approvals` 权威表，新增"执行关联"字段，
    批准后由执行队列调用 `call_tool_routed` 并写回结果；拒绝则终态 `denied`。
 6. **兼容保留**：现有 `/api/chat`、`/v1/chat/completions` 与全部既有 API 在
-   Phase 4 之前保持可用，作为回滚与旧客户端（PFAiX/Jan）通道。
+   Phase 4 之前保持可用，作为回滚与旧客户端（PFAiX；Jan 已于 2026-08-20 书面确认
+   停用，移出兼容范围）通道。
 7. **PFAiX 壳保留并转型**：dsh 替代的是 agent-core 的推理主循环，**不是** PFAiX。
    壳保留为"企业治理网关的人机终端"（审批台、文档归档、会议/圆桌真人参与、
    更新分发、用户身份）；其对话引擎在 Phase 3 起可选迁移到 dsh（优先走
@@ -270,7 +271,7 @@ PFAiX 当前经 agent-core 侧代码事实承担的角色：`/v1/chat/completion
 |---|---|
 | Phase 0–2 | 完全不动：继续走 `/v1/chat` legacy 通道，零迁移、零风险 |
 | Phase 2–3 | 转型而不是废弃：审批台与 dsh 的 `agentcore_approval_respond` 共用同一 `approvals` 权威表（ADR-015），两边都能审批；文档归档、会议真人参与、更新分发继续由壳承担 |
-| Phase 3 起 | 对话引擎二选一：**路线 A（推荐）** PFAiX 仍连 `/v1/chat`，agent-core 把请求转发 dsh（壳零改动）；**路线 B** PFAiX 直连 dsh 用户侧 API 成为瘦客户端（需 dsh 先具备多用户会话/鉴权，暂不做） |
+| Phase 3 起 | 对话引擎二选一：**路线 A（2026-08-20 修订，推荐）** PFAiX 壳"智能办公"Tab 以 WebView 嵌 dsh web（`:3080`）+ SSO 透传（一次性 ticket → HttpOnly Cookie），壳零对话逻辑改动；R0 实测 `dsh-host-webserver` 无插件级鉴权扩展点，badge 校验由 PFAiX 壳内本地回环代理承担（127.0.0.1→127.0.0.1，不新增暴露面，dsh 核零改动）；**路线 B** PFAiX 直连 dsh 用户侧 API 成为瘦客户端（需 dsh 先具备多用户会话/鉴权，暂不做） |
 | Phase 4 | 壳作为"企业终端"长期存在；后台引擎与 dsh 解耦 |
 
 约束：
@@ -304,6 +305,26 @@ PFAiX 当前经 agent-core 侧代码事实承担的角色：`/v1/chat/completion
   5. PFAiX 用户体验在对话引擎切换时退化 → 路线 A 无感转发 + legacy 通道回滚；
      会话隔离语义（`x-user-tag` / `x-conversation-id`）纳入 Phase 3 验收。
 
+## 与后续 ADR 的关系（2026-08-20 转 Accepted 时补入）
+
+1. 本 ADR 为收敛目标态；**ADR-017 降级为 legacy `/v1/chat`（PFAiX / 回滚基线）
+   的路径优化**，不再作为新主循环方向，其剩余 G 门（composer / skill_library /
+   TTC verifier 放行）取消。
+2. ADR-017 已落地的 bootstrap / hooks / TurnBudget 随 `/v1/chat` 存活，直到
+   Phase 4 评审删除 legacy chat；删除前不得先拆编排层。
+3. **L1 HARNESS 槽位原则（D7，2026-08-20 定向）**：L1 会话编排层是可替换槽位，
+   现役 dsh；agent-core 治理平面（权限/审批/配额/审计/命名空间）为不可替换的
+   企业资产。槽位无伤替换契约四条款：呈现（Web UI + SSO ticket/Cookie）、
+   治理（业务工具唯走网关、无 admin 凭据）、记忆（长期事实一律入 memoria，
+   引擎私有存储不持有）、技能（SKILL.md 跨引擎格式）。
+4. **反向保护**：网关只认标准契约（`X-Agent-Id/Key`、`X-Trace-Id`、幂等键、
+   三态响应），不得依赖任何 HARNESS 私有语义；违反即破坏可替换性，视同红线。
+5. R0 基线（2026-08-20 本机实测）：路由 51 = 公开 14 + 受保护 37
+   （`/api/approval/{id}/respond` 位于公开段，但 handler 内 `is_admin` +
+   `operation_hash` 校验成立，D6 不破）；memoria 检索延迟（HTTP MCP
+   `memory_search`，30 样本）p50=4064ms / p95=11693ms——网关路由设计需考虑
+   检索路径优化或异步化；审批时长近 14 天已决 n=0，不设 SLA。
+
 ## 迁移四阶段与验收
 
 ### Phase 0 — 双引擎过渡（已完成）
@@ -326,7 +347,9 @@ PFAiX 当前经 agent-core 侧代码事实承担的角色：`/v1/chat/completion
   写类工具开放（`GATEWAY_ALLOW_WRITE=1`）。
 - 验收：
   - [ ] 真实业务流量 X% 经网关执行（X 由灰度决定，起步 10%）
-  - [ ] 危险工具审批闭环在 dsh 内完成（pending → 人审 → 轮询取结果）
+  - [ ] 危险工具审批闭环：dsh 见 `202` → 人在 PFAiX 审批台（独立 admin 身份）
+        批准 → dsh 轮询终态；dsh 进程不持 ADMIN_KEY、不配 respond 工具
+        （申请/批准物理隔离）
   - [ ] chat legacy 随时可回退
   - [ ] PFAiX 壳全程无感（对话/审批/归档/更新接口零改动）
 
@@ -335,9 +358,10 @@ PFAiX 当前经 agent-core 侧代码事实承担的角色：`/v1/chat/completion
   meta/code evolve 保持后台可选；圆桌/分身调用迁至 dsh subagent。
 - 验收：
   - [ ] `/api/metrics` 中 chat 热路径 LLM 调用归零（维护路径除外）
-  - [ ] PFAiX/Jan 旧客户端经 `/v1/chat` 仍可用
-  - [ ] 路线 A（agent-core 转发 dsh）经 PFAiX 实测通过，且 `x-user-tag` /
-        `x-conversation-id` 会话隔离语义不变
+  - [ ] PFAiX 旧客户端经 `/v1/chat` 仍可用（Jan 已于 2026-08-20 书面确认停用，
+        移出验收范围）
+  - [ ] 路线 A（WebView 嵌 dsh web + SSO 透传）经 PFAiX 实测通过，二次登录 0 次，
+        且 `x-user-tag` / `x-conversation-id` 会话隔离语义在 WebView 内不变
 
 ### Phase 4 — 终态清理（可选，另行评审）
 - chat 主循环代码降级为 legacy feature-gate 或移除；agent-core 对外定位更名为
@@ -349,7 +373,10 @@ PFAiX 当前经 agent-core 侧代码事实承担的角色：`/v1/chat/completion
 1. 不在 dsh 侧重建 7 红线 / 审批 / 配额——治理只在 agent-core。
 2. 不做 LLM provider 代理网关（不接模型路由、不替换 OpenAI 网关）。
 3. 网关不阻塞等待审批（无同步审批模式）；不提供 v1 流式工具结果（SSE 留 v2）。
-4. 不迁移 dashboard/memoria 等业务 MCP 本身；不动 Memoria 存储层。
+4. 不迁移 dashboard/memoria 等业务 MCP 本身；不动 Memoria 存储层。memoria 检索
+   一并经网关路由（2026-08-20 R0 验证：memoria 权限矩阵仅 Agent/Admin 两级且为
+   测试守护而非运行时门禁，无只读凭据、无按工具 deny，"只读直连例外"不可执行，
+   予以收回）。
 5. 不删除 `/api/chat` 与 `/v1/chat/completions`（至少保留至 Phase 4 评审）。
 6. 不支持多实例分布式执行：单 agent-core 实例 + SQLite 真相源。
 7. 不要求 PFAiX 在 Phase 3 之前改版；不在壳内重建审批存储或治理逻辑。
