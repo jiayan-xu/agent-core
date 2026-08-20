@@ -1,7 +1,7 @@
 # ADR-017: LLM 编排层 v2 —— Flash 锚定引导 + Plan-Act-Reflect 状态机
 
 ## Status
-Accepted（P1–P3 代码落地；全部开关默认 OFF，生产灰度验收前保持关闭）
+Accepted（P1–P3 代码落地；2026-08-16 受控灰度已过，以灰度记录为准。2026-08-20 起依 ADR-016 降级为 legacy `/v1/chat` 路径优化：剩余 G 门取消，不再作为新主循环方向）
 
 ## Date
 2026-08-15
