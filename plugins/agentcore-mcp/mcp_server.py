@@ -80,10 +80,12 @@ def agent_headers() -> dict:
 
 
 def admin_headers() -> dict:
-    # 审批/运维 handler 的 is_admin 判定：x-agent-key == MEMORIA_ADMIN_KEY
+    # 审批/运维 handler 的 is_admin 判定：x-agent-key == AGENTCORE_ADMIN_KEY
+    # fail-closed（ADR-016 D6）：不回退 AGENT_KEY——挂载进 L1 槽位（dsh）的场景
+    # 禁止隐式持有 admin 能力；缺 ADMIN_KEY 即启动报错，而非静默降权复用。
     return {
         "X-Agent-Id": env("AGENTCORE_ADMIN_ID") or "admin",
-        "X-Agent-Key": require_credential("AGENTCORE_ADMIN_KEY", "AGENTCORE_AGENT_KEY"),
+        "X-Agent-Key": require_credential("AGENTCORE_ADMIN_KEY"),
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
