@@ -272,6 +272,11 @@ def _redact_badge_token(body, include_token: bool) -> None:
 
 
 def tool_tool_execute(args: dict) -> dict:
+    # 模型偶发双层嵌套 {"arguments": {"tool": ..., "arguments": ...}}——防御性展开
+    if isinstance(args.get("arguments"), dict) and "tool" in args["arguments"] and not args.get("tool"):
+        args = args["arguments"]
+    if not args.get("tool"):
+        return {"content": [{"type": "text", "text": "参数错误：必须提供 tool（工具名）与 arguments（参数对象），不要把整个请求再包进 arguments 键。"}], "isError": True}
     """R1 网关（ADR-016 §2）：无头工具执行。三态：
     200 executed（result 直接返回）/ 202 pending_approval（approval_id + operation_hash，
     人在 dashboard 审批台批准后可轮询终态）/ 4xx 错误文本原样透出。"""
