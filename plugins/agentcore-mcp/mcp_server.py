@@ -270,6 +270,39 @@ def _redact_badge_token(body, include_token: bool) -> None:
         body["badge_token"] = "[REDACTED: 用 include_token=true 重放可获取，但不可记录到日志]"
 
 
+
+def tool_tool_execute(args: dict) -> dict:
+    """R1 网关（ADR-016 §2）：无头工具执行。三态：
+    200 executed（result 直接返回）/ 202 pending_approval（approval_id + operation_hash，
+    人在 dashboard 审批台批准后可轮询终态）/ 4xx 错误文本原样透出。"""
+    body = {
+        "tool": args.get("tool", ""),
+        "arguments": args.get("arguments") or {},
+    }
+    for k in ("persona_id", "session_id", "trace_id", "idempotency_key"):
+        if args.get(k):
+            body[k] = args[k]
+    resp = http_json("POST", "/api/tool/execute", payload=body)
+    status, data = resp["status"], resp["json"]
+    # 统一成文本：executed 带 result；202 pending 带 approval 指引（错误路径 http_json 抛 ToolError）
+    if status == 202 and isinstance(data, dict):
+        merged = dict(data)
+        merged["_hint"] = (
+            "工具进入人工审批（approval_id=%s）。请告知用户在 PFAiX 审批台批准；"
+            "批准后用 agentcore_tool_execute_status 轮询终态。" % merged.get("approval_id")
+        )
+        return {"content": [{"type": "text", "text": json.dumps(merged, ensure_ascii=False)}]}
+    return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False) if data is not None else resp["raw"]}]}
+
+
+def tool_tool_execute_status(args: dict) -> dict:
+    """查询网关执行终态（202 审批单批准后的轮询入口）。"""
+    eid = args.get("execution_id", "")
+    resp = http_json("GET", "/api/tool/execute/" + urllib.parse.quote(eid))
+    data = resp["json"]
+    return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False) if data is not None else resp["raw"]}]}
+
+
 def tool_health(_args: dict) -> dict:
     res = http_json("GET", "/health", public=True, timeout_secs=10)
     return {"ok": True, "health": res["json"]}
@@ -845,7 +878,51 @@ TOOL_SPECS = [
              "goal": P("string", "优化目标说明"),
              "confirm": P("string", "必须显式传 APPLY"),
          }, ["target_path", "confirm"])),
+
+    dict(name="agentcore_tool_execute", description="业务工具执行网关（唯一合法业务工具通道）：提交工具调用给 agent-core 治理管线（鉴权/边界/审批/配额/审计，无 LLM）。三态：executed(直接返回结果)/pending_approval(202，需 PFAiX 审批台人工批准后轮询)/错误。问业务数据（入厂车次/吨位/库存等）一律用本工具。", handler=tool_tool_execute,
+         schema=schema({
+             "tool": P("string", "工具名，如 query_entrance（必填）"),
+             "arguments": P("object", "工具参数对象", additional_properties=True),
+             "persona_id": P("string", "分身 id，默认 default"),
+             "session_id": P("string", "会话归属，默认 gateway/{caller}"),
+             "trace_id": P("string", "链路追踪 id，缺省网关生成"),
+             "idempotency_key": P("string", "写类幂等键"),
+         }, ["tool"])),
+    dict(name="agentcore_tool_execute_status", description="查询网关执行终态：审批单批准/拒绝后轮询执行结果（executed/denied/failed）。", handler=tool_tool_execute_status,
+         schema=schema({
+             "execution_id": P("string", "执行 id（ex_...，必填）"),
+         }, ["execution_id"])),
 ]
+
+
+# ── D5 白名单强制点：AGENTCORE_EXPOSE_ADMIN=0 时对 dsh 槽位隐藏 admin/审批决定工具 ──
+# 不靠提示词自律——tools/list 直接不含，隐藏项调用也拒绝。
+ADMIN_HIDDEN_TOOLS = {
+    "agentcore_approval_respond",
+    "agentcore_collab_approval",
+    "agentcore_admin_degrade",
+    "agentcore_admin_killswitch",
+    "agentcore_admin_quota_put",
+    "agentcore_admin_audit",
+    "agentcore_admin_consolidate",
+    "agentcore_admin_harness_activate",
+    "agentcore_agent_repair",
+    "agentcore_meta_evolution_run",
+    "agentcore_code_evolve_apply",
+    "agentcore_register_agent",
+    "agentcore_save_config",
+}
+
+
+def admin_hidden() -> bool:
+    return env("AGENTCORE_EXPOSE_ADMIN") == "0"
+
+
+def visible_tools() -> list:
+    if admin_hidden():
+        return [t for t in TOOLS if t["name"] not in ADMIN_HIDDEN_TOOLS]
+    return TOOLS
+
 
 TOOL_HANDLERS = {spec["name"]: spec["handler"] for spec in TOOL_SPECS}
 TOOLS = [
@@ -879,7 +956,7 @@ def handle_initialize(req_id, params):
 
 
 def handle_tools_list(req_id):
-    return rpc_result(req_id, {"tools": TOOLS})
+    return rpc_result(req_id, {"tools": visible_tools()})
 
 
 def handle_tools_call(req_id, params):
@@ -890,6 +967,11 @@ def handle_tools_call(req_id, params):
     arguments = params.get("arguments") or {}
     if not isinstance(arguments, dict):
         arguments = {}
+    if admin_hidden() and name in ADMIN_HIDDEN_TOOLS:
+        return rpc_result(req_id, {
+            "content": [{"type": "text", "text": "tool %s is hidden on this mount (AGENTCORE_EXPOSE_ADMIN=0)" % name}],
+            "isError": True,
+        })
     handler = TOOL_HANDLERS.get(name)
     if handler is None:
         return rpc_result(req_id, {

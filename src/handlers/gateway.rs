@@ -90,6 +90,26 @@ pub(crate) async fn handle_tool_execute(
         );
     }
 
+    // ── 外部调用方权限底座：网关 caller 不在进程内权限链上（链只注册了 agent-core 自身），
+    // 按灰度开关授予 Read/Write 底座后再生效（幂等；审批/红线不受影响）──
+    {
+        let boundary = agent.boundary.lock().await;
+        let floor = if tool_level == "write" && gateway_allow_write() {
+            agent_core::boundary::PermissionLevel::Write
+        } else {
+            agent_core::boundary::PermissionLevel::Read
+        };
+        let registered = match boundary.perm_chain.lock() {
+            Ok(mut chain) => {
+                chain.register(&auth.agent_id, None, floor);
+                true
+            }
+            Err(_) => false,
+        };
+        drop(boundary);
+        let _ = registered;
+    }
+
     // ── 边界检查（调用方命名空间视角，与 chat 循环同一套硬规则）──
     let check = {
         let boundary = agent.boundary.lock().await;
