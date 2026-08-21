@@ -8,6 +8,7 @@ pub mod approval;
 pub mod chat;
 pub mod collab;
 pub mod evolve;
+pub mod gateway;
 pub mod identity;
 pub mod meetings;
 pub mod system;
