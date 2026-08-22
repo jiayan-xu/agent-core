@@ -110,17 +110,33 @@ pub(crate) async fn handle_tool_execute(
         let _ = registered;
     }
 
-    // ── 边界检查（调用方命名空间视角，与 chat 循环同一套硬规则）──
+    // ── 边界检查（按本次调用实际触碰的命名空间，而非调用方全量授权域）──
+    // 2026-08-22 修复：此前传 auth.allowed_ns（经 dept_ops 增强后必 >1 个），
+    // check_cross_ns 只要 >1 就拒——外部调用方任何工具都触发「跨 N 命名空间
+    // 聚合需审批」→ 网关对外部调用方完全不可用。对齐 chat 循环语义
+    // （current_ns_paths = 本次调用生效的 ns）：取 arguments.namespace；
+    // 无该参数的工具不存在跨域信号，授权层已把关，传 None 放行。
     let check = {
         let boundary = agent.boundary.lock().await;
-        let ns: Vec<String> = auth.allowed_ns.clone();
+        let mut ns: Vec<String> = Vec::new();
+        for key in ["namespace", "ns"] {
+            if let Some(v) = body.arguments.get(key).and_then(|v| v.as_str()) {
+                ns.extend(
+                    v.split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty()),
+                );
+            }
+        }
+        ns.sort();
+        ns.dedup();
         boundary.check_tool(
             &body.tool,
             &body.arguments,
             &auth.agent_id,
             "user",
             &agent.config.parent_permission,
-            Some(ns.as_slice()),
+            if ns.is_empty() { None } else { Some(ns.as_slice()) },
         )
     };
     if !check.allow {
