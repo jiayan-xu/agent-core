@@ -116,6 +116,12 @@ pub(crate) async fn handle_tool_execute(
     // 聚合需审批」→ 网关对外部调用方完全不可用。对齐 chat 循环语义
     // （current_ns_paths = 本次调用生效的 ns）：取 arguments.namespace；
     // 无该参数的工具不存在跨域信号，授权层已把关，传 None 放行。
+    //
+    // 2026-08-22 安全修复（D2-b 内测发现泄漏）：网关执行身份为 admin（"*"），
+    // 若不校验「请求的 ns ⊆ 调用方授权域」，任何调用方可借网关 admin 身份
+    // 读任意他人命名空间（实测 dsh-slot 越权读 d2b-user-a 成功）。故先做
+    // 包含校验（与 memoria check_ns_access 同规则：相等/双向前缀），再走
+    // 跨域聚合计数审批。
     let check = {
         let boundary = agent.boundary.lock().await;
         let mut ns: Vec<String> = Vec::new();
@@ -130,6 +136,22 @@ pub(crate) async fn handle_tool_execute(
         }
         ns.sort();
         ns.dedup();
+        // ① 越权校验：请求的每个 ns 必须被调用方授权域覆盖
+        for n in &ns {
+            let covered = auth.allowed_ns.iter().any(|g| {
+                g == "*" || g == n || n.starts_with(&format!("{g}/")) || g.starts_with(&format!("{n}/"))
+            });
+            if !covered {
+                return err_json(
+                    StatusCode::FORBIDDEN,
+                    "namespace-not-authorized",
+                    &format!(
+                        "边界拒绝：命名空间 '{}' 不在调用方 '{}' 授权范围内",
+                        n, auth.agent_id
+                    ),
+                );
+            }
+        }
         boundary.check_tool(
             &body.tool,
             &body.arguments,
