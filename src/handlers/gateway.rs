@@ -122,9 +122,9 @@ pub(crate) async fn handle_tool_execute(
     // 读任意他人命名空间（实测 dsh-slot 越权读 d2b-user-a 成功）。故先做
     // 包含校验（与 memoria check_ns_access 同规则：相等/双向前缀），再走
     // 跨域聚合计数审批。
+    let mut ns: Vec<String> = Vec::new();
     let check = {
         let boundary = agent.boundary.lock().await;
-        let mut ns: Vec<String> = Vec::new();
         for key in ["namespace", "ns"] {
             if let Some(v) = body.arguments.get(key).and_then(|v| v.as_str()) {
                 ns.extend(
@@ -161,7 +161,12 @@ pub(crate) async fn handle_tool_execute(
             if ns.is_empty() { None } else { Some(ns.as_slice()) },
         )
     };
-    if !check.allow {
+    // ── 「需审批」类边界拒绝 → 转 202 审批流（对齐 chat 循环 AWAITING_APPROVAL）──
+    // 2026-08-22 R2：boundary 的审批守卫（如 manage_whitelist「需要审批，请等待
+    // 审批人确认」）以 allow=false + reason 携带审批意图返回，此前被 403 短路，
+    // 网关的审批全链路永远走不到。凡 reason 含「审批」即转 202 创建审批请求。
+    let needs_approval = !check.allow && check.reason.contains("审批");
+    if !check.allow && !needs_approval {
         return err_json(
             StatusCode::FORBIDDEN,
             "boundary-rejected",
@@ -171,7 +176,7 @@ pub(crate) async fn handle_tool_execute(
 
     // ── 危险判定（dangerous 分级或红线）：进入人工审批，绝不直接执行 ──
     let is_dangerous = tool_level == "dangerous";
-    if is_dangerous || check.level == Some(BlockLevel::Red) {
+    if is_dangerous || check.level == Some(BlockLevel::Red) || needs_approval {
         if !agent.config.human_approval {
             return err_json(
                 StatusCode::FORBIDDEN,
@@ -188,6 +193,11 @@ pub(crate) async fn handle_tool_execute(
                 "dashboard-admin", // D6：批准只在 dashboard 审批台，网关不自批
                 &auth.agent_id,
                 &session_id,
+                // R2：批准后按调用方授权域恢复执行——参数带 ns 用之；
+                // 无 ns 参数的工具（如 manage_whitelist）传调用方全量授权域，
+                // 空列表会被源级门控以「不在授权范围」拒绝
+                Some(if ns.is_empty() { auth.allowed_ns.clone() } else { ns.clone() }),
+                Some(execution_id.clone()), // R2：批准后回写网关执行终态
             )
             .await;
         let operation_hash = agent
