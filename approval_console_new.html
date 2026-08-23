@@ -78,7 +78,7 @@ async function load() {
       const div = document.createElement("div");
       div.className = "card";
       const args = JSON.stringify(it.arguments, null, 2);
-      div.innerHTML = '<h3>' + esc(it.tool_name) + ' <span class="badge-warn">需人工确认</span></h3>' +
+      div.innerHTML = '<h3>' + esc(toolName(it.tool_name)) + ' <span class="badge-warn">需人工确认</span></h3>' +
         '<div class="meta">ID: ' + esc(it.approval_id) + ' · 请求方: ' + esc(it.requester_id) + ' · 创建: ' + new Date(it.created_at*1000).toLocaleString() + '</div>' +
         '<div class="meta">说明: ' + esc(it.description) + '</div>' +
         '<div class="meta">指纹: ' + esc(it.operation_hash) + '</div>' +
@@ -133,7 +133,7 @@ async function loadHistory() {
       const st = statusMap[it.status] || it.status;
       const stCls = it.status === "Denied" ? "st-denied" : (it.status === "Consumed" ? "st-consumed" : "st-approved");
       const decided = it.decided_at ? new Date(it.decided_at*1000).toLocaleString() : "—";
-      div.innerHTML = '<h3>' + esc(it.tool_name) + ' <span class="' + stCls + '">[' + esc(st) + ']</span></h3>' +
+      div.innerHTML = '<h3>' + esc(toolName(it.tool_name)) + ' <span class="' + stCls + '">[' + esc(st) + ']</span></h3>' +
         '<div class="meta">ID: ' + esc(it.approval_id) + ' · 请求方: ' + esc(it.requester_id) + ' · 创建: ' + new Date(it.created_at*1000).toLocaleString() + '</div>' +
         '<div class="meta">参数: ' + esc(argsTxt) + '</div>' +
         '<div class="meta">说明: ' + esc(it.description) + '</div>' +
@@ -152,6 +152,15 @@ function toast(m){
   document.body.appendChild(t);
   setTimeout(()=>t.remove(), 2500);
 }
+const TOOL_NAMES = {
+  "manage_whitelist": "白名单管理",
+  "sync_whitelist_plates": "白名单同步",
+  "sync_exception_correction": "异常修正同步",
+  "manage_samples": "取样台账同步",
+  "memory_remember": "写入记忆",
+  "memory_observe": "记忆观察",
+};
+function toolName(t){ return TOOL_NAMES[t] || t; }
 function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
 window.addEventListener("DOMContentLoaded", () => { load(); });
 
