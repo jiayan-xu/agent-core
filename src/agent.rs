@@ -3865,6 +3865,8 @@ impl AgentCore {
                 "dashboard-admin",
                 &self.config.identity.agent_id,
                 session_id,
+                None,
+                None,
             )
             .await;
         let pa = PendingAction {
@@ -8908,6 +8910,8 @@ impl AgentCore {
                                 "dashboard-admin", // 固定标识，由 dashboard 审批台经 HTTP 回执
                                 &self.config.identity.agent_id,
                                 session_id,
+                                None,
+                                None,
                             )
                             .await;
                         // P2-2: 审批创建事件（带 trace_id）
@@ -8951,6 +8955,8 @@ impl AgentCore {
                                 approver_id,
                                 &self.config.identity.agent_id,
                                 session_id,
+                                None,
+                                None,
                             )
                             .await;
                         let msg = serde_json::json!({
@@ -9025,6 +9031,8 @@ impl AgentCore {
                             "dashboard-admin",
                             &self.config.identity.agent_id,
                             session_id,
+                            None,
+                            None,
                         )
                         .await;
                     self.audit_logger
@@ -9062,6 +9070,8 @@ impl AgentCore {
                             approver_id,
                             &self.config.identity.agent_id,
                             session_id,
+                            None,
+                            None,
                         )
                         .await;
                     let msg = serde_json::json!({

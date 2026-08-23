@@ -160,6 +160,55 @@ pub(crate) async fn handle_approval_respond(
                 None,
             )
             .await;
+
+        // ── R2 网关链路：网关创建的审批，批准后自动恢复执行并回写终态 ──
+        // （chat 会话的审批由 execute_chat 轮询消费；网关审批无会话轮询，
+        //   必须在此处 spawn 恢复执行，否则批准后永远停在 AwaitingApproval）
+        if approved {
+            if let Some(p) = &pending {
+                if p.session_id.starts_with("gateway/") {
+                    let exec_args = p.arguments.clone();
+                    let allowed_ns = p.allowed_ns.clone().unwrap_or_default();
+                    let tool_name_gw = p.tool_name.clone();
+                    let execution_id = p.execution_id.clone();
+                    let agent_clone = Arc::clone(&agent);
+                    tokio::spawn(async move {
+                        // 与 chat 恢复执行同语义：注入 confirmed=true（受控写红线）
+                        let mut exec_args = exec_args;
+                        if let Some(obj) = exec_args.as_object_mut() {
+                            obj.insert("confirmed".to_string(), serde_json::json!(true));
+                            if tool_name_gw == "sync_exception_correction" {
+                                obj.insert("dry_run".to_string(), serde_json::json!(false));
+                            }
+                            if tool_name_gw == "manage_samples" {
+                                obj.insert("action".to_string(), serde_json::json!("sync"));
+                                obj.insert("dry_run".to_string(), serde_json::json!(false));
+                            }
+                        }
+                        let result = agent_clone
+                            .call_tool_routed(&tool_name_gw, "default", &exec_args, &allowed_ns, "")
+                            .await;
+                        if let Some(exe_id) = &execution_id {
+                            match &result {
+                                Ok(text) => agent_core::gateway::update_status(
+                                    exe_id,
+                                    agent_core::gateway::GatewayStatus::Executed,
+                                    Some(text.clone()),
+                                    None,
+                                ),
+                                Err(e) => agent_core::gateway::update_status(
+                                    exe_id,
+                                    agent_core::gateway::GatewayStatus::Failed,
+                                    None,
+                                    Some(e.clone()),
+                                ),
+                            }
+                        }
+                    });
+                }
+            }
+        }
+
         Json(serde_json::json!({ "ok": true, "decision": decision })).into_response()
     } else {
         Json(serde_json::json!({"error": "agent not ready"})).into_response()

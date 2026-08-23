@@ -51,6 +51,12 @@ pub struct PendingApproval {
     /// TASK-652：绑定会话；旧 JSON 回填缺省 `legacy`
     #[serde(default = "default_session_id")]
     pub session_id: String,
+    /// R2 网关链路：创建方附带的调用方授权域，批准后据此恢复执行
+    #[serde(default)]
+    pub allowed_ns: Option<Vec<String>>,
+    /// R2 网关链路：关联的网关执行记录 id，批准后回写终态
+    #[serde(default)]
+    pub execution_id: Option<String>,
 }
 
 fn default_session_id() -> String {
@@ -251,6 +257,8 @@ impl ApprovalManager {
                     description: rec.description.clone(),
                     approver_id: rec.approver_id.clone(),
                     requester_id: rec.requester_id.clone(),
+                    allowed_ns: None,
+                    execution_id: None,
                     status: ApprovalStatus::Pending,
                     created_at: rec.created_at,
                     operation_hash: rec.operation_hash.clone(),
@@ -330,6 +338,8 @@ impl ApprovalManager {
             approver_id,
             requester_id,
             "legacy",
+            None,
+            None,
         )
         .await
     }
@@ -343,6 +353,8 @@ impl ApprovalManager {
         approver_id: &str,
         requester_id: &str,
         session_id: &str,
+        allowed_ns: Option<Vec<String>>,
+        execution_id: Option<String>,
     ) -> String {
         // C1b 防重复建单：同 tool+requester 已有 pending → 复用既有 id，不重复造单。
         if crate::approval::is_pending_sync(self, tool_name, requester_id) {
@@ -381,6 +393,8 @@ impl ApprovalManager {
             created_at: now,
             operation_hash,
             session_id,
+            allowed_ns,
+            execution_id,
         };
         self.sqlite_upsert(&Self::pending_to_record(
             &pending,
