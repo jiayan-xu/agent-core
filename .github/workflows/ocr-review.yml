@@ -3,11 +3,9 @@ name: ocr-review
 # OpenCodeReview 代码审查门禁
 # - PR：审查 base..head 的 diff
 # - 推送到默认分支：审查 HEAD~1..HEAD
-# 需要仓库 Secret：AGNES_AI_API_KEY（Agnes AI API key，在 Settings > Secrets 添加）
-# LLM provider：agnes-ai（Agnes AI OpenAI 兼容 API）
-#   url = https://apihub.agnes-ai.cn/v1
-#   protocol = openai
-# 模型：agnes-2.5-pro
+# 需要仓库 Secret：DASHSCOPE_API_KEY（阿里云百炼 API key，在 Settings > Secrets 添加）
+# LLM provider：dashscope（ocr 内置 provider，走百炼 OpenAI 兼容端点）
+# 模型：qwen3.8-flash（2026-08-26 从 agnes-2.5-pro 切换；回退方法见 git 历史本文件）
 # 默认门禁：发现评论即 fail CI（见 scripts/ocr-review.sh 的 --gate）
 
 on:
@@ -46,23 +44,21 @@ jobs:
       - name: Install OpenCodeReview
         run: npm install -g @alibaba-group/open-code-review
 
-      - name: Configure LLM (Agnes AI)
+      - name: Configure LLM (DashScope Qwen)
         id: configure
         env:
-          AGNES_API_KEY: ${{ secrets.AGNES_AI_API_KEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
         run: |
-          if [ -z "$AGNES_API_KEY" ]; then
-            echo "::warning::缺少 Secret AGNES_AI_API_KEY，本次 PR 触发跳过评审；请用 workflow_dispatch 运行完整门禁"
+          if [ -z "$DASHSCOPE_API_KEY" ]; then
+            echo "::warning::缺少 Secret DASHSCOPE_API_KEY，本次 PR 触发跳过评审；请用 workflow_dispatch 运行完整门禁"
             echo "skip=1" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Agnes AI OpenAI 兼容 API（Chat Completions）
-          ocr config set provider agnes-ai
-          ocr config set custom_providers.agnes-ai.url https://apihub.agnes-ai.cn/v1
-          ocr config set custom_providers.agnes-ai.protocol openai
-          # 模型 ID：agnes-2.5-pro
-          ocr config set custom_providers.agnes-ai.model "agnes-2.5-pro"
-          ocr config set custom_providers.agnes-ai.api_key "$AGNES_API_KEY"
+          # 阿里云百炼 DashScope（ocr 内置 provider，走 OpenAI 兼容端点）
+          ocr config set provider dashscope
+          # 模型 ID：qwen3.8-flash
+          ocr config set providers.dashscope.model "qwen3.8-flash"
+          ocr config set providers.dashscope.api_key "$DASHSCOPE_API_KEY"
 
       - name: Run review (gate)
         if: steps.configure.outputs.skip != '1'
