@@ -1,1 +1,447 @@
-Ly8hIOWQr+WKqOi+heWKqe+8iOS7jiBzcmMvbWFpbi5ycyDmi4blh7rvvIxQNyDph43mnoTvvInjgIIKLy8hCi8vISDmib/ovb3vvJpDT1JTIOWxguaehOmAoOOAgXRyYWNpbmcg5Yid5aeL5YyW44CBdHJhY2Ug5Lit6Ze05Lu244CB56qX5Y+j5Zu+5qCH5Yqg6L2977yMCi8vISDku6Xlj4rmnI3liqHnq6/lkK/liqjvvIhgc3Bhd25fc2VydmVyYO+8mkFwcFN0YXRlIOaehOmAoCAvIOerr+WPo+e7keWumiAvIGFnZW50IOazqOWGjCAvCi8vISDlt6Hmo4Dlvqrnjq8gLyDot6/nlLHoo4XphY0gLyBIVFRQIHNlcnZl77yJ44CCCi8vISDnuq/mkKznp7sgKyBgcHViKGNyYXRlKWAg5Y+v6KeB5oCn77yM6Zu26KGM5Li65Y+Y5pu044CCCgp1c2Ugc3RkOjpjb2xsZWN0aW9uczo6SGFzaE1hcDsKdXNlIHN0ZDo6cGF0aDo6UGF0aEJ1ZjsKdXNlIHN0ZDo6c3luYzo6YXRvbWljOjp7QXRvbWljQm9vbCwgQXRvbWljVTY0LCBPcmRlcmluZ307CnVzZSBzdGQ6OnN5bmM6OkFyYzsKdXNlIHN0ZDo6dGltZTo6RHVyYXRpb247Cgp1c2UgYXh1bTo6ZXh0cmFjdDo6UmVxdWVzdDsKdXNlIGF4dW06Om1pZGRsZXdhcmU6Ok5leHQ7CnVzZSBjaHJvbm86OntMb2NhbCwgVGltZWxpa2V9Owp1c2UgcmFuZDo6Um5nOwp1c2UgdG9raW86OnN5bmM6Ok11dGV4Owp1c2UgdG9raW86OnRpbWU6OmludGVydmFsOwp1c2UgdG93ZXJfaHR0cDo6Y29yczo6e0FsbG93T3JpZ2luLCBBbnksIENvcnNMYXllcn07CnVzZSB0cmFjaW5nOjpJbnN0cnVtZW50Owp1c2UgdHJhY2luZ19zdWJzY3JpYmVyOjpmbXQ6OndyaXRlcjo6TWFrZVdyaXRlckV4dDsKdXNlIHRyYWNpbmdfc3Vic2NyaWJlcjo6RW52RmlsdGVyOwoKdXNlIGFnZW50X2NvcmU6Om1ldHJpY3M6Ok1ldHJpY3NSZWdpc3RyeTsKdXNlIGFnZW50X2NvcmU6OnJlc291cmNlczo6U2hhcmVkUmVzb3VyY2VTbmFwc2hvdDsKCnVzZSBjcmF0ZTo6Y29uZmlnOjoqOwp1c2UgY3JhdGU6OmhhbmRsZXJzOjppZGVudGl0eTo6YnVpbGRfYWdlbnQ7CnVzZSBjcmF0ZTo6aGFuZGxlcnM6Om1lZXRpbmdzOjp7CiAgICBzcGF3bl9tZWV0aW5nX2NoYW5uZWxfc3dlZXBlciwgc3Bhd25fbWVldGluZ19wcmVzZW5jZV9zd2VlcGVyLAp9Owp1c2UgY3JhdGU6OnJvdXRlczo6YnVpbGRfcm91dGVyOwp1c2UgY3JhdGU6OnN0YXRlOjoqOwoKcHViKGNyYXRlKSBmbiBidWlsZF9jb3JzX2xheWVyKGhvc3Q6ICZzdHIsIHBvcnQ6IHUxNiwgY29uZmlndXJlZDogJltTdHJpbmddKSAtPiBDb3JzTGF5ZXIgewogICAgLy8g5pyq6YWN572uIGNvcnNfb3JpZ2lucyDml7bvvJrmnKzlnLDlo7PvvIhUYXVyaSAvIHZpdGXvvInku7vmhI8gT3JpZ2luIOWPr+aOoua1iy/ogYrlpKnvvJsKICAgIC8vIOeUn+S6p+iLpeaUtue0p++8jOWcqCBjb25maWcudG9tbCDmmL7lvI/loavlhpkgY29yc19vcmlnaW5zIOeZveWQjeWNleOAggogICAgaWYgY29uZmlndXJlZC5pc19lbXB0eSgpIHsKICAgICAgICBsZXQgXyA9IChob3N0LCBwb3J0KTsKICAgICAgICByZXR1cm4gQ29yc0xheWVyOjpuZXcoKQogICAgICAgICAgICAuYWxsb3dfb3JpZ2luKEFsbG93T3JpZ2luOjptaXJyb3JfcmVxdWVzdCgpKQogICAgICAgICAgICAuYWxsb3dfbWV0aG9kcyhBbnkpCiAgICAgICAgICAgIC5hbGxvd19oZWFkZXJzKEFueSk7CiAgICB9CiAgICBsZXQgaGVhZGVyX3ZhbHVlczogVmVjPGF4dW06Omh0dHA6OkhlYWRlclZhbHVlPiA9IGNvbmZpZ3VyZWQKICAgICAgICAuaXRlcigpCiAgICAgICAgLmNsb25lZCgpCiAgICAgICAgLmZpbHRlcl9tYXAofG98IGF4dW06Omh0dHA6OkhlYWRlclZhbHVlOjp0cnlfZnJvbShvKS5vaygpKQogICAgICAgIC5jb2xsZWN0KCk7CiAgICBDb3JzTGF5ZXI6Om5ldygpCiAgICAgICAgLmFsbG93X29yaWdpbihBbGxvd09yaWdpbjo6bGlzdChoZWFkZXJfdmFsdWVzKSkKICAgICAgICAuYWxsb3dfbWV0aG9kcyhBbnkpCiAgICAgICAgLmFsbG93X2hlYWRlcnMoQW55KQp9CgovLy8g6Kej5p6Q5pel5b+X5paH5Lu26Lev5b6E77ya5oyJ5pel5pyf5ZG95ZCN77yM6YG/5YWN5Y2V5paH5Lu25peg6ZmQ5aKe6ZW/44CCCi8vLwovLy8g5LyY5YWI57qn77yaYEFHRU5UX0NPUkVfTE9HX0ZJTEVg77yI5Y+v5Li65paH5Lu25oiW55uu5b2V77yJPiDlvZPliY3lt6XkvZznm67lvZUgPiBleGUg5ZCM55uu5b2V44CCCi8vLyDkuInlpITpg73kuI3lj6/lhpnml7bov5Tlm54gTm9uZe+8iOmAgOWbnue6ryBzdGRvdXTvvIzkuI3lm6Dml6Xlv5fpl67popjpmLvloZ7lkK/liqjvvInjgIIKZm4gcmVzb2x2ZV9sb2dfZmlsZV9wYXRoKCkgLT4gT3B0aW9uPFBhdGhCdWY+IHsKICAgIGxldCBuYW1lID0gZm9ybWF0ISgiYWdlbnRjb3JlX3t9LmxvZyIsIExvY2FsOjpub3coKS5mb3JtYXQoIiVZLSVtLSVkIikpOwogICAgbGV0IG11dCBjYW5kaWRhdGVzOiBWZWM8UGF0aEJ1Zj4gPSBWZWM6Om5ldygpOwogICAgaWYgbGV0IE9rKHApID0gc3RkOjplbnY6OnZhcigiQUdFTlRfQ09SRV9MT0dfRklMRSIpIHsKICAgICAgICBsZXQgcCA9IFBhdGhCdWY6OmZyb20ocCk7CiAgICAgICAgY2FuZGlkYXRlcy5wdXNoKGlmIHAuaXNfZGlyKCkgeyBwLmpvaW4oJm5hbWUpIH0gZWxzZSB7IHAgfSk7CiAgICB9CiAgICBpZiBsZXQgT2soY3dkKSA9IHN0ZDo6ZW52OjpjdXJyZW50X2RpcigpIHsKICAgICAgICBjYW5kaWRhdGVzLnB1c2goY3dkLmpvaW4oJm5hbWUpKTsKICAgIH0KICAgIGlmIGxldCBPayhleGUpID0gc3RkOjplbnY6OmN1cnJlbnRfZXhlKCkgewogICAgICAgIGlmIGxldCBTb21lKGRpcikgPSBleGUucGFyZW50KCkgewogICAgICAgICAgICBjYW5kaWRhdGVzLnB1c2goZGlyLmpvaW4oJm5hbWUpKTsKICAgICAgICB9CiAgICB9CiAgICBmb3IgYyBpbiBjYW5kaWRhdGVzIHsKICAgICAgICBsZXQgcGFyZW50X29rID0gbWF0Y2ggYy5wYXJlbnQoKSB7CiAgICAgICAgICAgIFNvbWUocCkgPT4gcC5leGlzdHMoKSB8fCBzdGQ6OmZzOjpjcmVhdGVfZGlyX2FsbChwKS5pc19vaygpLAogICAgICAgICAgICBOb25lID0+IGZhbHNlLAogICAgICAgIH07CiAgICAgICAgaWYgcGFyZW50X29rCiAgICAgICAgICAgICYmIHN0ZDo6ZnM6Ok9wZW5PcHRpb25zOjpuZXcoKQogICAgICAgICAgICAgICAgLmNyZWF0ZSh0cnVlKQogICAgICAgICAgICAgICAgLmFwcGVuZCh0cnVlKQogICAgICAgICAgICAgICAgLm9wZW4oJmMpCiAgICAgICAgICAgICAgICAuaXNfb2soKQogICAgICAgIHsKICAgICAgICAgICAgcmV0dXJuIFNvbWUoYyk7CiAgICAgICAgfQogICAgfQogICAgTm9uZQp9CgovLy8g5Yid5aeL5YyWIHRyYWNpbmfvvJrlkIzml7blhpnlhaXml6Xlv5fmlofku7bkuI4gc3Rkb3V044CCCi8vLwovLy8g5pel5b+X6JC955uY55Sx5Luj56CB5L+d6K+B77yMKirkuI3kvp3otZblkK/liqjml7bmmK/lkKblgZrkuoYgc2hlbGwg6YeN5a6a5ZCRKirigJTigJTmraTliY3ku4XlhpkKLy8vIHN0ZG91dO+8jOS4gOaXpumHjeWQr+W/mOS6hiBgPj4geHh4LmxvZyAyPiYxYO+8jOaXpeW/l+WwseaVtOauteS4ouWkse+8iDIwMjYtMDgtMjEg6LW3Ci8vLyDov57nu63kuKLlpLEgOCDlpKnov5DooYzml6Xlv5fljbPnlLHmraTpgKDmiJDvvInjgIIKcHViKGNyYXRlKSBmbiBpbml0X3RyYWNpbmcoKSB7CiAgICBsZXQgZmlsdGVyID0gRW52RmlsdGVyOjp0cnlfZnJvbV9lbnYoIkFHRU5UX0NPUkVfTE9HIikKICAgICAgICAub3JfZWxzZSh8X3wgRW52RmlsdGVyOjp0cnlfZnJvbV9lbnYoIlJVU1RfTE9HIikpCiAgICAgICAgLnVud3JhcF9vcl9lbHNlKHxffCBFbnZGaWx0ZXI6Om5ldygiaW5mbyIpKTsKCiAgICBsZXQgYnVpbGRlciA9IHRyYWNpbmdfc3Vic2NyaWJlcjo6Zm10KCkKICAgICAgICAud2l0aF9lbnZfZmlsdGVyKGZpbHRlcikKICAgICAgICAud2l0aF90YXJnZXQodHJ1ZSk7CgogICAgbGV0IGxvZ19wYXRoID0gcmVzb2x2ZV9sb2dfZmlsZV9wYXRoKCk7CiAgICBtYXRjaCBsb2dfcGF0aCB7CiAgICAgICAgU29tZShwYXRoKSA9PiBtYXRjaCBzdGQ6OmZzOjpPcGVuT3B0aW9uczo6bmV3KCkKICAgICAgICAgICAgLmNyZWF0ZSh0cnVlKQogICAgICAgICAgICAuYXBwZW5kKHRydWUpCiAgICAgICAgICAgIC5vcGVuKCZwYXRoKQogICAgICAgIHsKICAgICAgICAgICAgT2soZmlsZSkgPT4gewogICAgICAgICAgICAgICAgZXByaW50bG4hKCJbYWdlbnQtY29yZV0gbG9nIGZpbGU6IHt9IiwgcGF0aC5kaXNwbGF5KCkpOwogICAgICAgICAgICAgICAgbGV0IF8gPSBidWlsZGVyLndpdGhfd3JpdGVyKEFyYzo6bmV3KGZpbGUpLmFuZChzdGQ6OmlvOjpzdGRvdXQpKS50cnlfaW5pdCgpOwogICAgICAgICAgICB9CiAgICAgICAgICAgIEVycihlKSA9PiB7CiAgICAgICAgICAgICAgICBlcHJpbnRsbiEoCiAgICAgICAgICAgICAgICAgICAgIlthZ2VudC1jb3JlXSBvcGVuIGxvZyBmaWxlIGZhaWxlZCAoe30pOiB7ZX0sIHN0ZG91dCBvbmx5IiwKICAgICAgICAgICAgICAgICAgICBwYXRoLmRpc3BsYXkoKQogICAgICAgICAgICAgICAgKTsKICAgICAgICAgICAgICAgIGxldCBfID0gYnVpbGRlci50cnlfaW5pdCgpOwogICAgICAgICAgICB9CiAgICAgICAgfSwKICAgICAgICBOb25lID0+IHsKICAgICAgICAgICAgZXByaW50bG4hKCJbYWdlbnQtY29yZV0gbm8gd3JpdGFibGUgbG9nIHBhdGgsIHN0ZG91dCBvbmx5Iik7CiAgICAgICAgICAgIGxldCBfID0gYnVpbGRlci50cnlfaW5pdCgpOwogICAgICAgIH0KICAgIH0KfQoKcHViKGNyYXRlKSBhc3luYyBmbiB0cmFjZV9taWRkbGV3YXJlKHJlcXVlc3Q6IFJlcXVlc3QsIG5leHQ6IE5leHQpIC0+IGF4dW06OnJlc3BvbnNlOjpSZXNwb25zZSB7CiAgICBsZXQgdHJhY2VfaWQgPSBmb3JtYXQhKCJ7Onh9IiwgcmFuZDo6dGhyZWFkX3JuZygpLmdlbjo6PHUxMjg+KCkpOwogICAgbGV0IHBhdGggPSByZXF1ZXN0LnVyaSgpLnBhdGgoKS50b19zdHJpbmcoKTsKICAgIGxldCBtZXRob2QgPSByZXF1ZXN0Lm1ldGhvZCgpLnRvX3N0cmluZygpOwogICAgbGV0IHNwYW4gPQogICAgICAgIHRyYWNpbmc6OmluZm9fc3BhbiEoImh0dHAucmVxdWVzdCIsIHRyYWNlX2lkID0gJXRyYWNlX2lkLCBtZXRob2QgPSAlbWV0aG9kLCBwYXRoID0gJXBhdGgpOwogICAgbGV0IG11dCByZXMgPSBuZXh0LnJ1bihyZXF1ZXN0KS5pbnN0cnVtZW50KHNwYW4pLmF3YWl0OwogICAgaWYgbGV0IE9rKHYpID0gYXh1bTo6aHR0cDo6SGVhZGVyVmFsdWU6OnRyeV9mcm9tKHRyYWNlX2lkKSB7CiAgICAgICAgcmVzLmhlYWRlcnNfbXV0KCkuaW5zZXJ0KCJ4LXRyYWNlLWlkIiwgdik7CiAgICB9CiAgICByZXMKfQoKLy8vIOWQjuWPsOe6v+eoi+WQr+WKqCBheHVtIOacjeWKoe+8mkFwcFN0YXRlIOaehOmAoCDihpIg56uv5Y+j57uR5a6aIOKGkiBhZ2VudCDms6jlhowg4oaSCi8vLyDlt6Hmo4Dlvqrnjq8g4oaSIOi3r+eUseijhemFjSDihpIgSFRUUCBzZXJ2ZeOAgmBzZXJ2ZXJfcmVhZHlgIOWcqOerr+WPo+e7keWumuaIkOWKn+WQjue9ruS9jeOAggovLy8g5LuOIHNyYy9tYWluLnJzIOi/geWFpe+8jOmbtuihjOS4uuWPmOabtOOAggpwdWIoY3JhdGUpIGZuIHNwYXduX3NlcnZlcigKICAgIGNvbmZpZzogQ29uZmlnLAogICAgcGF0aDogU3RyaW5nLAogICAgc2VydmVyX3JlYWR5OiBBcmM8QXRvbWljQm9vbD4sCiAgICBtZXRyaWNzOiBBcmM8TWV0cmljc1JlZ2lzdHJ5PiwKKSB7CiAgICBsZXQgYWRkciA9IGZvcm1hdCEoInt9Ont9IiwgY29uZmlnLmhvc3QsIGNvbmZpZy5wb3J0KTsKICAgIHN0ZDo6dGhyZWFkOjpzcGF3bihtb3ZlIHx8IHsKICAgICAgICBsZXQgcnQgPSBtYXRjaCB0b2tpbzo6cnVudGltZTo6UnVudGltZTo6bmV3KCkgewogICAgICAgICAgICBPayhyKSA9PiByLAogICAgICAgICAgICBFcnIoZSkgPT4gewogICAgICAgICAgICAgICAgZXByaW50bG4hKCLinJcgVG9raW8g6L+Q6KGM5pe25Yib5bu65aSx6LSlOiB7fSIsIGUpOwogICAgICAgICAgICAgICAgc3RkOjpwcm9jZXNzOjpleGl0KDEpOwogICAgICAgICAgICB9CiAgICAgICAgfTsKICAgICAgICAvLyDnmb3pvpnpqawgUGhhc2UgQzog5ZCv5Yqo5omr5o+P5LiA5qyh5pys5py66LWE5rqQ5Y+q6K+75YWD5pWw5o2u77yIc3NoL2dpdO+8ie+8jOS+m+adoeS7tuW8j+mXqOaOp+azqOWFpQogICAgICAgIGxldCBsb2NhbF9yZXNvdXJjZXM6IFNoYXJlZFJlc291cmNlU25hcHNob3QgPQogICAgICAgICAgICBBcmM6Om5ldyhzdGQ6OnN5bmM6Ok11dGV4OjpuZXcoYWdlbnRfY29yZTo6cmVzb3VyY2VzOjpzY2FuX2xvY2FsX3Jlc291cmNlcygpKSk7CiAgICAgICAgcnQuYmxvY2tfb24oYXN5bmMgbW92ZSB7CiAgICAgICAgICAgIGxldCBzdGF0ZSA9IEFyYzo6bmV3KEFwcFN0YXRlIHsKICAgICAgICAgICAgICAgIGNvbmZpZzogTXV0ZXg6Om5ldyhjb25maWcuY2xvbmUoKSksCiAgICAgICAgICAgICAgICBhZ2VudDogTXV0ZXg6Om5ldyhOb25lKSwKICAgICAgICAgICAgICAgIGNvbmZpZ19wYXRoOiBwYXRoLAogICAgICAgICAgICAgICAgYXV0aF9jYWNoZTogdG9raW86OnN5bmM6Ok11dGV4OjpuZXcoSGFzaE1hcDo6bmV3KCkpLAogICAgICAgICAgICAgICAgbnNfY2FjaGU6IHRva2lvOjpzeW5jOjpNdXRleDo6bmV3KEhhc2hNYXA6Om5ldygpKSwKICAgICAgICAgICAgICAgIGNvbGxhYl9zZWVuOiB0b2tpbzo6c3luYzo6TXV0ZXg6Om5ldyhIYXNoTWFwOjpuZXcoKSksCiAgICAgICAgICAgICAgICBjb25zb2xpZGF0ZV9sYXN0X3ltZDogdG9raW86OnN5bmM6Ok11dGV4OjpuZXcoU3RyaW5nOjpuZXcoKSksCiAgICAgICAgICAgICAgICBjb25zb2xpZGF0ZV9sYXN0OiB0b2tpbzo6c3luYzo6TXV0ZXg6Om5ldyhzZXJkZV9qc29uOjpqc29uISh7InN0YXR1cyI6Im5ldmVyIn0pKSwKICAgICAgICAgICAgICAgIGNvbnNjaW91c25lc3M6IHRva2lvOjpzeW5jOjpNdXRleDo6bmV3KE5vbmUpLAogICAgICAgICAgICAgICAgbG9jYWxfcmVzb3VyY2VzOiBsb2NhbF9yZXNvdXJjZXMuY2xvbmUoKSwKICAgICAgICAgICAgICAgIGNvbnNvbGlkYXRlX2N1cnNvcjogdG9raW86OnN5bmM6Ok11dGV4OjpuZXcoMCksCiAgICAgICAgICAgICAgICBiYWNrZ3JvdW5kX2V2ZW50czogdG9raW86OnN5bmM6Ok11dGV4OjpuZXcoc3RkOjpjb2xsZWN0aW9uczo6VmVjRGVxdWU6Om5ldygpKSwKICAgICAgICAgICAgICAgIG5leHRfZXZlbnRfaWQ6IEF0b21pY1U2NDo6bmV3KDEpLAogICAgICAgICAgICAgICAgZXZvbHZlX3J1bm5pbmc6IEF0b21pY0Jvb2w6Om5ldyhmYWxzZSksCiAgICAgICAgICAgICAgICBtZXRyaWNzOiBtZXRyaWNzLmNsb25lKCksCiAgICAgICAgICAgICAgICBtZWV0aW5nX3R4OiB0b2tpbzo6c3luYzo6TXV0ZXg6Om5ldyhIYXNoTWFwOjpuZXcoKSksCiAgICAgICAgICAgICAgICBtZWV0aW5nX3ByZXNlbmNlOiB0b2tpbzo6c3luYzo6TXV0ZXg6Om5ldyhIYXNoTWFwOjpuZXcoKSksCiAgICAgICAgICAgIH0pOwoKICAgICAgICAgICAgLy8g5YWI57uR5a6a56uv5Y+j77yM56Gu5L+d5pyN5Yqh56uL5Y2z5Y+v55So77yI5Y2z5L2/IE1lbW9yaWEg5oWiL+acquWwsee7quS5n+S4jemYu+WhnuWQr+WKqO+8iQogICAgICAgICAgICBsZXQgbGlzdGVuZXIgPSBtYXRjaCB0b2tpbzo6bmV0OjpUY3BMaXN0ZW5lcjo6YmluZCgmYWRkcikuYXdhaXQgewogICAgICAgICAgICAgICAgT2sobCkgPT4gbCwKICAgICAgICAgICAgICAgIEVycihlKSA9PiB7CiAgICAgICAgICAgICAgICAgICAgZXByaW50bG4hKCLinJcg56uv5Y+jIHt9IOe7keWumuWksei0pToge30iLCAmYWRkciwgZSk7CiAgICAgICAgICAgICAgICAgICAgc3RkOjpwcm9jZXNzOjpleGl0KDEpOwogICAgICAgICAgICAgICAgfQogICAgICAgICAgICB9OwogICAgICAgICAgICBzZXJ2ZXJfcmVhZHkuc3RvcmUodHJ1ZSwgT3JkZXJpbmc6OlNlcUNzdCk7CgogICAgICAgICAgICBpZiBjb25maWcuY29uZmlndXJlZCgpIHsKICAgICAgICAgICAgICAgIC8vIOWQjuWPsOW8guatpeazqOWGjCBBZ2VudO+8mumBv+WFjSByZWdpc3Rlcl9hZ2VudCDpmLvloZ7nq6/lj6Pnu5HlrprkuI7or7fmsYLmnI3liqEKICAgICAgICAgICAgICAgIGxldCByZWdfc3RhdGUgPSBzdGF0ZS5jbG9uZSgpOwogICAgICAgICAgICAgICAgbGV0IG11dCByZWdfY29uZmlnID0gY29uZmlnLmNsb25lKCk7CiAgICAgICAgICAgICAgICAvLyDlj4zkv53pmanvvJrnoa7kv53liIbouqvkuJPlsZ4gbGxtIOeahCAke0VOVn0g5Lmf5bGV5byA77yI5LiO5YWo5bGA5rGg5LiA6Ie077yJ77yMCiAgICAgICAgICAgICAgICAvLyDpgb/lhY0gcmVnX2NvbmZpZyDlnKggbG9hZCDlsZXlvIDkuYvlkI7ooqvph43mlrDloavlhYXmnKrlsZXlvIDlia/mnKzml7bvvIxwZXJzb25hIHRpY2sg5oqK5a2X6Z2i6YePICR7Li4ufSDlj5HlvoDlubPlj7DjgIIKICAgICAgICAgICAgICAgIGV4cGFuZF9jb25maWdfbGxtX2VudigmbXV0IHJlZ19jb25maWcpOwogICAgICAgICAgICAgICAgdG9raW86OnNwYXduKGFzeW5jIG1vdmUgewogICAgICAgICAgICAgICAgICAgIG1hdGNoIGJ1aWxkX2FnZW50KCZyZXNvbHZlX2NvbmZpZ19mb3JfcnVudGltZSgmcmVnX2NvbmZpZyksIGxvY2FsX3Jlc291cmNlcy5jbG9uZSgpLCByZWdfc3RhdGUubWV0cmljcy5jbG9uZSgpKS5hd2FpdCB7CiAgICAgICAgICAgICAgICAgICAgICAgIE9rKGFnZW50KSA9PiB7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICBwcmludGxuISgKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAi4pyTIEFnZW50IOW3suWwsee7qu+8iHt9QHt977yJIiwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICByZWdfY29uZmlnLmFnZW50X2lkLCByZWdfY29uZmlnLnNlcnZlcgogICAgICAgICAgICAgICAgICAgICAgICAgICAgKTsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICpyZWdfc3RhdGUuYWdlbnQubG9jaygpLmF3YWl0ID0gU29tZShBcmM6Om5ldyhhZ2VudCkpOwogICAgICAgICAgICAgICAgICAgICAgICAgICAgLy8gUGhhc2UgNe+8muS7jiBhZ2VudC50b21sIFtbcGVyc29uYXNdXSDphY3nva7ooajliqDovb3lubbogZTliIbouqvvvIhkZWZhdWx0IOW3suWcqCBBZ2VudENvcmU6Om5ldyDms6jlhozvvIkKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBsZXQgZyA9IHJlZ19zdGF0ZS5hZ2VudC5sb2NrKCkuYXdhaXQ7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgaWYgbGV0IFNvbWUocmVmIGEpID0gKmcgewogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBmb3IgcGMgaW4gJnJlZ19jb25maWcucGVyc29uYXMgewogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgbGV0IG93bmVyID0gaWYgcGMub3duZXJfdXNlcl9pZC5pc19lbXB0eSgpIHsgJnJlZ19jb25maWcuYWdlbnRfaWQgfSBlbHNlIHsgJnBjLm93bmVyX3VzZXJfaWQgfTsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGxldCBfID0gYS5jcmVhdGVfcGVyc29uYSgKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAmcGMuaWQsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgJnBjLmRpc3BsYXlfbmFtZSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBvd25lciwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBwYy50b29sX2FsbG93bGlzdC5jbG9uZSgpLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHBjLm1lbW9yeV9uYW1lc3BhY2UuY2xvbmUoKSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBwYy5sbG0uY2xvbmUoKSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBmYWxzZSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICk7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBmb3IgZ29hbCBpbiAmcGMuZ29hbHMgewogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGxldCBfID0gYS5wdXNoX3BlcnNvbmFfZ29hbCgmcGMuaWQsIGdvYWwpOwogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC8vIOWQr+WKqOaBouWkje+8muWIhui6q+engeacieWxnuaApyArIOWchuahjOS8muiuruiusOW9le+8iOi3qOmHjeWQr+S4jeS4ou+8iQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBhLmxvYWRfcGVyc29uYXNfZnJvbV9kaXNrKCk7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGEubG9hZF9tZWV0aW5nc19mcm9tX2Rpc2soKTsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAvLyBBMjog5ZCv5Yqo55m96b6Z6amsIFRJQ0sg5b+D6Lez77yI56m66ZeyIDIwbWluIC8g5oqi5Y2gIC8gNjAwcyB3YXRjaGRvZ++8iQogICAgICAgICAgICAgICAgICAgICAgICAgICAgbGV0IGNvbnMgPSBDb25zY2lvdXNuZXNzOjpuZXcocmVnX3N0YXRlLmNsb25lKCkpOwogICAgICAgICAgICAgICAgICAgICAgICAgICAgdG9raW86OnNwYXduKGNvbnMuY2xvbmUoKS5ydW4oKSk7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAqcmVnX3N0YXRlLmNvbnNjaW91c25lc3MubG9jaygpLmF3YWl0ID0gU29tZShjb25zKTsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIC8vIOWQr+WKqOWbnuWhqyAvaGVhbHRoLmRyZWFt77ya6YG/5YWN6L+b56iL6YeN5ZCv5ZCO5YGH6LGhIHN0YXR1cz1uZXZlcgogICAgICAgICAgICAgICAgICAgICAgICAgICAgLy8gYWdlbnQg5bey5bCx57uq77yM5ZCM5q2l5Zue5aGr77yI5aSx6LSl5LiN6Zi75pat77yJ77ybVElDSyDnqI3lkI7ov5jkvJrlho3lhpkgdHJpZ2dlcj10aWNrCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBoeWRyYXRlX2RyZWFtX2hlYWx0aF9mcm9tX21lbW9yaWEoJnJlZ19zdGF0ZSkuYXdhaXQ7CiAgICAgICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgICAgICAgICAgRXJyKGUpID0+IHsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHByaW50bG4hKCIhIEFnZW50IOWIneWni+WMluWksei0pToge33vvIjlj6/lnKjorr7nva7pobXph43or5XvvIkiLCBlKTsKICAgICAgICAgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgIH0pOwogICAgICAgICAgICB9CgogICAgICAgICAgICAvLyDlt6Hmo4Dlvqrnjq/vvIjlkKvlpLHotKXorqHmlbDvvIkKICAgICAgICAgICAgbGV0IHBhdHJvbF9zdGF0ZSA9IHN0YXRlLmNsb25lKCk7CiAgICAgICAgICAgIHRva2lvOjpzcGF3bihhc3luYyBtb3ZlIHsKICAgICAgICAgICAgICAgIGxldCBtdXQgdGltZXIgPSBpbnRlcnZhbChEdXJhdGlvbjo6ZnJvbV9zZWNzKDE4MDApKTsKICAgICAgICAgICAgICAgIHRpbWVyLnRpY2soKS5hd2FpdDsKICAgICAgICAgICAgICAgIGxldCBtdXQgZmFpbF9jb3VudCA9IDB1MzI7CiAgICAgICAgICAgICAgICBsZXQgbXV0IGluc2lnaHRfY3ljbGUgPSAwdTMyOwogICAgICAgICAgICAgICAgbGV0IG11dCBsYXN0X252cl95bWQgPSBTdHJpbmc6Om5ldygpOwogICAgICAgICAgICAgICAgbG9vcCB7CiAgICAgICAgICAgICAgICAgICAgdGltZXIudGljaygpLmF3YWl0OwogICAgICAgICAgICAgICAgICAgIGluc2lnaHRfY3ljbGUgKz0gMTsKICAgICAgICAgICAgICAgICAgICBsZXQgYWdlbnRfZ3VhcmQgPSBwYXRyb2xfc3RhdGUuYWdlbnQubG9jaygpLmF3YWl0OwogICAgICAgICAgICAgICAgICAgIGlmIGxldCBTb21lKHJlZiBhZ2VudCkgPSAqYWdlbnRfZ3VhcmQgewogICAgICAgICAgICAgICAgICAgICAgICAvLyDlt6Hmo4Dpobvopobnm5YgZGFzaGJvYXJkIOmDqOmXqCBuc++8iHN5c3RlbV9vcHMg5oyC5ZyoIGRlcHQvZ3VmZWnvvIkKICAgICAgICAgICAgICAgICAgICAgICAgbGV0IG11dCBhZ2VudF9ucyA9IHZlYyFbYWdlbnQuY29uZmlnLmlkZW50aXR5Lm5zKCldOwogICAgICAgICAgICAgICAgICAgICAgICBhZ2VudF9jb3JlOjpkZXB0X29wczo6ZW5yaWNoX2FsbG93ZWRfbnMoJm11dCBhZ2VudF9ucyk7CiAgICAgICAgICAgICAgICAgICAgICAgIGxldCB0YXNrcyA9IFsoInN5c3RlbV9vcHMiLCBzZXJkZV9qc29uOjpqc29uISh7ImFjdGlvbiI6ICJzdGF0dXMifSkpXTsKICAgICAgICAgICAgICAgICAgICAgICAgZm9yICh0b29sLCBhcmdzKSBpbiAmdGFza3MgewogICAgICAgICAgICAgICAgICAgICAgICAgICAgbWF0Y2ggYWdlbnQuY2FsbF90b29sX3JvdXRlZCh0b29sLCAiZGVmYXVsdCIsIGFyZ3MsICZhZ2VudF9ucywgIiIpLmF3YWl0IHsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBPayhyZXBseSkgPT4gewogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBmYWlsX2NvdW50ID0gMDsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgdHJhY2luZzo6aW5mbyEoCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAi5beh5qOAIHt9OiB7fSIsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB0b29sLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgJnJlcGx5LmNoYXJzKCkudGFrZSg2MCkuY29sbGVjdDo6PFN0cmluZz4oKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICApOwogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBFcnIoZSkgPT4gewogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBmYWlsX2NvdW50ID0gZmFpbF9jb3VudC5zYXR1cmF0aW5nX2FkZCgxKTsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgaWYgZmFpbF9jb3VudCA+PSAzIHsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHRyYWNpbmc6OmVycm9yISgKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAi5beh5qOA6L+e57ut5aSx6LSlIHt9IOasoe+8jOW3peWFtyB7fSIsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZmFpbF9jb3VudCwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB0b29sCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICApOwogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB9IGVsc2UgewogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgdHJhY2luZzo6d2FybiEoCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIuW3oeajgCB7fSDlpLHotKU6IHt977yI56ysIHt9IOasoe+8iSIsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgdG9vbCwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBlLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGZhaWxfY291bnQKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICk7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgICAgICAgICAgLy8g5q+P5pelIDIzOjMwIOWQjuiHquWKqOS4i+i9veeQhuaWhy/ph5HmupAv6IuP5paw5b2T5aSpIE5WUiDlvZXlg4/vvIjmr4/lpKnkuIDmrKHvvIkKICAgICAgICAgICAgICAgICAgICAgICAgbGV0IG52cl9ub3cgPSBjaHJvbm86OkxvY2FsOjpub3coKTsKICAgICAgICAgICAgICAgICAgICAgICAgbGV0IG52cl95bWQgPSBudnJfbm93LmZvcm1hdCgiJVktJW0tJWQiKS50b19zdHJpbmcoKTsKICAgICAgICAgICAgICAgICAgICAgICAgbGV0IG52cl9ob3VyID0gbnZyX25vdy5ob3VyKCk7CiAgICAgICAgICAgICAgICAgICAgICAgIGxldCBudnJfbWludXRlID0gbnZyX25vdy5taW51dGUoKTsKICAgICAgICAgICAgICAgICAgICAgICAgaWYgKG52cl9ob3VyID09IDIzICYmIG52cl9taW51dGUgPj0gMzApICYmIGxhc3RfbnZyX3ltZCAhPSBudnJfeW1kIHsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGZvciBjb21wYW55IGluIFsi55CG5paHIiwgIumHkea6kCIsICLoi4/mlrAiXSB7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgbGV0IG52cl9hcmdzID0gc2VyZGVfanNvbjo6anNvbiEoewogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAiZGF0ZSI6IG52cl95bWQsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICJjb21wYW55IjogY29tcGFueSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIndvcmtlcnMiOiAxCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgfSk7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgbWF0Y2ggYWdlbnQuY2FsbF90b29sX3JvdXRlZCgiZG93bmxvYWRfbnZyX3ZpZGVvcyIsICJkZWZhdWx0IiwgJm52cl9hcmdzLCAmYWdlbnRfbnMsICIiKS5hd2FpdCB7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIE9rKHJlcGx5KSA9PiB7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB0cmFjaW5nOjppbmZvISgiTlZS5a6a5pe25LiL6L29IHt9OiB7fSIsIGNvbXBhbnksICZyZXBseS5jaGFycygpLnRha2UoMTIwKS5jb2xsZWN0Ojo8U3RyaW5nPigpKTsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBFcnIoZSkgPT4gewogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgdHJhY2luZzo6ZXJyb3IhKCJOVlLlrprml7bkuIvovb0ge30g5aSx6LSlOiB7fSIsIGNvbXBhbnksIGUpOwogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgICAgICAgICAgICAgbGFzdF9udnJfeW1kID0gbnZyX3ltZDsKICAgICAgICAgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgICAgICAgICAvLyDmr48gNCDova7vvIjnuqYgMiDlsI/ml7bvvInmiafooYzkuIDmrKHmtJ7op4Hlj5HnjrAKICAgICAgICAgICAgICAgICAgICAgICAgaWYgaW5zaWdodF9jeWNsZSAlIDQgPT0gMCB7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICBsZXQgaW5zaWdodCA9IGFnZW50LnJ1bl9pbnNpZ2h0cygmYWdlbnRfbnMpLmF3YWl0OwogICAgICAgICAgICAgICAgICAgICAgICAgICAgdHJhY2luZzo6aW5mbyEoInt9IiwgaW5zaWdodCk7CiAgICAgICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgICAgICAgICAgLy8g5pqX55+l6K+G5bGCIEEy77ya5L2O5bOw77yIMDI6MDAtMDQ6NTkg5pys5Zyw77yJ5q+P5pel5pyA5aSa5bep5Zu65LiA6L2uCiAgICAgICAgICAgICAgICAgICAgICAgIGxldCBub3dfbG9jYWwgPSBMb2NhbDo6bm93KCk7CiAgICAgICAgICAgICAgICAgICAgICAgIGxldCBob3VyID0gbm93X2xvY2FsLmhvdXIoKTsKICAgICAgICAgICAgICAgICAgICAgICAgbGV0IHltZCA9IG5vd19sb2NhbC5mb3JtYXQoIiVZLSVtLSVkIikudG9fc3RyaW5nKCk7CiAgICAgICAgICAgICAgICAgICAgICAgIGxldCBhbHJlYWR5ID0gewogICAgICAgICAgICAgICAgICAgICAgICAgICAgbGV0IGcgPSBwYXRyb2xfc3RhdGUuY29uc29saWRhdGVfbGFzdF95bWQubG9jaygpLmF3YWl0OwogICAgICAgICAgICAgICAgICAgICAgICAgICAgKmcgPT0geW1kCiAgICAgICAgICAgICAgICAgICAgICAgIH07CiAgICAgICAgICAgICAgICAgICAgICAgIGlmICgyLi49NCkuY29udGFpbnMoJmhvdXIpICYmICFhbHJlYWR5IHsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGxldCBkZWZhdWx0X25zID0gZm9ybWF0ISgiYWdlbnQve30iLCBhZ2VudC5jb25maWcuaWRlbnRpdHkuYWdlbnRfaWQpOwogICAgICAgICAgICAgICAgICAgICAgICAgICAgbGV0IG5zX2xpc3QgPSBzdGQ6OmVudjo6dmFyKCJDT05TT0xJREFURV9OQU1FU1BBQ0VTIikKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAudW53cmFwX29yKGRlZmF1bHRfbnMuY2xvbmUoKSk7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICBsZXQgbnNfdmVjOiBWZWM8U3RyaW5nPiA9IG5zX2xpc3QKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAuc3BsaXQoJywnKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC5tYXAofHN8IHMudHJpbSgpLnRvX3N0cmluZygpKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC5maWx0ZXIofHN8ICFzLmlzX2VtcHR5KCkpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgLmNvbGxlY3QoKTsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGxldCBtdXQgcmVzdWx0cyA9IFZlYzo6bmV3KCk7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICBmb3IgbnMgaW4gJm5zX3ZlYyB7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgbGV0IHJlcyA9IGFnZW50LmNvbnNvbGlkYXRlKG5zKS5hd2FpdDsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB0cmFjaW5nOjppbmZvISgiW2NvbnNvbGlkYXRlXSB7fSIsIHJlcyk7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgcmVzdWx0cy5wdXNoKHNlcmRlX2pzb246Ompzb24hKHsibnMiOiBucywgInJlc3VsdCI6IHJlc30pKTsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIC8vIFBSNSDoh6rpqbHvvJrkvY7ls7AgY29uc29saWRhdGUg57u05oqk5ZGo5pyf5ZCO6Kem5Y+R5LiA6L2u5YWD6L+b5YyWCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAvLyDvvIjlj5cgbWV0YV9ldm9sdXRpb24uZW5hYmxlZCArIGNvb2xkb3duX2hvdXJzIOWPjOmHjeS/neaKpO+8jOmdnuS9juWzsC/mnKrlvIDlkK/liJnkuI3liqjkvZzvvIkKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGxldCBtZV92YWwgPSBhZ2VudC5ydW5fbWV0YV9ldm9sdXRpb24oJmRlZmF1bHRfbnMpLmF3YWl0OwogICAgICAgICAgICAgICAgICAgICAgICAgICAgdHJhY2luZzo6aW5mbyEodGFyZ2V0OiAiY29uc2Npb3VzbmVzcyIsICJtZXRhX2V2b2x1dGlvbihuaWdodGx5KToge30iLCBtZV92YWwpOwogICAgICAgICAgICAgICAgICAgICAgICAgICAgcmVzdWx0cy5wdXNoKHNlcmRlX2pzb246Ompzb24hKHsibnMiOiBkZWZhdWx0X25zLCAibWV0YV9ldm9sdXRpb24iOiBtZV92YWx9KSk7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAvLyDorrDlv4blupPnu7TmiqTvvJroobDlh4/lvqrnjq8gKyBHRlMg6L2u6L2s5aSH5Lu977yI5q+P5pel5LiA5qyh77yM5LiOIGNvbnNvbGlkYXRlIOWQjOWRqOacn++8mwogICAgICAgICAgICAgICAgICAgICAgICAgICAgLy8gZGVjYXkg6ZyA6YCQIG5zIOaYvuW8j+S8oCBuYW1lc3BhY2XvvIzop4EgYWdlbnQucnM6Om1lbW9yaWFfbWFpbnRlbmFuY2XvvIkKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGxldCBtYWludCA9IGFnZW50Lm1lbW9yaWFfbWFpbnRlbmFuY2UoJm5zX3ZlYykuYXdhaXQ7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICBpZiBtYWludC5jb250YWlucygiZmFpbGVkIikgewogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHRyYWNpbmc6Ondhcm4hKHRhcmdldDogImNvbnNjaW91c25lc3MiLCAibmlnaHRseSBtYWludGVuYW5jZSByZXBvcnRlZCBmYWlsdXJlOiB7fSIsIG1haW50KTsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIHJlc3VsdHMucHVzaChzZXJkZV9qc29uOjpqc29uISh7Im5zIjogInN5c3RlbSIsICJtYWludGVuYW5jZSI6IG1haW50fSkpOwogICAgICAgICAgICAgICAgICAgICAgICAgICAgcmVjb3JkX2RyZWFtX2hlYWx0aCgmcGF0cm9sX3N0YXRlLCAibmlnaHRseSIsIHJlc3VsdHMsIHRydWUpLmF3YWl0OwogICAgICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICAgICAgICAgIC8vIOavj+i9ruajgOafpSBkYXNoYm9hcmQgYWdlbnRfd29ya2VyIOWBpeW6t++8iOerr+WPoyA4MDEx77yJCiAgICAgICAgICAgICAgICAgICAgICAgIGxldCBhZ2VudF9vayA9IHJlcXdlc3Q6OmdldCgiaHR0cDovLzEyNy4wLjAuMTo4MDExL2hlYWx0aCIpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAuYXdhaXQKICAgICAgICAgICAgICAgICAgICAgICAgICAgIC5tYXAofHJ8IHIuc3RhdHVzKCkuaXNfc3VjY2VzcygpKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgLnVud3JhcF9vcihmYWxzZSk7CiAgICAgICAgICAgICAgICAgICAgICAgIGlmICFhZ2VudF9vayB7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAvLyBQMC0zIOS/ruWkje+8mmRhc2hib2FyZCDlh63mja7np7vlh7rmupDnoIHvvIzmlLnor7vnjq/looPlj5jph4/jgIIKICAgICAgICAgICAgICAgICAgICAgICAgICAgIC8vIERBU0hCT0FSRF9VU0VSIOm7mOiupCBhZG1pbu+8m0RBU0hCT0FSRF9QQVNTV09SRCDmnKrorr7nva7liJnot7Pov4fph43lkK/vvIjkuI3ms4TpnLIv5LiN5bSp5rqD77yJ44CCCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBsZXQgZGFzaF91c2VyID0gc3RkOjplbnY6OnZhcigiREFTSEJPQVJEX1VTRVIiKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC51bndyYXBfb3JfZWxzZSh8X3wgImFkbWluIi50b19zdHJpbmcoKSk7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICBsZXQgZGFzaF9wYXNzID0gc3RkOjplbnY6OnZhcigiREFTSEJPQVJEX1BBU1NXT1JEIikudW53cmFwX29yX2RlZmF1bHQoKTsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGlmIGRhc2hfcGFzcy5pc19lbXB0eSgpIHsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB0cmFjaW5nOjp3YXJuISgKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIuacquiuvue9riBEQVNIQk9BUkRfUEFTU1dPUkTvvIzot7Pov4cgZGFzaGJvYXJkIGFnZW50IHdvcmtlciDph43lkK8iCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgKTsKICAgICAgICAgICAgICAgICAgICAgICAgICAgIH0gZWxzZSB7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgdHJhY2luZzo6d2FybiEoIkFnZW50IHdvcmtlciDml6Dlk43lupTvvIzpgJrov4cgZGFzaGJvYXJkIEFQSSDph43lkK8iKTsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBsZXQgY2xpZW50ID0gcmVxd2VzdDo6Q2xpZW50OjpuZXcoKTsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBpZiBsZXQgT2sobG9naW4pID0gY2xpZW50CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC5wb3N0KCJodHRwOi8vMTI3LjAuMC4xOjgwMDAvYXBpL2xvZ2luIikKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgLmZvcm0oJlsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICgidXNlcm5hbWUiLCBkYXNoX3VzZXIuYXNfc3RyKCkpLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgKCJwYXNzd29yZCIsIGRhc2hfcGFzcy5hc19zdHIoKSksCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIF0pCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC5zZW5kKCkKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgLmF3YWl0CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgewogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBsZXQgY29va2llID0gbG9naW4KICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC5oZWFkZXJzKCkKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC5nZXQoInNldC1jb29raWUiKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgLmFuZF90aGVuKHx2fCB2LnRvX3N0cigpLm9rKCkpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAudW53cmFwX29yKCIiKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgLnRvX3N0cmluZygpOwogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBpZiAhY29va2llLmlzX2VtcHR5KCkgewogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgbGV0IF8gPSBjbGllbnQKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAucG9zdCgiaHR0cDovLzEyNy4wLjAuMTo4MDAwL2FwaS9zbm1pcy9hZ2VudC9zdGFydCIpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgLmhlYWRlcigiQ29va2llIiwgJmNvb2tpZSkKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAuc2VuZCgpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgLmF3YWl0OwogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgICAgIGRyb3AoYWdlbnRfZ3VhcmQpOwogICAgICAgICAgICAgICAgfQogICAgICAgICAgICB9KTsKCiAgICAgICAgICAgIGxldCBjb3JzID0gYnVpbGRfY29yc19sYXllcigmY29uZmlnLmhvc3QsIGNvbmZpZy5wb3J0LCAmY29uZmlnLmNvcnNfb3JpZ2lucyk7CiAgICAgICAgICAgIGxldCBhcHAgPSBidWlsZF9yb3V0ZXIoc3RhdGUuY2xvbmUoKSwgY29ycyk7CgogICAgICAgICAgICAvLyDlkI7lj7DlkajmnJ/lm57mlLbml6DmjqXmlLbogIXnmoTkvJrorq4gYnJvYWRjYXN0IOmAmumBk++8iOWFnOW6lea4heeQhuW5tuWPkemAgOWHuuernuaAgeWvvOiHtOeahCBTZW5kZXIg5rOE5ryP77yJCiAgICAgICAgICAgIHNwYXduX21lZXRpbmdfY2hhbm5lbF9zd2VlcGVyKHN0YXRlLmNsb25lKCkpOwogICAgICAgICAgICBzcGF3bl9tZWV0aW5nX3ByZXNlbmNlX3N3ZWVwZXIoc3RhdGUuY2xvbmUoKSk7CgogICAgICAgICAgICBpZiBsZXQgRXJyKGUpID0gYXh1bTo6c2VydmUobGlzdGVuZXIsIGFwcCkuYXdhaXQgewogICAgICAgICAgICAgICAgdHJhY2luZzo6ZXJyb3IhKCJIVFRQIOacjeWKoeW8guW4uOe7iOatojoge30iLCBlKTsKICAgICAgICAgICAgfQogICAgICAgIH0pOwogICAgfSk7Cn0KCi8vLyDliqDovb3nqpflj6Plm77moIfvvIjku44gbG9nby5wbmcg6Kej56CB77yM5L+d55WZIDI6MSDmr5TkvovvvJvku4UgR1VJIOaooeW8j+S9v+eUqO+8iQpwdWIoY3JhdGUpIGZuIF9sb2FkX2ljb24oKSAtPiBPcHRpb248dGFvOjp3aW5kb3c6Okljb24+IHsKICAgIGxldCBjd2QgPSBzdGQ6OmVudjo6Y3VycmVudF9kaXIoKS51bndyYXBfb3JfZGVmYXVsdCgpOwogICAgZm9yIHBhdGggaW4gJlsKICAgICAgICBjd2Quam9pbigibG9nby5wbmciKSwKICAgICAgICBjd2Quam9pbigic3RhdGljIikuam9pbigibG9nby5wbmciKSwKICAgICAgICBjd2Quam9pbigiYXNzZXRzIikuam9pbigibG9nby5wbmciKSwKICAgIF0gewogICAgICAgIGlmIGxldCBPayhkYXRhKSA9IHN0ZDo6ZnM6OnJlYWQocGF0aCkgewogICAgICAgICAgICBpZiBsZXQgT2soaW1nKSA9IGltYWdlOjpsb2FkX2Zyb21fbWVtb3J5KCZkYXRhKSB7CiAgICAgICAgICAgICAgICAvLyDljp/lm74gMjExNHgxMDUxICgyOjEp77yM57yp5pS+5YiwIDQ4eDI0IOS/neeVmeavlOS+iwogICAgICAgICAgICAgICAgbGV0IHJlc2l6ZWQgPSBpbWcucmVzaXplKDQ4LCAyNCwgaW1hZ2U6OmltYWdlb3BzOjpGaWx0ZXJUeXBlOjpMYW5jem9zMyk7CiAgICAgICAgICAgICAgICBsZXQgcmdiYSA9IHJlc2l6ZWQudG9fcmdiYTgoKTsKICAgICAgICAgICAgICAgIGxldCAodywgaCkgPSByZ2JhLmRpbWVuc2lvbnMoKTsKICAgICAgICAgICAgICAgIGlmIGxldCBPayhpY29uKSA9IHRhbzo6d2luZG93OjpJY29uOjpmcm9tX3JnYmEocmdiYS5pbnRvX3JhdygpLCB3LCBoKSB7CiAgICAgICAgICAgICAgICAgICAgcmV0dXJuIFNvbWUoaWNvbik7CiAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgIH0KICAgICAgICB9CiAgICB9CiAgICBOb25lCn0K
+//! 启动辅助（从 src/main.rs 拆出，P7 重构）。
+//!
+//! 承载：CORS 层构造、tracing 初始化、trace 中间件、窗口图标加载，
+//! 以及服务端启动（`spawn_server`：AppState 构造 / 端口绑定 / agent 注册 /
+//! 巡检循环 / 路由装配 / HTTP serve）。
+//! 纯搬移 + `pub(crate)` 可见性，零行为变更。
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::Request;
+use axum::middleware::Next;
+use chrono::{Local, Timelike};
+use rand::Rng;
+use tokio::sync::Mutex;
+use tokio::time::interval;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tracing::Instrument;
+use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::EnvFilter;
+
+use agent_core::metrics::MetricsRegistry;
+use agent_core::resources::SharedResourceSnapshot;
+
+use crate::config::*;
+use crate::handlers::identity::build_agent;
+use crate::handlers::meetings::{
+    spawn_meeting_channel_sweeper, spawn_meeting_presence_sweeper,
+};
+use crate::routes::build_router;
+use crate::state::*;
+
+pub(crate) fn build_cors_layer(host: &str, port: u16, configured: &[String]) -> CorsLayer {
+    // 未配置 cors_origins 时：本地壳（Tauri / vite）任意 Origin 可探测/聊天；
+    // 生产若收紧，在 config.toml 显式填写 cors_origins 白名单。
+    if configured.is_empty() {
+        let _ = (host, port);
+        return CorsLayer::new()
+            .allow_origin(AllowOrigin::mirror_request())
+            .allow_methods(Any)
+            .allow_headers(Any);
+    }
+    let header_values: Vec<axum::http::HeaderValue> = configured
+        .iter()
+        .cloned()
+        .filter_map(|o| axum::http::HeaderValue::try_from(o).ok())
+        .collect();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(header_values))
+        .allow_methods(Any)
+        .allow_headers(Any)
+}
+
+/// 解析日志文件路径：按日期命名，避免单文件无限增长。
+///
+/// 优先级：`AGENT_CORE_LOG_FILE`（可为文件或目录）> 当前工作目录 > exe 同目录。
+/// 三处都不可写时返回 None（退回纯 stdout，不因日志问题阻塞启动）。
+fn resolve_log_file_path() -> Option<PathBuf> {
+    let name = format!("agentcore_{}.log", Local::now().format("%Y-%m-%d"));
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("AGENT_CORE_LOG_FILE") {
+        let p = PathBuf::from(p);
+        candidates.push(if p.is_dir() { p.join(&name) } else { p });
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(&name));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(&name));
+        }
+    }
+    for c in candidates {
+        let parent_ok = match c.parent() {
+            Some(p) => p.exists() || std::fs::create_dir_all(p).is_ok(),
+            None => false,
+        };
+        if parent_ok
+            && std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&c)
+                .is_ok()
+        {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// 初始化 tracing：同时写入日志文件与 stdout。
+///
+/// 日志落盘由代码保证，**不依赖启动时是否做了 shell 重定向**——此前仅写
+/// stdout，一旦重启忘了 `>> xxx.log 2>&1`，日志就整段丢失（2026-08-21 起
+/// 连续丢失 8 天运行日志即由此造成）。
+pub(crate) fn init_tracing() {
+    let filter = EnvFilter::try_from_env("AGENT_CORE_LOG")
+        .or_else(|_| EnvFilter::try_from_env("RUST_LOG"))
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true);
+
+    let log_path = resolve_log_file_path();
+    match log_path {
+        Some(path) => match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                eprintln!("[agent-core] log file: {}", path.display());
+                let _ = builder.with_writer(Arc::new(file).and(std::io::stdout)).try_init();
+            }
+            Err(e) => {
+                eprintln!(
+                    "[agent-core] open log file failed ({}): {e}, stdout only",
+                    path.display()
+                );
+                let _ = builder.try_init();
+            }
+        },
+        None => {
+            eprintln!("[agent-core] no writable log path, stdout only");
+            let _ = builder.try_init();
+        }
+    }
+}
+
+pub(crate) async fn trace_middleware(request: Request, next: Next) -> axum::response::Response {
+    let trace_id = format!("{:x}", rand::thread_rng().gen::<u128>());
+    let path = request.uri().path().to_string();
+    let method = request.method().to_string();
+    let span =
+        tracing::info_span!("http.request", trace_id = %trace_id, method = %method, path = %path);
+    let mut res = next.run(request).instrument(span).await;
+    if let Ok(v) = axum::http::HeaderValue::try_from(trace_id) {
+        res.headers_mut().insert("x-trace-id", v);
+    }
+    res
+}
+
+/// 后台线程启动 axum 服务：AppState 构造 → 端口绑定 → agent 注册 →
+/// 巡检循环 → 路由装配 → HTTP serve。`server_ready` 在端口绑定成功后置位。
+/// 从 src/main.rs 迁入，零行为变更。
+pub(crate) fn spawn_server(
+    config: Config,
+    path: String,
+    server_ready: Arc<AtomicBool>,
+    metrics: Arc<MetricsRegistry>,
+) {
+    let addr = format!("{}:{}", config.host, config.port);
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("✗ Tokio 运行时创建失败: {}", e);
+                std::process::exit(1);
+            }
+        };
+        // 白龙马 Phase C: 启动扫描一次本机资源只读元数据（ssh/git），供条件式门控注入
+        let local_resources: SharedResourceSnapshot =
+            Arc::new(std::sync::Mutex::new(agent_core::resources::scan_local_resources()));
+        rt.block_on(async move {
+            let state = Arc::new(AppState {
+                config: Mutex::new(config.clone()),
+                agent: Mutex::new(None),
+                config_path: path,
+                auth_cache: tokio::sync::Mutex::new(HashMap::new()),
+                ns_cache: tokio::sync::Mutex::new(HashMap::new()),
+                collab_seen: tokio::sync::Mutex::new(HashMap::new()),
+                consolidate_last_ymd: tokio::sync::Mutex::new(String::new()),
+                consolidate_last: tokio::sync::Mutex::new(serde_json::json!({"status":"never"})),
+                consciousness: tokio::sync::Mutex::new(None),
+                local_resources: local_resources.clone(),
+                consolidate_cursor: tokio::sync::Mutex::new(0),
+                background_events: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+                next_event_id: AtomicU64::new(1),
+                evolve_running: AtomicBool::new(false),
+                metrics: metrics.clone(),
+                meeting_tx: tokio::sync::Mutex::new(HashMap::new()),
+                meeting_presence: tokio::sync::Mutex::new(HashMap::new()),
+            });
+
+            // 先绑定端口，确保服务立即可用（即使 Memoria 慢/未就绪也不阻塞启动）
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("✗ 端口 {} 绑定失败: {}", &addr, e);
+                    std::process::exit(1);
+                }
+            };
+            server_ready.store(true, Ordering::SeqCst);
+
+            if config.configured() {
+                // 后台异步注册 Agent：避免 register_agent 阻塞端口绑定与请求服务
+                let reg_state = state.clone();
+                let mut reg_config = config.clone();
+                // 双保险：确保分身专属 llm 的 ${ENV} 也展开（与全局池一致），
+                // 避免 reg_config 在 load 展开之后被重新填充未展开副本时，persona tick 把字面量 ${...} 发往平台。
+                expand_config_llm_env(&mut reg_config);
+                tokio::spawn(async move {
+                    match build_agent(&resolve_config_for_runtime(&reg_config), local_resources.clone(), reg_state.metrics.clone()).await {
+                        Ok(agent) => {
+                            println!(
+                                "✓ Agent 已就绪（{}@{}）",
+                                reg_config.agent_id, reg_config.server
+                            );
+                            *reg_state.agent.lock().await = Some(Arc::new(agent));
+                            // Phase 5：从 agent.toml [[personas]] 配置表加载并联分身（default 已在 AgentCore::new 注册）
+                            {
+                                let g = reg_state.agent.lock().await;
+                                if let Some(ref a) = *g {
+                                    for pc in &reg_config.personas {
+                                        let owner = if pc.owner_user_id.is_empty() { &reg_config.agent_id } else { &pc.owner_user_id };
+                                        let _ = a.create_persona(
+                                            &pc.id,
+                                            &pc.display_name,
+                                            owner,
+                                            pc.tool_allowlist.clone(),
+                                            pc.memory_namespace.clone(),
+                                            pc.llm.clone(),
+                                            false,
+                                        );
+                                        for goal in &pc.goals {
+                                            let _ = a.push_persona_goal(&pc.id, goal);
+                                        }
+                                    }
+                                    // 启动恢复：分身私有属性 + 圆桌会议记录（跨重启不丢）
+                                    a.load_personas_from_disk();
+                                    a.load_meetings_from_disk();
+                                }
+                            }
+                            // A2: 启动白龙马 TICK 心跳（空闲 20min / 抢占 / 600s watchdog）
+                            let cons = Consciousness::new(reg_state.clone());
+                            tokio::spawn(cons.clone().run());
+                            *reg_state.consciousness.lock().await = Some(cons);
+                            // 启动回填 /health.dream：避免进程重启后假象 status=never
+                            // agent 已就绪，同步回填（失败不阻断）；TICK 稍后还会再写 trigger=tick
+                            hydrate_dream_health_from_memoria(&reg_state).await;
+                        }
+                        Err(e) => {
+                            println!("! Agent 初始化失败: {}（可在设置页重试）", e);
+                        }
+                    }
+                });
+            }
+
+            // 巡检循环（含失败计数）
+            let patrol_state = state.clone();
+            tokio::spawn(async move {
+                let mut timer = interval(Duration::from_secs(1800));
+                timer.tick().await;
+                let mut fail_count = 0u32;
+                let mut insight_cycle = 0u32;
+                let mut last_nvr_ymd = String::new();
+                loop {
+                    timer.tick().await;
+                    insight_cycle += 1;
+                    let agent_guard = patrol_state.agent.lock().await;
+                    if let Some(ref agent) = *agent_guard {
+                        // 巡检须覆盖 dashboard 部门 ns（system_ops 挂在 dept/gufei）
+                        let mut agent_ns = vec![agent.config.identity.ns()];
+                        agent_core::dept_ops::enrich_allowed_ns(&mut agent_ns);
+                        let tasks = [("system_ops", serde_json::json!({"action": "status"}))];
+                        for (tool, args) in &tasks {
+                            match agent.call_tool_routed(tool, "default", args, &agent_ns, "").await {
+                                Ok(reply) => {
+                                    fail_count = 0;
+                                    tracing::info!(
+                                        "巡检 {}: {}",
+                                        tool,
+                                        &reply.chars().take(60).collect::<String>()
+                                    );
+                                }
+                                Err(e) => {
+                                    fail_count = fail_count.saturating_add(1);
+                                    if fail_count >= 3 {
+                                        tracing::error!(
+                                            "巡检连续失败 {} 次，工具 {}",
+                                            fail_count,
+                                            tool
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            "巡检 {} 失败: {}（第 {} 次）",
+                                            tool,
+                                            e,
+                                            fail_count
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        // 每日 23:30 后自动下载理文/金源/苏新当天 NVR 录像（每天一次）
+                        let nvr_now = chrono::Local::now();
+                        let nvr_ymd = nvr_now.format("%Y-%m-%d").to_string();
+                        let nvr_hour = nvr_now.hour();
+                        let nvr_minute = nvr_now.minute();
+                        if (nvr_hour == 23 && nvr_minute >= 30) && last_nvr_ymd != nvr_ymd {
+                            for company in ["理文", "金源", "苏新"] {
+                                let nvr_args = serde_json::json!({
+                                    "date": nvr_ymd,
+                                    "company": company,
+                                    "workers": 1
+                                });
+                                match agent.call_tool_routed("download_nvr_videos", "default", &nvr_args, &agent_ns, "").await {
+                                    Ok(reply) => {
+                                        tracing::info!("NVR定时下载 {}: {}", company, &reply.chars().take(120).collect::<String>());
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("NVR定时下载 {} 失败: {}", company, e);
+                                    }
+                                }
+                            }
+                            last_nvr_ymd = nvr_ymd;
+                        }
+                        // 每 4 轮（约 2 小时）执行一次洞见发现
+                        if insight_cycle % 4 == 0 {
+                            let insight = agent.run_insights(&agent_ns).await;
+                            tracing::info!("{}", insight);
+                        }
+                        // 暗知识层 A2：低峰（02:00-04:59 本地）每日最多巩固一轮
+                        let now_local = Local::now();
+                        let hour = now_local.hour();
+                        let ymd = now_local.format("%Y-%m-%d").to_string();
+                        let already = {
+                            let g = patrol_state.consolidate_last_ymd.lock().await;
+                            *g == ymd
+                        };
+                        if (2..=4).contains(&hour) && !already {
+                            let default_ns = format!("agent/{}", agent.config.identity.agent_id);
+                            let ns_list = std::env::var("CONSOLIDATE_NAMESPACES")
+                                .unwrap_or(default_ns.clone());
+                            let ns_vec: Vec<String> = ns_list
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            let mut results = Vec::new();
+                            for ns in &ns_vec {
+                                let res = agent.consolidate(ns).await;
+                                tracing::info!("[consolidate] {}", res);
+                                results.push(serde_json::json!({"ns": ns, "result": res}));
+                            }
+                            // PR5 自驱：低峰 consolidate 维护周期后触发一轮元进化
+                            // （受 meta_evolution.enabled + cooldown_hours 双重保护，非低峰/未开启则不动作）
+                            let me_val = agent.run_meta_evolution(&default_ns).await;
+                            tracing::info!(target: "consciousness", "meta_evolution(nightly): {}", me_val);
+                            results.push(serde_json::json!({"ns": default_ns, "meta_evolution": me_val}));
+                            // 记忆库维护：衰减循环 + GFS 轮转备份（每日一次，与 consolidate 同周期；
+                            // decay 需逐 ns 显式传 namespace，见 agent.rs::memoria_maintenance）
+                            let maint = agent.memoria_maintenance(&ns_vec).await;
+                            if maint.contains("failed") {
+                                tracing::warn!(target: "consciousness", "nightly maintenance reported failure: {}", maint);
+                            }
+                            results.push(serde_json::json!({"ns": "system", "maintenance": maint}));
+                            record_dream_health(&patrol_state, "nightly", results, true).await;
+                        }
+                        // 每轮检查 dashboard agent_worker 健康（端口 8011）
+                        let agent_ok = reqwest::get("http://127.0.0.1:8011/health")
+                            .await
+                            .map(|r| r.status().is_success())
+                            .unwrap_or(false);
+                        if !agent_ok {
+                            // P0-3 修复：dashboard 凭据移出源码，改读环境变量。
+                            // DASHBOARD_USER 默认 admin；DASHBOARD_PASSWORD 未设置则跳过重启（不泄露/不崩溃）。
+                            let dash_user = std::env::var("DASHBOARD_USER")
+                                .unwrap_or_else(|_| "admin".to_string());
+                            let dash_pass = std::env::var("DASHBOARD_PASSWORD").unwrap_or_default();
+                            if dash_pass.is_empty() {
+                                tracing::warn!(
+                                    "未设置 DASHBOARD_PASSWORD，跳过 dashboard agent worker 重启"
+                                );
+                            } else {
+                                tracing::warn!("Agent worker 无响应，通过 dashboard API 重启");
+                                let client = reqwest::Client::new();
+                                if let Ok(login) = client
+                                    .post("http://127.0.0.1:8000/api/login")
+                                    .form(&[
+                                        ("username", dash_user.as_str()),
+                                        ("password", dash_pass.as_str()),
+                                    ])
+                                    .send()
+                                    .await
+                                {
+                                    let cookie = login
+                                        .headers()
+                                        .get("set-cookie")
+                                        .and_then(|v| v.to_str().ok())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    if !cookie.is_empty() {
+                                        let _ = client
+                                            .post("http://127.0.0.1:8000/api/snmis/agent/start")
+                                            .header("Cookie", &cookie)
+                                            .send()
+                                            .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    drop(agent_guard);
+                }
+            });
+
+            let cors = build_cors_layer(&config.host, config.port, &config.cors_origins);
+            let app = build_router(state.clone(), cors);
+
+            // 后台周期回收无接收者的会议 broadcast 通道（兜底清理并发退出竞态导致的 Sender 泄漏）
+            spawn_meeting_channel_sweeper(state.clone());
+            spawn_meeting_presence_sweeper(state.clone());
+
+            if let Err(e) = axum::serve(listener, app).await {
+                tracing::error!("HTTP 服务异常终止: {}", e);
+            }
+        });
+    });
+}
+
+/// 加载窗口图标（从 logo.png 解码，保留 2:1 比例；仅 GUI 模式使用）
+pub(crate) fn _load_icon() -> Option<tao::window::Icon> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    for path in &[
+        cwd.join("logo.png"),
+        cwd.join("static").join("logo.png"),
+        cwd.join("assets").join("logo.png"),
+    ] {
+        if let Ok(data) = std::fs::read(path) {
+            if let Ok(img) = image::load_from_memory(&data) {
+                // 原图 2114x1051 (2:1)，缩放到 48x24 保留比例
+                let resized = img.resize(48, 24, image::imageops::FilterType::Lanczos3);
+                let rgba = resized.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                if let Ok(icon) = tao::window::Icon::from_rgba(rgba.into_raw(), w, h) {
+                    return Some(icon);
+                }
+            }
+        }
+    }
+    None
+}
