@@ -27,6 +27,7 @@
 """
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -276,6 +277,70 @@ def _redact_badge_token(body, include_token: bool) -> None:
 
 
 
+def _mask_file():
+    return env("AGENTCORE_MASK_FILE") or os.path.join(os.getcwd(), "pfaix_mask_map.json")
+
+
+_PLATE_RE = re.compile(r"[京津沪渝冀豫云辽黑吉苏浙皖闽赣鲁湘鄂粤桂川贵藏陕甘青宁新][A-HJ-NP-Z][A-HJ-NP-Z0-9]{4,6}")
+_ORG_RE = re.compile(r"[\u4e00-\u9fff（）()]{2,24}(?:有限公司|股份公司|集团|合伙企业)")
+_PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_IDCARD_RE = re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)")
+
+
+def mask_text(text):
+    """出口脱敏：车牌/公司名/手机号/身份证号 → [车牌N]/[公司N]/[手机N]/[证件N]。
+    映射持久化到 AGENTCORE_MASK_FILE（office_proxy 反掩码展示给用户用）。"""
+    if not isinstance(text, str) or not text:
+        return text
+    path = _mask_file()
+    try:
+        mapping = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}
+    except Exception:
+        mapping = {}
+    dirty = [False]
+
+    def put(token, val):
+        if val not in mapping:
+            mapping[val] = token
+            dirty[0] = True
+        return mapping[val]
+
+    counters = {"CAR": len([v for v in mapping.values() if v.startswith("[车牌")]),
+                "ORG": len([v for v in mapping.values() if v.startswith("[公司")]),
+                "PH": len([v for v in mapping.values() if v.startswith("[手机")]),
+                "ID": len([v for v in mapping.values() if v.startswith("[证件")])}
+
+    def mk(kind):
+        counters[kind] += 1
+        return "[%s%d]" % ({"CAR": "车牌", "ORG": "公司", "PH": "手机", "ID": "证件"}[kind], counters[kind])
+
+    text = _PLATE_RE.sub(lambda m: put(mk("CAR"), m.group(0)), text)
+    text = _ORG_RE.sub(lambda m: put(mk("ORG"), m.group(0)), text)
+    text = _PHONE_RE.sub(lambda m: put(mk("PH"), m.group(0)), text)
+    text = _IDCARD_RE.sub(lambda m: put(mk("ID"), m.group(0)), text)
+
+    if dirty[0]:
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(mapping, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception as e:
+            log("mask map save failed:", e)
+    return text
+
+
+def _mask_result_json(data):
+    """对工具返回的 JSON 做脱敏：整树递归，字符串叶子全部掩码。"""
+    if isinstance(data, dict):
+        return {k: _mask_result_json(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_mask_result_json(v) for v in data]
+    if isinstance(data, str):
+        return mask_text(data)
+    return data
+
+
 def tool_tool_execute(args: dict) -> dict:
     # 模型偶发双层嵌套 {"arguments": {"tool": ..., "arguments": ...}}——防御性展开
     if isinstance(args.get("arguments"), dict) and "tool" in args["arguments"] and not args.get("tool"):
@@ -283,8 +348,9 @@ def tool_tool_execute(args: dict) -> dict:
     if not args.get("tool"):
         return {"content": [{"type": "text", "text": "参数错误：必须提供 tool（工具名）与 arguments（参数对象），不要把整个请求再包进 arguments 键。"}], "isError": True}
     """R1 网关（ADR-016 §2）：无头工具执行。三态：
-    200 executed（result 直接返回）/ 202 pending_approval（approval_id + operation_hash，
-    人在 dashboard 审批台批准后可轮询终态）/ 4xx 错误文本原样透出。"""
+    200 executed（结果直接返回）/ 202 pending_approval（approval_id + operation_hash，
+    人在 dashboard 审批台批准后可轮询终态）/ 4xx 错误文本原样透出。
+    2026-09-02 出口脱敏：结果中的车牌/公司名/手机号/身份证号掩码后再出给模型（敏感数据不出公网）。"""
     body = {
         "tool": args.get("tool", ""),
         "arguments": args.get("arguments") or {},
@@ -294,6 +360,7 @@ def tool_tool_execute(args: dict) -> dict:
             body[k] = args[k]
     resp = http_json("POST", "/api/tool/execute", payload=body)
     status, data = resp["status"], resp["json"]
+    data = _mask_result_json(data)
     # 统一成文本：executed 带 result；202 pending 带 approval 指引（错误路径 http_json 抛 ToolError）
     if status == 202 and isinstance(data, dict):
         merged = dict(data)
