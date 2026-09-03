@@ -457,7 +457,7 @@ async fn execute_auto_approved(
         "auto_{}_{}_{}",
         chrono::Utc::now().timestamp_millis(),
         tool,
-        &uuid::Uuid::new_v4().to_string()[..8] // 防同毫秒并发碰撞（ocr 安全审查）
+        &format!("{:08x}", rand::Rng::gen::<u32>(&mut rand::thread_rng())) // 防同毫秒并发碰撞（ocr 安全审查）
     );
     let before_state = capture_before_state(&agent, &tool, &arguments, &allowed_ns).await;
     let before_json = before_state.as_ref().map(|b| b.to_string());

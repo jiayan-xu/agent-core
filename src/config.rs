@@ -388,6 +388,11 @@ pub(crate) fn expand_config_llm_env(cfg: &mut Config) {
             expand_llm_config(llm);
         }
     }
+    if let Some(ga) = cfg.gateway_approval.as_mut() {
+        if let Some(j) = ga.judge.as_mut() {
+            expand_provider(j);
+        }
+    }
     if let Some(ce) = cfg.code_evolution.as_mut() {
         if let Some(k) = ce.evolve_key.as_mut() {
             *k = expand_env(k);
