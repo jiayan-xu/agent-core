@@ -355,38 +355,58 @@ _MASK_SKIP_KEYS = {
     "tool_call_id", "session_id", "thread_id", "check_run_id",
     }
 
-def unmask_text(text):
-    """入站反掩码：[车牌N]/[公司N]/[手机N]/[证件N] → 原文。
-    模型看到的工具结果是掩码后的 token；模型用这些 token 构造写操作参数时，
-    必须在转发给网关前还原为原文，否则字面 token 会被写入业务库。"""
-    if not isinstance(text, str) or not text:
-        return text
+# 映射缓存（每次 tool_tool_execute 调用时刷新一次，递归内共享——ocr 性能审查）
+_MASK_CACHE = {"mapping": None, "sorted_pairs": None}
+
+
+def _load_unmask_map():
+    """加载掩码反向映射并按 token 长度降序排列。失败时返回空映射并告警。"""
     path = _mask_file()
     try:
         with open(path, encoding="utf-8") as f:
             mapping = json.load(f)
-        if not isinstance(mapping, dict):
-            return text
-    except (OSError, ValueError):
+        if not isinstance(mapping, dict) or not all(isinstance(v, str) for v in mapping.values()):
+            sys.stderr.write("[mask] WARN: unmask map invalid: %s\n" % path)
+            return {}, []
+        # 长值优先替换（防 [车牌1] 是 [车牌12] 的前缀）
+        pairs = sorted(mapping.items(), key=lambda kv: -len(kv[1]))
+        return mapping, pairs
+    except FileNotFoundError:
+        return {}, []  # 尚无映射（首次调用），不是错误
+    except (OSError, ValueError) as e:
+        sys.stderr.write("[mask] WARN: unmask map load failed (%s): %s\n" % (e, path))
+        return {}, []
+
+
+def _refresh_mask_cache():
+    m, pairs = _load_unmask_map()
+    _MASK_CACHE["mapping"] = m
+    _MASK_CACHE["sorted_pairs"] = pairs
+
+
+def unmask_text(text, pairs=None):
+    """入站反掩码：[车牌N] → 原文。pairs 传入时用缓存（递归内共享）。"""
+    if not isinstance(text, str) or not text:
         return text
-    # 长值优先替换（防 [车牌1] 是 [车牌12] 的前缀）
-    for real, token in sorted(mapping.items(), key=lambda kv: -len(kv[1])):
-        text = text.replace(token, real)
+    if pairs is None:
+        _, pairs = _load_unmask_map()
+    for real, token in pairs:
+        if token in text:
+            text = text.replace(token, real)
     return text
 
 
-def _unmask_arguments(args):
-    """递归反掩码工具参数（dict 值 + list 元素 + str）。"""
+def _unmask_arguments(args, pairs=None):
+    """递归反掩码工具参数（dict key+value / list / str）。pairs 共享缓存。"""
     if isinstance(args, dict):
-        # key 也反掩码（_mask_result_json 掩了 key，这里对称还原——ocr 审查）
         return {
-            (unmask_text(k) if isinstance(k, str) else k): _unmask_arguments(v)
+            (unmask_text(k, pairs) if isinstance(k, str) else k): _unmask_arguments(v, pairs)
             for k, v in args.items()
         }
     if isinstance(args, list):
-        return [_unmask_arguments(v) for v in args]
+        return [_unmask_arguments(v, pairs) for v in args]
     if isinstance(args, str):
-        return unmask_text(args)
+        return unmask_text(args, pairs)
     return args
 
 
@@ -419,7 +439,7 @@ def tool_tool_execute(args: dict) -> dict:
     body = {
         "tool": args.get("tool", ""),
         # 入站反掩码：模型可能用掩码 token 构造参数，还原为原文再发网关
-        "arguments": _unmask_arguments(args.get("arguments") or {}),
+        "arguments": (_refresh_mask_cache() or _unmask_arguments(args.get("arguments") or {}, _MASK_CACHE["sorted_pairs"])),
     }
     for k in ("persona_id", "session_id", "trace_id", "idempotency_key"):
         if args.get(k):
@@ -1138,7 +1158,7 @@ def handle_tools_call(req_id, params):
         })
     except ToolError as e:
         return rpc_result(req_id, {
-            "content": [{"type": "text", "text": "ERROR: %s" % e}],
+            "content": [{"type": "text", "text": "ERROR: %s" % mask_text(str(e))}],
             "isError": True,
         })
     except Exception as e:  # noqa: BLE001
