@@ -12,6 +12,8 @@ pub enum ApprovalRecordStatus {
     Approved,
     Denied,
     Consumed,
+    /// 分级审批：LLM judge 自动批准（已执行，不可再决策；区别于人工 Approved）
+    AutoApproved,
 }
 
 impl ApprovalRecordStatus {
@@ -21,6 +23,7 @@ impl ApprovalRecordStatus {
             Self::Approved => "Approved",
             Self::Denied => "Denied",
             Self::Consumed => "Consumed",
+            Self::AutoApproved => "AutoApproved",
         }
     }
 
@@ -29,6 +32,7 @@ impl ApprovalRecordStatus {
             "Approved" => Self::Approved,
             "Denied" => Self::Denied,
             "Consumed" => Self::Consumed,
+            "AutoApproved" => Self::AutoApproved,
             _ => Self::Pending,
         }
     }
@@ -193,7 +197,7 @@ impl ApprovalStore {
             "SELECT approval_id, session_id, agent_id, tool_name, arguments_json,
                     description, operation_hash, approver_id, requester_id, status,
                     created_at, decided_at, consumed_at, decision_reason, response_json
-             FROM approvals WHERE status != 'Consumed'",
+             FROM approvals WHERE status NOT IN ('Consumed', 'AutoApproved')",
         ) else {
             return out;
         };

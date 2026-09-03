@@ -310,14 +310,23 @@ def mask_text(text):
                 "PH": len([v for v in mapping.values() if v.startswith("[手机")]),
                 "ID": len([v for v in mapping.values() if v.startswith("[证件")])}
 
-    def mk(kind):
-        counters[kind] += 1
-        return "[%s%d]" % ({"CAR": "车牌", "ORG": "公司", "PH": "手机", "ID": "证件"}[kind], counters[kind])
 
-    text = _PLATE_RE.sub(lambda m: put(mk("CAR"), m.group(0)), text)
-    text = _ORG_RE.sub(lambda m: put(mk("ORG"), m.group(0)), text)
-    text = _PHONE_RE.sub(lambda m: put(mk("PH"), m.group(0)), text)
-    text = _IDCARD_RE.sub(lambda m: put(mk("ID"), m.group(0)), text)
+    # ocr 修复：先查 mapping 再分配（原 mk() 在 lambda 里无条件先求值，重复值浪费
+    # 计数器导致 token 编号复用 → 掩码歧义）
+    def _sub(kind):
+        def f(m):
+            val = m.group(0)
+            if val not in mapping:
+                counters[kind] += 1
+                mapping[val] = "[%s%d]" % (_CN_KIND[kind], counters[kind])
+                dirty[0] = True
+            return mapping[val]
+        return f
+
+    text = _PLATE_RE.sub(_sub("CAR"), text)
+    text = _ORG_RE.sub(_sub("ORG"), text)
+    text = _PHONE_RE.sub(_sub("PH"), text)
+    text = _IDCARD_RE.sub(_sub("ID"), text)
 
     if dirty[0]:
         try:
@@ -330,10 +339,17 @@ def mask_text(text):
     return text
 
 
+# 控制字段：值是 hex/id，被手机号正则误命中会破坏审批回显指纹（ocr 审查 high）
+_MASK_SKIP_KEYS = {
+    "operation_hash", "approval_id", "execution_id", "trace_id", "idempotency_key",
+    "tool_call_id", "session_id", "thread_id", "check_run_id",
+    "undo", "poll", "path",  # URL/path 含数字段不掩码
+}
+
 def _mask_result_json(data):
-    """对工具返回的 JSON 做脱敏：整树递归，字符串叶子全部掩码。"""
+    """对工具返回的 JSON 做脱敏：整树递归，字符串叶子掩码（控制字段除外）。"""
     if isinstance(data, dict):
-        return {k: _mask_result_json(v) for k, v in data.items()}
+        return {k: (v if k in _MASK_SKIP_KEYS else _mask_result_json(v)) for k, v in data.items()}
     if isinstance(data, list):
         return [_mask_result_json(v) for v in data]
     if isinstance(data, str):

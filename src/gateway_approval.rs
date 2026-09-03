@@ -284,8 +284,27 @@ pub fn build_undo_for(tool: &str, executed_args: &serde_json::Value, before: Opt
     let action = executed_args.get("action").and_then(|a| a.as_str())?.to_lowercase();
     let plate = executed_args.get("plate").and_then(|p| p.as_str())?.to_string();
     match action.as_str() {
-        // add 的逆 = remove（软删可逆，remove 的逆在 before 行里有）
-        "add" => Some(serde_json::json!({"action": "remove", "plate": plate, "confirmed": true})),
+        // add 的逆按 before 分支：改前已存在（覆盖写）→ 恢复原 company/waste_type；
+        // 改前不存在（纯新增）→ remove 软删。ocr 审查 high：无条件 remove 会误删
+        // 覆盖写场景的既有行、或误删 add 失败后未变更的行。
+        "add" => {
+            let existed = before
+                .and_then(|b| b.get("found"))
+                .and_then(|f| f.as_bool())
+                .unwrap_or(false);
+            if existed {
+                let b = before?;
+                Some(serde_json::json!({
+                    "action": "update_company",
+                    "plate": plate,
+                    "company_name": b.get("company").and_then(|c| c.as_str()).unwrap_or(""),
+                    "waste_type": b.get("waste_type").and_then(|w| w.as_str()).unwrap_or(""),
+                    "confirmed": true,
+                }))
+            } else {
+                Some(serde_json::json!({"action": "remove", "plate": plate, "confirmed": true}))
+            }
+        }
         // remove/update 的逆 = 用改前行恢复（add 回原值或 update 回原值）
         "remove" | "update_company" | "update_waste_type" => {
             let b = before?;
@@ -349,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_add_is_remove() {
+    fn undo_add_new_plate_is_remove() {
         let u = build_undo_for(
             "manage_whitelist",
             &serde_json::json!({"action":"add","plate":"鲁A11111"}),
@@ -358,6 +377,20 @@ mod tests {
         .unwrap();
         assert_eq!(u["action"], "remove");
         assert_eq!(u["confirmed"], true);
+    }
+
+    #[test]
+    fn undo_add_overwrite_restores_before() {
+        let before = serde_json::json!({"found": true, "company": "原公司", "waste_type": "原种类"});
+        let u = build_undo_for(
+            "manage_whitelist",
+            &serde_json::json!({"action":"add","plate":"鲁A22222","company_name":"新公司"}),
+            Some(&before),
+        )
+        .unwrap();
+        assert_eq!(u["action"], "update_company");
+        assert_eq!(u["company_name"], "原公司");
+        assert_eq!(u["waste_type"], "原种类");
     }
 
     #[test]

@@ -209,6 +209,7 @@ fn agent_with_officecli() -> AgentCore {
         intake_filter: agent_core::intake_filter::IntakeFilterConfig::default(),
         orchestration: agent_core::orchestration::OrchestrationConfig::default(),
         tool_overrides: vec![],
+        gateway_approval: Default::default(),
     };
     let harness = HarnessStore::open_memory().unwrap();
     let cp = CheckpointStore::open_memory().unwrap();
