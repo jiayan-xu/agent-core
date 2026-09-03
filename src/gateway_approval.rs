@@ -288,12 +288,10 @@ pub fn build_undo_for(tool: &str, executed_args: &serde_json::Value, before: Opt
         // 改前不存在（纯新增）→ remove 软删。ocr 审查 high：无条件 remove 会误删
         // 覆盖写场景的既有行、或误删 add 失败后未变更的行。
         "add" => {
-            let existed = before
-                .and_then(|b| b.get("found"))
-                .and_then(|f| f.as_bool())
-                .unwrap_or(false);
+            // before 缺失（capture 失败）时不可安全判断是否覆盖写 → 拒绝撤销（ocr 审查）
+            let b = before?;
+            let existed = b.get("found").and_then(|f| f.as_bool()).unwrap_or(false);
             if existed {
-                let b = before?;
                 Some(serde_json::json!({
                     "action": "update_company",
                     "plate": plate,
@@ -372,11 +370,21 @@ mod tests {
         let u = build_undo_for(
             "manage_whitelist",
             &serde_json::json!({"action":"add","plate":"鲁A11111"}),
-            None,
+            Some(&serde_json::json!({"found": false})),
         )
         .unwrap();
         assert_eq!(u["action"], "remove");
         assert_eq!(u["confirmed"], true);
+    }
+
+    #[test]
+    fn undo_add_missing_before_returns_none() {
+        assert!(build_undo_for(
+            "manage_whitelist",
+            &serde_json::json!({"action":"add","plate":"鲁A11111"}),
+            None,
+        )
+        .is_none());
     }
 
     #[test]

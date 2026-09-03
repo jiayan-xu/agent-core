@@ -281,6 +281,7 @@ def _mask_file():
     return env("AGENTCORE_MASK_FILE") or os.path.join(os.getcwd(), "pfaix_mask_map.json")
 
 
+_CN_KIND = {"CAR": "车牌", "ORG": "公司", "PH": "手机", "ID": "证件"}
 _PLATE_RE = re.compile(r"[京津沪渝冀豫云辽黑吉苏浙皖闽赣鲁湘鄂粤桂川贵藏陕甘青宁新][A-HJ-NP-Z][A-HJ-NP-Z0-9]{4,6}")
 _ORG_RE = re.compile(r"[\u4e00-\u9fff（）()]{2,24}(?:有限公司|股份公司|集团|合伙企业)")
 _PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
