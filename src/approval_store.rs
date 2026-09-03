@@ -104,8 +104,14 @@ impl ApprovalStore {
             .map_err(|e| format!("init approvals schema: {}", e))?;
         // 2026-09-03 分级审批：自动批准记录携带 judge 理由 / 改前状态 / 撤销链。
         // ALTER ADD COLUMN 幂等：已存在则忽略错误。
+        // ocr R7：区分「已存在列」（预期，忽略）和真实迁移失败（传播）
         for col in ["risk_reason TEXT", "before_state_json TEXT", "judge_meta TEXT", "undone_by TEXT"] {
-            let _ = self.conn.execute(&format!("ALTER TABLE approvals ADD COLUMN {}", col), []);
+            if let Err(e) = self.conn.execute(&format!("ALTER TABLE approvals ADD COLUMN {}", col), []) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(format!("approvals migration failed ({}): {}", col, msg));
+                }
+            }
         }
         Ok(())
     }
@@ -351,7 +357,7 @@ impl ApprovalStore {
                 |r| r.get::<_, i64>(0),
             )
             .map(|c| c as u32)
-            .unwrap_or(0)
+            .unwrap_or(u32::MAX) // fail-closed：查不到→配额视为已满，不自动批准（ocr R7）
     }
 
     pub fn list_history(&self, limit: usize) -> Vec<ApprovalRecord> {

@@ -159,7 +159,7 @@ impl AutoPolicy {
                 let act = action.to_lowercase();
                 !act.is_empty() && allowed.contains(&act.as_str())
             }
-            None => true,
+            None => false, // fail-closed：不在动作白名单表的一律不进（ocr R6+R7）
         }
     }
 }
@@ -222,6 +222,19 @@ async fn judge_risk_impl(
     let t0 = std::time::Instant::now();
     let args_str = serde_json::to_string(args).unwrap_or_default();
     let args_len = args_str.chars().count();
+    // 防伪围栏（ocr R6/R7）：参数值可含 </untrusted_data>/```/{"auto" 伪造判定输出
+    let has_injection = args_str.contains("</untrusted_data>")
+        || args_str.contains("untrusted_data")
+        || args_str.contains("{\"auto\"")
+        || args_str.contains("```");
+    if has_injection {
+        return RiskVerdict {
+            auto: false,
+            reason: "参数含判定标记/围栏标记，疑似注入，转人工".to_string(),
+            model: client.model_desc().to_string(),
+            elapsed_ms: t0.elapsed().as_millis() as u64,
+        };
+    }
     let is_batch = args_len > 1200 || args_str.matches(',').count() > 20;
     let summary: String = if args_len > 1200 {
         let cut: String = args_str.chars().take(1200).collect();
