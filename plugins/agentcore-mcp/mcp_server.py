@@ -378,7 +378,11 @@ def unmask_text(text):
 def _unmask_arguments(args):
     """递归反掩码工具参数（dict 值 + list 元素 + str）。"""
     if isinstance(args, dict):
-        return {k: _unmask_arguments(v) for k, v in args.items()}
+        # key 也反掩码（_mask_result_json 掩了 key，这里对称还原——ocr 审查）
+        return {
+            (unmask_text(k) if isinstance(k, str) else k): _unmask_arguments(v)
+            for k, v in args.items()
+        }
     if isinstance(args, list):
         return [_unmask_arguments(v) for v in args]
     if isinstance(args, str):
