@@ -1371,6 +1371,11 @@ fn llm_semaphore() -> &'static Semaphore {
 }
 
 impl LlmClient {
+    /// 审计用的模型标识（分级审批 judge 记录谁判的）
+    pub fn model_desc(&self) -> &str {
+        &self.config.model
+    }
+
     pub fn new(config: LlmConfig) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(60))

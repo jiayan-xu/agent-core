@@ -13,7 +13,7 @@ use tower_http::cors::CorsLayer;
 use crate::auth::auth_middleware;
 use crate::bootstrap::trace_middleware;
 use crate::handlers::admin::*;
-use crate::handlers::gateway::{handle_tool_execute, handle_tool_execute_get};
+use crate::handlers::gateway::{handle_auto_write_undo, handle_auto_writes_list, handle_tool_execute, handle_tool_execute_get};
 use crate::handlers::approval::*;
 use crate::handlers::chat::*;
 use crate::handlers::collab::*;
@@ -80,6 +80,8 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/memory/feedback", post(handle_memory_feedback))
         .route("/api/tool/execute", post(handle_tool_execute))
         .route("/api/tool/execute/{id}", get(handle_tool_execute_get))
+        .route("/api/tool/auto-writes", get(handle_auto_writes_list))
+        .route("/api/tool/auto-writes/{id}/undo", post(handle_auto_write_undo))
         .route("/v1/chat/completions", post(handle_v1_chat))
         .route("/api/persona", post(handle_persona_create).get(handle_persona_list))
         .route("/api/persona/{id}", delete(handle_persona_delete).get(handle_persona_get))

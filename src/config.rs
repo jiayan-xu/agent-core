@@ -89,6 +89,9 @@ pub(crate) struct Config {
     /// 使 operator 的 pin 跨重启生效。
     #[serde(default)]
     pub(crate) boundary: Option<BoundaryConfig>,
+    /// 分级审批（落 [gateway_approval]，缺省 human_all=现状全人工）
+    #[serde(default)]
+    pub(crate) gateway_approval: Option<agent_core::gateway_approval::GatewayApprovalConfig>,
 }
 
 /// 工具分类手动收紧配置（[boundary]）。
@@ -507,6 +510,7 @@ pub(crate) fn load_or_create_config() -> Config {
         intake_filter: None,
         orchestration: None,
         boundary: None,
+        gateway_approval: None,
     };
     init_domain_and_org(&cfg);
     let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());

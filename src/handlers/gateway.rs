@@ -1,6 +1,8 @@
 //! R1 网关 HTTP handler（`/api/tool/execute`，受保护路由）。
 //! 管线：鉴权(中间件) → 分级 → GATEWAY_ALLOW_WRITE 门 → 边界 → 危险判定(审批/拒绝)
-//! → call_tool_routed 执行 → 三态响应。不经过任何 LLM（ADR-016 决策 1）。
+//! → call_tool_routed 执行 → 三态响应。
+//! ADR-016（2026-09-03 修订）：执行路径仍无 LLM；仅审批分级允许一次可配置的
+//! 廉价 judge 调用（[gateway_approval] mode=llm_auto），fail-safe 落人工，全程审计。
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -70,14 +72,22 @@ pub(crate) async fn handle_tool_execute(
     let execution_id = new_execution_id();
 
     // ── 工具分级（与 chat 循环同源：classifier.classify）──
+    // C1a 地板兜底（2026-09-03 补）：manage_whitelist 同在 write/dangerous 两静态集，
+    // classify 顺序返回 write，GATEWAY_ALLOW_WRITE=0 下被写门 403，dangerous floor
+    // （HARD_DANGEROUS 精确集，check_tool 内黄线之源）在网关层漏判——按 C1a 注释
+    // "危险工具无论分类器如何都进黄线"的意图，在分级处显式升级。
     let tool_level = {
         let boundary = agent.boundary.lock().await;
-        let level = boundary
-            .classifier
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .classify(&body.tool)
-            .to_string();
+        let level = if boundary.is_dangerous_floor(&body.tool) {
+            "dangerous".to_string()
+        } else {
+            boundary
+                .classifier
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .classify(&body.tool)
+                .to_string()
+        };
         level
     };
 
@@ -166,6 +176,30 @@ pub(crate) async fn handle_tool_execute(
     // 审批人确认」）以 allow=false + reason 携带审批意图返回，此前被 403 短路，
     // 网关的审批全链路永远走不到。凡 reason 含「审批」即转 202 创建审批请求。
     let needs_approval = !check.allow && check.reason.contains("审批");
+    // 分级审批：judge 拒绝/quota 满时把理由带进审批单（见下方 llm_auto 分支）
+    let mut check_reason_auto = String::new();
+    // llm_auto 模式下的只读动作旁路：manage_whitelist query / dry_run 预览属读操作，
+    // 整工具在 dangerous 集导致查询也被拦进审批（judge 白烧 + 配额白扣 + before_state
+    // 抓取失败）。仅 llm_auto 生效——human_all 模式行为保持零变化。
+    let llm_auto_readonly_bypass = agent.config.gateway_approval.llm_auto_enabled()
+        && {
+            let policy = agent_core::gateway_approval::AutoPolicy::from_config(
+                &agent.config.gateway_approval,
+            );
+            policy.in_auto_zone(&body.tool)
+        }
+        && (body
+            .arguments
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || body.tool.eq_ignore_ascii_case("manage_whitelist")
+                && body
+                    .arguments
+                    .get("action")
+                    .and_then(|a| a.as_str())
+                    .map(|a| a.eq_ignore_ascii_case("query"))
+                    .unwrap_or(false));
     if !check.allow && !needs_approval {
         return err_json(
             StatusCode::FORBIDDEN,
@@ -176,7 +210,70 @@ pub(crate) async fn handle_tool_execute(
 
     // ── 危险判定（dangerous 分级或红线）：进入人工审批，绝不直接执行 ──
     let is_dangerous = tool_level == "dangerous";
-    if is_dangerous || check.level == Some(BlockLevel::Red) || needs_approval {
+    if (is_dangerous || check.level == Some(BlockLevel::Red) || needs_approval)
+        && !llm_auto_readonly_bypass
+    {
+        // ── 分级审批（2026-09-03）：T1 自动区 LLM judge；Red/硬人工名单永远人工 ──
+        // judge 失败/超时/超 quota → fail-safe 落人工（理由附审批单）。
+        if check.level != Some(BlockLevel::Red)
+            && agent.config.gateway_approval.llm_auto_enabled()
+        {
+            let policy = agent_core::gateway_approval::AutoPolicy::from_config(
+                &agent.config.gateway_approval,
+            );
+            let quota_used = agent
+                .approval_manager
+                .sqlite_store()
+                .and_then(|s| s.lock().ok())
+                .map(|s| s.count_auto_today(&auth.agent_id))
+                .unwrap_or(u32::MAX);
+            let quota_ok = quota_used < agent.config.gateway_approval.daily_quota;
+            if policy.in_auto_zone(&body.tool) {
+                if quota_ok {
+                    // judge 选型：[gateway_approval].judge > 主 [llm] 第一个
+                    // fallback（快模型）> 主 provider。分类任务要快，思考型主模型易超时。
+                    let judge_override = agent
+                        .config
+                        .gateway_approval
+                        .judge
+                        .clone()
+                        .or_else(|| agent.config.llm.fallbacks.first().cloned());
+                    let verdict = agent_core::gateway_approval::judge_risk_with(
+                        &agent.llm,
+                        judge_override.as_ref(),
+                        &body.tool,
+                        &body.arguments,
+                        agent.config.gateway_approval.judge_timeout_ms,
+                    )
+                    .await;
+                    if verdict.auto {
+                        return execute_auto_approved(
+                            agent.clone(),
+                            auth.agent_id.clone(),
+                            body.tool.clone(),
+                            body.arguments.clone(),
+                            ns.clone(),
+                            auth.allowed_ns.clone(),
+                            session_id.clone(),
+                            execution_id.clone(),
+                            trace_id.clone(),
+                            verdict,
+                        )
+                        .await;
+                    }
+                    check_reason_auto = format!(
+                        "{} | LLM判定转人工: {}",
+                        check.reason, verdict.reason
+                    );
+                } else {
+                    check_reason_auto = format!(
+                        "{} | 每日自动批准配额已满({}/{}),转人工",
+                        check.reason, quota_used, agent.config.gateway_approval.daily_quota
+                    );
+                }
+            }
+        }
+
         if !agent.config.human_approval {
             return err_json(
                 StatusCode::FORBIDDEN,
@@ -189,7 +286,11 @@ pub(crate) async fn handle_tool_execute(
             .create_request_for_session(
                 &body.tool,
                 &body.arguments,
-                &format!("[gateway:{}] {}", auth.agent_id, check.reason),
+                &if check_reason_auto.is_empty() {
+                    format!("[gateway:{}] {}", auth.agent_id, check.reason)
+                } else {
+                    format!("[gateway:{}] {}", auth.agent_id, check_reason_auto)
+                },
                 "dashboard-admin", // D6：批准只在 dashboard 审批台，网关不自批
                 &auth.agent_id,
                 &session_id,
@@ -301,5 +402,267 @@ pub(crate) async fn handle_tool_execute_get(
     match get_execution(&execution_id) {
         Some(e) => (StatusCode::OK, Json(execution_to_json(&e))).into_response(),
         None => err_json(StatusCode::NOT_FOUND, "not-found", "执行不存在或已过期"),
+    }
+}
+
+// ── 分级审批辅助（2026-09-03）────────────────────────────────────────────
+
+/// T1 工具改前状态抓取（撤销依据）。首批 manage_whitelist 行级；其余 None。
+async fn capture_before_state(
+    agent: &Arc<agent_core::agent::AgentCore>,
+    tool: &str,
+    args: &serde_json::Value,
+    allowed_ns: &[String],
+) -> Option<serde_json::Value> {
+    if tool != "manage_whitelist" {
+        return None;
+    }
+    let plate = args.get("plate")?.as_str()?.to_string();
+    // confirmed=true 过受控写红线（boundary 对 manage_whitelist 全动作黄线，query 也拦）
+    let q = serde_json::json!({"action": "query", "plate": plate, "confirmed": true});
+    // allowed_ns 不能为空：源级门控拒空授权域（网关 R2 同坑）
+    let res = agent
+        .call_tool_routed(tool, "default", &q, allowed_ns, "")
+        .await
+        .ok()?;
+    let text = res;
+    // manage_whitelist query 返回 JSON 文本（dashboard skill 包装）
+    let v: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let in_list = v.get("in_whitelist").and_then(|x| x.as_bool()).unwrap_or(false);
+    Some(serde_json::json!({
+        "found": in_list,
+        "company": v.get("company").and_then(|x| x.as_str()).unwrap_or(""),
+        "waste_type": v.get("waste_type").and_then(|x| x.as_str()).unwrap_or(""),
+        "raw": v,
+    }))
+}
+
+/// 自动批准执行路径：权威表记录（AutoApproved + before_state + judge 元数据）
+/// → 注入 confirmed=true 执行 → 审计 → 200（带 undo 路径）。
+#[allow(clippy::too_many_arguments)]
+async fn execute_auto_approved(
+    agent: Arc<agent_core::agent::AgentCore>,
+    caller: String,
+    tool: String,
+    arguments: serde_json::Value,
+    ns: Vec<String>,
+    allowed_ns: Vec<String>,
+    session_id: String,
+    execution_id: String,
+    trace_id: String,
+    verdict: agent_core::gateway_approval::RiskVerdict,
+) -> axum::response::Response {
+    let t_auto = std::time::Instant::now();
+    let approval_id = format!("auto_{}_{}", chrono::Utc::now().timestamp_millis(), tool);
+    let before_state = capture_before_state(&agent, &tool, &arguments, &allowed_ns).await;
+    let before_json = before_state.as_ref().map(|b| b.to_string());
+    let judge_meta = serde_json::json!({
+        "model": verdict.model, "judge_ms": verdict.elapsed_ms,
+    })
+    .to_string();
+    if let Some(store) = agent.approval_manager.sqlite_store() {
+        if let Ok(g) = store.lock() {
+            let _ = g.insert_auto_approval(
+                &approval_id,
+                &session_id,
+                &caller,
+                &tool,
+                &serde_json::to_string(&arguments).unwrap_or_default(),
+                &verdict.reason,
+                &judge_meta,
+                before_json.as_deref(),
+            );
+        }
+    }
+    agent
+        .audit_logger
+        .record_event(agent_core::audit::AuditEvent {
+            ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            trace_id: agent_core::audit::new_trace_id(),
+            agent_id: caller.clone(),
+            session_id: None,
+            event_type: agent_core::audit::AuditEventType::AutoApproval,
+            detail: format!(
+                "[auto-approve] {} reason={} model={} judge_ms={} args={}",
+                tool,
+                verdict.reason,
+                verdict.model,
+                verdict.elapsed_ms,
+                serde_json::to_string(&arguments).unwrap_or_default().chars().take(300).collect::<String>()
+            ),
+        })
+        .await;
+    record_execution(GatewayExecution {
+        execution_id: execution_id.clone(),
+        caller_agent_id: caller.clone(),
+        tool_name: tool.clone(),
+        status: GatewayStatus::Executing,
+        approval_id: Some(approval_id.clone()),
+        operation_hash: None,
+        trace_id: trace_id.clone(),
+        result: None,
+        error: None,
+        created_at: chrono::Utc::now().timestamp(),
+        updated_at: chrono::Utc::now().timestamp(),
+    });
+    // 与审批恢复执行同语义：confirmed 注入（受控写红线）
+    let mut exec_args = arguments.clone();
+    if let Some(obj) = exec_args.as_object_mut() {
+        obj.insert("confirmed".to_string(), serde_json::json!(true));
+    }
+    let exec_ns: Vec<String> = if ns.is_empty() { allowed_ns } else { ns };
+    let result = agent
+        .call_tool_routed(&tool, "default", &exec_args, &exec_ns, "")
+        .await;
+    match &result {
+        Ok(text) => {
+            if let Some(store) = agent.approval_manager.sqlite_store() {
+                if let Ok(g) = store.lock() {
+                    let _ = g.set_auto_response(
+                        &approval_id,
+                        &text.chars().take(4000).collect::<String>(),
+                    );
+                }
+            }
+            agent_core::gateway::update_status(
+                &execution_id,
+                GatewayStatus::Executed,
+                Some(text.clone()),
+                None,
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "executed",
+                    "auto_approved": true,
+                    "approval_id": approval_id,
+                    "risk_reason": verdict.reason,
+                    "judge_model": verdict.model,
+                    "undo": { "path": format!("/api/tool/auto-writes/{}/undo", approval_id) },
+                    "result": text,
+                    "execution_id": execution_id,
+                    "trace_id": trace_id,
+                    "elapsed_ms": t_auto.elapsed().as_millis() as u64,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            agent_core::gateway::update_status(
+                &execution_id,
+                GatewayStatus::Failed,
+                None,
+                Some(e.clone()),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "auto_approved": true,
+                    "approval_id": approval_id,
+                    "error": e,
+                    "execution_id": execution_id,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// GET /api/tool/auto-writes?limit=50 —— 近期自动批准记录（含改前状态/撤销标记）
+pub(crate) async fn handle_auto_writes_list(
+    State(st): State<Arc<crate::state::AppState>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let agent = {
+        let guard = st.agent.lock().await;
+        match guard.clone() {
+            Some(a) => a,
+            None => return err_json(StatusCode::SERVICE_UNAVAILABLE, "agent-not-ready", "agent 未就绪"),
+        }
+    };
+    let limit = q
+        .get("limit")
+        .and_then(|x| x.parse::<usize>().ok())
+        .unwrap_or(50)
+        .min(200);
+    let rows = agent
+        .approval_manager
+        .sqlite_store()
+        .and_then(|s| s.lock().ok())
+        .map(|s| s.list_auto_approvals(limit))
+        .unwrap_or_default();
+    Json(serde_json::json!({"count": rows.len(), "items": rows})).into_response()
+}
+
+/// POST /api/tool/auto-writes/{id}/undo —— 一键撤销（人发起的纠正动作，直接执行+审计）
+pub(crate) async fn handle_auto_write_undo(
+    State(st): State<Arc<crate::state::AppState>>,
+    axum::Extension(auth): axum::Extension<crate::auth::AuthContext>,
+    Path(approval_id): Path<String>,
+) -> axum::response::Response {
+    let agent = {
+        let guard = st.agent.lock().await;
+        match guard.clone() {
+            Some(a) => a,
+            None => return err_json(StatusCode::SERVICE_UNAVAILABLE, "agent-not-ready", "agent 未就绪"),
+        }
+    };
+    let rec = agent
+        .approval_manager
+        .sqlite_store()
+        .and_then(|s| s.lock().ok())
+        .and_then(|s| s.get_auto_approval(&approval_id));
+    let Some(rec) = rec else {
+        return err_json(StatusCode::NOT_FOUND, "not-found", "自动批准记录不存在");
+    };
+    if rec.get("undone_by").and_then(|x| x.as_str()).is_some() {
+        return err_json(StatusCode::CONFLICT, "already-undone", "该操作已被撤销过");
+    }
+    let tool = rec.get("tool_name").and_then(|x| x.as_str()).unwrap_or("");
+    let args = rec.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+    let before = rec.get("before_state");
+    let undo_args = agent_core::gateway_approval::build_undo_for(tool, &args, before);
+    let Some(undo_args) = undo_args else {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "not-undoable",
+            "该工具/操作暂不支持自动撤销（无改前快照或无逆操作）",
+        );
+    };
+    // 标记撤销（原子：重复点击第二次会 409）
+    if let Some(store) = agent.approval_manager.sqlite_store() {
+        if let Ok(g) = store.lock() {
+            if let Err(e) = g.mark_undone(&approval_id, &format!("undo-ref:{}", approval_id)) {
+                return err_json(StatusCode::CONFLICT, "already-undone", &e);
+            }
+        }
+    }
+    // 撤销是人工发起的纠正：直接执行（undo 参数已带 confirmed），全程审计
+    let result = agent
+        .call_tool_routed(tool, "default", &undo_args, &auth.allowed_ns.clone(), "")
+        .await;
+    agent
+        .audit_logger
+        .record_event(agent_core::audit::AuditEvent {
+            ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            trace_id: agent_core::audit::new_trace_id(),
+            agent_id: auth.agent_id.clone(),
+            session_id: None,
+            event_type: agent_core::audit::AuditEventType::UndoExecuted,
+            detail: format!(
+                "[undo] auto={} tool={} args={}",
+                approval_id,
+                tool,
+                serde_json::to_string(&undo_args).unwrap_or_default().chars().take(300).collect::<String>()
+            ),
+        })
+        .await;
+    match result {
+        Ok(text) => Json(serde_json::json!({
+            "ok": true, "undone": approval_id, "undo_args": undo_args, "result": text
+        }))
+        .into_response(),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, "undo-failed", &e),
     }
 }
