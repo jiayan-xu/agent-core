@@ -393,7 +393,7 @@ def tool_tool_execute_status(args: dict) -> dict:
     """查询网关执行终态（202 审批单批准后的轮询入口）。"""
     eid = args.get("execution_id", "")
     resp = http_json("GET", "/api/tool/execute/" + urllib.parse.quote(eid))
-    data = resp["json"]
+    data = _mask_result_json(resp["json"])  # 状态轮询同样掩码（ocr 安全审查）
     return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False) if data is not None else resp["raw"]}]}
 
 

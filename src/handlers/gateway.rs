@@ -186,7 +186,7 @@ pub(crate) async fn handle_tool_execute(
             let policy = agent_core::gateway_approval::AutoPolicy::from_config(
                 &agent.config.gateway_approval,
             );
-            policy.in_auto_zone(&body.tool)
+            policy.in_auto_zone(&body.tool, &body.arguments)
         }
         && (body
             .arguments
@@ -228,7 +228,7 @@ pub(crate) async fn handle_tool_execute(
                 .map(|s| s.count_auto_today(&auth.agent_id))
                 .unwrap_or(u32::MAX);
             let quota_ok = quota_used < agent.config.gateway_approval.daily_quota;
-            if policy.in_auto_zone(&body.tool) {
+            if policy.in_auto_zone(&body.tool, &body.arguments) {
                 if quota_ok {
                     // judge 选型：[gateway_approval].judge > 主 [llm] 第一个
                     // fallback（快模型）> 主 provider。分类任务要快，思考型主模型易超时。
@@ -453,7 +453,12 @@ async fn execute_auto_approved(
     verdict: agent_core::gateway_approval::RiskVerdict,
 ) -> axum::response::Response {
     let t_auto = std::time::Instant::now();
-    let approval_id = format!("auto_{}_{}", chrono::Utc::now().timestamp_millis(), tool);
+    let approval_id = format!(
+        "auto_{}_{}_{}",
+        chrono::Utc::now().timestamp_millis(),
+        tool,
+        &uuid::Uuid::new_v4().to_string()[..8] // 防同毫秒并发碰撞（ocr 安全审查）
+    );
     let before_state = capture_before_state(&agent, &tool, &arguments, &allowed_ns).await;
     let before_json = before_state.as_ref().map(|b| b.to_string());
     let judge_meta = serde_json::json!({
