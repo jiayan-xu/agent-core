@@ -457,7 +457,7 @@ async fn execute_auto_approved(
         "auto_{}_{}_{}",
         chrono::Utc::now().timestamp_millis(),
         tool,
-        &uuid::Uuid::new_v4().to_string()[..8] // 防同毫秒并发碰撞（ocr 安全审查）
+        &format!("{:08x}", rand::Rng::gen::<u32>(&mut rand::thread_rng())) // 防同毫秒并发碰撞（ocr 安全审查）
     );
     let before_state = capture_before_state(&agent, &tool, &arguments, &allowed_ns).await;
     let before_json = before_state.as_ref().map(|b| b.to_string());
@@ -577,6 +577,7 @@ async fn execute_auto_approved(
 /// GET /api/tool/auto-writes?limit=50 —— 近期自动批准记录（含改前状态/撤销标记）
 pub(crate) async fn handle_auto_writes_list(
     State(st): State<Arc<crate::state::AppState>>,
+    axum::Extension(auth): axum::Extension<crate::auth::AuthContext>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
     let agent = {
@@ -591,12 +592,21 @@ pub(crate) async fn handle_auto_writes_list(
         .and_then(|x| x.parse::<usize>().ok())
         .unwrap_or(50)
         .min(200);
+    // caller scoping：非 admin 只看自己的自动批准记录（ocr R8 安全审查）
+    let is_admin = auth.allowed_ns.iter().any(|ns| ns == "*");
     let rows = agent
         .approval_manager
         .sqlite_store()
         .and_then(|s| s.lock().ok())
         .map(|s| s.list_auto_approvals(limit))
         .unwrap_or_default();
+    let rows: Vec<serde_json::Value> = if is_admin {
+        rows
+    } else {
+        rows.into_iter()
+            .filter(|r| r.get("agent_id").and_then(|a| a.as_str()) == Some(auth.agent_id.as_str()))
+            .collect()
+    };
     Json(serde_json::json!({"count": rows.len(), "items": rows})).into_response()
 }
 
@@ -621,6 +631,14 @@ pub(crate) async fn handle_auto_write_undo(
     let Some(rec) = rec else {
         return err_json(StatusCode::NOT_FOUND, "not-found", "自动批准记录不存在");
     };
+    // caller scoping：只能撤销自己的自动批准（admin 例外）
+    let is_admin = auth.allowed_ns.iter().any(|ns| ns == "*");
+    if !is_admin {
+        let owner = rec.get("agent_id").and_then(|a| a.as_str()).unwrap_or("");
+        if owner != auth.agent_id {
+            return err_json(StatusCode::FORBIDDEN, "not-owner", "只能撤销自己的自动批准记录");
+        }
+    }
     if rec.get("undone_by").and_then(|x| x.as_str()).is_some() {
         return err_json(StatusCode::CONFLICT, "already-undone", "该操作已被撤销过");
     }

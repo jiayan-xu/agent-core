@@ -355,10 +355,70 @@ _MASK_SKIP_KEYS = {
     "tool_call_id", "session_id", "thread_id", "check_run_id",
     }
 
+# 映射缓存（每次 tool_tool_execute 调用时刷新一次，递归内共享——ocr 性能审查）
+_MASK_CACHE = {"mapping": None, "sorted_pairs": None}
+
+
+def _load_unmask_map():
+    """加载掩码反向映射并按 token 长度降序排列。失败时返回空映射并告警。"""
+    path = _mask_file()
+    try:
+        with open(path, encoding="utf-8") as f:
+            mapping = json.load(f)
+        if not isinstance(mapping, dict) or not all(isinstance(v, str) for v in mapping.values()):
+            sys.stderr.write("[mask] WARN: unmask map invalid: %s\n" % path)
+            return {}, []
+        # 长值优先替换（防 [车牌1] 是 [车牌12] 的前缀）
+        pairs = sorted(mapping.items(), key=lambda kv: -len(kv[1]))
+        return mapping, pairs
+    except FileNotFoundError:
+        return {}, []  # 尚无映射（首次调用），不是错误
+    except (OSError, ValueError) as e:
+        sys.stderr.write("[mask] WARN: unmask map load failed (%s): %s\n" % (e, path))
+        return {}, []
+
+
+def _refresh_mask_cache():
+    m, pairs = _load_unmask_map()
+    _MASK_CACHE["mapping"] = m
+    _MASK_CACHE["sorted_pairs"] = pairs
+
+
+def unmask_text(text, pairs=None):
+    """入站反掩码：[车牌N] → 原文。pairs 传入时用缓存（递归内共享）。"""
+    if not isinstance(text, str) or not text:
+        return text
+    if pairs is None:
+        _, pairs = _load_unmask_map()
+    for real, token in pairs:
+        if token in text:
+            text = text.replace(token, real)
+    return text
+
+
+def _unmask_arguments(args, pairs=None):
+    """递归反掩码工具参数（dict key+value / list / str）。pairs 共享缓存。"""
+    if isinstance(args, dict):
+        return {
+            (unmask_text(k, pairs) if isinstance(k, str) else k): _unmask_arguments(v, pairs)
+            for k, v in args.items()
+        }
+    if isinstance(args, list):
+        return [_unmask_arguments(v, pairs) for v in args]
+    if isinstance(args, str):
+        return unmask_text(args, pairs)
+    return args
+
+
 def _mask_result_json(data):
-    """对工具返回的 JSON 做脱敏：整树递归，字符串叶子掩码（控制字段除外）。"""
+    """对工具返回的 JSON 做脱敏：整树递归，字符串叶子掩码（控制字段除外）。
+    dict key 也掩码（Excel/台账工具的 map 可能用车牌/公司名做 key）。"""
     if isinstance(data, dict):
-        return {k: (v if k in _MASK_SKIP_KEYS else _mask_result_json(v)) for k, v in data.items()}
+        return {
+            (mask_text(k) if isinstance(k, str) and k not in _MASK_SKIP_KEYS else k):
+            (v if k in _MASK_SKIP_KEYS else _mask_result_json(v))
+            for k, v in data.items()
+        }
     if isinstance(data, list):
         return [_mask_result_json(v) for v in data]
     if isinstance(data, str):
@@ -378,7 +438,8 @@ def tool_tool_execute(args: dict) -> dict:
     2026-09-02 出口脱敏：结果中的车牌/公司名/手机号/身份证号掩码后再出给模型（敏感数据不出公网）。"""
     body = {
         "tool": args.get("tool", ""),
-        "arguments": args.get("arguments") or {},
+        # 入站反掩码：模型可能用掩码 token 构造参数，还原为原文再发网关
+        "arguments": (_refresh_mask_cache() or _unmask_arguments(args.get("arguments") or {}, _MASK_CACHE["sorted_pairs"])),
     }
     for k in ("persona_id", "session_id", "trace_id", "idempotency_key"):
         if args.get(k):
@@ -394,7 +455,10 @@ def tool_tool_execute(args: dict) -> dict:
             "批准后用 agentcore_tool_execute_status 轮询终态。" % merged.get("approval_id")
         )
         return {"content": [{"type": "text", "text": json.dumps(merged, ensure_ascii=False)}]}
-    return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False) if data is not None else resp["raw"]}]}
+    _raw = resp["raw"] if data is None else None
+    if _raw and isinstance(_raw, str):
+        _raw = mask_text(_raw)  # raw body 也掩码（ocr R8：旁路泄露）
+    return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False) if data is not None else _raw}]}
 
 
 def tool_tool_execute_status(args: dict) -> dict:
@@ -402,7 +466,10 @@ def tool_tool_execute_status(args: dict) -> dict:
     eid = args.get("execution_id", "")
     resp = http_json("GET", "/api/tool/execute/" + urllib.parse.quote(eid))
     data = _mask_result_json(resp["json"])  # 状态轮询同样掩码（ocr 安全审查）
-    return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False) if data is not None else resp["raw"]}]}
+    _raw = resp["raw"] if data is None else None
+    if _raw and isinstance(_raw, str):
+        _raw = mask_text(_raw)  # raw body 也掩码（ocr R8：旁路泄露）
+    return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False) if data is not None else _raw}]}
 
 
 def tool_health(_args: dict) -> dict:
@@ -1091,7 +1158,7 @@ def handle_tools_call(req_id, params):
         })
     except ToolError as e:
         return rpc_result(req_id, {
-            "content": [{"type": "text", "text": "ERROR: %s" % e}],
+            "content": [{"type": "text", "text": "ERROR: %s" % mask_text(str(e))}],
             "isError": True,
         })
     except Exception as e:  # noqa: BLE001
