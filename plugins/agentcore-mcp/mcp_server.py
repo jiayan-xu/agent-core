@@ -27,6 +27,7 @@
 """
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -276,6 +277,95 @@ def _redact_badge_token(body, include_token: bool) -> None:
 
 
 
+def _mask_file():
+    return env("AGENTCORE_MASK_FILE") or os.path.join(os.getcwd(), "pfaix_mask_map.json")
+
+
+_CN_KIND = {"CAR": "车牌", "ORG": "公司", "PH": "手机", "ID": "证件"}
+_PLATE_RE = re.compile(r"[京津沪渝冀豫云辽黑吉苏浙皖闽赣鲁湘鄂粤桂川贵藏陕甘青宁新][A-HJ-NP-Z][A-HJ-NP-Z0-9]{4,6}")
+_ORG_RE = re.compile(r"[\u4e00-\u9fff（）()]{2,24}(?:有限公司|股份公司|集团|合伙企业)")
+_PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_IDCARD_RE = re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)")
+
+
+def mask_text(text):
+    """出口脱敏：车牌/公司名/手机号/身份证号 → [车牌N]/[公司N]/[手机N]/[证件N]。
+    映射持久化到 AGENTCORE_MASK_FILE（office_proxy 反掩码展示给用户用）。"""
+    if not isinstance(text, str) or not text:
+        return text
+    path = _mask_file()
+    load_failed = [False]
+    try:
+        with open(path, encoding="utf-8") as f:
+            mapping = json.load(f)
+        if not isinstance(mapping, dict):
+            mapping = {}
+            load_failed[0] = True
+    except FileNotFoundError:
+        mapping = {}
+    except (OSError, ValueError) as e:
+        sys.stderr.write("[mask] WARN: load failed ({}) {}: disabling write-back\n".format(e, path))
+        mapping = {}
+        load_failed[0] = True
+    dirty = [False]
+
+    def put(token, val):
+        if val not in mapping:
+            mapping[val] = token
+            dirty[0] = True
+        return mapping[val]
+
+    counters = {"CAR": len([v for v in mapping.values() if v.startswith("[车牌")]),
+                "ORG": len([v for v in mapping.values() if v.startswith("[公司")]),
+                "PH": len([v for v in mapping.values() if v.startswith("[手机")]),
+                "ID": len([v for v in mapping.values() if v.startswith("[证件")])}
+
+
+    # ocr 修复：先查 mapping 再分配（原 mk() 在 lambda 里无条件先求值，重复值浪费
+    # 计数器导致 token 编号复用 → 掩码歧义）
+    def _sub(kind):
+        def f(m):
+            val = m.group(0)
+            if val not in mapping:
+                counters[kind] += 1
+                mapping[val] = "[%s%d]" % (_CN_KIND[kind], counters[kind])
+                dirty[0] = True
+            return mapping[val]
+        return f
+
+    text = _PLATE_RE.sub(_sub("CAR"), text)
+    text = _ORG_RE.sub(_sub("ORG"), text)
+    text = _PHONE_RE.sub(_sub("PH"), text)
+    text = _IDCARD_RE.sub(_sub("ID"), text)
+
+    if dirty[0] and not load_failed[0]:
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(mapping, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception as e:
+            log("mask map save failed:", e)
+    return text
+
+
+# 控制字段：值是 hex/id，被手机号正则误命中会破坏审批回显指纹（ocr 审查 high）
+_MASK_SKIP_KEYS = {
+    "operation_hash", "approval_id", "execution_id", "trace_id", "idempotency_key",
+    "tool_call_id", "session_id", "thread_id", "check_run_id",
+    }
+
+def _mask_result_json(data):
+    """对工具返回的 JSON 做脱敏：整树递归，字符串叶子掩码（控制字段除外）。"""
+    if isinstance(data, dict):
+        return {k: (v if k in _MASK_SKIP_KEYS else _mask_result_json(v)) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_mask_result_json(v) for v in data]
+    if isinstance(data, str):
+        return mask_text(data)
+    return data
+
+
 def tool_tool_execute(args: dict) -> dict:
     # 模型偶发双层嵌套 {"arguments": {"tool": ..., "arguments": ...}}——防御性展开
     if isinstance(args.get("arguments"), dict) and "tool" in args["arguments"] and not args.get("tool"):
@@ -283,8 +373,9 @@ def tool_tool_execute(args: dict) -> dict:
     if not args.get("tool"):
         return {"content": [{"type": "text", "text": "参数错误：必须提供 tool（工具名）与 arguments（参数对象），不要把整个请求再包进 arguments 键。"}], "isError": True}
     """R1 网关（ADR-016 §2）：无头工具执行。三态：
-    200 executed（result 直接返回）/ 202 pending_approval（approval_id + operation_hash，
-    人在 dashboard 审批台批准后可轮询终态）/ 4xx 错误文本原样透出。"""
+    200 executed（结果直接返回）/ 202 pending_approval（approval_id + operation_hash，
+    人在 dashboard 审批台批准后可轮询终态）/ 4xx 错误文本原样透出。
+    2026-09-02 出口脱敏：结果中的车牌/公司名/手机号/身份证号掩码后再出给模型（敏感数据不出公网）。"""
     body = {
         "tool": args.get("tool", ""),
         "arguments": args.get("arguments") or {},
@@ -294,6 +385,7 @@ def tool_tool_execute(args: dict) -> dict:
             body[k] = args[k]
     resp = http_json("POST", "/api/tool/execute", payload=body)
     status, data = resp["status"], resp["json"]
+    data = _mask_result_json(data)
     # 统一成文本：executed 带 result；202 pending 带 approval 指引（错误路径 http_json 抛 ToolError）
     if status == 202 and isinstance(data, dict):
         merged = dict(data)
@@ -309,7 +401,7 @@ def tool_tool_execute_status(args: dict) -> dict:
     """查询网关执行终态（202 审批单批准后的轮询入口）。"""
     eid = args.get("execution_id", "")
     resp = http_json("GET", "/api/tool/execute/" + urllib.parse.quote(eid))
-    data = resp["json"]
+    data = _mask_result_json(resp["json"])  # 状态轮询同样掩码（ocr 安全审查）
     return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False) if data is not None else resp["raw"]}]}
 
 

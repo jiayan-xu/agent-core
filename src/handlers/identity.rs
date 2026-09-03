@@ -980,6 +980,7 @@ pub(crate) async fn build_agent(
         human_approval,              // L2: 人工审批通道（真人兜底）
         meta_evolution: config.meta_evolution.clone().unwrap_or_default(),
         safety: safety_cfg,
+        gateway_approval: config.gateway_approval.clone().unwrap_or_default(),
         features: config.features.clone(),
         lats: config.lats.clone(),
         multiagent: config.multiagent.clone(),

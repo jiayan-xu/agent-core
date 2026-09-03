@@ -105,6 +105,11 @@ pub struct ApprovalManager {
 }
 
 impl ApprovalManager {
+    /// 分级审批：暴露权威存储（AutoApproved 记录 / 撤销链 / quota 计数）
+    pub fn sqlite_store(&self) -> Option<&std::sync::Arc<std::sync::Mutex<crate::approval_store::ApprovalStore>>> {
+        self.sqlite.as_ref()
+    }
+
     /// 内存模式（测试 / 无持久化需求）
     pub fn new() -> Self {
         Self::new_with_sqlite(None, None)
@@ -957,6 +962,8 @@ mod tests {
             created_at: 1000.0,
             operation_hash: "op_hash_456".to_string(),
             session_id: "s1".to_string(),
+            allowed_ns: None,
+            execution_id: None,
         };
         let json = am.build_a2a_request(&approval, "agent/agent-001/dept/运营部");
         assert_eq!(json["type"], "approval_request");
@@ -1147,6 +1154,8 @@ mod tests {
                 "admin",
                 "agent-001",
                 "sess/p3",
+                None,
+                None,
             )
             .await;
         let hash = am.get_pending(&aid).await.unwrap().operation_hash;
@@ -1191,6 +1200,8 @@ mod tests {
                     "dashboard-admin",
                     "agent-001",
                     "sess/demo",
+                    None,
+                    None,
                 )
                 .await;
             let hash = am.get_pending(&aid).await.unwrap().operation_hash;
@@ -1225,6 +1236,8 @@ mod tests {
                 "admin",
                 "agent-001",
                 "sess/A",
+                None,
+                None,
             )
             .await;
         let hash_a = am.get_pending(&aid_a).await.unwrap().operation_hash;

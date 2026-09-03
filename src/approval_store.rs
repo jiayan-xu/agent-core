@@ -12,6 +12,8 @@ pub enum ApprovalRecordStatus {
     Approved,
     Denied,
     Consumed,
+    /// 分级审批：LLM judge 自动批准（已执行，不可再决策；区别于人工 Approved）
+    AutoApproved,
 }
 
 impl ApprovalRecordStatus {
@@ -21,6 +23,7 @@ impl ApprovalRecordStatus {
             Self::Approved => "Approved",
             Self::Denied => "Denied",
             Self::Consumed => "Consumed",
+            Self::AutoApproved => "AutoApproved",
         }
     }
 
@@ -29,6 +32,7 @@ impl ApprovalRecordStatus {
             "Approved" => Self::Approved,
             "Denied" => Self::Denied,
             "Consumed" => Self::Consumed,
+            "AutoApproved" => Self::AutoApproved,
             _ => Self::Pending,
         }
     }
@@ -98,6 +102,17 @@ impl ApprovalStore {
                 CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id);",
             )
             .map_err(|e| format!("init approvals schema: {}", e))?;
+        // 2026-09-03 分级审批：自动批准记录携带 judge 理由 / 改前状态 / 撤销链。
+        // ALTER ADD COLUMN 幂等：已存在则忽略错误。
+        // ocr R7：区分「已存在列」（预期，忽略）和真实迁移失败（传播）
+        for col in ["risk_reason TEXT", "before_state_json TEXT", "judge_meta TEXT", "undone_by TEXT"] {
+            if let Err(e) = self.conn.execute(&format!("ALTER TABLE approvals ADD COLUMN {}", col), []) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(format!("approvals migration failed ({}): {}", col, msg));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -188,7 +203,7 @@ impl ApprovalStore {
             "SELECT approval_id, session_id, agent_id, tool_name, arguments_json,
                     description, operation_hash, approver_id, requester_id, status,
                     created_at, decided_at, consumed_at, decision_reason, response_json
-             FROM approvals WHERE status != 'Consumed'",
+             FROM approvals WHERE status NOT IN ('Consumed', 'AutoApproved')",
         ) else {
             return out;
         };
@@ -204,6 +219,147 @@ impl ApprovalStore {
     }
 
     /// 审批历史（含已消费/已拒绝），按创建时间倒序，供审批台审计留证查看
+    // ── 分级审批（2026-09-03）：AutoApproved 记录与撤销链 ──
+
+    /// 写入自动批准记录（status=AutoApproved，创建即批准）
+    pub fn insert_auto_approval(
+        &self,
+        approval_id: &str,
+        session_id: &str,
+        agent_id: &str,
+        tool_name: &str,
+        arguments_json: &str,
+        risk_reason: &str,
+        judge_meta: &str,
+        before_state_json: Option<&str>,
+    ) -> Result<(), String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO approvals (
+                    approval_id, session_id, agent_id, tool_name, arguments_json,
+                    description, operation_hash, approver_id, requester_id, status,
+                    created_at, decided_at, consumed_at, decision_reason, response_json,
+                    risk_reason, before_state_json, judge_meta, undone_by
+                ) VALUES (?, ?, ?, ?, ?, '', '', ?, ?, 'AutoApproved', ?, ?, NULL, ?, NULL, ?, ?, ?, NULL)",
+                params![
+                    approval_id,
+                    session_id,
+                    agent_id,
+                    tool_name,
+                    arguments_json,
+                    agent_id,
+                    agent_id,
+                    now,
+                    now,
+                    format!("llm-judge: {}", risk_reason),
+                    risk_reason,
+                    before_state_json.unwrap_or(""),
+                    judge_meta,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("insert_auto_approval: {}", e))
+    }
+
+    /// 回填执行结果（AutoApproved 的 response_json）
+    pub fn set_auto_response(&self, approval_id: &str, response: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE approvals SET response_json = ? WHERE approval_id = ?",
+                params![response, approval_id],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("set_auto_response: {}", e))
+    }
+
+    /// 标记已被撤销（记录撤销单 id，防重复撤销）
+    pub fn mark_undone(&self, approval_id: &str, undo_approval_id: &str) -> Result<(), String> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE approvals SET undone_by = ? WHERE approval_id = ? AND undone_by IS NULL",
+                params![undo_approval_id, approval_id],
+            )
+            .map_err(|e| format!("mark_undone: {}", e))?;
+        if n == 0 {
+            return Err("already-undone-or-missing".to_string());
+        }
+        Ok(())
+    }
+
+    /// 近期自动批准列表（倒序）
+    pub fn list_auto_approvals(&self, limit: usize) -> Vec<serde_json::Value> {
+        let mut stmt = match self.conn.prepare(
+            "SELECT approval_id, agent_id, tool_name, arguments_json, status, created_at,
+                    risk_reason, before_state_json, judge_meta, response_json, undone_by
+             FROM approvals WHERE status = 'AutoApproved' ORDER BY created_at DESC LIMIT ?",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(serde_json::json!({
+                "approval_id": r.get::<_, String>(0).unwrap_or_default(),
+                "agent_id": r.get::<_, String>(1).unwrap_or_default(),
+                "tool_name": r.get::<_, String>(2).unwrap_or_default(),
+                "arguments": serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(3).unwrap_or_default()).unwrap_or(serde_json::Value::Null),
+                "created_at": r.get::<_, f64>(5).unwrap_or(0.0),
+                "risk_reason": r.get::<_, String>(6).unwrap_or_default(),
+                "before_state": serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(7).unwrap_or_default()).unwrap_or(serde_json::Value::Null),
+                "judge_meta": r.get::<_, String>(8).unwrap_or_default(),
+                "response": r.get::<_, Option<String>>(9).unwrap_or(None),
+                "undone_by": r.get::<_, Option<String>>(10).unwrap_or(None),
+            }))
+        });
+        match rows {
+            Ok(it) => it.filter_map(|x| x.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    /// 取单条自动批准（撤销端点用）
+    pub fn get_auto_approval(&self, approval_id: &str) -> Option<serde_json::Value> {
+        let mut stmt = self.conn.prepare(
+            "SELECT approval_id, agent_id, tool_name, arguments_json, before_state_json, undone_by
+             FROM approvals WHERE approval_id = ? AND status = 'AutoApproved'",
+        )
+        .ok()?;
+        stmt.query_row(params![approval_id], |r| {
+            Ok(serde_json::json!({
+                "approval_id": r.get::<_, String>(0).unwrap_or_default(),
+                "agent_id": r.get::<_, String>(1).unwrap_or_default(),
+                "tool_name": r.get::<_, String>(2).unwrap_or_default(),
+                "arguments": serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(3).unwrap_or_default()).unwrap_or(serde_json::Value::Null),
+                "before_state": serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(4).unwrap_or_default()).unwrap_or(serde_json::Value::Null),
+                "undone_by": r.get::<_, Option<String>>(5).unwrap_or(None),
+            }))
+        })
+        .ok()
+    }
+
+    /// 每人当日 AutoApproved 计数（quota）
+    pub fn count_auto_today(&self, agent_id: &str) -> u32 {
+        let day_start = {
+            use chrono::TimeZone;
+            let today = chrono::Utc::now().date_naive();
+            chrono::Utc
+                .from_utc_datetime(&today.and_hms_opt(0, 0, 0).unwrap())
+                .timestamp() as f64
+        };
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM approvals WHERE status = 'AutoApproved' AND agent_id = ? AND created_at >= ?",
+                params![agent_id, day_start],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c as u32)
+            .unwrap_or(u32::MAX) // fail-closed：查不到→配额视为已满，不自动批准（ocr R7）
+    }
+
     pub fn list_history(&self, limit: usize) -> Vec<ApprovalRecord> {
         let mut out = Vec::new();
         let Ok(mut stmt) = self.conn.prepare(

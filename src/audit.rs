@@ -45,6 +45,10 @@ pub enum AuditEventType {
     ToolInvocation,
     /// 身份变更（注册 / 调岗）
     IdentityChange,
+    /// 分级审批：LLM judge 自动批准（detail 含工具/理由/模型/耗时）
+    AutoApproval,
+    /// 分级审批：自动批准写操作的撤销已执行
+    UndoExecuted,
 }
 
 impl AuditEventType {
@@ -60,6 +64,8 @@ impl AuditEventType {
             AuditEventType::HarnessHit => "harness_hit",
             AuditEventType::ToolInvocation => "tool_invocation",
             AuditEventType::IdentityChange => "identity_change",
+            AuditEventType::AutoApproval => "auto_approval",
+            AuditEventType::UndoExecuted => "undo_executed",
         }
     }
 
@@ -76,6 +82,8 @@ impl AuditEventType {
             "harness_hit" => Some(AuditEventType::HarnessHit),
             "tool_invocation" => Some(AuditEventType::ToolInvocation),
             "identity_change" => Some(AuditEventType::IdentityChange),
+            "auto_approval" => Some(AuditEventType::AutoApproval),
+            "undo_executed" => Some(AuditEventType::UndoExecuted),
             _ => None,
         }
     }

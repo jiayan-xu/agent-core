@@ -196,6 +196,8 @@ pub struct AgentConfig {
     pub meta_evolution: crate::meta_evolve::MetaEvolutionConfig,
     /// PR5: 安全配置（含审批门控模式，默认 Auto 免人工审批）
     pub safety: crate::meta_evolve::SafetyConfig,
+    /// 分级审批（2026-09-03）：llm_auto 启用 LLM judge 自动批准区；缺省 human_all=现状
+    pub gateway_approval: crate::gateway_approval::GatewayApprovalConfig,
     /// HY3 1.3：三大项热路径接线开关（默认全 OFF；G 门未复验前不得开启）
     /// 注：AgentConfig 本身不 derive serde（由代码从 Config 构造），TOML 默认值
     /// 在 main.rs 的 `Config` 上处理，此处无需 `#[serde(default)]`。
