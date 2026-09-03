@@ -294,10 +294,19 @@ def mask_text(text):
     if not isinstance(text, str) or not text:
         return text
     path = _mask_file()
+    load_failed = [False]
     try:
-        mapping = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {}
-    except Exception:
+        with open(path, encoding="utf-8") as f:
+            mapping = json.load(f)
+        if not isinstance(mapping, dict):
+            mapping = {}
+            load_failed[0] = True
+    except FileNotFoundError:
         mapping = {}
+    except (OSError, ValueError) as e:
+        sys.stderr.write("[mask] WARN: load failed ({}) {}: disabling write-back\n".format(e, path))
+        mapping = {}
+        load_failed[0] = True
     dirty = [False]
 
     def put(token, val):
@@ -329,7 +338,7 @@ def mask_text(text):
     text = _PHONE_RE.sub(_sub("PH"), text)
     text = _IDCARD_RE.sub(_sub("ID"), text)
 
-    if dirty[0]:
+    if dirty[0] and not load_failed[0]:
         try:
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -344,8 +353,7 @@ def mask_text(text):
 _MASK_SKIP_KEYS = {
     "operation_hash", "approval_id", "execution_id", "trace_id", "idempotency_key",
     "tool_call_id", "session_id", "thread_id", "check_run_id",
-    "undo", "poll", "path",  # URL/path 含数字段不掩码
-}
+    }
 
 def _mask_result_json(data):
     """对工具返回的 JSON 做脱敏：整树递归，字符串叶子掩码（控制字段除外）。"""
