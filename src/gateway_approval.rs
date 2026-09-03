@@ -290,7 +290,9 @@ pub fn build_undo_for(tool: &str, executed_args: &serde_json::Value, before: Opt
         "add" => {
             // before 缺失（capture 失败）时不可安全判断是否覆盖写 → 拒绝撤销（ocr 审查）
             let b = before?;
-            let existed = b.get("found").and_then(|f| f.as_bool()).unwrap_or(false);
+            // found 读不到 bool（capture 失败→空串→Null/半截快照）≠「改前不存在」：
+            // 判不出就拒绝撤销（? → None → 400 not-undoable），绝不按 false 猜测。
+            let existed = b.get("found").and_then(|f| f.as_bool())?;
             if existed {
                 Some(serde_json::json!({
                     "action": "update_company",
@@ -306,7 +308,8 @@ pub fn build_undo_for(tool: &str, executed_args: &serde_json::Value, before: Opt
         // remove/update 的逆 = 用改前行恢复（add 回原值或 update 回原值）
         "remove" | "update_company" | "update_waste_type" => {
             let b = before?;
-            if b.get("found").and_then(|f| f.as_bool()).unwrap_or(false) == false {
+            let found = b.get("found").and_then(|f| f.as_bool())?;
+            if !found {
                 // 改前就不在白名单：逆 = remove
                 return Some(serde_json::json!({"action": "remove", "plate": plate, "confirmed": true}));
             }
