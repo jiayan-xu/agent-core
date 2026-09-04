@@ -473,9 +473,15 @@ pub struct StanceCard {
 }
 
 impl StanceCard {
-    /// 从 LLM 原始回答构建立场卡：宽容解析 JSON（首个 `{` 到最后一个 `}`），
-    /// 任何失败都降级为未结构化卡（原文完整保留，绝不丢立场）。
-    fn parse(persona_id: String, display_name: String, raw: String) -> StanceCard {
+    /// 从 LLM 原始回答构造立场卡的**唯一公开构造器**（ocr PR#66 评审：字段全 pub 而
+    /// 构造器私有，下游只能经结构体字面量造出违反不变量的卡——空 stance、非空
+    /// citations、confidence 越界；收敛到本路径统一裁决）。
+    ///
+    /// JSON 提取三级策略（同评审）：①剥 ```json 围栏后整串直解；②扫描**配平**的
+    /// `{...}` 候选逐个尝试（首 `{` 到末 `}` 的朴素切片会被正文里无关的花括号撑爆，
+    /// 把好卡静默降级）；③全部失败降级未结构化卡（原文完整保留，绝不丢立场），
+    /// 失败切片 debug 留痕可观测。
+    pub fn from_raw(persona_id: String, display_name: String, raw: String) -> StanceCard {
         const UNSTRUCTURED: &str = "未结构化";
         let fallback = |raw: String| StanceCard {
             persona_id: persona_id.clone(),
@@ -488,13 +494,9 @@ impl StanceCard {
             raw: raw.clone(),
             structured: false,
         };
-        let Some(start) = raw.find('{') else { return fallback(raw) };
-        let Some(end) = raw.rfind('}') else { return fallback(raw) };
-        if end < start {
-            return fallback(raw);
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw[start..=end]) else {
-            return fallback(raw);
+        let v = match Self::extract_json_value(&raw, &persona_id) {
+            Some(v) => v,
+            None => return fallback(raw),
         };
         // stance 必须是非空字符串；缺失**或空串**（模型常见空值输出）都视为解析
         // 失败走降级——否则分布里会出现空键残缺文本（ocr PR#65 第五轮）。
@@ -514,13 +516,20 @@ impl StanceCard {
             .map(|s| s.trim().chars().take(200).collect::<String>())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| stance_raw.trim().chars().take(80).collect());
+        // key_reasons：条数 ≤3 且**每条限长 120 字**（与 summary 200 字同反膨胀理由，
+        // ocr PR#66 评审）；非字符串元素丢弃时 debug 留痕（schema 漂移可观测）
         let key_reasons: Vec<String> = v
             .get("key_reasons")
             .and_then(|x| x.as_array())
             .map(|a| {
+                let dropped = a.iter().filter(|r| r.as_str().is_none()).count();
+                if dropped > 0 {
+                    tracing::debug!(target = "roundtable", persona = %persona_id, dropped,
+                        "key_reasons 含非字符串元素，已丢弃");
+                }
                 a.iter()
                     .filter_map(|r| r.as_str())
-                    .map(|r| r.trim().to_string())
+                    .map(|r| r.trim().chars().take(120).collect::<String>())
                     .filter(|r| !r.is_empty())
                     .take(3)
                     .collect()
@@ -534,7 +543,25 @@ impl StanceCard {
                 persona = %persona_id,
                 "分身输出了 citations（无证据池，已丢弃防伪溯源；接记忆检索后可评估启用）");
         }
-        let confidence = v.get("confidence").and_then(|x| x.as_u64()).map(|c| c.min(100) as u8);
+        // confidence 宽容解码（ocr PR#66 评审）：u64 / f64（≤1 视为百分比小数）/ 数字
+        // 字符串三种常见编码都接受，越界 clamp 100，无法解码 debug 留痕
+        let confidence = v.get("confidence").and_then(|x| {
+            let n = x
+                .as_u64()
+                .or_else(|| {
+                    x.as_f64().map(|f| if f <= 1.0 { (f * 100.0).round() as u64 } else { f.round() as u64 })
+                })
+                .or_else(|| {
+                    x.as_str()
+                        .and_then(|s| s.trim().parse::<f64>().ok())
+                        .map(|f| if f <= 1.0 { (f * 100.0).round() as u64 } else { f.round() as u64 })
+                });
+            if n.is_none() {
+                tracing::debug!(target = "roundtable", persona = %persona_id,
+                    value = %x, "confidence 无法解码（非数字/数字字符串），置空");
+            }
+            n
+        }).map(|c| c.min(100) as u8);
         StanceCard {
             persona_id,
             display_name,
@@ -547,6 +574,61 @@ impl StanceCard {
             structured: true,
         }
     }
+
+    /// 三级 JSON 提取：剥围栏直解 → 配平花括号候选逐个尝试 → None。
+    /// 候选失败 debug 留痕（静默降级不可观测是评审点名的问题）。
+    fn extract_json_value(raw: &str, persona_id: &str) -> Option<serde_json::Value> {
+        // ① 剥 ```json / ``` 围栏后整串直解（最常见良好输出）
+        let mut cleaned = raw.trim();
+        if cleaned.starts_with("```") {
+            let after_first_fence = cleaned.splitn(2, '\n').nth(1).unwrap_or("");
+            cleaned = after_first_fence.trim();
+            if let Some(pos) = cleaned.rfind("```") {
+                cleaned = cleaned[..pos].trim();
+            }
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(cleaned) {
+            return Some(v);
+        }
+        // ② 配平扫描：深度归零处截断候选，逐个尝试（正文含无关 { } 或多个对象时，
+        // 朴素「首 { 到末 }」切片必失败）
+        let bytes = raw.as_bytes();
+        let mut candidates: Vec<(usize, usize)> = Vec::new();
+        let mut depth: i32 = 0;
+        let mut start: Option<usize> = None;
+        for (i, b) in bytes.iter().enumerate() {
+            match b {
+                b'{' => {
+                    if depth == 0 {
+                        start = Some(i);
+                    }
+                    depth += 1;
+                }
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(s) = start {
+                            candidates.push((s, i));
+                        }
+                        start = None;
+                    }
+                }
+                _ => {}
+            }
+            if candidates.len() >= 4 {
+                break; // 防极端输出（如一串单独花括号）拖慢扫描
+            }
+        }
+        for (s, e) in candidates {
+            match serde_json::from_str::<serde_json::Value>(&raw[s..=e]) {
+                Ok(v) => return Some(v),
+                Err(err) => tracing::debug!(target = "roundtable", persona = %persona_id,
+                    slice_len = e - s + 1, error = %err,
+                    "立场卡 JSON 候选切片解析失败，尝试下一个"),
+            }
+        }
+        None
+    }
 }
 
 /// 立场词规范化：仅包含词匹配，零 LLM。
@@ -556,7 +638,9 @@ impl StanceCard {
 ///    「条件支持」（180° 极性反转）；
 /// 2. 「无条件/不设条件/无附加条件 + 支持」不落「条件支持」；
 /// 3. 「不支持」天然含「支持」子串，由反对分支先截胡；
-/// 4. 未命中任何规范词时保留原文（截 16 字），不强行归四类。
+/// 4. 未命中任何规范词（如 "Support"/"倾向于认可"）归**固定桶「其他」**——
+///    自由文本当分布键会产生一次性碎键、拆分同票桶并静默废掉对立提示
+///    （ocr PR#66 评审），原词保留在 summary/raw 可回溯。
 fn normalize_stance(s: &str) -> String {
     let t = s.trim();
     let unconditional = t.contains("无条件") || t.contains("不设条件") || t.contains("无附加条件");
@@ -571,7 +655,7 @@ fn normalize_stance(s: &str) -> String {
     } else if t.contains("支持") {
         "支持".to_string()
     } else {
-        t.chars().take(16).collect()
+        "其他".to_string()
     }
 }
 
@@ -2271,7 +2355,7 @@ impl AgentCore {
             Ok(Err(e)) => format!("(LLM 调用失败: {})", e),
             Err(_) => "(该分身 LLM 调用超时，已跳过其立场)".to_string(),
         };
-        let card = StanceCard::parse(p.persona_id.clone(), p.display_name.clone(), raw);
+        let card = StanceCard::from_raw(p.persona_id.clone(), p.display_name.clone(), raw);
         (p.persona_id.clone(), card, provider_label)
     }
 
@@ -2310,10 +2394,21 @@ impl AgentCore {
             crate::llm::Message { role: "system".to_string(), content: Some(sys_chair), tool_calls: None, tool_call_id: None },
             crate::llm::Message { role: "user".to_string(), content: Some(user_chair), tool_calls: None, tool_call_id: None },
         ];
-        // 附注是非权威增强，同样加硬性超时；失败静默降级为无附注。
+        // 附注是非权威增强，同样加硬性超时；失败降级为无附注，但**失败原因留痕**
+        // （ocr PR#66 评审）：持续 provider 故障与「主席无话可说」必须可区分。
         match tokio::time::timeout(std::time::Duration::from_secs(45), self.llm.chat(&chair_msgs, &[])).await {
             Ok(Ok(r)) if !r.text.trim().is_empty() => Some(r.text.trim().to_string()),
-            _ => None,
+            Ok(Ok(_)) => None, // 模型空响应：合法的「无附注」状态
+            Ok(Err(e)) => {
+                tracing::warn!(target = "roundtable", error = %e,
+                    "chair_display_note: LLM 调用失败，本次无主席附注");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(target = "roundtable",
+                    "chair_display_note: LLM 调用超时(45s)，本次无主席附注");
+                None
+            }
         }
     }
 
@@ -14974,3 +15069,138 @@ mod whitelist_v11_tests {
     }
 }
 
+
+#[cfg(test)]
+mod stance_card_tests {
+    use super::{aggregate_stances, StanceCard};
+
+    fn card(raw: &str) -> StanceCard {
+        StanceCard::from_raw("p1".into(), "分身一".into(), raw.into())
+    }
+
+    /// 围栏 JSON（最常见良好输出）正常解析为结构化卡
+    #[test]
+    fn fenced_json_parses() {
+        let c = card("```json\n{\"stance\":\"支持\",\"summary\":\"可行\",\"key_reasons\":[\"成本可控\"],\"confidence\":85}\n```");
+        assert!(c.structured);
+        assert_eq!(c.stance, "支持");
+        assert_eq!(c.summary, "可行");
+        assert_eq!(c.key_reasons, vec!["成本可控".to_string()]);
+        assert_eq!(c.confidence, Some(85));
+        assert!(c.citations.is_empty());
+    }
+
+    /// 正文夹杂花括号 + 前后 prose：配平扫描不吃无关括号（朴素首末切片必失败的场景）
+    #[test]
+    fn prose_and_braces_parse_balanced_object() {
+        let c = card("我认为 {从监管角度} 应该推进。\n{\"stance\":\"条件支持\",\"summary\":\"需先过审批\",\"confidence\":\"90\"}\n补充：见第 3 条");
+        assert!(c.structured, "应解析出配平对象: {}", c.stance);
+        assert_eq!(c.stance, "条件支持");
+        assert_eq!(c.confidence, Some(90)); // 数字字符串编码
+    }
+
+    /// 两个对象：取第一个可解析的配平候选
+    #[test]
+    fn two_objects_first_balanced_wins() {
+        let c = card("{\"stance\":\"中立\",\"summary\":\"先观察\"} 后续 {\"stance\":\"支持\"}");
+        assert!(c.structured);
+        assert_eq!(c.stance, "中立");
+    }
+
+    /// stance 空串 / 缺失 / 纯文本无 JSON → 全部降级未结构化，原文保留
+    #[test]
+    fn empty_or_missing_stance_degrades() {
+        for raw in [
+            "{\"stance\":\"\",\"summary\":\"x\"}",
+            "{\"summary\":\"没有立场字段\"}",
+            "这是纯文本回答，没有 JSON。",
+            "",
+        ] {
+            let c = card(raw);
+            assert!(!c.structured, "应降级: {raw}");
+            assert_eq!(c.stance, "未结构化");
+            assert_eq!(c.raw, raw);
+        }
+    }
+
+    /// 极性表：混合/双否定/无条件标记不得 180° 反转
+    #[test]
+    fn normalize_stance_polarity_matrix() {
+        let f = |s: &str| super::normalize_stance(s);
+        assert_eq!(f("条件不支持"), "反对");
+        assert_eq!(f("有条件下不支持"), "反对");
+        assert_eq!(f("反对条件支持"), "反对");
+        assert_eq!(f("不支持"), "反对");
+        assert_eq!(f("不反对，条件支持"), "条件支持");
+        assert_eq!(f("无条件支持"), "支持");
+        assert_eq!(f("支持（不设条件）"), "支持");
+        assert_eq!(f("支持，无附加条件"), "支持");
+        assert_eq!(f("中立"), "中立");
+        assert_eq!(f("支持"), "支持");
+        // 未命中规范词 → 固定「其他」桶（不产生一次性碎键）
+        assert_eq!(f("Support"), "其他");
+        assert_eq!(f("倾向于认可"), "其他");
+        assert_eq!(f("需要更多数据"), "其他");
+    }
+
+    /// confidence 多编码 + clamp + 不可解码为 None
+    #[test]
+    fn confidence_encodings() {
+        assert_eq!(card("{\"stance\":\"支持\",\"confidence\":0.9}").confidence, Some(90));
+        assert_eq!(card("{\"stance\":\"支持\",\"confidence\":85.0}").confidence, Some(85));
+        assert_eq!(card("{\"stance\":\"支持\",\"confidence\":\"70\"}").confidence, Some(70));
+        assert_eq!(card("{\"stance\":\"支持\",\"confidence\":120}").confidence, Some(100));
+        assert_eq!(card("{\"stance\":\"支持\",\"confidence\":\"high\"}").confidence, None);
+    }
+
+    /// key_reasons 限 3 条、每条限 120 字；非字符串元素丢弃
+    #[test]
+    fn key_reasons_bounded() {
+        let long: String = "长".repeat(500);
+        let c = card(&format!(
+            "{{\"stance\":\"支持\",\"key_reasons\":[\"{long}\",\"b\",\"c\",\"d\",42]}}"
+        ));
+        assert_eq!(c.key_reasons.len(), 3);
+        assert_eq!(c.key_reasons[0].chars().count(), 120);
+        assert_eq!(c.key_reasons[1], "b");
+    }
+
+    /// summary 超 200 字截断
+    #[test]
+    fn summary_capped() {
+        let long: String = "话".repeat(999);
+        let c = card(&format!("{{\"stance\":\"中立\",\"summary\":\"{long}\"}}"));
+        assert_eq!(c.summary.chars().count(), 200);
+    }
+
+    /// 聚合：分布统计 + 对立提示 + 降级计数 + 同票稳定排序（可复现）
+    #[test]
+    fn aggregate_distribution_and_divergence() {
+        let cards = vec![
+            card("{\"stance\":\"支持\",\"summary\":\"a\"}"),
+            card("{\"stance\":\"反对\",\"summary\":\"b\"}"),
+            card("{\"stance\":\"反对\",\"summary\":\"c\"}"),
+            card("{\"stance\":\"Support\",\"summary\":\"d\"}"), // → 其他
+            card("纯文本降级"),
+        ];
+        let agg = aggregate_stances(&cards);
+        assert_eq!(agg.total, 5);
+        assert_eq!(agg.structured, 4);
+        assert!(agg.summary.contains("反对 2"));
+        assert!(agg.summary.contains("支持 1"));
+        assert!(agg.summary.contains("其他 1"));
+        assert!(agg.summary.contains("1 份未结构化"));
+        assert!(agg.summary.contains("存在对立立场"));
+        // 同票时按立场名排序（稳定可复现）
+        assert!(agg.distribution.windows(2).all(|w| w[0].1 > w[1].1 || (w[0].1 == w[1].1 && w[0].0 <= w[1].0)));
+    }
+
+    /// 全降级输入：无结构化卡，提示均为降级原文
+    #[test]
+    fn aggregate_all_degraded() {
+        let agg = aggregate_stances(&[card("文本一"), card("文本二")]);
+        assert_eq!(agg.structured, 0);
+        assert!(agg.summary.contains("无结构化立场卡"));
+        assert!(agg.summary.contains("2 份未结构化"));
+    }
+}
