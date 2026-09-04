@@ -12508,9 +12508,18 @@ impl AgentCore {
             }
         }
 
-        // （游标推进移至 prompt 构造之后：见 window_cursor——ocr PR#68 第四轮）
-
-        // 整批无合格原料
+        // 整批无合格原料的早退**必须先推进游标**（ocr PR#68 第五轮 high：推进
+        // 移到 prompt 构造之后，此早退发生在其前——同批垃圾会被永久重拉重滤）
+        if obs_lines.is_empty() && !items.is_empty() {
+            let _ = mem_client
+                .call(
+                    "dream_state_update",
+                    &serde_json::json!({
+                        "phase": "consolidate", "namespace": ns, "cursor_ts": max_ts, "items_out": 0
+                    }),
+                )
+                .await;
+        }
         if obs_lines.is_empty() {
             return ConsolidateOutcome {
                 ns: ns.to_string(),
@@ -12557,12 +12566,20 @@ impl AgentCore {
         // 外的观察永久消费——常态下 ~28k 字批次只有 ~70 条可见，多数被静默丢弃；
         // 游标只推到最后一条可见观察，窗口外留给下一轮 = 延迟而非丢失。同时间戳的
         // 边界观察下一轮会重拉，属可接受的重复提取）
+        // 钳制进 [cursor_ts, max_ts] 并在空/漂移时回退 max_ts（ocr PR#68 第五轮
+        // high：obs_ts 缺 created_at 时为空串——空游标会让下轮全历史重拉、旧值
+        // 会原地踏步，宁丢窗口优化不失单调推进。同时间戳边界的契约见上方注释：
+        // memoria `created_at > since` 严格大于，同秒的未处理尾部观察会被跳过，
+        // 相比整窗丢弃已数量级收敛；行级水位需 memoria 侧支持，不在本 PR 范围）
         let window_cursor: String = if included < obs_lines.len() {
             let later = obs_ts
                 .get(included.saturating_sub(1))
                 .cloned()
                 .unwrap_or_default();
-            if later.as_str() > max_ts.as_str() { max_ts.clone() } else { later }
+            let ok = !later.is_empty()
+                && later.as_str() >= cursor_ts.as_str()
+                && later.as_str() <= max_ts.as_str();
+            if ok { later } else { max_ts.clone() }
         } else {
             max_ts.clone()
         };
@@ -12590,7 +12607,9 @@ impl AgentCore {
                     observations: obs_lines.len(),
                     observations_visible: included,
                     fetched: items.len(),
-                    cursor: max_ts.clone(),
+                    // 与已持久化的游标一致（ocr PR#68 第五轮 high：事件载荷报
+                    // max_ts 而落库是 window_cursor，排障与对账会被误导）
+                    cursor: window_cursor.clone(),
                     detail: format!("LLM 失败: {}{}", e, window_note),
                 }
             }
