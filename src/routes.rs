@@ -69,6 +69,7 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
             post(handle_admin_harness_activate),
         )
         .route("/api/admin/consolidate", post(handle_admin_consolidate))
+        .route("/api/admin/consolidate_eval", post(handle_admin_consolidate_eval))
         .route("/api/admin/agent/repair", post(handle_agent_repair))
         .route("/api/agent/events", axum::routing::get(handle_agent_events))
         .route("/api/save-config", post(handle_save_config))
@@ -77,6 +78,7 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/collab/approval", post(handle_collab_approval))
         .route("/api/collab/delete", post(handle_collab_delete))
         .route("/api/collab/peers", get(handle_collab_peers))
+        .route("/api/collab/profile", get(handle_collab_profile))
         .route("/api/memory/feedback", post(handle_memory_feedback))
         .route("/api/tool/execute", post(handle_tool_execute))
         .route("/api/tool/execute/{id}", get(handle_tool_execute_get))
