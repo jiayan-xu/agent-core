@@ -88,12 +88,12 @@ static EVAL_SET: &[EvalCase] = &[
         keywords: &["团建聚餐", "订位"],
     },
     EvalCase {
-        obs: "刚才把冒烟测试用例完整跑了一遍，全部通过没有报错，环境看起来没什么问题，可以继续后面的联调工作了。",
+        obs: "刚才把新写的冒烟用例完整地跑了一遍，总共十二个断言全部顺利通过且没有任何报错信息，本地环境看起来没有什么明显的问题，下午可以继续安排前后端联调和接口自测的工作。",
         expect_pattern: false,
         keywords: &["冒烟"],
     },
     EvalCase {
-        obs: "cd /c/Users/user/agent-core && cargo check --all-targets 这条命令用来做快速编译检查，跑完大概二十秒左右，输出末尾出现 Finished 就说明没有编译错误。",
+        obs: "cd /c/Users/user/agent-core 这条目录下面的仓库可以用 cargo check --all-targets 命令做快速编译检查，跑完大概需要二十秒左右的时间，输出末尾出现 Finished 字样就说明当前代码没有编译错误可以提交。",
         expect_pattern: false,
         keywords: &["cargo check"],
     },
@@ -450,10 +450,10 @@ mod tests {
     /// 泄漏：引用负例或禁区关键词（含改大小写）都计 leak，且按用例去重
     #[test]
     fn leak_detection_ci_and_citation() {
-        let r = score("世界杯相关的规则不该出现在这里【依据: 7】\nPATROL.LOG 巡检流水也不该在【依据: 1】");
+        let r = score("团建聚餐相关的规则不该出现在这里【依据: 8】\nPATROL.LOG 巡检流水也不该在【依据: 1】");
         // 第二行引用正例 1 但文本命中禁区指纹 → 正例命中 + 负例泄漏并存
         assert!(r.case_results[0].cited);
-        assert_eq!(r.negative_leaks, 2, "负例 7（引用）与负例 8（关键词，大小写不敏感）都泄漏");
+        assert_eq!(r.negative_leaks, 2, "负例 8（引用）与负例 7（关键词，大小写不敏感）都泄漏");
     }
 
     /// outcome 三态：无模式 / 门槛拒绝 / 空
