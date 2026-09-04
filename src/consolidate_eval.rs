@@ -5,29 +5,40 @@
 //!
 //! 判分全部程序化，无 LLM 参与判分：
 //! - **正例**（应提炼的观察）：被 ≥1 条**过写库门槛**的 pattern 以【依据】引用 → hit；
-//! - **负例**（prompt 禁区样本：流水账 / 无关话题 / 测试冒烟 / 工具回显）：被任何
-//!   valid pattern 引用 → leak；
+//! - **负例**（prompt 禁区样本）：**在任何候选行**（含未过写库门槛的）中以引用或
+//!   禁区关键词出现 → leak。泄漏检查刻意放在写库门槛**之前**——门槛本身会硬拒含
+//!   「世界杯」等词的行，若只查过门槛的 pattern，最典型的违规形式反而永远计 0；
 //! - 北极星指标 = `positive_hit_rate`（命中正例数 / 正例总数）；次级指标
-//!   `keyword_hits`（pattern 文本含正例关键词）与 `negative_leaks`（禁区泄漏）。
+//!   `keyword_hits` 与 `negative_leaks`（按负例用例去重计数，与正例计数同单位）。
+//!
+//! 口径与生产严格一致：prompt 字面量与【依据】解析共用 agent.rs 的
+//! `pattern_extraction_prompt` / `parse_pattern_citation`；候选先 `take(8)`、过门槛后
+//! `take(5)`，与生产 consolidate 相同——评估测的必须是正在运行的行为。
 //!
 //! 评估会**真实调用提炼 LLM**：仅 admin 手动触发（/api/admin/consolidate_eval），
-//! 不进任何自动循环；报告原子落盘 `data/consolidate_eval/<时间戳>.json` 供跨次比较。
+//! 不进任何自动循环；报告 tmp+rename 原子落盘 `data/consolidate_eval/<毫秒时间戳>.json`
+//! 供跨次比较。
 
 use std::time::Instant;
 
 use crate::agent::AgentCore;
 
-/// 评估用例。`expect_pattern=false` 的观察是 prompt 禁区样本（理想行为：不引用）。
+/// 题集版本戳：**任何对 EVAL_SET 的修改（含追加）都必须递增本值**——追加用例同样
+/// 更换基线（分母变化使历史 hit_rate 不可比）。报告落盘携带本值，
+/// `list_past_hit_rates` 按版本过滤，P3 进化循环不会把跨版本数字当序列比较。
+pub const EVAL_SET_VERSION: u32 = 1;
+
+/// 评估用例。`expect_pattern=false` 的观察是 prompt 禁区样本（理想行为：不被引用）。
 struct EvalCase {
     obs: &'static str,
     expect_pattern: bool,
-    /// 命中关键词（次级指标：pattern 文本包含任一关键词也计 keyword hit）
+    /// 正例：命中关键词（次级指标：过门槛 pattern 文本包含任一关键词也计 keyword hit）；
+    /// 负例：禁区关键词（任何候选行包含 → 该负例计一次 leak）。
     keywords: &'static [&'static str],
 }
 
-/// 固定题集（v1）。选题对齐 consolidate prompt 的正反两面：
-/// 正例 = 可长期复用的工程/运维/业务规则观察；负例 = prompt 明令禁止的四类禁区。
-/// 修改题集 = 更换基线，会使历史评估不可比——新增用例只能追加，不得改写已发布用例。
+/// 固定题集（v1）。正例 = 可长期复用的工程/运维/业务规则观察；负例 = prompt 明令
+/// 禁止的四类禁区。修改题集（含追加）= 更换基线：递增 EVAL_SET_VERSION。
 static EVAL_SET: &[EvalCase] = &[
     EvalCase {
         obs: "掺烧工业固废前必须先做热值反推校验，热值低于 8000 kJ/kg 的批次要下调掺烧比",
@@ -59,75 +70,91 @@ static EVAL_SET: &[EvalCase] = &[
         expect_pattern: true,
         keywords: &["PFAiX", "安装"],
     },
-    // ── 负例：prompt 禁区四类 ──
+    // ── 负例：prompt 禁区四类（keywords = 禁区指纹，任何候选行命中即 leak）──
     EvalCase {
         obs: "2026-09-04 14:32 cron 巡检任务运行完成，输出已写入 logs/patrol.log",
         expect_pattern: false,
-        keywords: &[],
+        keywords: &["cron", "patrol.log", "巡检任务运行完成"],
     },
     EvalCase {
         obs: "世界杯决赛今晚开球，大家记得准时观看",
         expect_pattern: false,
-        keywords: &[],
+        keywords: &["世界杯", "world cup"],
     },
     EvalCase {
         obs: "刚才把冒烟测试用例跑了一遍，全部通过了",
         expect_pattern: false,
-        keywords: &[],
+        keywords: &["冒烟"],
     },
     EvalCase {
         obs: "cd /c/Users/user/agent-core && cargo check --all-targets",
         expect_pattern: false,
-        keywords: &[],
+        keywords: &["cargo check"],
     },
 ];
 
-/// 评估报告（JSON 序列化后落盘，供跨次比较）
+/// 单条候选 pattern 的可调试记录（报告落盘，跨次比较时能区分覆盖回归与格式回归）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PatternFinding {
+    pub text: String,
+    pub cites: Vec<usize>,
+    pub passed_gate: bool,
+}
+
+/// 每个用例的判定结果（报告落盘：哪个正例没命中、哪个负例泄漏一目了然）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CaseResult {
+    pub index: usize,
+    pub expect_pattern: bool,
+    pub cited: bool,
+    pub keyword_hit: bool,
+    pub leaked: bool,
+}
+
+/// 评估报告（JSON 序列化后原子落盘，供跨次比较）
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EvalReport {
     pub ns: String,
+    pub eval_set_version: u32,
     pub cases_positive: usize,
     pub cases_negative: usize,
-    /// 过写库门槛（pattern_ok_for_consolidate）的 pattern 数
+    /// ok：有有效 pattern，hit_rate 可比；no_patterns / empty_reply：本轮无基线意义
+    pub outcome: String,
+    /// 过写库门槛（pattern_ok_for_consolidate）的 pattern 数（与生产一致：先 take(8) 后 take(5)）
     pub patterns_valid: usize,
     /// 被有效 pattern 引用的正例数
     pub positive_hits: usize,
-    /// **北极星指标**：positive_hits / cases_positive
+    /// **北极星指标**：positive_hits / cases_positive（仅 outcome=ok 有意义）
     pub positive_hit_rate: f64,
-    /// 次级指标：pattern 文本包含正例关键词的正例数
+    /// 次级指标：过门槛 pattern 文本包含正例关键词的正例数
     pub keyword_hits: usize,
-    /// 负例被引用次数（应趋近 0，>0 说明禁区约束退化）
+    /// 负例被 implicated 的用例数（引用或禁区关键词，任一候选行；应趋近 0）
     pub negative_leaks: usize,
+    /// 过门槛但未标注【依据】的 pattern 条数（>0 = 格式回归：hit_rate 低未必是覆盖回归）
+    pub patterns_missing_citations: usize,
     pub duration_ms: u64,
-    pub patterns: Vec<String>,
+    pub patterns: Vec<PatternFinding>,
+    pub case_results: Vec<CaseResult>,
     pub ts: String,
 }
 
-/// 跑一轮固定评估：真实调用提炼 LLM（与 consolidate 同款 prompt 结构），程序判分。
+/// 跑一轮固定评估：真实调用提炼 LLM（与生产 consolidate 同款 prompt），程序判分。
 /// 消耗一次 LLM 调用——仅限 admin 手动触发。
 pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalReport, String> {
     let started = Instant::now();
     let positives = EVAL_SET.iter().filter(|c| c.expect_pattern).count();
     let negatives = EVAL_SET.len() - positives;
 
-    // 与 consolidate 相同的 prompt 结构（编号观察 + 依据标注要求），仅原料换成固定题集
+    // 与生产相同的 prompt（共享字面量）+ 编号观察；仅原料与范围说明换成评估题集
     let obs_text = EVAL_SET
         .iter()
         .enumerate()
         .map(|(i, c)| format!("[{}] {}", i + 1, c.obs))
         .collect::<Vec<_>>()
         .join("\n- ");
-    let prompt = format!(
-        "你是知识巩固引擎。只从观察中提炼**可长期复用**的高层规则（架构取舍、运维约束、业务偏好、排障经验）。\n\
-         硬性禁止写成 pattern：\n\
-         - 一次性会话过程、工具回显、文件路径流水账、cron 任务日志\n\
-         - 测试/冒烟/世界杯等无关话题\n\
-         - 复述某条观察原文、或过短空话\n\
-         每条模式一行、一句话、具体可执行，最多 5 条；行末必须标注支撑它的观察序号，格式如【依据: 1,3】。\n\
-         若无可提炼内容，只输出「无模式」。\n\n\
-         ## 待巩固观察（评估题集，命名空间 {}）\n- {}",
-        ns,
-        obs_text.chars().take(6000).collect::<String>()
+    let prompt = AgentCore::pattern_extraction_prompt(
+        &format!("评估题集：正例 {} / 负例 {}，命名空间 {}", positives, negatives, ns),
+        &obs_text,
     );
     let msg = crate::llm::Message {
         role: "system".to_string(),
@@ -139,76 +166,99 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
         .llm
         .chat(&[msg], &[])
         .await
-        .map_err(|e| format!("评估 LLM 调用失败: {}", e))?;
-    let reply = reply.text.trim().to_string();
+        .map_err(|e| format!("评估 LLM 调用失败: {}", e))?
+        .text
+        .trim()
+        .to_string();
 
-    // 解析（与 consolidate 相同规则）：行末【依据: 序号】→ 过写库门槛的 pattern
-    let mut patterns_valid: Vec<(String, Vec<usize>)> = Vec::new();
-    for line in reply.lines() {
-        let l = line.trim();
-        if l.is_empty() {
-            continue;
-        }
-        if l.contains("无模式") && l.chars().count() < 20 {
-            break;
-        }
-        let (text, cite) = match l.find("【依据") {
-            Some(pos) => (&l[..pos], &l[pos..]),
-            None => (l, ""),
-        };
-        let nums: Vec<usize> = cite
-            .split(|c: char| !c.is_ascii_digit())
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse::<usize>().ok())
-            .filter(|n| *n >= 1 && *n <= EVAL_SET.len())
-            .collect();
-        let p = text
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    let empty_reply = reply.is_empty();
+    let no_patterns =
+        reply == "无模式" || (reply.contains("无模式") && reply.chars().count() < 20);
+
+    // 解析：与生产同规则（take(8) 候选 → 过门槛 → take(5)），引用解析共享 parse_pattern_citation
+    let mut findings: Vec<PatternFinding> = Vec::new();
+    for line in reply
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .take(8)
+    {
+        let (text, cites) = AgentCore::parse_pattern_citation(line, EVAL_SET.len());
+        let text = text
             .trim_start_matches(|c: char| {
                 c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' ' || c == '*'
             })
             .trim()
             .to_string();
-        if !p.is_empty() && AgentCore::pattern_ok_for_consolidate(&p) {
-            patterns_valid.push((p, nums));
+        if text.is_empty() {
+            continue;
+        }
+        findings.push(PatternFinding {
+            passed_gate: AgentCore::pattern_ok_for_consolidate(&text),
+            text,
+            cites,
+        });
+    }
+    // 有效 pattern = 过门槛且不超过生产上限 take(5)
+    let valid: Vec<&PatternFinding> = findings
+        .iter()
+        .filter(|f| f.passed_gate)
+        .take(5)
+        .collect();
+    // 但有效 pattern 之外的候选行仍参与**泄漏**检查（写库门槛本身会拦部分禁区词，
+    // 只查过门槛行会让最典型的回归形式永远计 0——见模块头注释）
+    let leak_scan_lines: Vec<&PatternFinding> = findings.iter().collect();
+
+    // 程序判分（零语义自由裁量）
+    let mut cited = vec![false; EVAL_SET.len()];
+    let mut leaked = vec![false; EVAL_SET.len()];
+    for f in &valid {
+        for n in &f.cites {
+            cited[n.saturating_sub(1)] = true;
         }
     }
-
-    // 程序判分：引用关系决定 hit / leak，零语义自由裁量
-    let mut cited = vec![false; EVAL_SET.len()];
-    let mut negative_leaks = 0usize;
-    for (_, cites) in &patterns_valid {
-        for n in cites {
-            let idx = n.saturating_sub(1);
-            if let Some(case) = EVAL_SET.get(idx) {
-                if case.expect_pattern {
-                    cited[idx] = true;
-                } else {
-                    negative_leaks += 1;
+    for f in &leak_scan_lines {
+        for (i, case) in EVAL_SET.iter().enumerate() {
+            if !case.expect_pattern {
+                let kw_hit = case.keywords.iter().any(|k| f.text.contains(k));
+                let cited_hit = f.cites.contains(&(i + 1));
+                if kw_hit || cited_hit {
+                    leaked[i] = true;
                 }
             }
         }
     }
-    let positive_hits = EVAL_SET
-        .iter()
-        .zip(&cited)
-        .filter(|(c, h)| c.expect_pattern && **h)
-        .count();
-    let keyword_hits = EVAL_SET
+    let case_results: Vec<CaseResult> = EVAL_SET
         .iter()
         .enumerate()
-        .filter(|(i, c)| {
-            c.expect_pattern
-                && patterns_valid.iter().any(|(p, _)| {
-                    c.keywords.iter().any(|k| p.contains(k)) || cited[*i]
-                })
+        .map(|(i, c)| CaseResult {
+            index: i + 1,
+            expect_pattern: c.expect_pattern,
+            cited: c.expect_pattern && cited[i],
+            keyword_hit: c.expect_pattern
+                && valid.iter().any(|f| {
+                    c.keywords.iter().any(|k| f.text.contains(k)) || cited[i]
+                }),
+            leaked: !c.expect_pattern && leaked[i],
         })
-        .count();
-    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        .collect();
+    let positive_hits = case_results.iter().filter(|r| r.cited).count();
+    let keyword_hits = case_results.iter().filter(|r| r.keyword_hit).count();
+    let negative_leaks = case_results.iter().filter(|r| r.leaked).count();
+    let patterns_missing_citations = valid.iter().filter(|f| f.cites.is_empty()).count();
+    let outcome = if empty_reply || no_patterns || valid.is_empty() {
+        if empty_reply { "empty_reply" } else { "no_patterns" }.to_string()
+    } else {
+        "ok".to_string()
+    };
     let report = EvalReport {
         ns: ns.to_string(),
+        eval_set_version: EVAL_SET_VERSION,
         cases_positive: positives,
         cases_negative: negatives,
-        patterns_valid: patterns_valid.len(),
+        outcome,
+        patterns_valid: valid.len(),
         positive_hits,
         positive_hit_rate: if positives > 0 {
             positive_hits as f64 / positives as f64
@@ -217,22 +267,35 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
         },
         keyword_hits,
         negative_leaks,
+        patterns_missing_citations,
         duration_ms: started.elapsed().as_millis() as u64,
-        patterns: patterns_valid.iter().map(|(p, _)| p.clone()).collect(),
-        ts: ts.clone(),
+        patterns: findings,
+        case_results,
+        ts,
     };
 
-    // 落盘 data/consolidate_eval/<ts>.json（best-effort：失败不影响返回）
+    // 原子落盘 data/consolidate_eval/<毫秒时间戳>.json：tmp + rename（对齐仓库
+    // write_meetings_file / experience_memo 约定），毫秒文件名防同秒覆盖；
+    // 每一步失败都 warn 留痕，不再静默吞错。
     let dir = std::path::Path::new("data/consolidate_eval");
-    if std::fs::create_dir_all(dir).is_ok() {
-        let file_ts = ts.replace([':', ' '], "-");
-        if let Ok(json) = serde_json::to_string_pretty(&report) {
-            let _ = std::fs::write(dir.join(format!("{}.json", file_ts)), json);
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(target: "consolidate_eval", error = %e, "P2-2: 无法创建评估目录，报告未落盘");
+    } else {
+        let file_ts = chrono::Local::now().format("%Y%m%dT%H%M%S%3f");
+        let final_path = dir.join(format!("{}.json", file_ts));
+        let tmp_path = dir.join(format!("{}.json.tmp", file_ts));
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => match std::fs::write(&tmp_path, json).and_then(|_| std::fs::rename(&tmp_path, &final_path)) {
+                Ok(()) => {}
+                Err(e) => tracing::warn!(target: "consolidate_eval", error = %e, "P2-2: 评估报告落盘失败"),
+            },
+            Err(e) => tracing::warn!(target: "consolidate_eval", error = %e, "P2-2: 评估报告序列化失败"),
         }
     }
     tracing::info!(
         target: "consolidate_eval",
         ns = %report.ns,
+        outcome = %report.outcome,
         hit_rate = format!("{:.2}", report.positive_hit_rate),
         leaks = report.negative_leaks,
         valid = report.patterns_valid,
@@ -241,10 +304,11 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
     Ok(report)
 }
 
-/// 读取历史评估报告的北极星指标序列（跨次比较用；按文件名时间戳升序）。
-/// 供未来 P3 进化循环取「上一次基线」——现在先提供读取面。
-pub fn list_past_hit_rates() -> Vec<(String, f64)> {
-    let mut out: Vec<(String, f64)> = Vec::new();
+/// 读取历史评估的基线序列（跨次比较用；按文件名时间戳升序）。
+/// **只返回 `outcome=ok` 且版本等于当前题集的报告**——空回复/无模式轮没有基线意义，
+/// 跨题集版本的数字不可比（见 EVAL_SET_VERSION）。
+pub fn list_past_hit_rates() -> Vec<(String, u32, f64)> {
+    let mut out: Vec<(String, u32, f64)> = Vec::new();
     let dir = std::path::Path::new("data/consolidate_eval");
     let mut names: Vec<_> = std::fs::read_dir(dir)
         .map(|rd| {
@@ -258,12 +322,19 @@ pub fn list_past_hit_rates() -> Vec<(String, f64)> {
     for path in names {
         if let Ok(text) = std::fs::read_to_string(&path) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if v["outcome"].as_str() != Some("ok") {
+                    continue;
+                }
+                let version = v["eval_set_version"].as_u64().unwrap_or(0) as u32;
+                if version != EVAL_SET_VERSION {
+                    continue;
+                }
                 let rate = v["positive_hit_rate"].as_f64().unwrap_or(0.0);
                 let ts = v["ts"]
                     .as_str()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| path.display().to_string());
-                out.push((ts, rate));
+                out.push((ts, version, rate));
             }
         }
     }
