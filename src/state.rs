@@ -305,13 +305,17 @@ impl Consciousness {
                     tracing::info!(target: "consciousness", "{}", line);
                     results_json.push(serde_json::json!({
                         "ns": outcome.ns, "result": outcome.detail,
+                        "status": outcome.status,
                         "patterns_added": outcome.patterns_added,
                         "observations": outcome.observations,
+                        "observations_visible": outcome.observations_visible,
                     }));
                     let structured = serde_json::json!({
                         "kind": "consolidate", "ns": outcome.ns,
+                        "status": outcome.status,
                         "patterns_added": outcome.patterns_added,
                         "observations": outcome.observations,
+                        "observations_visible": outcome.observations_visible,
                         "fetched": outcome.fetched,
                         "cursor": outcome.cursor,
                         "detail": outcome.detail,

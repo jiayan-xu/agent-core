@@ -22,16 +22,12 @@
 
 use std::time::Instant;
 
-use crate::agent::{AgentCore, PatternReplyKind, PATTERN_BUDGET};
+use crate::agent::{AgentCore, PatternReplyKind, CONSOLIDATE_MIN_OBS_CHARS_DEFAULT, PATTERN_BUDGET};
 
 /// 题集版本戳：**任何对 EVAL_SET 的修改（含追加）都必须递增本值**——追加用例同样
 /// 更换基线（分母变化使历史 hit_rate 不可比）。报告落盘携带本值，
 /// `list_past_hit_rates` 按版本过滤，P3 进化循环不会把跨版本数字当序列比较。
 pub const EVAL_SET_VERSION: u32 = 2;
-
-/// 生产原料门槛默认值（CONSOLIDATE_MIN_OBS_CHARS，agent.rs consolidate 读同一 env；
-/// 此处只用于题集完整性单测的独立常量，评估不重复过滤——题集构造时即已达标）。
-const PRODUCTION_MIN_OBS_CHARS: usize = 70;
 
 /// 评估用例。`expect_pattern=false` 的观察是 prompt 禁区样本（理想行为：不被引用）。
 struct EvalCase {
@@ -165,7 +161,7 @@ fn score_reply(reply: &str, included: usize, ns: &str, duration_ms: u64, ts: Str
             passed_gate: c.passed_gate,
         })
         .collect();
-    let valid: Vec<&PatternFinding> = findings.iter().filter(|f| f.passed_gate).take(5).collect();
+    let valid: Vec<&PatternFinding> = findings.iter().filter(|f| f.passed_gate).take(PATTERN_BUDGET).collect();
     // 泄漏扫描覆盖**全部候选行**（门槛前）——写库门槛本身会拦部分禁区词，
     // 只查过门槛行会让最典型的回归形式永远计 0
     let leak_scan_lines: Vec<&PatternFinding> = findings.iter().collect();
@@ -426,10 +422,10 @@ mod tests {
     fn eval_set_passes_production_gate() {
         for (i, c) in EVAL_SET.iter().enumerate() {
             assert!(
-                AgentCore::obs_ok_for_consolidate(c.obs, PRODUCTION_MIN_OBS_CHARS),
+                AgentCore::obs_ok_for_consolidate(c.obs, CONSOLIDATE_MIN_OBS_CHARS_DEFAULT),
                 "用例 {} 未过生产原料门槛（≥{} 字）：{}",
                 i + 1,
-                PRODUCTION_MIN_OBS_CHARS,
+                CONSOLIDATE_MIN_OBS_CHARS_DEFAULT,
                 &c.obs[..30.min(c.obs.len())]
             );
         }
@@ -450,11 +446,17 @@ mod tests {
     /// 引用→命中映射：正例被引用计 hit；窗口外序号被管线丢弃不计伪命中
     #[test]
     fn citation_to_hit_mapping() {
-        let r = score("规则甲条文内容足够长可以过门槛的【依据: 1,3】\n规则乙条文内容同样足够长过门槛【依据: 99】");
+        let r = score("规则甲条文内容足够长可以稳定通过写库门槛的【依据: 1,3】\n规则乙条文内容同样写得足够长能通过写库门槛【依据: 99】");
         assert_eq!(r.outcome, "ok");
         assert!(r.case_results[0].cited, "正例 1 应命中");
         assert!(r.case_results[2].cited, "正例 3 应命中");
-        assert!(!r.case_results.iter().any(|c| c.index == 99), "窗口外序号不产生用例");
+        // 直接断言管线不变量（ocr PR#68 第三轮：index==99 对枚举构造恒不可达，
+        // 是空断言）：窗口外序号必须被 max_n 过滤在候选 cites 之外
+        assert!(
+            r.patterns.iter().all(|f| !f.cites.contains(&99)),
+            "窗口外引用必须被过滤，实际 cites: {:?}",
+            r.patterns.iter().map(|f| &f.cites).collect::<Vec<_>>()
+        );
     }
 
     /// 泄漏：引用负例或禁区关键词（含改大小写）都计 leak，且按用例去重

@@ -458,10 +458,17 @@ pub struct RoundtableResult {
 /// 日志用 [`summary_line`](Self::summary_line)。
 pub struct ConsolidateOutcome {
     pub ns: String,
+    /// 机器可读状态（ocr PR#68 第三轮：LLM 失败/空响应/无模式/门槛拒绝/部分写失败
+    /// 此前只能从 detail 中文文本猜，事件 JSON 与 /health.dream 无法编程区分）：
+    /// ok / llm_error / empty / no_patterns / gate_rejected
+    pub status: &'static str,
     /// 写回的 pattern 条数
     pub patterns_added: u64,
     /// 本批合格观察数（evidence 池）
     pub observations: usize,
+    /// 6000 字窗口内实际喂给 LLM 的观察数（窗口外已被游标消费——与 observations
+    /// 的差值即被静默消费量，消费方必须可辨别，ocr PR#68 第三轮）
+    pub observations_visible: usize,
     /// 本批拉取总数（含不合格）
     pub fetched: usize,
     /// 推进后的游标
@@ -516,6 +523,46 @@ impl PatternReply {
 /// P2-2 共用：单轮 pattern 配额（prompt「最多 5 条」与写库 take(5) 的同源常量，
 /// 评估的预算归一也用它——ocr PR#68 第二轮：配额在评估里重写一份必然漂移）。
 pub(crate) const PATTERN_BUDGET: usize = 5;
+
+/// P2-2 共用：巩固原料门槛的**默认值**（CONSOLIDATE_MIN_OBS_CHARS 未设时生效）。
+/// 评估题集完整性测试消费同一常量（ocr PR#68 第三轮：第二份拷贝会在生产默认值
+/// 调整时静默失效，评估测回生产从不产生的分布）。
+pub(crate) const CONSOLIDATE_MIN_OBS_CHARS_DEFAULT: usize = 70;
+
+/// P2-2 共用：剥离行首列表/序号标记（`- `、`* `、`1.`、`1、` 等组合）。
+/// 行首引用判定（parse_pattern_citation）与候选文本剥离（parse_pattern_reply）
+/// 共用同一谓词——两处集合不同步会漏剥或错剥（ocr PR#68 第三轮 high）。
+fn strip_list_markers(s: &str) -> &str {
+    let mut t = s.trim_start_matches(|c: char| c == '-' || c == '*' || c == '·' || c == '•' || c.is_whitespace());
+    loop {
+        let next = t
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == '、')
+            .trim_start();
+        if next.len() == t.len() {
+            break;
+        }
+        t = next;
+    }
+    t.trim_start_matches(|c: char| c.is_whitespace())
+}
+
+/// P2-2 共用：剥离前导的 `[N]`/`【N】` 批内索引 token——prompt 用 `[3] 规则…`
+/// 渲染观察，模型回显该格式时前导 `[3]` 是批次局部索引，落库后无意义且污染
+/// 检索（ocr PR#68 第三轮）。
+fn strip_leading_index(s: &str) -> &str {
+    let t = s.trim_start();
+    for (open, close) in [('[', ']'), ('【', '】')] {
+        if let Some(rest) = t.strip_prefix(open) {
+            if let Some(off) = rest.find(close) {
+                let inner = &rest[..off];
+                if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) && off <= 4 {
+                    return strip_leading_index(&rest[off + close.len_utf8()..]);
+                }
+            }
+        }
+    }
+    t
+}
 
 /// 会议实时状态机阶段（会议升级 Step3）。
 /// serde snake_case 序列化与前端 / 旧 meetings.json 字符串完全一致（ai_speaking / awaiting_humans / discussing / done），向后兼容。
@@ -12334,7 +12381,7 @@ impl AgentCore {
         let min_obs_chars: usize = std::env::var("CONSOLIDATE_MIN_OBS_CHARS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(70);
+            .unwrap_or(CONSOLIDATE_MIN_OBS_CHARS_DEFAULT);
 
         // 1. 取游标
         let ds_raw = mem_client
@@ -12372,8 +12419,10 @@ impl AgentCore {
         if items.is_empty() {
             return ConsolidateOutcome {
                 ns: ns.to_string(),
+                status: "no_patterns",
                 patterns_added: 0,
                 observations: 0,
+                observations_visible: 0,
                 fetched: 0,
                 cursor: cursor_ts.clone(),
                 detail: format!("无新观察（cursor={}）", cursor_ts),
@@ -12432,8 +12481,10 @@ impl AgentCore {
         if obs_lines.is_empty() {
             return ConsolidateOutcome {
                 ns: ns.to_string(),
+                status: "no_patterns",
                 patterns_added: 0,
                 observations: 0,
+                observations_visible: 0,
                 fetched: items.len(),
                 cursor: max_ts.clone(),
                 detail: format!(
@@ -12479,11 +12530,13 @@ impl AgentCore {
             Err(e) => {
                 return ConsolidateOutcome {
                     ns: ns.to_string(),
+                    status: "llm_error",
                     patterns_added: 0,
                     observations: obs_lines.len(),
+                    observations_visible: included,
                     fetched: items.len(),
                     cursor: max_ts.clone(),
-                    detail: format!("LLM 失败: {}", e),
+                    detail: format!("LLM 失败: {}{}", e, window_note),
                 }
             }
         };
@@ -12493,16 +12546,26 @@ impl AgentCore {
         // 序号上界 `included`（6000 字窗口内实际可见数），窗口外引用一律无效。
         let parsed = AgentCore::parse_pattern_reply(&reply, included);
         if parsed.kind != PatternReplyKind::Valid {
+            // Empty 与 NoPatterns 分开上报（ocr PR#68 第三轮：枚举区分了却被折进
+            // 同一句「无模式」——空响应更像 provider 故障，值得单独观测）
+            let (status, reason) = match parsed.kind {
+                PatternReplyKind::Empty => ("empty", "空响应"),
+                _ => ("no_patterns", "无模式"),
+            };
             return ConsolidateOutcome {
                 ns: ns.to_string(),
+                status,
                 patterns_added: 0,
                 observations: obs_lines.len(),
+                observations_visible: included,
                 fetched: items.len(),
                 cursor: max_ts.clone(),
                 detail: format!(
-                    "无模式（合格观察 {}，跳过 {}，cursor→{}）",
+                    "{}（合格观察 {}，跳过 {}{}，cursor→{}）",
+                    reason,
                     obs_lines.len(),
                     skipped,
+                    window_note,
                     max_ts
                 ),
             };
@@ -12520,16 +12583,19 @@ impl AgentCore {
                 .count();
             return ConsolidateOutcome {
                 ns: ns.to_string(),
+                status: "gate_rejected",
                 patterns_added: 0,
                 observations: obs_lines.len(),
+                observations_visible: included,
                 fetched: items.len(),
                 cursor: max_ts.clone(),
                 detail: format!(
-                    "LLM 产出未过写库门槛（候选 {}：门槛拒绝 {}，引用前置空正文 {}；合格观察 {}，cursor→{}）",
+                    "LLM 产出未过写库门槛（候选 {}：门槛拒绝 {}，引用前置空正文 {}；合格观察 {}{}，cursor→{}）",
                     parsed.lines.len(),
                     gate_rejected,
                     stripped_empty,
                     obs_lines.len(),
+                    window_note,
                     max_ts
                 ),
             };
@@ -12581,7 +12647,27 @@ impl AgentCore {
             // 写入结果如实计数（ocr PR#65 第五轮）：patterns_added 被事件 JSON/HTTP
             // 响应当指标消费，memoria 写失败仍 +1 会持续虚高（游标已推进不重试）
             match mem_client.call("memory_remember", &args).await {
-                Ok(_) => written += 1,
+                Ok(text) => {
+                    // MCP isError 结果以 Ok 文本返回（ocr PR#68 第三轮：transport Ok
+                    // 不等于业务成功——参数/配额/ns 策略拒绝都在 result.isError 里）
+                    let business_err = serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("result")
+                                .or(Some(&v))
+                                .and_then(|r| r.get("isError"))
+                                .and_then(|b| b.as_bool())
+                        })
+                        .unwrap_or(false);
+                    if business_err {
+                        write_failed += 1;
+                        tracing::warn!(target: "consolidate", ns = %ns,
+                            "pattern 写入被 Memoria 业务拒绝（isError，游标已推进不重试）：{}",
+                            text.chars().take(200).collect::<String>());
+                    } else {
+                        written += 1;
+                    }
+                }
                 Err(e) => {
                     write_failed += 1;
                     tracing::warn!(target: "consolidate", ns = %ns, error = %e,
@@ -12852,8 +12938,10 @@ impl AgentCore {
 
         ConsolidateOutcome {
             ns: ns.to_string(),
+            status: if write_failed > 0 { "partial_write" } else { "ok" },
             patterns_added: written,
             observations: obs_lines.len(),
+            observations_visible: included,
             fetched: items.len(),
             cursor: max_ts.clone(),
             detail: format!(
@@ -12950,7 +13038,9 @@ impl AgentCore {
         } else {
             entries[..included].join("\n- ")
         };
-        let included = included.max(1);
+        // 空题集返回 0（ocr PR#68 第三轮：max(1) 在无条目时给出伪上界，
+        // parse_pattern_reply 会接受指向不存在证据的引用）；首条超长才保 1
+        let included = if entries.is_empty() { 0 } else { included.max(1) };
         (
             format!(
                 "你是知识巩固引擎。只从观察中提炼**可长期复用**的高层规则（架构取舍、运维约束、业务偏好、排障经验）。\n\
@@ -12958,10 +13048,10 @@ impl AgentCore {
                  - 一次性会话过程、工具回显、文件路径流水账、cron 任务日志\n\
                  - 测试/冒烟/世界杯等无关话题\n\
                  - 复述某条观察原文、或过短空话\n\
-                 每条模式一行、一句话、具体可执行，最多 5 条；行末必须标注支撑它的观察序号，格式如【依据: 1,3】。\n\
+                 每条模式一行、一句话、具体可执行，最多 {} 条；行末必须标注支撑它的观察序号，格式如【依据: 1,3】。\n\
                  若无可提炼内容，只输出「无模式」。\n\n\
                  ## 待巩固观察（{}）\n- {}",
-                scope, obs_text
+                PATTERN_BUDGET, scope, obs_text
             ),
             included,
         )
@@ -12992,12 +13082,10 @@ impl AgentCore {
             .filter(|n| *n >= 1 && *n <= max_n)
             .collect();
         let after = &line[pos + rel_end + 3..];
-        // 列表标记先剥再判空前缀（ocr PR#68 第二轮）：`- 【依据: 1】 规则…` 的
-        // 前缀是 "- " 非空，恢复不触发，标记剥离后正文为空 → 整行被丢
-        let prefix_core = line[..pos]
-            .trim_start_matches(|c: char| c == '-' || c == '*' || c == '·' || c == '•' || c.is_whitespace())
-            .trim_start_matches(|c: char| c.is_numeric() || c == '.')
-            .trim();
+        // 列表标记先剥再判空前缀（ocr PR#68 第二轮；第三轮 high：剥离谓词与
+        // parse_pattern_reply 的后续剥离不同步——`1、【依据: 1】 …` 的顿号前缀
+        // 漏剥，行首恢复不触发、后续剥离成空、整行被丢）。共用同一谓词。
+        let prefix_core = strip_list_markers(&line[..pos]);
         let text = if prefix_core.is_empty() && !after.trim().is_empty() {
             // 行首引用：正文在闭括号之后（恢复，防整批空文本）
             after.trim().to_string()
@@ -13023,12 +13111,7 @@ impl AgentCore {
             .take(8)
         {
             let (text, cites) = AgentCore::parse_pattern_citation(line, max_n);
-            let text = text
-                .trim_start_matches(|c: char| {
-                    c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' ' || c == '*'
-                })
-                .trim()
-                .to_string();
+            let text = strip_leading_index(strip_list_markers(&text)).to_string();
             if text.is_empty() {
                 // 空正文行（如纯引用回显）保留占位以便诊断计数，但不过门槛
                 lines.push(PatternCandidate { text, cites, passed_gate: false });
