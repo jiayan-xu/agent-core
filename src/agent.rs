@@ -334,17 +334,23 @@ fn strip_step_citations(answer: &str) -> String {
     let mut it = answer.char_indices().peekable();
     while let Some((i, c)) = it.next() {
         if answer[i..].starts_with("[步骤") {
+            // 兼容 [步骤N] 与 prompt 实际渲染的 [步骤 N]（数字前后均可有空格，
+            // ocr PR#67 第六轮 high：带空格形态漏剥会直接漏进用户可见回复）
             let rest = &answer[i + "[步骤".len()..];
-            let digits_end = rest
+            let ws1 = rest.len() - rest.trim_start_matches(' ').len();
+            let after_ws = &rest[ws1..];
+            let digits_end = after_ws
                 .find(|ch: char| !ch.is_ascii_digit())
-                .unwrap_or(rest.len());
-            if digits_end > 0 && rest[digits_end..].starts_with(']') {
-                let mut skip = "[步骤".len() + digits_end + 1;
-                if rest[digits_end + 1..].starts_with(' ') {
+                .unwrap_or(after_ws.len());
+            let after_digits_ws = after_ws[digits_end..].trim_start_matches(' ');
+            if digits_end > 0 && after_digits_ws.starts_with(']') {
+                let ws_total = ws1 + (after_ws[digits_end..].len() - after_digits_ws.len());
+                let mut skip = i + "[步骤".len() + ws_total + digits_end + 1; // +1 为 ]
+                if answer[skip..].starts_with(' ') {
                     skip += 1;
                 }
                 while let Some(&(j, _)) = it.peek() {
-                    if j < i + skip {
+                    if j < skip {
                         it.next();
                     } else {
                         break;
@@ -8613,6 +8619,14 @@ impl AgentCore {
             // **不整包克隆**（ocr PR#67 第二轮：候选可达数十 KB，克隆发生在所有
             // 守卫判定之前；借用构造 prompt 与替换串，仅在写回时短暂独占）
             let content: &str = messages[idx].content.as_deref().unwrap_or("");
+            // 防膨胀**前置**（ocr PR#67 第六轮：事后守卫烧完 LLM 才发现白干——
+            // 替换恒花 ≈retained_est 字，原文不大于它就不可能变小，直接跳过）
+            if (chars as u64) <= retained_est as u64 {
+                tracing::debug!(target: "orchestration.summary",
+                    tool_call_id = ?messages[idx].tool_call_id, chars,
+                    "候选小于替换成本（≈{} 字），跳过不烧摘要调用", retained_est);
+                continue;
+            }
             // 投影（无锁；首条豁免——见函数头注释）
             let lost_delta_est = (chars as u64).saturating_sub(retained_est as u64);
             if any_summarized
@@ -8693,7 +8707,7 @@ impl AgentCore {
                     let new_len = replacement.chars().count() as u64;
                     if new_len < chars as u64 {
                         lost_so_far += (chars as u64).saturating_sub(new_len);
-                        total_now = total_now - (chars as u64) + new_len;
+                        total_now = total_now.saturating_sub(chars as u64) + new_len;
                         any_summarized = true;
                         messages[idx].content = Some(replacement);
                     } else {
@@ -12440,9 +12454,10 @@ impl AgentCore {
         } else {
             (&[], None)
         };
-        // 识别但为空的记录数组（**含顶层空数组**，ocr PR#67 第二轮：早退分支只查
-        // envelope_key.is_none 会把 `[]` 当「无记录数组」吞掉）→ Some(0)
-        if records.is_empty() && v.is_array() {
+        // 识别但为空的记录数组（**仅顶层空数组**，ocr PR#67 第六轮 high：非对象
+        // 数组 `[1,2,3]` 此前也被吞成 ("[]", Some(0))——真数据被静默丢弃还出具
+        // 伪零计数；非对象数组落到下方「无记录数组」透传分支）→ Some(0)
+        if v.as_array().is_some_and(|a| a.is_empty()) {
             return ("[]".to_string(), Some(0), "records");
         }
         if records.is_empty() && envelope_key.is_none() {
@@ -15247,10 +15262,14 @@ mod tool_summary_accounting_tests {
     /// 格式变更而忘记同步解析时，本测试先红。
     #[test]
     fn tool_summary_marker_round_trip() {
-        // 与 maybe_summarize_tool_outputs 成功分支的替换模板一致（核算字段在最前）
-        let content = "[工具结果摘要](溯源: 原文 16000 字，tool_call_id=Some(\"tc-1\")，摘要为 LLM 生成非原文)\n这里是摘要正文。\n\n[原文保留前2000字]\n原始内容开头……";
+        // 夹具用**生产构造器**生成（ocr PR#67 第六轮：手写字面量就是第五轮要
+        // 消灭的四处拷贝之一——模板漂移时生产核算静默坏而测试仍绿）
+        let content = format!(
+            "{}\n这里是摘要正文。\n\n[原文保留前2000字]\n原始内容开头……",
+            super::tool_summary_header(16000, &Some("tc-1".to_string()))
+        );
         let cur = content.chars().count() as u64;
-        assert_eq!(AgentCore::tool_summary_discard_of(content), 16000 - cur);
+        assert_eq!(AgentCore::tool_summary_discard_of(&content), 16000 - cur);
 
         // squash 后缀（截断标记拼接在尾部）但头部仍可解析 → **照常计算**
         // （ocr PR#67 第三轮 high：一律免疫会让累计护栏反复重置）
@@ -15365,6 +15384,10 @@ mod extraction_helpers_tests {
         let (_, k2, kind2) = AgentCore::truncate_json_records("不是 JSON", 100);
         assert_eq!(k2, None);
         assert_eq!(kind2, "unparsed");
+        // 非对象顶层数组（[1,2,3]）：透传不误报 Some(0)（ocr PR#67 第六轮 high）
+        let (text4, k4, kind4) = AgentCore::truncate_json_records("[1,2,3]", 100);
+        assert_eq!(k4, None, "非记录数组不得出具伪计数");
+        assert!(text4.contains('1'), "数据必须透传不得丢弃");
         let (text, k3, kind3) = AgentCore::truncate_json_records(r#"{"ok":true}"#, 100);
         assert!(text.contains("ok"));
         assert_eq!(k3, None);
@@ -15380,6 +15403,9 @@ mod step_citation_tests {
     #[test]
     fn strips_step_tokens() {
         assert_eq!(strip_step_citations("结果如[步骤1]，共 3 条"), "结果如，共 3 条");
+        // prompt 实际渲染的是带空格形态（ocr PR#67 第六轮 high）
+        assert_eq!(strip_step_citations("结果如[步骤 1]，共 3 条"), "结果如，共 3 条");
+        assert_eq!(strip_step_citations("[步骤 2] 数据在[步骤1]处"), "数据在处");
         assert_eq!(strip_step_citations("[步骤2] 数据在[步骤1]"), "数据在");
         // 非法形态（无数字/未闭合）原样保留
         assert_eq!(strip_step_citations("[步骤] 普通文本"), "[步骤] 普通文本");
