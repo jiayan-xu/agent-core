@@ -477,6 +477,38 @@ impl ConsolidateOutcome {
     }
 }
 
+/// P2-2 共用：LLM 回复的归类（parse_pattern_reply 输出）。
+/// 区分「模型空响应 / 明说无模式 / 有候选」——生产与评估共用同一判定
+/// （此前「无模式」启发式在两处复制，ocr PR#68）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PatternReplyKind {
+    Empty,
+    NoPatterns,
+    Valid,
+}
+
+/// P2-2 共用：单条 pattern 候选（保留门槛前状态，供评估做门槛前泄漏扫描与诊断计数）。
+#[derive(Debug, Clone)]
+pub(crate) struct PatternCandidate {
+    pub text: String,
+    pub cites: Vec<usize>,
+    pub passed_gate: bool,
+}
+
+/// P2-2 共用：`parse_pattern_reply` 的结果。
+pub(crate) struct PatternReply {
+    pub kind: PatternReplyKind,
+    /// take(8) 内解析出的全部候选（含未过门槛与空正文行）
+    pub lines: Vec<PatternCandidate>,
+}
+
+impl PatternReply {
+    /// 与生产配额一致的有效 pattern：过写库门槛后取前 5
+    pub fn valid_patterns(&self) -> Vec<&PatternCandidate> {
+        self.lines.iter().filter(|c| c.passed_gate).take(5).collect()
+    }
+}
+
 /// 会议实时状态机阶段（会议升级 Step3）。
 /// serde snake_case 序列化与前端 / 旧 meetings.json 字符串完全一致（ai_speaking / awaiting_humans / discussing / done），向后兼容。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -12433,7 +12465,12 @@ impl AgentCore {
                 }
             }
         };
-        if reply.is_empty() || reply == "无模式" || (reply.contains("无模式") && reply.chars().count() < 20) {
+        // 5. 写回 pattern（≤5，再过一道写库过滤）。
+        // P2-2 共用管线 parse_pattern_reply（ocr PR#68：take(8)/引用解析/标记剥离/
+        // 门槛/take(5) 与「无模式」判定与评估共用同一实现，杜绝双份漂移）；
+        // 序号上界 `included`（6000 字窗口内实际可见数），窗口外引用一律无效。
+        let parsed = AgentCore::parse_pattern_reply(&reply, included);
+        if parsed.kind != PatternReplyKind::Valid {
             return ConsolidateOutcome {
                 ns: ns.to_string(),
                 patterns_added: 0,
@@ -12449,30 +12486,16 @@ impl AgentCore {
             };
         }
 
-        // 5. 写回 pattern（≤5，再过一道写库过滤）。
-        // P1-d：共享引用解析器（引用区在 `】` 截断，行尾数字不误入）；序号上界用
-        // `included`（6000 字窗口内实际可见的观察数），窗口外观察的引用一律无效
-        // → 映射观察内存 ID（evidence 指针）
-        let clean_patterns: Vec<(String, Vec<usize>)> = reply
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .take(8) // 先多取，过滤后再截断
-            .map(|l| {
-                let (p, c) = AgentCore::parse_pattern_citation(l, included);
-                let p = p
-                    .trim_start_matches(|c: char| {
-                        c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' ' || c == '*'
-                    })
-                    .trim()
-                    .to_string();
-                (p, c)
-            })
-            .filter(|(p, _)| Self::pattern_ok_for_consolidate(p))
-            .take(5)
-            .collect();
-
-        if clean_patterns.is_empty() {
+        let valid_patterns = parsed.valid_patterns();
+        if valid_patterns.is_empty() {
+            // 诊断细分（ocr PR#68）：「引用前置导致正文为空」与「门槛拒绝」是不同
+            // 的修复动作，且前者的批次已被游标消费、不可重放——必须可辨别
+            let stripped_empty = parsed.lines.iter().filter(|c| c.text.is_empty()).count();
+            let gate_rejected = parsed
+                .lines
+                .iter()
+                .filter(|c| !c.text.is_empty() && !c.passed_gate)
+                .count();
             return ConsolidateOutcome {
                 ns: ns.to_string(),
                 patterns_added: 0,
@@ -12480,7 +12503,10 @@ impl AgentCore {
                 fetched: items.len(),
                 cursor: max_ts.clone(),
                 detail: format!(
-                    "LLM 产出未过写库门槛（合格观察 {}，cursor→{}）",
+                    "LLM 产出未过写库门槛（候选 {}：门槛拒绝 {}，引用前置空正文 {}；合格观察 {}，cursor→{}）",
+                    parsed.lines.len(),
+                    gate_rejected,
+                    stripped_empty,
                     obs_lines.len(),
                     max_ts
                 ),
@@ -12488,9 +12514,9 @@ impl AgentCore {
         }
 
         // P2.2d：consolidate retain 路径 — LLM 抽取 signal tags 并随 memory_remember 持久化
-        let pattern_texts: Vec<String> = clean_patterns
+        let pattern_texts: Vec<String> = valid_patterns
             .iter()
-            .map(|(p, _)| p.clone())
+            .map(|c| c.text.clone())
             .collect();
         let signal_tags_by_idx = self
             .llm_extract_signal_tags_batch(&pattern_texts)
@@ -12498,26 +12524,30 @@ impl AgentCore {
 
         let mut written = 0u64;
         let mut write_failed = 0u64;
-        for (i, (clean, cites)) in clean_patterns.iter().enumerate() {
-            // P1-d evidence 指针：序号 + 内存 ID（ID 截前 5 个防 content 膨胀）；
-            // 未标注依据时如实记「未标注」，不伪造可回溯性。
-            let cite_nums: Vec<String> = cites.iter().map(|n| n.to_string()).collect();
-            let cite_ids: Vec<String> = cites
+        for (i, cand) in valid_patterns.iter().enumerate() {
+            // P1-d evidence 指针——**序号:ID 配对**（ocr PR#68：两个独立列表在去重/
+            // 截断/空 ID 过滤后位置错位，读者无法逐条回溯；配对一次成型，缺 ID 记 ?）
+            let mut seen = std::collections::BTreeSet::new();
+            let pairs: Vec<String> = cand
+                .cites
                 .iter()
-                .filter_map(|n| obs_ids.get(n.saturating_sub(1)))
-                .filter(|s| !s.is_empty())
+                .filter(|n| seen.insert(**n))
                 .take(5)
-                .cloned()
+                .map(|n| {
+                    let id = obs_ids
+                        .get(n.saturating_sub(1))
+                        .map(|s| s.as_str())
+                        .filter(|s| !s.is_empty());
+                    format!("{}:{}", n, id.unwrap_or("?"))
+                })
                 .collect();
-            let evidence = if cite_nums.is_empty() {
+            let evidence = if pairs.is_empty() {
                 format!("依据观察:未标注（本批 {} 条候选）", obs_lines.len())
-            } else if cite_ids.is_empty() {
-                format!("依据观察:[{}]", cite_nums.join(","))
             } else {
-                format!("依据观察:[{}]（id:{})", cite_nums.join(","), cite_ids.join(","))
+                format!("依据观察:{}", pairs.join(","))
             };
             let mut args = serde_json::json!({
-                "content": format!("[pattern] {} | ns={} | {}", clean, ns, evidence),
+                "content": format!("[pattern] {} | ns={} | {}", cand.text, ns, evidence),
                 "tags": ["pattern", "auto_consolidated"],
                 "category": "pattern",
                 "confidence": 70,
@@ -12867,28 +12897,37 @@ impl AgentCore {
     /// 漂移，届时历史基线测的就不是正在运行的 prompt，ocr PR#65 评审 high）。
     /// `scope` 为「## 待巩固观察（…）」括号内的范围说明。
     ///
-    /// 返回 `(prompt, 纳入观察数)`：prompt 只喂前 6000 字，被截断在窗口外的观察
-    /// 模型从未见过——引用解析的 `max_n` 必须用**实际纳入数**而非全量数，否则
-    /// 幻觉序号会被记成「模型没看过的观察」的证据（ocr PR#65 第三轮评审）。
+    /// 返回 `(prompt, 纳入观察数)`：**只渲染完整落在 6000 字窗口内的条目**，窗口外
+    /// 的既不出现也不可引用——「可见」与「可引用」严格一致（ocr PR#68：若渲染
+    /// take(6000) 全文，第 included+1 条会带合法 `[N]` 标记部分可见，其引用却被
+    /// 静默丢弃、evidence 退化为「未标注」）。首条超长时渲染其 6000 字截断并计 1；
+    /// 计数与渲染同源，无双重构造漂移。
     pub(crate) fn pattern_extraction_prompt(scope: &str, obs_lines: &[String]) -> (String, usize) {
-        let obs_text = obs_lines
+        const WINDOW: usize = 6000;
+        let entries: Vec<String> = obs_lines
             .iter()
             .enumerate()
             .map(|(i, l)| format!("[{}] {}", i + 1, l))
-            .collect::<Vec<_>>()
-            .join("\n- ");
-        // 数出完整落在 6000 字窗口内的观察条数（join 分隔符 3 字计入长度）
+            .collect();
         let mut included = 0usize;
         let mut used = 0usize;
-        for (i, l) in obs_lines.iter().enumerate() {
-            let entry_len = format!("[{}] {}", i + 1, l).chars().count() + if i > 0 { 3 } else { 0 };
-            if used + entry_len > 6000 {
+        for (i, e) in entries.iter().enumerate() {
+            let len = e.chars().count() + if i > 0 { 3 } else { 0 };
+            if used + len > WINDOW {
                 break;
             }
-            used += entry_len;
+            used += len;
             included += 1;
         }
-        let included = included.max(1); // 首条超长也至少纳入 1 条（prompt 行为与 take(6000) 一致：首条部分可见）
+        let obs_text = if included == 0 {
+            entries
+                .first()
+                .map(|e| e.chars().take(WINDOW).collect::<String>())
+                .unwrap_or_default()
+        } else {
+            entries[..included].join("\n- ")
+        };
+        let included = included.max(1);
         (
             format!(
                 "你是知识巩固引擎。只从观察中提炼**可长期复用**的高层规则（架构取舍、运维约束、业务偏好、排障经验）。\n\
@@ -12899,8 +12938,7 @@ impl AgentCore {
                  每条模式一行、一句话、具体可执行，最多 5 条；行末必须标注支撑它的观察序号，格式如【依据: 1,3】。\n\
                  若无可提炼内容，只输出「无模式」。\n\n\
                  ## 待巩固观察（{}）\n- {}",
-                scope,
-                obs_text.chars().take(6000).collect::<String>()
+                scope, obs_text
             ),
             included,
         )
@@ -12910,6 +12948,9 @@ impl AgentCore {
     /// 行尾后续数字（版本号/端口号/"见 5"/"窗口 1 分钟"）不会被误当引用
     /// （ocr PR#65 评审：评估里这直接污染北极星指标，生产里污染 evidence 指针）。
     /// `max_n` = 合法序号上界（观察总数）。返回 (去引用的 pattern 文本, 1-based 序号)。
+    /// **行首引用恢复**（ocr PR#68）：模型把标记放开头（`【依据: 1】 规则内容…`）时
+    /// 前缀为空，恢复闭括号之后的正文——否则引用回显风格输出会整批空文本，
+    /// 在游标已推进的前提下造成批次静默永久丢失。
     pub(crate) fn parse_pattern_citation(line: &str, max_n: usize) -> (String, Vec<usize>) {
         let Some(pos) = line.find("【依据") else {
             return (line.trim().to_string(), Vec::new());
@@ -12927,7 +12968,54 @@ impl AgentCore {
             .filter_map(|s| s.parse::<usize>().ok())
             .filter(|n| *n >= 1 && *n <= max_n)
             .collect();
-        (line[..pos].trim().to_string(), nums)
+        let after = &line[pos + rel_end + 3..];
+        let text = if line[..pos].trim().is_empty() && !after.trim().is_empty() {
+            // 行首引用：正文在闭括号之后（恢复，防整批空文本）
+            after.trim().to_string()
+        } else {
+            line[..pos].trim().to_string()
+        };
+        (text, nums)
+    }
+
+    /// P2-2 共用：LLM 回复 → pattern 候选的**唯一**管线（ocr PR#68：prompt 字面量
+    /// 收敛了，但 take(8)→引用解析→标记剥离→写库门槛→take(5) 与「无模式」判定
+    /// 仍是两处复制，配额/标记一改评估就测旧管线而基线仍宣称可比）。
+    /// 生产 consolidate 与 consolidate_eval 共用本入口。
+    pub(crate) fn parse_pattern_reply(reply: &str, max_n: usize) -> PatternReply {
+        let empty = reply.is_empty();
+        let no_patterns =
+            reply == "无模式" || (reply.contains("无模式") && reply.chars().count() < 20);
+        let mut lines: Vec<PatternCandidate> = Vec::new();
+        for line in reply
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .take(8)
+        {
+            let (text, cites) = AgentCore::parse_pattern_citation(line, max_n);
+            let text = text
+                .trim_start_matches(|c: char| {
+                    c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' ' || c == '*'
+                })
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                // 空正文行（如纯引用回显）保留占位以便诊断计数，但不过门槛
+                lines.push(PatternCandidate { text, cites, passed_gate: false });
+                continue;
+            }
+            let passed_gate = AgentCore::pattern_ok_for_consolidate(&text);
+            lines.push(PatternCandidate { text, cites, passed_gate });
+        }
+        let kind = if empty {
+            PatternReplyKind::Empty
+        } else if no_patterns {
+            PatternReplyKind::NoPatterns
+        } else {
+            PatternReplyKind::Valid
+        };
+        PatternReply { kind, lines }
     }
 
     /// 巩固原料门槛：挡短文本 / 测试 / 会话助理前缀 / cron 流水
