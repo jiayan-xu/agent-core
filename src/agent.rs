@@ -347,11 +347,14 @@ pub struct AgentCore {
     /// P1-1: 会话历史摘要缓存（session_id → (已摘要条数, 摘要文本, 已摘要区间指纹)）——滑动窗口+摘要层。
     /// 指纹防「外部历史替换但条数不变」场景返回过期摘要（P1 审查#3）。
     history_summary_cache: tokio::sync::Mutex<HashMap<String, (usize, String, u64)>>,
-    /// P1-b（R3 护栏）：每会话工具摘要台账（session_id → (累计丢弃字符数, 纳入统计的工具输出总字符数)）。
+    /// P1-b（R3 护栏）：每会话工具摘要台账（session_id → **累计丢弃字符数**）。
     /// 「累计丢弃占比 ≤30%」防长会话多轮摘要叠加造成信息渐进丢失（ADR-017 P3 原有
-    /// max_per_round 只限单轮，不限累计）。容量上限 200 条，超出整体清空（对齐
-    /// history_summary_cache 约定；清空只临时放宽占比上限，无正确性风险）。
-    tool_summary_ledger: tokio::sync::Mutex<HashMap<String, (u64, u64)>>,
+    /// max_per_round 只限单轮，不限累计）。分母不用累计值——**每次调用快照当前
+    /// ctx.messages 里 tool 消息的总体量**（已被 squash 截断/摘要替换的消息按其现存
+    /// 体积计），天然避免「同一条消息逐轮重复入账推高分母、变相放宽上限」的偏差。
+    /// 容量上限 200 条，超出整体清空（对齐 history_summary_cache 约定；
+    /// 清空只丢失丢弃累计、临时放宽上限，无正确性风险）。
+    tool_summary_ledger: tokio::sync::Mutex<HashMap<String, u64>>,
     /// Phase B（GenOffice snapshotBefore 借鉴）：本次 run 首个非只读工具执行前的消息快照，
     /// 供回滚 UI / 自进化 dry_run 复用。map 键 = "session_id|trace_id" 复合键：
     /// 同 session 并发 run 各自独立，互不覆盖、互不误取（第八轮 bug·medium 修复）；
@@ -560,7 +563,9 @@ fn normalize_stance(s: &str) -> String {
     let unconditional = t.contains("无条件") || t.contains("不设条件") || t.contains("无附加条件");
     if t.contains("中立") {
         "中立".to_string()
-    } else if t.contains("条件") && t.contains("支持") && !unconditional {
+    } else if t.contains("条件") && t.contains("支持") && !unconditional && !t.contains("不支持") {
+        // 「不支持」守卫：条件不支持/有条件下不支持 必须落「反对」而非被「条件支持」
+        // 截胡（180° 极性反转，ocr PR#65 第二轮评审）
         "条件支持".to_string()
     } else if t.contains("反对") || t.contains("不支持") {
         "反对".to_string()
@@ -1371,6 +1376,7 @@ impl AgentCore {
             session_manager: SessionManager::new(),
             history_summary_cache: tokio::sync::Mutex::new(HashMap::new()),
             tool_summary_ledger: tokio::sync::Mutex::new(HashMap::new()),
+
             mutation_snapshot: tokio::sync::Mutex::new(HashMap::new()),
             snapshot_seq: std::sync::atomic::AtomicU64::new(1),
             audit_logger: AuditLogger::new(mcp_for_audit),
@@ -6349,8 +6355,18 @@ impl AgentCore {
     /// 风格对齐审计 `summarize_args`：纯截断与过滤，零语义加工。
     fn extract_step_facts(res: &str) -> (Option<Vec<String>>, usize) {
         let has_alnum = |s: &str| s.chars().any(|c| c.is_alphanumeric());
+        // 有内容总行数**先独立数完**（同谓词：非空且含字母数字）——抽取循环
+        // 凑满 5 条即 break，若行数在同一循环里累加会停在 ~6 行，
+        // 截断声明严重低报原文体量（ocr PR#65 第二轮评审）
+        let total_lines = res
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && has_alnum(t)
+            })
+            .count();
         let mut facts: Vec<String> = Vec::new();
-        let mut push = |line: &str, facts: &mut Vec<String>| {
+        let push = |line: &str, facts: &mut Vec<String>| {
             let t = line.trim();
             if t.is_empty() || facts.len() >= 5 {
                 return;
@@ -6361,13 +6377,11 @@ impl AgentCore {
             }
         };
         let mut headline_done = false;
-        let mut total_lines = 0usize;
         for line in res.lines() {
             let t = line.trim();
             if t.is_empty() || !has_alnum(t) {
                 continue;
             }
-            total_lines += 1;
             if !headline_done {
                 push(t, &mut facts);
                 headline_done = true;
@@ -8632,14 +8646,15 @@ impl AgentCore {
     /// `max_per_round: 0` 是显式语义「本轮不摘要」，此处直接返回，不静默改成 1；
     /// `threshold_chars: 0` 是显式语义「所有 tool 结果都摘要」（见配置文档）。
     ///
-    /// P1-b（R3 护栏②）：单会话累计「丢弃占比」上限 30%。台账 `(lost, total)`：
-    /// `lost` = 已摘要条目的原文扣除保留头部后的丢弃字符；`total` = 纳入统计的全部
-    /// 工具输出字符（含未达阈值的小条目——它们是被保留的信息锚点，必须进分母，
-    /// 否则纯大条目会话里首条摘要占比恒为 100%，规则变成永久 no-op）。
-    /// 投影 `lost' * 10 > total' * 3` 且 `total' ≥ 12000`（约 3 个大条目的体量，
-    /// 之前不计）才拒绝。锁纪律对齐 `maybe_history_summary`（agent.rs 注释）：
-    /// 计数快照读取后**先释放锁再 await LLM**，成功后在短暂重取锁内记账——
-    /// 否则共享 AgentCore 上所有并发会话的摘要阶段被慢 provider 串行化。
+    /// P1-b（R3 护栏②）：单会话累计「丢弃占比」上限 30%。分子 = 台账累计的丢弃字符
+    /// （摘要成功后原文扣除保留头部）；分母 = **本次调用时 ctx.messages 里全部 tool
+    /// 消息的现存体量快照**（含小条目与已摘要消息的保留部分——它们是被保留的信息
+    /// 锚点）。用快照而非累计分母：同一条消息在多轮间不会被重复入账推高分母
+    /// （否则按轮数 N 变相放宽上限，ocr PR#65 第二轮评审）。
+    /// 投影 `lost' * 10 > total_now * 3` 且 `total_now ≥ 12000` 才拒绝。
+    /// 锁纪律对齐 `maybe_history_summary`：计数快照读取后**先释放锁再 await LLM**，
+    /// 成功后在短暂重取锁内记账——否则共享 AgentCore 上所有并发会话的摘要阶段
+    /// 被慢 provider 串行化。
     async fn maybe_summarize_tool_outputs(
         &self,
         session_id: &str,
@@ -8652,12 +8667,11 @@ impl AgentCore {
         const SUMMARY_SHARE_CAP_DEN: u64 = 10;
         const SUMMARY_SHARE_FLOOR_CHARS: u64 = 12_000;
         const RAW_RETAIN_CHARS: usize = 2000;
-        // 台账容量上限：对齐 history_summary_cache 的 `len() >= 200 { clear() }` 约定。
-        // 清空只临时放宽 30% 上限（下一会话重新累计），无正确性风险。
+        // 台账容量上限：对齐 history_summary_cache 的 `len() >= 200 { clear() }` 约定
         const LEDGER_MAX_ENTRIES: usize = 200;
         let cfg = &self.orchestration.cfg.tool_summary;
         if cfg.max_per_round == 0 {
-            tracing::debug!(target = "orchestration.summary",
+            tracing::debug!(target: "orchestration.summary",
                 "tool_summary.max_per_round=0：本轮不摘要（0 是显式关闭语义，不静默改成 1）");
             return;
         }
@@ -8668,6 +8682,13 @@ impl AgentCore {
             .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
             .sum::<usize>() as u64
             / 4;
+        // 分母快照：当前上下文里全部 tool 消息的现存体量（本方法自身消息不会被计入，
+        // 因为 filter 的都是 role=tool）
+        let total_now: u64 = messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.content.as_ref().map(|c| c.chars().count()).unwrap_or(0) as u64)
+            .sum();
         let mut summarized_this_round = 0usize;
         for m in messages.iter_mut().filter(|m| m.role == "tool") {
             if summarized_this_round >= cfg.max_per_round {
@@ -8679,39 +8700,26 @@ impl AgentCore {
             // 单次字符计数复用：跳过判定/截断标记/日志都用同一值，避免对超长
             // 输出重复全量扫描（ocr perf·low 修复）。
             let chars = content.chars().count();
-            if content.starts_with(MARKER) {
-                // 已摘要消息不再计入分母（其体积在摘要成功当轮已入账）
+            // 已摘要消息：其丢弃量已在成功当轮入账，现存体积已在 total_now 体现
+            if content.starts_with(MARKER) || chars <= cfg.threshold_chars {
                 continue;
             }
-            if chars <= cfg.threshold_chars {
-                // 未达阈值 = 被保留的信息锚点，只入分母不入分子。
-                // 已知松弛：多轮场景同一条小消息每轮重复入账（llm_loop 轮数有上限，
-                // 方向是放宽上限，不会漏拦）。
+            // 投影检查用的分子快照（锁在此释放，LLM await 期间不持锁）
+            let lost = {
                 let mut g = self.tool_summary_ledger.lock().await;
                 if g.len() >= LEDGER_MAX_ENTRIES {
                     g.clear();
                 }
-                g.entry(session_id.to_string()).or_insert((0, 0)).1 += chars as u64;
-                continue;
-            }
-            // 投影检查用的计数快照（锁在此释放，LLM await 期间不持锁）
-            let (lost, total) = {
-                let mut g = self.tool_summary_ledger.lock().await;
-                if g.len() >= LEDGER_MAX_ENTRIES {
-                    g.clear();
-                }
-                *g.entry(session_id.to_string()).or_insert((0, 0))
+                *g.entry(session_id.to_string()).or_insert(0)
             };
-            let proj_lost = lost + (chars as u64).saturating_sub(RAW_RETAIN_CHARS as u64);
-            let proj_total = total + chars as u64;
-            let refused_by_cap =
-                proj_total >= SUMMARY_SHARE_FLOOR_CHARS && proj_lost * SUMMARY_SHARE_CAP_DEN > proj_total * SUMMARY_SHARE_CAP_NUM;
-            if refused_by_cap {
-                tracing::info!(target = "orchestration.summary",
-                    session = %session_id, lost, total, incoming = chars,
+            let lost_delta = (chars as u64).saturating_sub(RAW_RETAIN_CHARS as u64);
+            let proj_lost = lost + lost_delta;
+            if total_now >= SUMMARY_SHARE_FLOOR_CHARS
+                && proj_lost * SUMMARY_SHARE_CAP_DEN > total_now * SUMMARY_SHARE_CAP_NUM
+            {
+                tracing::info!(target: "orchestration.summary",
+                    session = %session_id, lost, total_now, incoming = chars,
                     "工具摘要累计丢弃占比将超 30% 上限，本条保留原文（防长会话渐进信息丢失）");
-                let mut g = self.tool_summary_ledger.lock().await;
-                g.entry(session_id.to_string()).or_insert((0, 0)).1 += chars as u64;
                 continue;
             }
             // 上下文窗口保护：超长 tool 输出先截断到有界前缀再进 prompt——
@@ -8735,7 +8743,7 @@ impl AgentCore {
             if let Err(e) =
                 budget.check_token(req_est.saturating_add(next_loop_est + SUMMARY_RESPONSE_EST))
             {
-                tracing::warn!(target = "orchestration.summary", err = %e,
+                tracing::warn!(target: "orchestration.summary", err = %e,
                     "摘要预算不足（含下一主循环预留），保留原文");
                 break;
             }
@@ -8772,14 +8780,11 @@ impl AgentCore {
                         raw_head,
                         if truncated { "…" } else { "" }
                     ));
-                    // 成功记账：分母 + 全量，分子 + 实际丢弃（原文 - 保留头部）
-                    let lost_delta = (chars as u64).saturating_sub(RAW_RETAIN_CHARS as u64);
+                    // 成功记账：分子 += 实际丢弃（原文 - 保留头部）；分母是快照无需累计
                     let mut g = self.tool_summary_ledger.lock().await;
-                    let e = g.entry(session_id.to_string()).or_insert((0, 0));
-                    e.1 += chars as u64;
-                    e.0 += lost_delta;
+                    *g.entry(session_id.to_string()).or_insert(0) += lost_delta;
                 }
-                Ok(_) => tracing::warn!(target = "orchestration.summary", "摘要返回空文本，保留原文"),
+                Ok(_) => tracing::warn!(target: "orchestration.summary", "摘要返回空文本，保留原文"),
                 Err(e) => tracing::warn!(target: "orchestration.summary", err = %e, "摘要失败，保留原文"),
             }
         }
@@ -13283,9 +13288,13 @@ impl AgentCore {
         let Some(pos) = line.find("【依据") else {
             return (line.trim().to_string(), Vec::new());
         };
-        let region = &line[pos..];
-        let end = region.find('】').map(|i| pos + i + 3).unwrap_or(line.len());
-        let cite = &line[pos..end.min(line.len())];
+        // 引用区严格截止到闭括号；**括号未闭合（prompt 漂移/行被截断）视为无引用**——
+        // 回退扫整行会让行尾所有数字（版本/端口/"1 分钟"）都变成伪引用
+        // （ocr PR#65 第二轮评审）
+        let Some(rel_end) = line[pos..].find('】') else {
+            return (line[..pos].trim().to_string(), Vec::new());
+        };
+        let cite = &line[pos..pos + rel_end + 3];
         let nums: Vec<usize> = cite
             .split(|c: char| !c.is_ascii_digit())
             .filter(|s| !s.is_empty())

@@ -210,7 +210,13 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
     // 只查过门槛行会让最典型的回归形式永远计 0——见模块头注释）
     let leak_scan_lines: Vec<&PatternFinding> = findings.iter().collect();
 
-    // 程序判分（零语义自由裁量）
+    // 程序判分（零语义自由裁量）。
+    // 关键词匹配一律**大小写不敏感**（对齐生产门槛 pattern_ok 的 lower.contains）：
+    // ASCII 指纹（cron/PATROL.LOG/World Cup/cargo check）正是 LLM 最爱改大小写的
+    // 词，大小写敏感会把真实泄漏误判为干净（ocr PR#65 第二轮评审）。
+    let contains_ci = |haystack: &str, needle: &str| -> bool {
+        haystack.to_lowercase().contains(&needle.to_lowercase())
+    };
     let mut cited = vec![false; EVAL_SET.len()];
     let mut leaked = vec![false; EVAL_SET.len()];
     for f in &valid {
@@ -221,7 +227,7 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
     for f in &leak_scan_lines {
         for (i, case) in EVAL_SET.iter().enumerate() {
             if !case.expect_pattern {
-                let kw_hit = case.keywords.iter().any(|k| f.text.contains(k));
+                let kw_hit = case.keywords.iter().any(|k| contains_ci(&f.text, k));
                 let cited_hit = f.cites.contains(&(i + 1));
                 if kw_hit || cited_hit {
                     leaked[i] = true;
@@ -236,10 +242,10 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
             index: i + 1,
             expect_pattern: c.expect_pattern,
             cited: c.expect_pattern && cited[i],
+            // keyword_hit 与 cited 是**独立信号**：只看文本关键词命中，不含引用
+            // （`|| cited[i]` 会让本指标退化成 positive_hits 的超集，失去独立诊断价值）
             keyword_hit: c.expect_pattern
-                && valid.iter().any(|f| {
-                    c.keywords.iter().any(|k| f.text.contains(k)) || cited[i]
-                }),
+                && valid.iter().any(|f| c.keywords.iter().any(|k| contains_ci(&f.text, k))),
             leaked: !c.expect_pattern && leaked[i],
         })
         .collect();
@@ -329,7 +335,12 @@ pub fn list_past_hit_rates() -> Vec<(String, u32, f64)> {
                 if version != EVAL_SET_VERSION {
                     continue;
                 }
-                let rate = v["positive_hit_rate"].as_f64().unwrap_or(0.0);
+                // 字段缺失/不可解析 → **丢弃该记录**，不得默认 0.0——伪造的 0.0 与
+                // 真实最差分不可区分，会毒化 P3 的 keep/discard 基线
+                // （ocr PR#65 第二轮评审）
+                let Some(rate) = v["positive_hit_rate"].as_f64() else {
+                    continue;
+                };
                 let ts = v["ts"]
                     .as_str()
                     .map(|s| s.to_string())
