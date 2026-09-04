@@ -6068,16 +6068,19 @@ impl AgentCore {
                 }
                 _ => {
                     // 单行输出 / 无可抽取要点 → 保留截断原文（P1 修复：按字符截断防
-                    // 多字节 UTF-8 切半 panic）
-                    let truncated: String = if res.chars().count() > 1500 {
+                    // 多字节 UTF-8 切半 panic）；**截断必须在标题里声明**（ocr PR#67
+                    // 第四轮：静默丢尾巴还标「原始数据」正是本 PR 要消灭的伪溯源）
+                    let cut = res.chars().count() > 1500;
+                    let truncated: String = if cut {
                         res.chars().take(1500).collect()
                     } else {
                         res.to_string()
                     };
                     tool_ctx.push_str(&format!(
-                        "\n[步骤 {}] (id={}) 原始数据：\n{}\n",
+                        "\n[步骤 {}] (id={}) 原始数据{}：\n{}\n",
                         i + 1,
                         step_id,
+                        if cut { "（前 1500 字，已截断，未展示内容不在回答范围内）" } else { "" },
                         truncated
                     ));
                 }
@@ -8636,11 +8639,22 @@ impl AgentCore {
                     );
                     // 同轮账目同步（ocr PR#65 第五轮）：max_per_round>1 时后续候选
                     // 必须看到本条的丢弃与体量变化，否则第 2 条仍按首条豁免放行
+                    // 防膨胀守卫（ocr PR#67 第四轮）：替换恒花 ≈2900 字（标记头+
+                    // 摘要+原文头），threshold 与 ~2900 之间的消息会被「摘要」变大——
+                    // 白花一次辅助调用还推高 30% 分母（护栏反向变松）。仅当替换
+                    // 真的更小时才生效。
                     let new_len = replacement.chars().count() as u64;
-                    lost_so_far += (chars as u64).saturating_sub(new_len);
-                    total_now = total_now - (chars as u64) + new_len;
-                    any_summarized = true;
-                    messages[idx].content = Some(replacement);
+                    if new_len < chars as u64 {
+                        lost_so_far += (chars as u64).saturating_sub(new_len);
+                        total_now = total_now - (chars as u64) + new_len;
+                        any_summarized = true;
+                        messages[idx].content = Some(replacement);
+                    } else {
+                        summarized_this_round -= 1; // 未生效，不占 max_per_round 名额
+                        tracing::debug!(target: "orchestration.summary",
+                            tool_call_id = ?tool_call_id_snapshot, chars, new_len,
+                            "摘要替换不小于原文，保留原文（防上下文反膨胀）");
+                    }
                 }
                 Ok(_) => tracing::warn!(target: "orchestration.summary", "摘要返回空文本，保留原文"),
                 Err(e) => tracing::warn!(target: "orchestration.summary", err = %e, "摘要失败，保留原文"),
@@ -15182,8 +15196,14 @@ mod tool_summary_accounting_tests {
 
         // squash 后缀（截断标记拼接在尾部）但头部仍可解析 → **照常计算**
         // （ocr PR#67 第三轮 high：一律免疫会让累计护栏反复重置）
-        let squashed = format!("{}…(output truncated: too long)", &content[..200.min(content.len())]);
+        // squash 长消息分支等价物：头部保留、正文按字符切掉（字节切会落在多字节
+        // 字符中间 panic；60 字确保真的截断且在「原文 16000 字，」之后）
+        let squashed = format!(
+            "{}…(output truncated: too long)",
+            content.chars().take(60).collect::<String>()
+        );
         let cur2 = squashed.chars().count() as u64;
+        assert!(squashed.chars().count() < content.chars().count(), "夹具必须真的截断");
         assert_eq!(AgentCore::tool_summary_discard_of(&squashed), 16000 - cur2);
 
         // 非 MARKER 消息：0
