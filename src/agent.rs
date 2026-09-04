@@ -6054,7 +6054,7 @@ impl AgentCore {
                         // 不完整时附**有界原文片段**（ocr PR#65 第五轮）：本函数返回值会
                         // 替换 report，指向「原始结果」的引用是悬空的；清单型问题也不该
                         // 只凭 5 行要点作答——原文片段直接随行，不依赖外部引用。
-                        const RAW_TAIL_CHARS: usize = 1200;
+                        const RAW_TAIL_CHARS: usize = 600;
                         let tail: String = res.chars().take(RAW_TAIL_CHARS).collect();
                         tool_ctx.push_str(&format!(
                             "（摘录不全，原文片段前 {} 字：）\n{}\n",
@@ -6151,17 +6151,23 @@ impl AgentCore {
         if let Some(h) = content_lines.first() {
             push(h, &mut facts);
         }
-        let numeric: Vec<&&str> = content_lines
+        // 数字行用**下标集合**标记（ocr PR#67 第二轮：Vec+contains 在大输出上
+        // 是 O(n²)——numeric.contains(&l) 对每行线性扫描指针）
+        let numeric_idx: std::collections::HashSet<usize> = content_lines
             .iter()
+            .enumerate()
             .skip(1)
-            .filter(|l| l.bytes().any(|b| b.is_ascii_digit()))
+            .filter(|(_, l)| l.bytes().any(|b| b.is_ascii_digit()))
+            .map(|(i, _)| i)
             .collect();
-        for l in &numeric {
-            push(l, &mut facts);
+        for (i, l) in content_lines.iter().enumerate().skip(1) {
+            if numeric_idx.contains(&i) {
+                push(l, &mut facts);
+            }
         }
         // 补位：数字行不足时纳入非数字实体行（企业名/状态/路径），保持原顺序
-        for l in content_lines.iter().skip(1) {
-            if !numeric.contains(&l) {
+        for (i, l) in content_lines.iter().enumerate().skip(1) {
+            if !numeric_idx.contains(&i) {
                 push(l, &mut facts);
             }
             if facts.len() >= 5 {
@@ -8425,11 +8431,10 @@ impl AgentCore {
         if !content.starts_with(MARKER) {
             return 0;
         }
-        // squash 免疫（ocr PR#67）：squash_stale_tool_outputs 会在摘要之后再次截断同一条
-        // 消息（保留 MARKER 头）；此时「原文 N 字 − 现存长度」混入了 squash 的截断量，
-        // 长会话里会让 30% 上限永久误触发、opt-in 摘要器对最大载荷自动关闭。
-        // 检测到 squash 截断标记即放弃本条的丢弃核算（返回 0，宁松勿谎）。
-        if content.contains("output truncated") {
+        // squash 免疫（ocr PR#67 第二轮收窄）：squash 的截断标记是**后缀拼接**
+        // （head + TRUNC_MARKER）或整条替换为 SHORT_MARKER——用 ends_with/全等精确
+        // 匹配；contains 太宽，正文或摘要里出现这个短语就会误免疫。
+        if content.ends_with("…(output truncated: too long)") || content.trim() == "(truncated)" {
             return 0;
         }
         let Some(p) = content.find("原文 ") else {
@@ -8502,7 +8507,16 @@ impl AgentCore {
             .filter(|m| m.role == "tool")
             .map(|m| m.content.as_ref().map(|c| c.chars().count()).unwrap_or(0) as u64)
             .sum();
-        let mut any_summarized = lost_so_far > 0;
+        // 「已存在摘要」的判定是**消息上有 MARKER 头**，而非 lost>0（ocr PR#67 第二轮：
+        // 全部摘要消息的丢弃量都解析失败/被 squash 免疫置 0 时，lost=0 会让首条
+        // 豁免在已有多条摘要的上下文里错误复活）
+        let any_summarized = messages.iter().any(|m| {
+            m.role == "tool"
+                && m.content
+                    .as_deref()
+                    .map_or(false, |c| c.starts_with(MARKER))
+        });
+        let mut any_summarized = any_summarized;
         // 候选收集 + 体积降序（判定与扫描顺序无关；大载荷收益最高优先）
         let mut candidates: Vec<(usize, usize)> = messages
             .iter()
@@ -8520,7 +8534,9 @@ impl AgentCore {
             if summarized_this_round >= cfg.max_per_round {
                 break;
             }
-            let content: String = messages[idx].content.clone().unwrap_or_default();
+            // **不整包克隆**（ocr PR#67 第二轮：候选可达数十 KB，克隆发生在所有
+            // 守卫判定之前；借用构造 prompt 与替换串，仅在写回时短暂独占）
+            let content: &str = messages[idx].content.as_deref().unwrap_or("");
             // 投影（无锁；首条豁免——见函数头注释）
             let lost_delta_est = (chars as u64).saturating_sub(retained_est as u64);
             if any_summarized
@@ -12293,23 +12309,34 @@ impl AgentCore {
         {
             (arr.as_slice(), None)
         } else if let Some(o) = v.as_object() {
-            let mut arrays: Vec<(&String, &Vec<serde_json::Value>)> = o
+            let mut arrays: Vec<(&String, &Vec<serde_json::Value>, usize)> = o
                 .iter()
-                .filter_map(|(k, x)| x.as_array().map(|a| (k, a)))
+                .filter_map(|(k, x)| {
+                    let a = x.as_array()?;
+                    // 序列化长度**预计算**（ocr PR#67 第二轮：comparator 里 to_string
+                    // 每次比较重复序列化，大数组排序是 O(n·log n) 次全量序列化）
+                    let ser_len = serde_json::to_string(a).unwrap_or_default().len();
+                    Some((k, a, ser_len))
+                })
                 .collect();
             arrays.sort_by(|a, b| {
                 b.1.len()
                     .cmp(&a.1.len())
-                    .then_with(|| serde_json::to_string(b.1).unwrap_or_default().len().cmp(&serde_json::to_string(a.1).unwrap_or_default().len()))
+                    .then_with(|| b.2.cmp(&a.2))
                     .then_with(|| a.0.cmp(b.0))
             });
             match arrays.first() {
-                Some((k, arr)) => (arr.as_slice(), Some(k.as_str())),
+                Some((k, arr, _)) => (arr.as_slice(), Some(k.as_str())),
                 None => (&[], None),
             }
         } else {
             (&[], None)
         };
+        // 识别但为空的记录数组（**含顶层空数组**，ocr PR#67 第二轮：早退分支只查
+        // envelope_key.is_none 会把 `[]` 当「无记录数组」吞掉）→ Some(0)
+        if records.is_empty() && v.is_array() {
+            return ("[]".to_string(), Some(0));
+        }
         if records.is_empty() && envelope_key.is_none() {
             // 可解析但无记录数组（如聚合对象）：整体不超限时全量喂，超限按字符截断
             let text = serde_json::to_string(&v).unwrap_or_default();
