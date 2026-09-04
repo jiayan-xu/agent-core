@@ -344,8 +344,8 @@ pub(crate) fn spawn_server(
                             let mut results = Vec::new();
                             for ns in &ns_vec {
                                 let res = agent.consolidate(ns).await;
-                                tracing::info!("[consolidate] {}", res);
-                                results.push(serde_json::json!({"ns": ns, "result": res}));
+                                tracing::info!("[consolidate] {}", res.summary_line());
+                                results.push(serde_json::json!({"ns": ns, "result": res.detail, "patterns_added": res.patterns_added}));
                             }
                             // PR5 自驱：低峰 consolidate 维护周期后触发一轮元进化
                             // （受 meta_evolution.enabled + cooldown_hours 双重保护，非低峰/未开启则不动作）

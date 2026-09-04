@@ -347,6 +347,10 @@ pub struct AgentCore {
     /// P1-1: 会话历史摘要缓存（session_id → (已摘要条数, 摘要文本, 已摘要区间指纹)）——滑动窗口+摘要层。
     /// 指纹防「外部历史替换但条数不变」场景返回过期摘要（P1 审查#3）。
     history_summary_cache: tokio::sync::Mutex<HashMap<String, (usize, String, u64)>>,
+    /// P1-b（R3 护栏）：每会话工具摘要台账（session_id → (已摘要字符数, 工具输出总字符数)）。
+    /// 用于「累计摘要占比 ≤30%」上限——防长会话多轮摘要叠加造成信息渐进丢失
+    /// （ADR-017 P3 原有 max_per_round 只限单轮，不限累计）。
+    tool_summary_ledger: tokio::sync::Mutex<HashMap<String, (u64, u64)>>,
     /// Phase B（GenOffice snapshotBefore 借鉴）：本次 run 首个非只读工具执行前的消息快照，
     /// 供回滚 UI / 自进化 dry_run 复用。map 键 = "session_id|trace_id" 复合键：
     /// 同 session 并发 run 各自独立，互不覆盖、互不误取（第八轮 bug·medium 修复）；
@@ -443,12 +447,207 @@ impl InboxCache {
     }
 }
 
-/// Phase 6：圆桌结果
+/// P1-a：圆桌立场卡——分身立场的结构化表示（《程序化汇合改造方案》P1-a）。
+///
+/// LLM 原始回答经 [`StanceCard::parse`] 程序解析生成；解析失败时 `structured=false`
+/// **降级保留原文**（stance 记为「未结构化」），立场信息永不丢弃。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StanceCard {
+    pub persona_id: String,
+    pub display_name: String,
+    /// 规范化立场：支持 / 反对 / 中立 / 条件支持；解析失败为「未结构化」。
+    /// 规范化仅做包含词匹配（中立 → 条件支持 → 反对/不支持 → 支持），不交 LLM。
+    pub stance: String,
+    /// 一句话立场摘要（结构化时取 LLM 的 summary 字段；降级时截取原文首行）。
+    pub summary: String,
+    /// 关键理由（结构化时 ≤3 条）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub key_reasons: Vec<String>,
+    /// 证据引用 ID（LLM 自报，无则空；本方案不校验其真实性，仅透传回溯）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub citations: Vec<String>,
+    /// 置信度 0-100（仅结构化卡存在）。
+    pub confidence: Option<u8>,
+    /// 原始回答全文（可回溯；未结构化卡的内容主体）。
+    pub raw: String,
+    /// 是否成功解析为结构化立场卡。
+    pub structured: bool,
+}
+
+impl StanceCard {
+    /// 从 LLM 原始回答构建立场卡：宽容解析 JSON（首个 `{` 到最后一个 `}`），
+    /// 任何失败都降级为未结构化卡（原文完整保留，绝不丢立场）。
+    fn parse(persona_id: String, display_name: String, raw: String) -> StanceCard {
+        const UNSTRUCTURED: &str = "未结构化";
+        let fallback = |raw: String| StanceCard {
+            persona_id: persona_id.clone(),
+            display_name: display_name.clone(),
+            stance: UNSTRUCTURED.to_string(),
+            summary: raw.lines().next().unwrap_or("").trim().chars().take(80).collect(),
+            key_reasons: Vec::new(),
+            citations: Vec::new(),
+            confidence: None,
+            raw: raw.clone(),
+            structured: false,
+        };
+        let Some(start) = raw.find('{') else { return fallback(raw) };
+        let Some(end) = raw.rfind('}') else { return fallback(raw) };
+        if end < start {
+            return fallback(raw);
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw[start..=end]) else {
+            return fallback(raw);
+        };
+        // stance 必须是字符串；缺失视为解析失败（宁可降级也不猜）。
+        let Some(stance_raw) = v.get("stance").and_then(|x| x.as_str()) else {
+            return fallback(raw);
+        };
+        let norm = normalize_stance(stance_raw);
+        let summary = v
+            .get("summary")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| stance_raw.trim().chars().take(80).collect());
+        let key_reasons: Vec<String> = v
+            .get("key_reasons")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| r.as_str())
+                    .map(|r| r.trim().to_string())
+                    .filter(|r| !r.is_empty())
+                    .take(3)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let citations: Vec<String> = v
+            .get("citations")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| c.as_str())
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty())
+                    .take(10)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let confidence = v.get("confidence").and_then(|x| x.as_u64()).map(|c| c.min(100) as u8);
+        StanceCard {
+            persona_id,
+            display_name,
+            stance: norm,
+            summary,
+            key_reasons,
+            citations,
+            confidence,
+            raw,
+            structured: true,
+        }
+    }
+}
+
+/// 立场词规范化：仅包含词匹配，命中顺序避免「不支持」误判为「支持」。
+/// 未命中任何规范词时保留原文（截 16 字）——不强行归四类。
+fn normalize_stance(s: &str) -> String {
+    let t = s.trim();
+    if t.contains("中立") {
+        "中立".to_string()
+    } else if t.contains("条件") && t.contains("支持") {
+        "条件支持".to_string()
+    } else if t.contains("反对") || t.contains("不支持") {
+        "反对".to_string()
+    } else if t.contains("支持") {
+        "支持".to_string()
+    } else {
+        t.chars().take(16).collect()
+    }
+}
+
+/// P1-a：程序聚合结果——共识结论的唯一权威来源（替代原主席一句话综合）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StanceAggregate {
+    /// 立场卡总数
+    pub total: usize,
+    /// 其中结构化卡数（降级卡计入总数但不参与分布统计）
+    pub structured: usize,
+    /// 立场分布（仅结构化卡，票数降序）
+    pub distribution: Vec<(String, usize)>,
+    /// 单行程序摘要：会议记录 `consensus` 字段与 memoria 首行共用
+    pub summary: String,
+}
+
+/// P1-a：程序化汇合立场卡（确定性，无 LLM 参与）。
+///
+/// 分布统计只计结构化卡；降级卡单列提示。存在对立立场（支持 vs 反对）时
+/// 在摘要末尾追加分歧提示——分歧的细节由立场卡行承载，不做 LLM 裁决。
+pub fn aggregate_stances(cards: &[StanceCard]) -> StanceAggregate {
+    let total = cards.len();
+    let mut dist: std::collections::BTreeMap<String, usize> = Default::default();
+    for c in cards.iter().filter(|c| c.structured) {
+        *dist.entry(c.stance.clone()).or_insert(0) += 1;
+    }
+    let structured: usize = dist.values().sum();
+    let mut distribution: Vec<(String, usize)> = dist.into_iter().collect();
+    // 票数降序；同票按立场名稳定排序（保证同一输入永远同一输出——程序化汇合的可复现要求）
+    distribution.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let dist_text = distribution
+        .iter()
+        .map(|(k, n)| format!("{} {}", k, n))
+        .collect::<Vec<_>>()
+        .join("、");
+    let mut summary = if structured > 0 {
+        format!("立场分布：{}（共 {} 席）", dist_text, total)
+    } else {
+        format!("立场分布：无结构化立场卡（共 {} 席，均为降级原文）", total)
+    };
+    if structured < total {
+        summary.push_str(&format!("，其中 {} 份未结构化已降级保留原文", total - structured));
+    }
+    let has = |k: &str| distribution.iter().any(|(s, _)| *s == k);
+    if has("支持") && has("反对") {
+        summary.push_str("；存在对立立场，分歧详见各方立场卡");
+    }
+    StanceAggregate { total, structured, distribution, summary }
+}
+
+/// Phase 6：圆桌结果。
+/// P1-a 起 `consensus` 为**程序聚合摘要**（[`aggregate_stances`]），主席 LLM 一句话
+/// 降级为 `display_note` 附注（非权威，可缺省）。
 pub struct RoundtableResult {
-    /// 各分身立场：(persona_id, stance)
-    pub stances: Vec<(String, String)>,
-    /// 主席收敛结论
+    /// 各分身立场卡（结构化 / 降级原文）
+    pub stances: Vec<StanceCard>,
+    /// 程序聚合的立场分布摘要（权威共识表示）
     pub consensus: String,
+    /// 主席附注（LLM 生成，非权威结论；失败/超时为 None）
+    pub display_note: Option<String>,
+}
+
+/// P1-d：consolidate 结构化结果（《程序化汇合改造方案》P1-d）。
+///
+/// 原 consolidate 返回人读 String，事件队列只能拿到转述文本。结构化后：
+/// 事件队列取字段拼 JSON summary（LLM 文本沉到 detail），HTTP/健康记录取 detail，
+/// 日志用 [`summary_line`](Self::summary_line)。
+pub struct ConsolidateOutcome {
+    pub ns: String,
+    /// 写回的 pattern 条数
+    pub patterns_added: u64,
+    /// 本批合格观察数（evidence 池）
+    pub observations: usize,
+    /// 本批拉取总数（含不合格）
+    pub fetched: usize,
+    /// 推进后的游标
+    pub cursor: String,
+    /// 人读摘要（不含 `consolidate[ns]:` 前缀）
+    pub detail: String,
+}
+
+impl ConsolidateOutcome {
+    /// 日志用单行（与历史日志格式一致）
+    pub fn summary_line(&self) -> String {
+        format!("consolidate[{}]: {}", self.ns, self.detail)
+    }
 }
 
 /// 会议实时状态机阶段（会议升级 Step3）。
@@ -1165,6 +1364,7 @@ impl AgentCore {
             inbox_cache: tokio::sync::Mutex::new(InboxCache::new()),
             session_manager: SessionManager::new(),
             history_summary_cache: tokio::sync::Mutex::new(HashMap::new()),
+            tool_summary_ledger: tokio::sync::Mutex::new(HashMap::new()),
             mutation_snapshot: tokio::sync::Mutex::new(HashMap::new()),
             snapshot_seq: std::sync::atomic::AtomicU64::new(1),
             audit_logger: AuditLogger::new(mcp_for_audit),
@@ -2048,14 +2248,18 @@ impl AgentCore {
         pool
     }
 
-    /// Phase 6：圆桌 —— 单个分身就议题发表立场（供 run_roundtable / SSE 流式复用）
+    /// Phase 6：圆桌 —— 单个分身就议题发表立场（供 run_roundtable / SSE 流式复用）。
+    ///
+    /// P1-a：输出改为**立场卡 JSON**，由 [`StanceCard::parse`] 程序解析；
+    /// 解析失败自动降级为未结构化卡（原文保留），立场信息不丢。
+    /// 返回 (persona_id, 立场卡, provider 标签)。
     pub async fn persona_stance(
         &self,
         p: &crate::runtime::self_runtime::Persona,
         topic: &str,
         index: usize,
         pool: &[LlmConfig],
-    ) -> (String, String, String) {
+    ) -> (String, StanceCard, String) {
         let (client, provider_label) = match &p.llm {
             Some(c) => (c.clone(), "persona-configured".to_string()),
             None => {
@@ -2068,60 +2272,83 @@ impl AgentCore {
             "你是分身『{}』（{}）。请从你的角色视角独立发表观点，不要附和他人。",
             p.persona_id, p.display_name
         );
-        let user = format!("圆桌议题：{}\n请给出你的立场（2-4 句）。", topic);
+        let user = format!(
+            "圆桌议题：{}\n请独立思考后，只输出一个 JSON 对象（JSON 之外不要有任何文字）：\n{{\"stance\": \"支持/反对/中立/条件支持 四选一\", \"summary\": \"一句话概括你的立场\", \"key_reasons\": [\"最多三条关键理由\"], \"citations\": [\"支撑立场的证据或记忆ID，没有就用空数组\"], \"confidence\": 0到100的整数}}",
+            topic
+        );
         let msgs = vec![
             crate::llm::Message { role: "system".to_string(), content: Some(sys), tool_calls: None, tool_call_id: None },
             crate::llm::Message { role: "user".to_string(), content: Some(user), tool_calls: None, tool_call_id: None },
         ];
         // 逐调用硬性超时：避免单个 provider 卡死（如重试退避叠加）拖垮整场圆桌。
         // 超时则该席返回占位立场，圆桌继续收敛，不让一个坏模型阻断其余模型。
-        let stance = match tokio::time::timeout(std::time::Duration::from_secs(45), client.chat(&msgs, &[])).await {
+        // 占位文本会走 StanceCard::parse 的降级路径，以未结构化卡保留。
+        let raw = match tokio::time::timeout(std::time::Duration::from_secs(45), client.chat(&msgs, &[])).await {
             Ok(Ok(r)) => r.text,
             Ok(Err(e)) => format!("(LLM 调用失败: {})", e),
             Err(_) => "(该分身 LLM 调用超时，已跳过其立场)".to_string(),
         };
-        (p.persona_id.clone(), stance, provider_label)
+        let card = StanceCard::parse(p.persona_id.clone(), p.display_name.clone(), raw);
+        (p.persona_id.clone(), card, provider_label)
     }
 
-    /// Phase 6：主席收敛共识
-    pub async fn chair_consensus(
+    /// Phase 6：主席附注（P1-a 降级，**非权威结论**）。
+    ///
+    /// 原 `chair_consensus` 把 N 方立场综合成一句话并作为唯一共识——《程序化汇合改造方案》
+    /// P1-a 起共识改由 [`aggregate_stances`] 程序聚合，本函数输出仅作为人类参考附注。
+    /// 失败 / 超时返回 None（附注可缺省，不再产生占位噪声文本）。
+    pub async fn chair_display_note(
         &self,
         topic: &str,
-        stances: &[(String, String)],
+        stances: &[StanceCard],
         chair_persona: Option<&str>,
-    ) -> String {
+    ) -> Option<String> {
         let chair_id = chair_persona.unwrap_or("default").to_string();
         let joined = stances
             .iter()
-            .map(|(id, s)| format!("【{}】{}", id, s))
+            .map(|c| {
+                // 结构化卡给摘要 + 规范立场；降级卡给原文（截 300 字防 prompt 膨胀）
+                let text = if c.structured {
+                    format!("{}（{}）", c.summary, c.stance)
+                } else {
+                    c.raw.chars().take(300).collect::<String>()
+                };
+                format!("【{}】{}", c.persona_id, text)
+            })
             .collect::<Vec<_>>()
             .join("\n");
-        let sys_chair = format!("你是圆桌主席（{}）。请综合各方立场，给出一句话共识结论。", chair_id);
-        let user_chair = format!("议题：{}\n各方立场：\n{}\n\n请给出共识结论。", topic, joined);
+        let sys_chair = format!(
+            "你是圆桌主席（{}）。请基于各方立场卡，用一两句话点评立场分布与主要分歧，供人类参考。\
+             这是参考附注，不是权威结论；不要替各方下最终结论。",
+            chair_id
+        );
+        let user_chair = format!("议题：{}\n各方立场卡：\n{}\n\n请给出主席附注。", topic, joined);
         let chair_msgs = vec![
             crate::llm::Message { role: "system".to_string(), content: Some(sys_chair), tool_calls: None, tool_call_id: None },
             crate::llm::Message { role: "user".to_string(), content: Some(user_chair), tool_calls: None, tool_call_id: None },
         ];
-        // 同样加硬性超时，避免主席收敛被全局 LLM 卡死。
+        // 附注是非权威增强，同样加硬性超时；失败静默降级为无附注。
         match tokio::time::timeout(std::time::Duration::from_secs(45), self.llm.chat(&chair_msgs, &[])).await {
-            Ok(Ok(r)) => r.text,
-            Ok(Err(e)) => format!("(主席收敛失败: {})", e),
-            Err(_) => "(主席收敛超时)".to_string(),
+            Ok(Ok(r)) if !r.text.trim().is_empty() => Some(r.text.trim().to_string()),
+            _ => None,
         }
     }
 
-    /// Phase 6：圆桌 —— 多分身就同一议题发表立场并收敛（收集式，供非流式调用 / tests）
+    /// Phase 6：圆桌 —— 多分身就同一议题发表立场并收敛（收集式，供非流式调用 / tests）。
+    ///
+    /// P1-a：`consensus` 为程序聚合摘要（权威），`display_note` 为主席附注（可缺省）。
     pub async fn run_roundtable(&self, topic: &str, chair_persona: Option<&str>) -> RoundtableResult {
         let mut personas = self.list_personas();
         personas.sort_by(|a, b| a.persona_id.cmp(&b.persona_id));
         let pool = self.llm_pool();
-        let mut stances: Vec<(String, String)> = Vec::new();
+        let mut stances: Vec<StanceCard> = Vec::new();
         for (i, p) in personas.iter().enumerate() {
-            let (id, stance, _prov) = self.persona_stance(p, topic, i, &pool).await;
-            stances.push((id, stance));
+            let (_id, card, _prov) = self.persona_stance(p, topic, i, &pool).await;
+            stances.push(card);
         }
-        let consensus = self.chair_consensus(topic, &stances, chair_persona).await;
-        RoundtableResult { stances, consensus }
+        let agg = aggregate_stances(&stances);
+        let display_note = self.chair_display_note(topic, &stances, chair_persona).await;
+        RoundtableResult { stances, consensus: agg.summary, display_note }
     }
 
     /// 从 session_id 解析调用者专属命名空间。
@@ -6020,44 +6247,59 @@ impl AgentCore {
 
     /// PFAiX 回答格式化修复：把组合执行产出的机器话（"执行结果：N/N 步骤成功" + 原始工具 JSON）
     /// 改写成用户易懂的中文自然语言。失败时回退原始 report，绝不把原始 JSON 直接甩给用户。
+    ///
+    /// P1-b（R2）：LLM 输入从「原文截 1500 字」改为**程序抽取的要点行**（确定性，不过 LLM），
+    /// 要求回答用 [步骤N] 标注数据来源；回答未引用任何步骤编号时打 warning（引用完整性检查）。
     async fn summarize_composition(
         &self,
         user_query: &str,
         step_results: &HashMap<u32, String>,
         report: &str,
     ) -> String {
-        // 按 step_id 升序稳定拼装工具原始数据（截断避免超长）
+        // 按 step_id 升序稳定拼装（P1-b：程序抽取要点，抽不到带数字的行才降级喂截断原文）
         let mut keys: Vec<&u32> = step_results.keys().collect();
         keys.sort();
         let mut tool_ctx = String::new();
         for (i, step_id) in keys.iter().enumerate() {
             let res = &step_results[*step_id];
-            // P1 修复：按字符截断而非字节切片，避免多字节 UTF-8（中文）在第 1500 字节处
-            // 落字符中间导致 panic。
-            let truncated: String = if res.chars().count() > 1500 {
-                res.chars().take(1500).collect()
-            } else {
-                res.to_string()
-            };
-            tool_ctx.push_str(&format!(
-                "\n[步骤 {}] (id={}):\n{}\n",
-                i + 1,
-                step_id,
-                truncated
-            ));
+            let facts = Self::extract_step_facts(res);
+            match facts {
+                Some(lines) if !lines.is_empty() => {
+                    tool_ctx.push_str(&format!("\n[步骤 {}] (id={}) 要点：\n", i + 1, step_id));
+                    for f in &lines {
+                        tool_ctx.push_str(&format!("- {}\n", f));
+                    }
+                }
+                _ => {
+                    // 无可抽取要点（纯文本无数字等）→ 降级保留截断原文（P1 修复：按字符截断防
+                    // 多字节 UTF-8 切半 panic）
+                    let truncated: String = if res.chars().count() > 1500 {
+                        res.chars().take(1500).collect()
+                    } else {
+                        res.to_string()
+                    };
+                    tool_ctx.push_str(&format!(
+                        "\n[步骤 {}] (id={}) 原始数据：\n{}\n",
+                        i + 1,
+                        step_id,
+                        truncated
+                    ));
+                }
+            }
         }
         let prompt = format!(
             "你是固废监管系统的查询助手。用户用中文提问，系统已通过多个工具步骤查到了结果。\n\
-             请基于下面的工具返回数据，用简洁的中文自然语言回答用户的原始问题。\n\
+             请基于下面的各步骤要点，用简洁的中文自然语言回答用户的原始问题。\n\
              要求：\n\
              1. 直接说结论和数据，不要复述执行过程，不要出现\"执行结果\"、\"最终结果\"等机器字眼。\n\
              2. 若数据为空（如查询结果 0 条），明确告诉用户「没有查到相关记录」，并简要解释可能原因，不要原样输出 JSON。\n\
-             3. 涉及的数字、车牌、企业名要原样保留，不要编造。\n\
-             4. 回答控制在 200 字以内。\n\
+             3. 涉及的数字、车牌、企业名要原样保留，不要编造；只使用要点中出现的数据。\n\
+             4. 回答控制在 400 字以内。\n\
+             5. 关键数据用 [步骤N] 标注来源（如 [步骤1]）。\n\
              \n\
              ## 用户的原始问题\n{}\n\
              \n\
-             ## 工具返回的原始数据{}",
+             ## 各步骤工具结果要点{}",
             user_query, tool_ctx
         );
 
@@ -6069,8 +6311,64 @@ impl AgentCore {
         };
 
         match self.llm.chat(&[msg], &[]).await {
-            Ok(r) if !r.text.trim().is_empty() => r.text.trim().to_string(),
+            Ok(r) if !r.text.trim().is_empty() => {
+                let answer = r.text.trim().to_string();
+                // P1-b 引用完整性检查：回答未引用任何步骤编号 → 可能是 LLM 自由发挥，告警留痕
+                if !answer.contains("步骤") {
+                    tracing::warn!(
+                        steps = ?keys,
+                        "P1-b: 组合执行回答未引用任何步骤编号（引用完整性检查），原始 report 可兜底核对"
+                    );
+                }
+                answer
+            }
             _ => report.to_string(), // LLM 失败/空响应 → 回退原始 report，绝不直接吐 JSON
+        }
+    }
+
+    /// P1-b（R2）：从工具原始输出中**确定性**抽取要点行（不调 LLM）。
+    ///
+    /// 规则：首条非空行（表头/结论行）+ 含 ASCII 数字的行（数据行），各截 100 字，
+    /// 合计 ≤5 行、去重。返回 None 表示抽不到含数字的数据行（调用方降级喂截断原文）。
+    /// 风格对齐审计 `summarize_args`：纯截断与过滤，零语义加工。
+    fn extract_step_facts(res: &str) -> Option<Vec<String>> {
+        let mut facts: Vec<String> = Vec::new();
+        let push = |line: &str, facts: &mut Vec<String>| {
+            let t = line.trim();
+            if t.is_empty() || facts.len() >= 5 {
+                return;
+            }
+            let one: String = t.chars().take(100).collect();
+            if !facts.contains(&one) {
+                facts.push(one);
+            }
+        };
+        let mut headline_done = false;
+        for line in res.lines() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if !headline_done {
+                push(t, &mut facts);
+                headline_done = true;
+                continue;
+            }
+            if t.bytes().any(|b| b.is_ascii_digit()) {
+                push(t, &mut facts);
+            }
+            if facts.len() >= 5 {
+                break;
+            }
+        }
+        let has_data = facts
+            .iter()
+            .skip(1)
+            .any(|f| f.bytes().any(|b| b.is_ascii_digit()));
+        if has_data {
+            Some(facts)
+        } else {
+            None
         }
     }
 
@@ -6438,7 +6736,13 @@ impl AgentCore {
                 // 最近未覆盖消息（最终结果/最后决策）必须进结论，否则记忆不完整；
                 // 尾部总长 2000 字符封顶（缓存 stale 时 10% 历史可超数万字符，防结论膨胀）
                 Some((upto, text)) if !text.trim().is_empty() => {
-                    let mut out = text;
+                    // P1-c（R4）：复用摘要作结论底稿时强制携带来源声明——结论前半是机器摘要
+                    // 而非原文复述，后续召回/展示时人类可辨别可信度层级。
+                    let mut out = format!(
+                        "（声明：本结论前半部分来自机器摘要，覆盖本会话前 {upto} 轮，非原文复述；session={}）\n",
+                        session_id
+                    );
+                    out.push_str(&text);
                     if upto < history.len() {
                         out.push_str("\n\n## 会话尾部（未压缩原文）\n");
                         let mut tail_chars = 0usize;
@@ -7802,7 +8106,7 @@ impl AgentCore {
             if self.orchestration.cfg.tool_summary.enabled
                 && (_round as usize + 1) >= self.orchestration.cfg.tool_summary.start_round
             {
-                self.maybe_summarize_tool_outputs(&mut ctx.messages, &budget).await;
+                self.maybe_summarize_tool_outputs(session_id, &mut ctx.messages, &budget).await;
             }
             // Phase B：每轮工具执行后按字节预算截断陈旧 tool 输出（防跨轮载荷越滚越大）
             Self::squash_stale_tool_outputs(&mut ctx.messages);
@@ -8310,17 +8614,26 @@ impl AgentCore {
     /// `threshold_chars: 0` 是显式语义「所有 tool 结果都摘要」（见配置文档）。
     async fn maybe_summarize_tool_outputs(
         &self,
+        session_id: &str,
         messages: &mut Vec<Message>,
         budget: &crate::orchestration::TurnBudget,
     ) {
         const MARKER: &str = "[工具结果摘要]";
         const SUMMARY_RESPONSE_EST: u64 = 200; // prompt 要求 <=800 字，预留响应估算
+        // P1-b（R3 护栏②）：单会话累计摘要占比上限 30%。台账记录 (已摘要字符, 工具输出总字符)，
+        // 投影后超限且总量达到意义门槛（≥4000 字，防小会话首条即被永久卡死）则跳过。
+        // max_per_round 只限单轮条数，防不了长会话多轮叠加的渐进信息丢失。
+        const SUMMARY_SHARE_CAP_NUM: u64 = 3; // 30%
+        const SUMMARY_SHARE_CAP_DEN: u64 = 10;
+        const SUMMARY_SHARE_FLOOR_CHARS: u64 = 4000;
         let cfg = &self.orchestration.cfg.tool_summary;
         if cfg.max_per_round == 0 {
             tracing::debug!(target = "orchestration.summary",
                 "tool_summary.max_per_round=0：本轮不摘要（0 是显式关闭语义，不静默改成 1）");
             return;
         }
+        let mut ledger = self.tool_summary_ledger.lock().await;
+        let ledger_entry = ledger.entry(session_id.to_string()).or_insert((0, 0));
         // 摘要后主循环还要再发一次 LLM 请求：预算检查必须给下一轮主请求留出
         // 余量，否则可选摘要会把额度吃光，下一轮被硬拒成「预算不足」。
         let next_loop_est = messages
@@ -8349,6 +8662,21 @@ impl AgentCore {
             const SUMMARY_INPUT_CAP_CHARS: usize = 16_000;
             let input_head: String = content.chars().take(SUMMARY_INPUT_CAP_CHARS).collect();
             let input_truncated = chars > SUMMARY_INPUT_CAP_CHARS;
+            // P1-b（R3 护栏②）：累计占比投影检查——本条摘掉后若占比超 30% 则放弃，保留原文
+            {
+                let (summed, total) = *ledger_entry;
+                let proj_summed = summed + chars as u64;
+                let proj_total = (total + chars as u64).max(1);
+                if proj_total >= SUMMARY_SHARE_FLOOR_CHARS
+                    && proj_summed * SUMMARY_SHARE_CAP_DEN > proj_total * SUMMARY_SHARE_CAP_NUM
+                {
+                    tracing::info!(target = "orchestration.summary",
+                        session = %session_id, summed, total, incoming = chars,
+                        "工具摘要累计占比将超 30% 上限，本条保留原文（防长会话渐进信息丢失）");
+                    ledger_entry.1 += chars as u64;
+                    continue;
+                }
+            }
             let prompt = format!(
                 "请把下面的工具输出压缩成不超过 800 字的要点摘要。必须保留：数值、日期、\
                  人名/车牌/企业名等实体、结论性语句。禁止添加原输出中不存在的信息。\n\n工具输出：\n{}{}",
@@ -8389,11 +8717,14 @@ impl AgentCore {
                         "工具结果已 LLM 摘要");
                     // opt-in 摘要：保留 bounded 原文头部，防止后续轮次需要的关键事实
                     // 因摘要遗漏而永久丢失（摘要 + 原文头部仍然显著压缩超长输出）。
+                    // P1-b（R3 护栏①）：摘要头部携带溯源信息（tool_call_id + 原始字数），
+                    // 明确该块是「不可信机器摘要」，原文另有保留。
                     const RAW_RETAIN_CHARS: usize = 2000;
                     let raw_head: String = content.chars().take(RAW_RETAIN_CHARS).collect();
                     let truncated = content.chars().count() > RAW_RETAIN_CHARS;
                     m.content = Some(format!(
-                        "{MARKER}\n{}\n\n[原文保留前{RAW_RETAIN_CHARS}字]\n{}{}",
+                        "{MARKER}(溯源: tool_call_id={:?}，原文 {chars} 字，摘要为 LLM 生成非原文)\n{}\n\n[原文保留前{RAW_RETAIN_CHARS}字]\n{}{}",
+                        m.tool_call_id,
                         r.text,
                         raw_head,
                         if truncated { "…" } else { "" }
@@ -12028,17 +12359,55 @@ impl AgentCore {
         if reply.is_empty() || reply == "无异常" {
             return "洞见: 无异常".to_string();
         }
+        // P1-d（R5）：content 首行为**程序生成**的统计行（确定性，可核对），LLM 洞见文本跟随其后；
+        // tags 强制携带数据窗口与来源——洞见可回溯到其数据面，而非凭空一句话。
+        let n_entrance = Self::count_data_records(&data);
+        let n_stats = Self::count_data_records(&stats);
+        let content = format!(
+            "[洞见] 数据窗口 {}~{}（7 天）；程序统计：入厂记录约 {} 条、月统计约 {} 条（源 query_entrance+query_monthly_stats）\n{}",
+            week_ago, today, n_entrance, n_stats, reply
+        );
         let _ = self
             .mcp
             .call(
                 "memory_remember",
                 &serde_json::json!({
-                    "content": format!("[洞见] {} | {}~{}", reply, week_ago, today),
-                    "tags": ["insight", "auto_discovered"], "confidence": 70,
+                    "content": content,
+                    "tags": [
+                        "insight", "auto_discovered", "insight:7d",
+                        format!("window:{}~{}", week_ago, today),
+                        format!("records:{}", n_entrance),
+                    ],
+                    "confidence": 70,
                 }),
             )
             .await;
         format!("洞见: {}", reply)
+    }
+
+    /// P1-d（R5）：确定性统计工具返回的记录条数——JSON 数组/含 items|data|results|rows 字段的
+    /// 对象取长度；否则按非空行数估计。解析失败返回 0（统计行如实显示「约 0 条」，
+    /// 不影响 LLM 洞见文本本身）。
+    fn count_data_records(s: &str) -> usize {
+        let count_array = |v: &serde_json::Value| -> usize {
+            v.as_array().map(|a| a.len()).unwrap_or(0)
+        };
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s.trim()) {
+            if v.is_array() {
+                return count_array(&v);
+            }
+            if let Some(o) = v.as_object() {
+                for key in ["items", "data", "results", "rows", "list"] {
+                    if let Some(arr) = o.get(key) {
+                        let n = count_array(arr);
+                        if n > 0 {
+                            return n;
+                        }
+                    }
+                }
+            }
+        }
+        s.lines().filter(|l| !l.trim().is_empty()).count()
     }
 
     /// P2.2d：LLM 批量抽取 text_signals → `signal:*` tags（consolidate retain 路径）。
@@ -12256,7 +12625,7 @@ impl AgentCore {
     ///
     /// 以 admin 身份调用 memoria（系统维护任务，合法跨命名空间读取观察原料）。
     /// ns 隔离：每个 ns 独立游标、独立 pattern 库。
-    pub async fn consolidate(&self, ns: &str) -> String {
+    pub async fn consolidate(&self, ns: &str) -> ConsolidateOutcome {
         // 系统维护任务：admin/jarvis 身份与密钥必须配对（勿用聊天 agent_id + jarvis badge）。
         let mem_client = memoria_maintenance_client(&self.config.memoria_url, &self.mcp);
 
@@ -12304,7 +12673,14 @@ impl AgentCore {
             .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
             .unwrap_or_default();
         if items.is_empty() {
-            return format!("consolidate[{}]: 无新观察（cursor={}）", ns, cursor_ts);
+            return ConsolidateOutcome {
+                ns: ns.to_string(),
+                patterns_added: 0,
+                observations: 0,
+                fetched: 0,
+                cursor: cursor_ts.clone(),
+                detail: format!("无新观察（cursor={}）", cursor_ts),
+            };
         }
 
         let skip_ner = std::env::var("CONSOLIDATE_SKIP_NER")
@@ -12315,7 +12691,10 @@ impl AgentCore {
             .unwrap_or(true);
 
         // 3. 质量过滤 + 推进游标用的 max_ts（整批，含不合格）
+        // P1-d：同步收集观察内存 ID（memoria memory_fetch_unconsolidated 返回 id 字段），
+        // 供 pattern 携带 evidence 指针回溯。
         let mut obs_lines: Vec<String> = Vec::new();
+        let mut obs_ids: Vec<String> = Vec::new();
         let mut max_ts = cursor_ts.clone();
         let mut skipped = 0u64;
         for it in &items {
@@ -12331,6 +12710,12 @@ impl AgentCore {
             let c = c.trim();
             if Self::obs_ok_for_consolidate(c, min_obs_chars) {
                 obs_lines.push(c.to_string());
+                obs_ids.push(
+                    it.get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                );
             } else {
                 skipped += 1;
             }
@@ -12348,24 +12733,38 @@ impl AgentCore {
 
         // 整批无合格原料
         if obs_lines.is_empty() {
-            return format!(
-                "consolidate[{}]: 本批 {} 条均不合格（跳过 {}，cursor→{}）",
-                ns,
-                items.len(),
-                skipped,
-                max_ts
-            );
+            return ConsolidateOutcome {
+                ns: ns.to_string(),
+                patterns_added: 0,
+                observations: 0,
+                fetched: items.len(),
+                cursor: max_ts.clone(),
+                detail: format!(
+                    "本批 {} 条均不合格（跳过 {}，cursor→{}）",
+                    items.len(),
+                    skipped,
+                    max_ts
+                ),
+            };
         }
 
-        // 4. LLM 提炼 ≤5 pattern（严格：只要可复用工程/运营规则）
-        let obs_text = obs_lines.join("\n- ");
+        // 4. LLM 提炼 ≤5 pattern（严格：只要可复用工程/运营规则）。
+        // P1-d：观察带序号喂给 LLM，要求每条 pattern 行末标注【依据: 序号】，
+        // 程序解析后映射回观察内存 ID 作为 evidence 指针（可回溯，防「pattern 凭空出现」）。
+        let obs_text = obs_lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("[{}] {}", i + 1, l))
+            .collect::<Vec<_>>()
+            .join("\n- ");
         let prompt = format!(
             "你是知识巩固引擎。只从观察中提炼**可长期复用**的高层规则（架构取舍、运维约束、业务偏好、排障经验）。\n\
              硬性禁止写成 pattern：\n\
              - 一次性会话过程、工具回显、文件路径流水账、cron 任务日志\n\
              - 测试/冒烟/世界杯等无关话题\n\
              - 复述某条观察原文、或过短空话\n\
-             每条模式一句话、具体可执行，最多 5 条。若无可提炼内容，只输出「无模式」。\n\n\
+             每条模式一行、一句话、具体可执行，最多 5 条；行末必须标注支撑它的观察序号，格式如【依据: 1,3】。\n\
+             若无可提炼内容，只输出「无模式」。\n\n\
              ## 待巩固观察（合格 {} / 本批拉取 {}，命名空间 {}）\n- {}",
             obs_lines.len(),
             items.len(),
@@ -12380,56 +12779,112 @@ impl AgentCore {
         };
         let reply = match self.llm.chat(&[msg], &[]).await {
             Ok(r) => r.text.trim().to_string(),
-            Err(e) => return format!("consolidate[{}] LLM 失败: {}", ns, e),
+            Err(e) => {
+                return ConsolidateOutcome {
+                    ns: ns.to_string(),
+                    patterns_added: 0,
+                    observations: obs_lines.len(),
+                    fetched: items.len(),
+                    cursor: max_ts.clone(),
+                    detail: format!("LLM 失败: {}", e),
+                }
+            }
         };
         if reply.is_empty() || reply == "无模式" || (reply.contains("无模式") && reply.chars().count() < 20) {
-            return format!(
-                "consolidate[{}]: 无模式（合格观察 {}，跳过 {}，cursor→{}）",
-                ns,
-                obs_lines.len(),
-                skipped,
-                max_ts
-            );
+            return ConsolidateOutcome {
+                ns: ns.to_string(),
+                patterns_added: 0,
+                observations: obs_lines.len(),
+                fetched: items.len(),
+                cursor: max_ts.clone(),
+                detail: format!(
+                    "无模式（合格观察 {}，跳过 {}，cursor→{}）",
+                    obs_lines.len(),
+                    skipped,
+                    max_ts
+                ),
+            };
         }
 
-        // 5. 写回 pattern（≤5，再过一道写库过滤）
-        let patterns: Vec<&str> = reply
+        // 5. 写回 pattern（≤5，再过一道写库过滤）。
+        // P1-d：解析每条行末【依据: 序号】→ 映射观察内存 ID（evidence 指针）
+        let parse_citation = |line: &str| -> (String, Vec<usize>) {
+            let (text, cite) = match line.find("【依据") {
+                Some(pos) => (&line[..pos], &line[pos..]),
+                None => (line, ""),
+            };
+            let nums: Vec<usize> = cite
+                .split(|c: char| !c.is_ascii_digit())
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse::<usize>().ok())
+                .filter(|n| *n >= 1 && *n <= obs_lines.len())
+                .collect();
+            (text.trim().to_string(), nums)
+        };
+        let clean_patterns: Vec<(String, Vec<usize>)> = reply
             .lines()
             .map(|l| l.trim())
             .filter(|l| !l.is_empty())
             .take(8) // 先多取，过滤后再截断
-            .collect();
-        let clean_patterns: Vec<String> = patterns
-            .iter()
-            .map(|p| {
-                p.trim_start_matches(|c: char| {
-                    c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' ' || c == '*'
-                })
-                .trim()
-                .to_string()
+            .map(parse_citation)
+            .map(|(p, c)| {
+                let p = p
+                    .trim_start_matches(|c: char| {
+                        c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' ' || c == '*'
+                    })
+                    .trim()
+                    .to_string();
+                (p, c)
             })
-            .filter(|p| Self::pattern_ok_for_consolidate(p))
+            .filter(|(p, _)| Self::pattern_ok_for_consolidate(p))
             .take(5)
             .collect();
 
         if clean_patterns.is_empty() {
-            return format!(
-                "consolidate[{}]: LLM 产出未过写库门槛（合格观察 {}，cursor→{}）",
-                ns,
-                obs_lines.len(),
-                max_ts
-            );
+            return ConsolidateOutcome {
+                ns: ns.to_string(),
+                patterns_added: 0,
+                observations: obs_lines.len(),
+                fetched: items.len(),
+                cursor: max_ts.clone(),
+                detail: format!(
+                    "LLM 产出未过写库门槛（合格观察 {}，cursor→{}）",
+                    obs_lines.len(),
+                    max_ts
+                ),
+            };
         }
 
         // P2.2d：consolidate retain 路径 — LLM 抽取 signal tags 并随 memory_remember 持久化
+        let pattern_texts: Vec<String> = clean_patterns
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect();
         let signal_tags_by_idx = self
-            .llm_extract_signal_tags_batch(&clean_patterns)
+            .llm_extract_signal_tags_batch(&pattern_texts)
             .await;
 
         let mut written = 0u64;
-        for (i, clean) in clean_patterns.iter().enumerate() {
+        for (i, (clean, cites)) in clean_patterns.iter().enumerate() {
+            // P1-d evidence 指针：序号 + 内存 ID（ID 截前 5 个防 content 膨胀）；
+            // 未标注依据时如实记「未标注」，不伪造可回溯性。
+            let cite_nums: Vec<String> = cites.iter().map(|n| n.to_string()).collect();
+            let cite_ids: Vec<String> = cites
+                .iter()
+                .filter_map(|n| obs_ids.get(n.saturating_sub(1)))
+                .filter(|s| !s.is_empty())
+                .take(5)
+                .cloned()
+                .collect();
+            let evidence = if cite_nums.is_empty() {
+                format!("依据观察:未标注（本批 {} 条候选）", obs_lines.len())
+            } else if cite_ids.is_empty() {
+                format!("依据观察:[{}]", cite_nums.join(","))
+            } else {
+                format!("依据观察:[{}]（id:{})", cite_nums.join(","), cite_ids.join(","))
+            };
             let mut args = serde_json::json!({
-                "content": format!("[pattern] {} | ns={}", clean, ns),
+                "content": format!("[pattern] {} | ns={} | {}", clean, ns, evidence),
                 "tags": ["pattern", "auto_consolidated"],
                 "category": "pattern",
                 "confidence": 70,
@@ -12701,15 +13156,21 @@ impl AgentCore {
             }
         }
 
-        format!(
-            "consolidate[{}]: 从 {} 条合格观察提炼 {} 条 pattern（本批拉取 {}，跳过 {}，cursor→{}）",
-            ns,
-            obs_lines.len(),
-            written,
-            items.len(),
-            skipped,
-            max_ts
-        )
+        ConsolidateOutcome {
+            ns: ns.to_string(),
+            patterns_added: written,
+            observations: obs_lines.len(),
+            fetched: items.len(),
+            cursor: max_ts.clone(),
+            detail: format!(
+                "从 {} 条合格观察提炼 {} 条 pattern（本批拉取 {}，跳过 {}，cursor→{}）",
+                obs_lines.len(),
+                written,
+                items.len(),
+                skipped,
+                max_ts
+            ),
+        }
     }
 
     /// 记忆库系统维护：衰减循环（memory_decay）+ GFS 轮转备份（memory_backup）。
@@ -12754,7 +13215,7 @@ impl AgentCore {
     }
 
     /// 巩固原料门槛：挡短文本 / 测试 / 会话助理前缀 / cron 流水
-    fn obs_ok_for_consolidate(content: &str, min_chars: usize) -> bool {
+    pub(crate) fn obs_ok_for_consolidate(content: &str, min_chars: usize) -> bool {
         let c = content.trim();
         if c.chars().count() < min_chars {
             return false;
@@ -12781,7 +13242,7 @@ impl AgentCore {
     }
 
     /// pattern 写库门槛：挡空话 / 禁题 / 过短
-    fn pattern_ok_for_consolidate(p: &str) -> bool {
+    pub(crate) fn pattern_ok_for_consolidate(p: &str) -> bool {
         let t = p.trim();
         if t.chars().count() < 16 {
             return false;

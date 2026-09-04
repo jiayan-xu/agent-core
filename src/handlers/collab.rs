@@ -881,6 +881,131 @@ pub(crate) async fn handle_collab_peers(
     }
 }
 
+/// P2-1：协作画像（GET /api/collab/profile）——《程序化汇合改造方案》§8 P2。
+///
+/// 蜂群实验结论「信息可见性决定组织形态」：只看社交关系的 Agent 会「朋友的朋友」式抱团
+/// （聚类系数 0.53），看到彼此的专长与活跃后才转向择优组队（降到 0.28）。本端点把同组织
+/// Agent 的能力/活跃信号只读聚合暴露给协作面，供 a2a 择优。
+///
+/// 数据源（全部只读、零 LLM、逐项降级不阻断）：
+/// - memoria `agent_list`：注册面（与 peers 同源同过滤）；
+/// - memoria `audit_query` 近 2000 条行为样本：按 agent 聚合事件数 / 最近活跃 / 工具偏好；
+/// - memoria `memory_quota_status`：当日写入量（配额窗口计数）。
+/// 说明：任务级「正确率」需任务回执体系（未建），本版先暴露工具偏好与活跃度作为专长信号。
+pub(crate) async fn handle_collab_profile(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let (_agent_id, _allowed_ns) = match authenticate(&headers, &st).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let agent_guard = st.agent.lock().await;
+    let Some(ref agent) = *agent_guard else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "agent 尚未就绪"})),
+        )
+            .into_response();
+    };
+
+    // 1. 注册面（与 peers 同源 + 同过滤）
+    let peers = match agent.collab_list_peers().await {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({"error": e})),
+            )
+                .into_response()
+        }
+    };
+    let visible: Vec<&serde_json::Value> = peers
+        .iter()
+        .filter(|a| peer_in_company(a["namespace"].as_str().unwrap_or("")))
+        .collect();
+
+    // 2. 行为样本：audit_query 无 per-agent 过滤参数，单次拉取近 2000 条后程序分组
+    const AUDIT_SAMPLE: u64 = 2000;
+    let audit = agent
+        .mcp
+        .call_json("audit_query", &serde_json::json!({ "limit": AUDIT_SAMPLE }))
+        .await
+        .ok();
+    // agent_id → (事件数, 最近活跃时间, 工具计数)——BTreeMap 保证 top_tools 输出稳定可复现
+    let mut behavior: std::collections::HashMap<
+        String,
+        (u64, String, std::collections::BTreeMap<String, u64>),
+    > = std::collections::HashMap::new();
+    if let Some(a) = &audit {
+        if let Some(logs) = a["logs"].as_array() {
+            for log in logs {
+                let id = log["agent_id"].as_str().unwrap_or("").to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                let entry = behavior
+                    .entry(id)
+                    .or_insert_with(|| (0, String::new(), Default::default()));
+                entry.0 += 1;
+                let ts = log["timestamp"].as_str().unwrap_or("");
+                if entry.1.is_empty() || ts > entry.1.as_str() {
+                    entry.1 = ts.to_string();
+                }
+                let tool = log["tool"].as_str().unwrap_or("unknown").to_string();
+                *entry.2.entry(tool).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // 3. 组装画像（当日写入量逐 peer best-effort 查询；失败留 null 不阻断）
+    let mut agents_json: Vec<serde_json::Value> = Vec::with_capacity(visible.len());
+    for a in &visible {
+        let agent_id = a["agent_id"].as_str().unwrap_or("").to_string();
+        let ns = peers_ns_of(&peers, &agent_id);
+        let writes_today = agent
+            .mcp
+            .call_json(
+                "memory_quota_status",
+                &serde_json::json!({ "namespace": ns }),
+            )
+            .await
+            .ok()
+            .and_then(|q| q["quotas"]["write"]["used"].as_u64());
+        let activity = behavior.get(&agent_id).map(|(events, last, tools)| {
+            let mut top: Vec<(String, u64)> =
+                tools.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            top.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
+            serde_json::json!({
+                "sampled_events": events,
+                "last_active": last,
+                "top_tools": top
+                    .into_iter()
+                    .take(3)
+                    .map(|(t, n)| serde_json::json!({"tool": t, "count": n}))
+                    .collect::<Vec<_>>(),
+            })
+        });
+        agents_json.push(serde_json::json!({
+            "agent_id": a["agent_id"],
+            "display_name": a["display_name"],
+            "namespace": a["namespace"],
+            "permission": a["permission"],
+            "primary_ns": ns,
+            "activity": activity,
+            "writes_today": writes_today,
+        }));
+    }
+
+    axum::Json(serde_json::json!({
+        "agents": agents_json,
+        "audit_sample_limit": AUDIT_SAMPLE,
+        "audit_available": audit.is_some(),
+        "note": "画像为只读聚合（零 LLM）：top_tools/活跃度来自 memoria 审计抽样，writes_today 为当日配额窗口计数；任务级正确率待任务回执体系建立后接入（方案 §8）",
+    }))
+    .into_response()
+}
+
 /// POST /api/collab/delete — 删除收件箱中的一条消息（通知清理）
 #[derive(serde::Deserialize)]
 pub(crate) struct CollabDeleteBody {
