@@ -466,8 +466,13 @@ pub struct StanceCard {
     pub citations: Vec<String>,
     /// 置信度 0-100（仅结构化卡存在）。
     pub confidence: Option<u8>,
-    /// 原始回答全文（可回溯；未结构化卡的内容主体）。
+    /// 原始回答（可回溯；未结构化卡的内容主体）。**硬上限 4000 字**：卡片整包进
+    /// SSE stance 载荷、降级卡原文进 memoria content，每个字段都有反膨胀上限而
+    /// raw 无限会让一个话痨模型按席位数放大事件流/会议记录/记忆库
+    /// （ocr PR#66 第二轮）；超限截断加标，前 4000 字足以回溯立场来源。
     pub raw: String,
+    /// raw 是否被 4000 字上限截断（截断时读者可知原文更长）。
+    pub raw_truncated: bool,
     /// 是否成功解析为结构化立场卡。
     pub structured: bool,
 }
@@ -483,16 +488,32 @@ impl StanceCard {
     /// 失败切片 debug 留痕可观测。
     pub fn from_raw(persona_id: String, display_name: String, raw: String) -> StanceCard {
         const UNSTRUCTURED: &str = "未结构化";
-        let fallback = |raw: String| StanceCard {
-            persona_id: persona_id.clone(),
-            display_name: display_name.clone(),
-            stance: UNSTRUCTURED.to_string(),
-            summary: raw.lines().next().unwrap_or("").trim().chars().take(80).collect(),
-            key_reasons: Vec::new(),
-            citations: Vec::new(),
-            confidence: None,
-            raw: raw.clone(),
-            structured: false,
+        // raw 反膨胀上限（ocr PR#66 第二轮）：截断加标，立场可回溯性保留在前 4000 字
+        const RAW_CAP: usize = 4000;
+        let clamp_raw = |raw: &str| -> (String, bool) {
+            if raw.chars().count() > RAW_CAP {
+                (
+                    format!("{}…(原文超长已截断)", raw.chars().take(RAW_CAP).collect::<String>()),
+                    true,
+                )
+            } else {
+                (raw.to_string(), false)
+            }
+        };
+        let fallback = |raw: String| {
+            let (raw_kept, raw_truncated) = clamp_raw(&raw);
+            StanceCard {
+                persona_id: persona_id.clone(),
+                display_name: display_name.clone(),
+                stance: UNSTRUCTURED.to_string(),
+                summary: raw.lines().next().unwrap_or("").trim().chars().take(80).collect(),
+                key_reasons: Vec::new(),
+                citations: Vec::new(),
+                confidence: None,
+                raw: raw_kept,
+                raw_truncated,
+                structured: false,
+            }
         };
         let v = match Self::extract_json_value(&raw, &persona_id) {
             Some(v) => v,
@@ -545,9 +566,14 @@ impl StanceCard {
         }
         // confidence 宽容解码（ocr PR#66 评审）：u64 / f64（≤1 视为百分比小数）/ 数字
         // 字符串三种常见编码都接受，越界 clamp 100，无法解码 debug 留痕
+        // confidence 宽容解码（ocr PR#66 第二轮）：u64/f64/数字字符串三种编码走
+        // **同一条**归一规则（≤1 视为百分比小数 ×100，否则原值；clamp 100）——
+        // 此前 u64 的 1 是 1% 而 f64 的 1.0 是 100%，同一语义两种结果
+        let normalize_conf = |n: u64| -> u64 { if n <= 1 { n * 100 } else { n } };
         let confidence = v.get("confidence").and_then(|x| {
             let n = x
                 .as_u64()
+                .map(normalize_conf)
                 .or_else(|| {
                     x.as_f64().map(|f| if f <= 1.0 { (f * 100.0).round() as u64 } else { f.round() as u64 })
                 })
@@ -562,6 +588,7 @@ impl StanceCard {
             }
             n
         }).map(|c| c.min(100) as u8);
+        let (raw_kept, raw_truncated) = clamp_raw(&raw);
         StanceCard {
             persona_id,
             display_name,
@@ -570,7 +597,8 @@ impl StanceCard {
             key_reasons,
             citations: Vec::new(),
             confidence,
-            raw,
+            raw: raw_kept,
+            raw_truncated,
             structured: true,
         }
     }
@@ -587,11 +615,16 @@ impl StanceCard {
                 cleaned = cleaned[..pos].trim();
             }
         }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(cleaned) {
-            return Some(v);
+        // ① 只接受**对象**（ocr PR#66 第二轮：顶层数组/字符串/数字也算"合法 JSON"，
+        // 直接返回会让 `[{"stance":…}]` 走不到下面的配平扫描而整卡降级）；
+        // 数组里的对象会被 ② 的花括号配平逐个捕获
+        if let Ok(serde_json::Value::Object(o)) = serde_json::from_str::<serde_json::Value>(cleaned) {
+            return Some(serde_json::Value::Object(o));
         }
         // ② 配平扫描：深度归零处截断候选，逐个尝试（正文含无关 { } 或多个对象时，
-        // 朴素「首 { 到末 }」切片必失败）
+        // 朴素「首 { 到末 }」切片必失败）。**游离 `}` 在深度 0 时忽略**（前导噪声
+        // 花括号否则会把深度打成负数、吞掉后面真正的对象）；未闭合的尾部 `{`
+        // 自然不产出候选
         let bytes = raw.as_bytes();
         let mut candidates: Vec<(usize, usize)> = Vec::new();
         let mut depth: i32 = 0;
@@ -604,7 +637,7 @@ impl StanceCard {
                     }
                     depth += 1;
                 }
-                b'}' => {
+                b'}' if depth > 0 => {
                     depth -= 1;
                     if depth == 0 {
                         if let Some(s) = start {
@@ -615,7 +648,7 @@ impl StanceCard {
                 }
                 _ => {}
             }
-            if candidates.len() >= 4 {
+            if candidates.len() >= 8 {
                 break; // 防极端输出（如一串单独花括号）拖慢扫描
             }
         }
@@ -632,28 +665,27 @@ impl StanceCard {
 }
 
 /// 立场词规范化：仅包含词匹配，零 LLM。
-/// 命中顺序（ocr PR#65 多轮评审收敛）：
-/// 1. 显式反对先行：「反对（且非『不反对』）/不支持」优先于一切含「支持」
-///    的分支——否则「条件不支持」「反对条件支持」等混合标记会被归成
-///    「条件支持」（180° 极性反转）；
-/// 2. 「无条件/不设条件/无附加条件 + 支持」不落「条件支持」；
-/// 3. 「不支持」天然含「支持」子串，由反对分支先截胡；
-/// 4. 未命中任何规范词（如 "Support"/"倾向于认可"）归**固定桶「其他」**——
-///    自由文本当分布键会产生一次性碎键、拆分同票桶并静默废掉对立提示
-///    （ocr PR#66 评审），原词保留在 summary/raw 可回溯。
+/// 命中顺序（ocr PR#66 两轮评审收敛）：
+/// 1. **显式极性倾斜优先于「中立」字面**：「中立偏反对/不支持但保持中立」归
+///    反对、「中立偏支持」归支持——中立先匹配会把倾斜表态抹平成中立；
+/// 2. 「反对（且非『不反对』）/不支持」优先于一切含「支持」的分支（180° 反转
+///    防护：条件不支持/反对条件支持）；「无条件/不设条件/无附加条件」不落
+///    「条件支持」；「不支持」天然含「支持」子串由反对分支先截胡；
+/// 3. 无任何极性/中立标记 → 固定桶「其他」（自由文本当分布键会产生一次性
+///    碎键、拆分同票桶、静默废掉对立提示），原词保留在 summary/raw。
 fn normalize_stance(s: &str) -> String {
     let t = s.trim();
     let unconditional = t.contains("无条件") || t.contains("不设条件") || t.contains("无附加条件");
-    let opposes =
-        (t.contains("反对") && !t.contains("不反对")) || t.contains("不支持");
-    if t.contains("中立") {
-        "中立".to_string()
-    } else if opposes {
+    let pos = t.contains("支持");
+    let neg = (t.contains("反对") && !t.contains("不反对")) || t.contains("不支持");
+    if neg {
         "反对".to_string()
-    } else if t.contains("条件") && t.contains("支持") && !unconditional {
+    } else if pos && t.contains("条件") && !unconditional {
         "条件支持".to_string()
-    } else if t.contains("支持") {
+    } else if pos {
         "支持".to_string()
+    } else if t.contains("中立") {
+        "中立".to_string()
     } else {
         "其他".to_string()
     }
@@ -15136,6 +15168,9 @@ mod stance_card_tests {
         assert_eq!(f("支持（不设条件）"), "支持");
         assert_eq!(f("支持，无附加条件"), "支持");
         assert_eq!(f("中立"), "中立");
+        // 倾斜表态：极性优先于「中立」字面（ocr PR#66 第二轮）
+        assert_eq!(f("中立偏反对"), "反对");
+        assert_eq!(f("中立偏支持"), "支持");
         assert_eq!(f("支持"), "支持");
         // 未命中规范词 → 固定「其他」桶（不产生一次性碎键）
         assert_eq!(f("Support"), "其他");
