@@ -15043,3 +15043,28 @@ mod whitelist_v11_tests {
     }
 }
 
+#[cfg(test)]
+mod tool_summary_accounting_tests {
+    use super::AgentCore;
+
+    /// P1-b R3 无状态核算的往返契约（ocr PR#65 第五轮）：构造 MARKER 头 →
+    /// tool_summary_discard_of 必须还原「原文 N 字 − 现存长度」。MARKER 头
+    /// 格式变更而忘记同步解析时，本测试先红。
+    #[test]
+    fn tool_summary_marker_round_trip() {
+        // 与 maybe_summarize_tool_outputs 成功分支的替换模板一致的头部
+        let content = "[工具结果摘要](溯源: tool_call_id=Some(\"tc-1\")，原文 16000 字，摘要为 LLM 生成非原文)\n这里是摘要正文。\n\n[原文保留前2000字]\n原始内容开头……";
+        let cur = content.chars().count() as u64;
+        assert_eq!(AgentCore::tool_summary_discard_of(content), 16000 - cur);
+
+        // 非 MARKER 消息：0
+        assert_eq!(AgentCore::tool_summary_discard_of("普通工具输出，无标记"), 0);
+        // MARKER 但头部破损（无「原文 N 字」）：0，不 panic
+        assert_eq!(AgentCore::tool_summary_discard_of("[工具结果摘要] 头部信息缺失"), 0);
+        // 数字非整数 / 超长：0
+        assert_eq!(
+            AgentCore::tool_summary_discard_of("[工具结果摘要](溯源: tool_call_id=None，原文 abc 字，摘要为 LLM 生成非原文)\n正文"),
+            0
+        );
+    }
+}
