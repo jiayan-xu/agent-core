@@ -116,9 +116,15 @@ pub struct CaseResult {
 pub struct EvalReport {
     pub ns: String,
     pub eval_set_version: u32,
+    /// 6000 字窗口内实际可见的观察数（< 题集大小时尾部用例从未展示给模型——
+    /// hit_rate 会被结构性压低，报告必须可辨别这一状态）
+    pub observations_visible: usize,
     pub cases_positive: usize,
     pub cases_negative: usize,
-    /// ok：有有效 pattern，hit_rate 可比；no_patterns / empty_reply：本轮无基线意义
+    /// ok：有有效 pattern，hit_rate 可比；no_patterns：模型明说无模式；
+    /// gate_rejected：有候选但全部未过写库门槛（prompt 变更最易触发的回归形态，
+    /// 与 no_patterns 必须区分，否则该回归连同其 negative_leaks 一起被当
+    /// 「无基线意义」丢弃）；empty_reply：模型空响应
     pub outcome: String,
     /// 过写库门槛（pattern_ok_for_consolidate）的 pattern 数（与生产一致：先 take(8) 后 take(5)）
     pub patterns_valid: usize,
@@ -251,14 +257,27 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
     let keyword_hits = case_results.iter().filter(|r| r.keyword_hit).count();
     let negative_leaks = case_results.iter().filter(|r| r.leaked).count();
     let patterns_missing_citations = valid.iter().filter(|f| f.cites.is_empty()).count();
-    let outcome = if empty_reply || no_patterns || valid.is_empty() {
-        if empty_reply { "empty_reply" } else { "no_patterns" }.to_string()
+    // 三态区分（ocr PR#65 第四轮）：「模型说无模式」与「候选全被写库门槛拒绝」
+    // 是不同信号——后者是 prompt 变更最易触发的回归，且其 negative_leaks 有价值
+    let outcome = if empty_reply {
+        "empty_reply".to_string()
+    } else if no_patterns {
+        "no_patterns".to_string()
+    } else if valid.is_empty() {
+        "gate_rejected".to_string()
     } else {
         "ok".to_string()
     };
+    // 题集超出 6000 字窗口 → 尾部用例从未展示给模型，hit_rate 会被结构性压低
+    if included < EVAL_SET.len() {
+        tracing::warn!(target: "consolidate_eval",
+            visible = included, total = EVAL_SET.len(),
+            "P2-2: 评估题集超出 6000 字窗口，尾部用例从未展示给模型——hit_rate 被结构性压低，需精简用例或拆批");
+    }
     let report = EvalReport {
         ns: ns.to_string(),
         eval_set_version: EVAL_SET_VERSION,
+        observations_visible: included,
         cases_positive: positives,
         cases_negative: negatives,
         outcome,
@@ -279,21 +298,33 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
     };
 
     // 原子落盘 data/consolidate_eval/<毫秒时间戳>.json：tmp + rename（对齐仓库
-    // write_meetings_file / experience_memo 约定），毫秒文件名防同秒覆盖；
-    // 每一步失败都 warn 留痕，不再静默吞错。
-    let dir = std::path::Path::new("data/consolidate_eval");
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        tracing::warn!(target: "consolidate_eval", error = %e, "P2-2: 无法创建评估目录，报告未落盘");
-    } else {
-        let file_ts = chrono::Local::now().format("%Y%m%dT%H%M%S%3f");
-        let final_path = dir.join(format!("{}.json", file_ts));
-        let tmp_path = dir.join(format!("{}.json.tmp", file_ts));
-        match serde_json::to_string_pretty(&report) {
-            Ok(json) => match std::fs::write(&tmp_path, json).and_then(|_| std::fs::rename(&tmp_path, &final_path)) {
-                Ok(()) => {}
-                Err(e) => tracing::warn!(target: "consolidate_eval", error = %e, "P2-2: 评估报告落盘失败"),
-            },
-            Err(e) => tracing::warn!(target: "consolidate_eval", error = %e, "P2-2: 评估报告序列化失败"),
+    // write_meetings_file / experience_memo 约定），毫秒文件名防同秒覆盖。
+    // 整块 fs I/O 移入 spawn_blocking（ocr PR#65 第四轮）：本函数在 axum handler
+    // 的响应路径上被 await，同步 create_dir_all/write/rename 在被 AV 扫描的
+    // Windows 目录上会阻塞 tokio worker（仓库 persist_meetings_for 同款约定）。
+    // 报告已完整构造，落盘失败仅 warn，不阻塞响应语义。
+    {
+        let report_json = match serde_json::to_string_pretty(&report) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(target: "consolidate_eval", error = %e, "P2-2: 评估报告序列化失败");
+                String::new()
+            }
+        };
+        if !report_json.is_empty() {
+            let dir = std::path::PathBuf::from("data/consolidate_eval");
+            let file_ts = chrono::Local::now().format("%Y%m%dT%H%M%S%3f").to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(&dir)?;
+                let final_path = dir.join(format!("{}.json", file_ts));
+                let tmp_path = dir.join(format!("{}.json.tmp", file_ts));
+                std::fs::write(&tmp_path, &report_json)
+                    .and_then(|_| std::fs::rename(&tmp_path, &final_path))
+            })
+            .await
+            .map_err(|e| tracing::warn!(target: "consolidate_eval", error = %e, "P2-2: 评估报告落盘任务失败"))
+            .and_then(|r| r.map_err(|e| tracing::warn!(target: "consolidate_eval", error = %e, "P2-2: 评估报告落盘失败")))
+            ;
         }
     }
     tracing::info!(
@@ -309,13 +340,16 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
 }
 
 /// 读取历史评估的基线序列（跨次比较用；按文件名时间戳升序）。
-/// **只返回 `outcome=ok` 且版本等于当前题集的报告**——空回复/无模式轮没有基线意义，
-/// 跨题集版本的数字不可比（见 EVAL_SET_VERSION）。
-/// 三类跳过都留痕（ocr PR#65 第三轮评审）：读文件/解析失败与字段缺失 warn（可能
-/// 是 serde 字段名漂移或报告损坏，值得人看一眼）；版本不匹配 debug + 汇总一行——
-/// 否则「20 份报告全部损坏」与「从未跑过评估」返回同一个空 Vec，调用方无从区分。
-pub fn list_past_hit_rates() -> Vec<(String, u32, f64)> {
-    let mut out: Vec<(String, u32, f64)> = Vec::new();
+/// **只返回 `outcome=ok` 且版本等于当前题集的报告**——空回复/无模式/门槛拒绝轮
+/// 没有基线意义，跨题集版本的数字不可比（见 EVAL_SET_VERSION）。
+/// 元组携带 `ns`（ocr PR#65 第四轮）：agent_id 变更或多实例共享 data/ 时，
+/// 不同命名空间的 run 混进同一条序列正是版本过滤要消灭的静默不可比——
+/// P3 消费方按 ns 分组后再比较。
+/// 三类跳过都留痕：读文件/解析失败与字段缺失 warn（可能是 serde 字段名漂移
+/// 或报告损坏，值得人看一眼）；版本不匹配 debug + 汇总一行——否则「20 份报告
+/// 全部损坏」与「从未跑过评估」返回同一个空 Vec，调用方无从区分。
+pub fn list_past_hit_rates() -> Vec<(String, u32, String, f64)> {
+    let mut out: Vec<(String, u32, String, f64)> = Vec::new();
     let mut skipped_version = 0u32;
     let dir = std::path::Path::new("data/consolidate_eval");
     let mut names: Vec<_> = std::fs::read_dir(dir)
@@ -363,7 +397,8 @@ pub fn list_past_hit_rates() -> Vec<(String, u32, f64)> {
             .as_str()
             .map(|s| s.to_string())
             .unwrap_or_else(|| path.display().to_string());
-        out.push((ts, version, rate));
+        let ns = v["ns"].as_str().map(|s| s.to_string()).unwrap_or_default();
+        out.push((ts, version, ns, rate));
     }
     if skipped_version > 0 {
         tracing::debug!(target: "consolidate_eval", count = skipped_version,
