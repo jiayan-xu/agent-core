@@ -22,7 +22,7 @@
 
 use std::time::Instant;
 
-use crate::agent::{AgentCore, PatternReplyKind};
+use crate::agent::{AgentCore, PatternReplyKind, PATTERN_BUDGET};
 
 /// 题集版本戳：**任何对 EVAL_SET 的修改（含追加）都必须递增本值**——追加用例同样
 /// 更换基线（分母变化使历史 hit_rate 不可比）。报告落盘携带本值，
@@ -100,7 +100,7 @@ static EVAL_SET: &[EvalCase] = &[
 ];
 
 /// 单条候选 pattern 的可调试记录（报告落盘，跨次比较时能区分覆盖回归与格式回归）
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PatternFinding {
     pub text: String,
     pub cites: Vec<usize>,
@@ -108,7 +108,7 @@ pub struct PatternFinding {
 }
 
 /// 每个用例的判定结果（报告落盘：哪个正例没命中、哪个负例泄漏一目了然）
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CaseResult {
     pub index: usize,
     pub expect_pattern: bool,
@@ -118,7 +118,7 @@ pub struct CaseResult {
 }
 
 /// 评估报告（JSON 序列化后原子落盘，供跨次比较）
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EvalReport {
     pub ns: String,
     pub eval_set_version: u32,
@@ -216,8 +216,6 @@ fn score_reply(reply: &str, included: usize, ns: &str, duration_ms: u64, ts: Str
         PatternReplyKind::Valid => "ok",
     }
     .to_string();
-    // 与生产预算一致的单轮 pattern 上限
-    const PATTERN_BUDGET: usize = 5;
     let denom = positives.min(PATTERN_BUDGET);
     EvalReport {
         ns: ns.to_string(),
@@ -285,19 +283,29 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
     // write_meetings_file / experience_memo 约定）。整块 fs I/O 在 spawn_blocking
     // （ocr PR#65 第四轮）：本函数在 axum handler 响应路径上被 await，同步 fs 在被
     // AV 扫描的 Windows 目录上会阻塞 tokio worker。
-    if let Ok(report_json) = serde_json::to_string_pretty(&report) {
-        let dir = std::path::PathBuf::from("data/consolidate_eval");
-        let file_ts = chrono::Local::now().format("%Y%m%dT%H%M%S%3f").to_string();
-        let _ = tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(&dir)?;
-            let final_path = dir.join(format!("{}.json", file_ts));
-            let tmp_path = dir.join(format!("{}.json.tmp", file_ts));
-            std::fs::write(&tmp_path, &report_json)
-                .and_then(|_| std::fs::rename(&tmp_path, &final_path))
-        })
-        .await
-        .map_err(|e| tracing::warn!(target: "consolidate_eval", error = %e, "P2-2: 评估报告落盘任务失败"))
-        .and_then(|r| r.map_err(|e| tracing::warn!(target: "consolidate_eval", error = %e, "P2-2: 评估报告落盘失败")));
+    // 序列化失败也 warn（ocr PR#68 第二轮：f64 NaN/Infinity 会被 serde_json 拒绝，
+    // 静默跳过会让「评估完成」日志与磁盘上无报告并存）；成功日志**以实际落盘
+    // 结果为准**，不再无条件宣称已落盘。
+    let mut persisted = false;
+    match serde_json::to_string_pretty(&report) {
+        Ok(report_json) => {
+            let dir = std::path::PathBuf::from("data/consolidate_eval");
+            let file_ts = chrono::Local::now().format("%Y%m%dT%H%M%S%3f").to_string();
+            let res = tokio::task::spawn_blocking(move || {
+                std::fs::create_dir_all(&dir)?;
+                let final_path = dir.join(format!("{}.json", file_ts));
+                let tmp_path = dir.join(format!("{}.json.tmp", file_ts));
+                std::fs::write(&tmp_path, &report_json)
+                    .and_then(|_| std::fs::rename(&tmp_path, &final_path))
+            })
+            .await;
+            match res {
+                Ok(Ok(())) => persisted = true,
+                Ok(Err(e)) => tracing::warn!(target: "consolidate_eval", error = %e, "P2-2: 评估报告落盘失败"),
+                Err(e) => tracing::warn!(target: "consolidate_eval", error = %e, "P2-2: 评估报告落盘任务失败"),
+            }
+        }
+        Err(e) => tracing::warn!(target: "consolidate_eval", error = %e, "P2-2: 评估报告序列化失败（NaN/Infinity？），未落盘"),
     }
     tracing::info!(
         target: "consolidate_eval",
@@ -306,7 +314,8 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
         hit_rate = format!("{:.2}", report.positive_hit_rate),
         leaks = report.negative_leaks,
         valid = report.patterns_valid,
-        "P2-2: 固定评估完成（报告已落盘 data/consolidate_eval/）"
+        persisted,
+        "P2-2: 固定评估完成"
     );
     let _ = (positives, negatives); // 仅日志用途的统计在报告里已有
     Ok(report)
@@ -339,6 +348,7 @@ fn list_past_hit_rates_blocking(dir: &std::path::Path) -> Vec<(String, u32, Stri
     let mut out: Vec<(String, u32, String, f64)> = Vec::new();
     let mut skipped_version = 0u32;
     let mut skipped_outcome = 0u32;
+    let mut skipped_window = 0u32;
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out, // 从未评估：合法空
@@ -366,39 +376,39 @@ fn list_past_hit_rates_blocking(dir: &std::path::Path) -> Vec<(String, u32, Stri
                 continue;
             }
         };
-        let v = match serde_json::from_str::<serde_json::Value>(&text) {
+        // typed 解析（ocr PR#68 第二轮）：读写共用 EvalReport schema——字符串键
+        // 索引复制一份字段名，serde 改名时读侧静默错位；typed 缺字段即解析失败，
+        // 漂移可观测
+        let rep = match serde_json::from_str::<EvalReport>(&text) {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(target: "consolidate_eval", path = %path.display(), error = %e,
-                    "P2-2: 基线报告 JSON 解析失败，已跳过");
+                    "P2-2: 基线报告解析失败（schema 漂移或损坏），已跳过");
                 continue;
             }
         };
-        if v["outcome"].as_str() != Some("ok") {
+        if rep.outcome != "ok" {
             skipped_outcome += 1;
             continue;
         }
-        let version = v["eval_set_version"].as_u64().unwrap_or(0) as u32;
-        if version != EVAL_SET_VERSION {
+        if rep.eval_set_version != EVAL_SET_VERSION {
             skipped_version += 1;
             continue;
         }
-        // 字段缺失/不可解析 → 丢弃并 warn，不得默认 0.0 毒化基线
-        let Some(rate) = v["positive_hit_rate"].as_f64() else {
-            tracing::warn!(target: "consolidate_eval", path = %path.display(),
-                "P2-2: 基线报告缺 positive_hit_rate 字段（serde 字段名漂移？），已跳过");
+        // 窗口截断轮剔除（ocr PR#68 第二轮）：题集超窗时尾部用例从未展示，
+        // 该轮 hit_rate 被结构性压低，与完整轮不可比
+        if rep.observations_visible < EVAL_SET.len() {
+            skipped_window += 1;
             continue;
-        };
-        let ts = v["ts"]
-            .as_str()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| path.display().to_string());
-        let ns = v["ns"].as_str().map(|s| s.to_string()).unwrap_or_default();
-        out.push((ts, version, ns, rate));
+        }
+        let rate = rep.positive_hit_rate;
+        let ts = rep.ts;
+        out.push((ts, rep.eval_set_version, rep.ns, rate));
     }
-    if skipped_version > 0 || skipped_outcome > 0 {
+    if skipped_version > 0 || skipped_outcome > 0 || skipped_window > 0 {
         tracing::debug!(target: "consolidate_eval",
             version_skipped = skipped_version, outcome_skipped = skipped_outcome,
+            window_skipped = skipped_window,
             "P2-2: 基线读取跳过统计；outcome_skipped 持续增长需排查 prompt 回归");
     }
     out.reverse(); // 升序返回
@@ -484,8 +494,16 @@ mod tests {
         // 不存在 → 合法空
         assert!(list_past_hit_rates_blocking(&tmp).is_empty());
         std::fs::create_dir_all(&tmp).unwrap();
-        let ok = serde_json::json!({"outcome":"ok","eval_set_version":EVAL_SET_VERSION,"positive_hit_rate":0.8,"ts":"t1","ns":"agent/a"});
-        let old_ver = serde_json::json!({"outcome":"ok","eval_set_version":1,"positive_hit_rate":0.9,"ts":"t0","ns":"agent/a"});
+        let ok = serde_json::json!({
+            "ns":"agent/a","eval_set_version":EVAL_SET_VERSION,"observations_visible":EVAL_SET.len(),
+            "cases_positive":6,"cases_negative":4,"outcome":"ok","patterns_valid":5,
+            "positive_hits":4,"positive_hit_rate":0.8,"keyword_hits":5,"negative_leaks":0,
+            "patterns_missing_citations":0,"duration_ms":1,"patterns":[],"case_results":[],"ts":"t1"});
+        let old_ver = serde_json::json!({
+            "ns":"agent/a","eval_set_version":1,"observations_visible":EVAL_SET.len(),
+            "cases_positive":6,"cases_negative":4,"outcome":"ok","patterns_valid":5,
+            "positive_hits":5,"positive_hit_rate":0.9,"keyword_hits":6,"negative_leaks":0,
+            "patterns_missing_citations":0,"duration_ms":1,"patterns":[],"case_results":[],"ts":"t0"});
         std::fs::write(tmp.join("a.json"), ok.to_string()).unwrap();
         std::fs::write(tmp.join("b.json"), old_ver.to_string()).unwrap();
         std::fs::write(tmp.join("c.json"), "{broken").unwrap();

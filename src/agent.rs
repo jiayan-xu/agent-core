@@ -503,11 +503,19 @@ pub(crate) struct PatternReply {
 }
 
 impl PatternReply {
-    /// 与生产配额一致的有效 pattern：过写库门槛后取前 5
+    /// 与生产配额一致的有效 pattern：过写库门槛后取 [`PATTERN_BUDGET`] 条
     pub fn valid_patterns(&self) -> Vec<&PatternCandidate> {
-        self.lines.iter().filter(|c| c.passed_gate).take(5).collect()
+        self.lines
+            .iter()
+            .filter(|c| c.passed_gate)
+            .take(PATTERN_BUDGET)
+            .collect()
     }
 }
+
+/// P2-2 共用：单轮 pattern 配额（prompt「最多 5 条」与写库 take(5) 的同源常量，
+/// 评估的预算归一也用它——ocr PR#68 第二轮：配额在评估里重写一份必然漂移）。
+pub(crate) const PATTERN_BUDGET: usize = 5;
 
 /// 会议实时状态机阶段（会议升级 Step3）。
 /// serde snake_case 序列化与前端 / 旧 meetings.json 字符串完全一致（ai_speaking / awaiting_humans / discussing / done），向后兼容。
@@ -12446,6 +12454,20 @@ impl AgentCore {
             &format!("合格 {} / 本批拉取 {}，命名空间 {}", obs_lines.len(), items.len(), ns),
             &obs_lines,
         );
+        // 窗口截断留痕（ocr PR#68 第二轮）：游标在 LLM 之前已推进整批——窗口外的
+        // 观察被永久消费、永不提取，而事件 JSON 的 observations 报的是合格总数，
+        // 会让人误以为全部喂给了 LLM。默认 400 条×70 字 ≈ 30k 字，6000 字窗口
+        // 只装得下 ~70 条：这是常态而非边缘情况，必须 warn + detail 如实标注。
+        if included < obs_lines.len() {
+            tracing::warn!(target: "consolidate", ns = %ns,
+                visible = included, qualified = obs_lines.len(),
+                "本批观察超出 6000 字窗口：窗口外 {} 条已被游标消费、本次不提取", obs_lines.len() - included);
+        }
+        let window_note = if included < obs_lines.len() {
+            format!("（窗口内 {}/{}，窗口外已被游标消费）", included, obs_lines.len())
+        } else {
+            String::new()
+        };
         let msg = crate::llm::Message {
             role: "system".to_string(),
             content: Some(prompt),
@@ -12835,7 +12857,7 @@ impl AgentCore {
             fetched: items.len(),
             cursor: max_ts.clone(),
             detail: format!(
-                "从 {} 条合格观察提炼 {} 条 pattern（本批拉取 {}，跳过 {}{}，cursor→{}）",
+                "从 {} 条合格观察提炼 {} 条 pattern（本批拉取 {}，跳过 {}{}{}，cursor→{}）",
                 obs_lines.len(),
                 written,
                 items.len(),
@@ -12845,6 +12867,7 @@ impl AgentCore {
                 } else {
                     String::new()
                 },
+                window_note,
                 max_ts
             ),
         }
@@ -12969,7 +12992,13 @@ impl AgentCore {
             .filter(|n| *n >= 1 && *n <= max_n)
             .collect();
         let after = &line[pos + rel_end + 3..];
-        let text = if line[..pos].trim().is_empty() && !after.trim().is_empty() {
+        // 列表标记先剥再判空前缀（ocr PR#68 第二轮）：`- 【依据: 1】 规则…` 的
+        // 前缀是 "- " 非空，恢复不触发，标记剥离后正文为空 → 整行被丢
+        let prefix_core = line[..pos]
+            .trim_start_matches(|c: char| c == '-' || c == '*' || c == '·' || c == '•' || c.is_whitespace())
+            .trim_start_matches(|c: char| c.is_numeric() || c == '.')
+            .trim();
+        let text = if prefix_core.is_empty() && !after.trim().is_empty() {
             // 行首引用：正文在闭括号之后（恢复，防整批空文本）
             after.trim().to_string()
         } else {
