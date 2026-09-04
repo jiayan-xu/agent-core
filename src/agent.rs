@@ -495,12 +495,540 @@ impl InboxCache {
     }
 }
 
-/// Phase 6：圆桌结果
+/// P1-a：圆桌立场卡——分身立场的结构化表示（《程序化汇合改造方案》P1-a）。
+///
+/// LLM 原始回答经 [`StanceCard::parse`] 程序解析生成；解析失败时 `structured=false`
+/// **降级保留原文**（stance 记为「未结构化」），立场信息永不丢弃。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StanceCard {
+    pub persona_id: String,
+    pub display_name: String,
+    /// 规范化立场：支持 / 反对 / 中立 / 条件支持；解析失败为「未结构化」。
+    /// 规范化仅做包含词匹配（中立 → 条件支持 → 反对/不支持 → 支持），不交 LLM。
+    pub stance: String,
+    /// 一句话立场摘要（结构化时取 LLM 的 summary 字段；降级时截取原文首行）。
+    pub summary: String,
+    /// 关键理由（结构化时 ≤3 条）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub key_reasons: Vec<String>,
+    /// 证据引用 ID。**预留字段：当前恒为空**——persona_stance 调用不提供证据池
+    /// （无检索上下文），任何非空值都必然是模型编造的伪溯源，正是本方案要消灭的
+    /// 失败模式（ocr PR#65 第三轮评审）。接入 persona 记忆检索后再启用。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub citations: Vec<String>,
+    /// 置信度 0-100（仅结构化卡存在）。
+    pub confidence: Option<u8>,
+    /// 原始回答（可回溯；未结构化卡的内容主体）。**硬上限 4000 字**：卡片整包进
+    /// SSE stance 载荷、降级卡原文进 memoria content，每个字段都有反膨胀上限而
+    /// raw 无限会让一个话痨模型按席位数放大事件流/会议记录/记忆库
+    /// （ocr PR#66 第二轮）；超限截断加标，前 4000 字足以回溯立场来源。
+    pub raw: String,
+    /// raw 是否被 4000 字上限截断（截断时读者可知原文更长）。
+    pub raw_truncated: bool,
+    /// 是否成功解析为结构化立场卡。
+    pub structured: bool,
+}
+
+impl StanceCard {
+    /// 从 LLM 原始回答构造立场卡的**唯一公开构造器**（ocr PR#66 评审：字段全 pub 而
+    /// 构造器私有，下游只能经结构体字面量造出违反不变量的卡——空 stance、非空
+    /// citations、confidence 越界；收敛到本路径统一裁决）。
+    ///
+    /// JSON 提取三级策略（同评审）：①剥 ```json 围栏后整串直解；②扫描**配平**的
+    /// `{...}` 候选逐个尝试（首 `{` 到末 `}` 的朴素切片会被正文里无关的花括号撑爆，
+    /// 把好卡静默降级）；③全部失败降级未结构化卡（原文完整保留，绝不丢立场），
+    /// 失败切片 debug 留痕可观测。
+    pub fn from_raw(persona_id: String, display_name: String, raw: String) -> StanceCard {
+        // raw 反膨胀上限（ocr PR#66 第二轮）：截断加标，立场可回溯性保留在前 4000 字
+        const RAW_CAP: usize = 4000;
+        let clamp_raw = |raw: &str| -> (String, bool) {
+            if raw.chars().count() > RAW_CAP {
+                (
+                    format!("{}…(原文超长已截断)", raw.chars().take(RAW_CAP).collect::<String>()),
+                    true,
+                )
+            } else {
+                (raw.to_string(), false)
+            }
+        };
+        let fallback = |raw: String| {
+            let (raw_kept, raw_truncated) = clamp_raw(&raw);
+            StanceCard {
+                persona_id: persona_id.clone(),
+                display_name: display_name.clone(),
+                stance: STANCE_UNSTRUCTURED.to_string(),
+                summary: raw.lines().next().unwrap_or("").trim().chars().take(80).collect(),
+                key_reasons: Vec::new(),
+                citations: Vec::new(),
+                confidence: None,
+                raw: raw_kept,
+                raw_truncated,
+                structured: false,
+            }
+        };
+        let v = match Self::extract_json_value(&raw, &persona_id) {
+            Some(v) => v,
+            None => return fallback(raw),
+        };
+        // stance 必须是非空字符串；缺失**或空串**（模型常见空值输出）都视为解析
+        // 失败走降级——否则分布里会出现空键残缺文本（ocr PR#65 第五轮）。
+        let Some(stance_raw) = v
+            .get("stance")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return fallback(raw);
+        };
+        let norm = normalize_stance(stance_raw);
+        // summary 硬限长（200 字）：模型无视「一句话」要求时防主席附注 prompt 与
+        // memoria 载荷被单卡膨胀（ocr PR#65 第三轮评审）
+        let summary: String = v
+            .get("summary")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().chars().take(200).collect::<String>())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| stance_raw.trim().chars().take(80).collect());
+        // key_reasons：条数 ≤3 且**每条限长 120 字**（与 summary 200 字同反膨胀理由，
+        // ocr PR#66 评审）；非字符串元素丢弃时 debug 留痕（schema 漂移可观测）
+        let key_reasons: Vec<String> = v
+            .get("key_reasons")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                let dropped = a.iter().filter(|r| r.as_str().is_none()).count();
+                if dropped > 0 {
+                    tracing::debug!(target = "roundtable", persona = %persona_id, dropped,
+                        "key_reasons 含非字符串元素，已丢弃");
+                }
+                a.iter()
+                    .filter_map(|r| r.as_str())
+                    .map(|r| r.trim().chars().take(120).collect::<String>())
+                    .filter(|r| !r.is_empty())
+                    .take(3)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // citations：**解析即丢弃**（ocr PR#65 第四轮）——本调用不提供证据池，任何
+        // 非空值必为编造伪溯源；模型仍输出该键时 debug 记录（将来接 persona 记忆
+        // 检索时可据此评估启用价值），字段恒空进 SSE/载荷。
+        if v.get("citations").and_then(|x| x.as_array()).map(|a| !a.is_empty()).unwrap_or(false) {
+            tracing::debug!(target = "roundtable",
+                persona = %persona_id,
+                "分身输出了 citations（无证据池，已丢弃防伪溯源；接记忆检索后可评估启用）");
+        }
+        // confidence 宽容解码（ocr PR#66 评审）：u64 / f64（≤1 视为百分比小数）/ 数字
+        // 字符串三种常见编码都接受，越界 clamp 100，无法解码 debug 留痕
+        // confidence 宽容解码（ocr PR#66 第三轮收口）：prompt 明确要求 0-100 **整数**，
+        // 所以整数 1 就是 1%——小数换算只在真分数区间 (0,1) 生效（0.9→90），
+        // u64/f64/数字字符串三种编码走同一条规则
+        let normalize_conf = |n: u64| -> u64 { n };
+        let from_float = |f: f64| -> u64 {
+            if f > 0.0 && f < 1.0 {
+                (f * 100.0).round() as u64
+            } else {
+                f.round() as u64
+            }
+        };
+        let confidence = v.get("confidence").and_then(|x| {
+            let n = x
+                .as_u64()
+                .map(normalize_conf)
+                .or_else(|| x.as_f64().map(from_float))
+                .or_else(|| x.as_str().and_then(|s| s.trim().parse::<f64>().ok()).map(from_float));
+            if n.is_none() {
+                tracing::debug!(target = "roundtable", persona = %persona_id,
+                    value = %x, "confidence 无法解码（非数字/数字字符串），置空");
+            }
+            n
+        }).map(|c| c.min(100) as u8);
+        let (raw_kept, raw_truncated) = clamp_raw(&raw);
+        StanceCard {
+            persona_id,
+            display_name,
+            stance: norm,
+            summary,
+            key_reasons,
+            citations: Vec::new(),
+            confidence,
+            raw: raw_kept,
+            raw_truncated,
+            structured: true,
+        }
+    }
+
+    /// 三级 JSON 提取：剥围栏直解 → 配平花括号候选逐个尝试 → None。
+    /// 候选失败 debug 留痕（静默降级不可观测是评审点名的问题）。
+    fn extract_json_value(raw: &str, persona_id: &str) -> Option<serde_json::Value> {
+        // ① 剥 ```json / ``` 围栏后整串直解（最常见良好输出）
+        let mut cleaned = raw.trim();
+        if cleaned.starts_with("```") {
+            let after_first_fence = cleaned.splitn(2, '\n').nth(1).unwrap_or("");
+            cleaned = after_first_fence.trim();
+            if let Some(pos) = cleaned.rfind("```") {
+                cleaned = cleaned[..pos].trim();
+            }
+        }
+        // ① 只接受**对象**（ocr PR#66 第二轮：顶层数组/字符串/数字也算"合法 JSON"，
+        // 直接返回会让 `[{"stance":…}]` 走不到下面的配平扫描而整卡降级）；
+        // 数组里的对象会被 ② 的花括号配平逐个捕获
+        if let Ok(serde_json::Value::Object(o)) = serde_json::from_str::<serde_json::Value>(cleaned) {
+            return Some(serde_json::Value::Object(o));
+        }
+        // ② 配平扫描（两遍，ocr PR#66 第四轮）：A 遍全文配平——正文里未配平的
+        // `{` 会把深度永久抬高、`"` 奇数次会卡在 in_string，好卡零候选；A 遍为空
+        // 时 B 遍**按行重置状态**（JSON 对象几乎总在单行内，prose 花括号不跨行
+        // 污染；多行 pretty JSON 已由 ① 的整串直解覆盖）。字符串字面量内的花括号
+        // 不计数（第三轮），转义符跳过。
+        let scan = |per_line_reset: bool| -> Vec<(usize, usize)> {
+        let bytes = raw.as_bytes();
+        let mut candidates: Vec<(usize, usize)> = Vec::new();
+        let mut depth: i32 = 0;
+        let mut start: Option<usize> = None;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (i, b) in bytes.iter().enumerate() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if *b == b'\\' {
+                    escaped = true;
+                } else if *b == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_string = true,
+                b'{' => {
+                    if depth == 0 {
+                        start = Some(i);
+                    }
+                    depth += 1;
+                }
+                b'}' if depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(s) = start {
+                            candidates.push((s, i));
+                        }
+                        start = None;
+                    }
+                }
+                _ => {}
+            }
+            if candidates.len() >= 8 {
+                break; // 防极端输出（如一串单独花括号）拖慢扫描
+            }
+            if per_line_reset && *b == b'\n' {
+                // 行结束重置（B 遍）：未配平的花括号/未闭合引号不跨行污染
+                depth = 0;
+                start = None;
+                in_string = false;
+                escaped = false;
+            }
+        }
+            candidates
+        };
+        let candidates = {
+            let a = scan(false);
+            if a.is_empty() {
+                let b = scan(true);
+                if !b.is_empty() {
+                    tracing::debug!(target = "roundtable", persona = %persona_id,
+                        "全文配平扫描零候选，按行重置后命中 {} 个（正文含未配平花括号/引号）", b.len());
+                }
+                b
+            } else {
+                a
+            }
+        };
+        if candidates.is_empty() {
+            tracing::debug!(target = "roundtable", persona = %persona_id,
+                "立场卡 JSON 候选为零（无配平对象），降级未结构化");
+        }
+        // 候选优先级（ocr PR#66 第三轮）：**首个含可用 stance 的对象** > 首个对象 >
+        // 任何可解析值——正文先出现无关小对象（{"x":1}）时不再劫持解析结果
+        let mut first_object: Option<serde_json::Value> = None;
+        let mut first_any: Option<serde_json::Value> = None;
+        for (s, e) in candidates {
+            match serde_json::from_str::<serde_json::Value>(&raw[s..=e]) {
+                Ok(v) => {
+                    // 候选优先级键是**可用的 stance**（非空字符串，与 from_raw 下游
+                    // 契约一致，ocr PR#66 第四轮）：`{"stance":""}` 占位对象不该
+                    // 立即命中、让后面的好卡失去机会）
+                    let usable_stance = v
+                        .get("stance")
+                        .and_then(|x| x.as_str())
+                        .map(|x| !x.trim().is_empty())
+                        .unwrap_or(false);
+                    if usable_stance {
+                        return Some(v);
+                    }
+                    if v.is_object() && first_object.is_none() {
+                        first_object = Some(v);
+                    } else if first_any.is_none() {
+                        first_any = Some(v);
+                    }
+                }
+                Err(err) => tracing::debug!(target = "roundtable", persona = %persona_id,
+                    slice_len = e - s + 1, error = %err,
+                    "立场卡 JSON 候选切片解析失败，尝试下一个"),
+            }
+        }
+        first_object.or(first_any)
+    }
+}
+
+/// P1-a：立场桶名单一来源（ocr PR#66 第四轮：字面量散在 UNSTRUCTURED/
+/// normalize_stance/aggregate_stances 三处，改名会静默废掉对立提示与降级分支）。
+pub(crate) const STANCE_SUPPORT: &str = "支持";
+pub(crate) const STANCE_OPPOSE: &str = "反对";
+pub(crate) const STANCE_NEUTRAL: &str = "中立";
+pub(crate) const STANCE_CONDITIONAL: &str = "条件支持";
+pub(crate) const STANCE_OTHER: &str = "其他";
+pub(crate) const STANCE_UNSTRUCTURED: &str = "未结构化";
+
+/// 立场词规范化：仅包含词匹配，零 LLM。
+/// 命中顺序（ocr PR#66 两轮评审收敛）：
+/// 1. **显式极性倾斜优先于「中立」字面**：「中立偏反对/不支持但保持中立」归
+///    反对、「中立偏支持」归支持——中立先匹配会把倾斜表态抹平成中立；
+/// 2. 「反对（且非『不反对』）/不支持」优先于一切含「支持」的分支（180° 反转
+///    防护：条件不支持/反对条件支持）；「无条件/不设条件/无附加条件」不落
+///    「条件支持」；「不支持」天然含「支持」子串由反对分支先截胡；
+/// 3. 无任何极性/中立标记 → 固定桶「其他」（自由文本当分布键会产生一次性
+///    碎键、拆分同票桶、静默废掉对立提示），原词保留在 summary/raw。
+fn normalize_stance(s: &str) -> String {
+    let t = s.trim();
+    let unconditional = t.contains("无条件") || t.contains("不设条件") || t.contains("无附加条件");
+    let pos = t.contains("支持");
+    let neg = (t.contains("反对") && !t.contains("不反对")) || t.contains("不支持");
+    if neg {
+        STANCE_OPPOSE.to_string()
+    } else if pos && t.contains("条件") && !unconditional {
+        STANCE_CONDITIONAL.to_string()
+    } else if pos {
+        STANCE_SUPPORT.to_string()
+    } else if t.contains("中立") {
+        STANCE_NEUTRAL.to_string()
+    } else {
+        STANCE_OTHER.to_string()
+    }
+}
+
+/// P1-a：程序聚合结果——共识结论的唯一权威来源（替代原主席一句话综合）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StanceAggregate {
+    /// 立场卡总数
+    pub total: usize,
+    /// 其中结构化卡数（降级卡计入总数但不参与分布统计）
+    pub structured: usize,
+    /// 立场分布（仅结构化卡，票数降序）
+    pub distribution: Vec<(String, usize)>,
+    /// 单行程序摘要：会议记录 `consensus` 字段与 memoria 首行共用
+    pub summary: String,
+}
+
+/// P1-a：程序化汇合立场卡（确定性，无 LLM 参与）。
+///
+/// 分布统计只计结构化卡；降级卡单列提示。存在对立立场（支持 vs 反对）时
+/// 在摘要末尾追加分歧提示——分歧的细节由立场卡行承载，不做 LLM 裁决。
+pub fn aggregate_stances(cards: &[StanceCard]) -> StanceAggregate {
+    let total = cards.len();
+    let mut dist: std::collections::BTreeMap<String, usize> = Default::default();
+    for c in cards.iter().filter(|c| c.structured) {
+        *dist.entry(c.stance.clone()).or_insert(0) += 1;
+    }
+    let structured: usize = dist.values().sum();
+    let mut distribution: Vec<(String, usize)> = dist.into_iter().collect();
+    // 票数降序；同票按立场名稳定排序（保证同一输入永远同一输出——程序化汇合的可复现要求）
+    distribution.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let dist_text = distribution
+        .iter()
+        .map(|(k, n)| format!("{} {}", k, n))
+        .collect::<Vec<_>>()
+        .join("、");
+    let mut summary = if structured > 0 {
+        format!("立场分布：{}（共 {} 席）", dist_text, total)
+    } else {
+        format!("立场分布：无结构化立场卡（共 {} 席，均为降级原文）", total)
+    };
+    if structured < total {
+        summary.push_str(&format!("，其中 {} 份未结构化已降级保留原文", total - structured));
+    }
+    // 对立提示（ocr PR#66 第四轮释义）：**条件支持计入支持侧**——半支持与反对
+    // 并存同样是有待人类裁决的分歧；桶名用常量防改名漂移。
+    let supportive = distribution
+        .iter()
+        .filter(|(s, _)| *s == STANCE_SUPPORT || *s == STANCE_CONDITIONAL)
+        .map(|(_, n)| n)
+        .sum::<usize>();
+    let opposing = distribution
+        .iter()
+        .filter(|(s, _)| *s == STANCE_OPPOSE)
+        .map(|(_, n)| n)
+        .sum::<usize>();
+    if supportive > 0 && opposing > 0 {
+        summary.push_str("；存在对立立场，分歧详见各方立场卡");
+    }
+    StanceAggregate { total, structured, distribution, summary }
+}
+
+/// Phase 6：圆桌结果。
+/// P1-a 起 `consensus` 为**程序聚合摘要**（[`aggregate_stances`]），主席 LLM 一句话
+/// 降级为 `display_note` 附注（非权威，可缺省）。
 pub struct RoundtableResult {
-    /// 各分身立场：(persona_id, stance)
-    pub stances: Vec<(String, String)>,
-    /// 主席收敛结论
+    /// 各分身立场卡（结构化 / 降级原文）
+    pub stances: Vec<StanceCard>,
+    /// 程序聚合的立场分布摘要（权威共识表示）
     pub consensus: String,
+    /// 主席附注（LLM 生成，非权威结论；失败/超时为 None）
+    pub display_note: Option<String>,
+}
+
+/// P1-d：consolidate 结构化结果（《程序化汇合改造方案》P1-d）。
+///
+/// 原 consolidate 返回人读 String，事件队列只能拿到转述文本。结构化后：
+/// 事件队列取字段拼 JSON summary（LLM 文本沉到 detail），HTTP/健康记录取 detail，
+/// 日志用 [`summary_line`](Self::summary_line)。
+/// P1-d/P2：consolidate 结果的机器可读状态（ocr PR#68 第四轮：字符串状态会
+/// 漏更新文档/打错字；枚举 + serde 让消费方可穷举匹配）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsolidateStatus {
+    /// 正常写回
+    Ok,
+    /// memoria 零观察（最常见的空转 tick——与「LLM 看到合格输入但提炼不出」
+    /// 必须可区分，后者才是 prompt 回归信号）
+    NoInput,
+    /// LLM 调用失败
+    LlmError,
+    /// 模型空响应
+    Empty,
+    /// 模型明说无模式
+    NoPatterns,
+    /// 候选全被写库门槛拒绝
+    GateRejected,
+    /// 部分写入失败
+    PartialWrite,
+}
+
+impl ConsolidateStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConsolidateStatus::Ok => "ok",
+            ConsolidateStatus::NoInput => "no_input",
+            ConsolidateStatus::LlmError => "llm_error",
+            ConsolidateStatus::Empty => "empty",
+            ConsolidateStatus::NoPatterns => "no_patterns",
+            ConsolidateStatus::GateRejected => "gate_rejected",
+            ConsolidateStatus::PartialWrite => "partial_write",
+        }
+    }
+}
+
+pub struct ConsolidateOutcome {
+    pub ns: String,
+    /// 机器可读状态（ocr PR#68 第三轮引入、第四轮枚举化；见 ConsolidateStatus）
+    pub status: ConsolidateStatus,
+    /// 写回的 pattern 条数
+    pub patterns_added: u64,
+    /// 本批合格观察数（evidence 池）
+    pub observations: usize,
+    /// 6000 字窗口内实际喂给 LLM 的观察数（窗口外延迟到后续轮次——与 observations
+    /// 的差值即被静默消费量，消费方必须可辨别，ocr PR#68 第三轮）
+    pub observations_visible: usize,
+    /// 本批拉取总数（含不合格）
+    pub fetched: usize,
+    /// 推进后的游标
+    pub cursor: String,
+    /// 人读摘要（不含 `consolidate[ns]:` 前缀）
+    pub detail: String,
+}
+
+impl ConsolidateOutcome {
+    /// 日志用单行（与历史日志格式一致）
+    pub fn summary_line(&self) -> String {
+        format!("consolidate[{}]: {}", self.ns, self.detail)
+    }
+}
+
+/// P2-2 共用：LLM 回复的归类（parse_pattern_reply 输出）。
+/// 区分「模型空响应 / 明说无模式 / 有候选」——生产与评估共用同一判定
+/// （此前「无模式」启发式在两处复制，ocr PR#68）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PatternReplyKind {
+    Empty,
+    NoPatterns,
+    Valid,
+}
+
+/// P2-2 共用：单条 pattern 候选（保留门槛前状态，供评估做门槛前泄漏扫描与诊断计数）。
+#[derive(Debug, Clone)]
+pub(crate) struct PatternCandidate {
+    pub text: String,
+    pub cites: Vec<usize>,
+    pub passed_gate: bool,
+}
+
+/// P2-2 共用：`parse_pattern_reply` 的结果。
+pub(crate) struct PatternReply {
+    pub kind: PatternReplyKind,
+    /// take(8) 内解析出的全部候选（含未过门槛与空正文行）
+    pub lines: Vec<PatternCandidate>,
+}
+
+impl PatternReply {
+    /// 与生产配额一致的有效 pattern：过写库门槛后取 [`PATTERN_BUDGET`] 条
+    pub fn valid_patterns(&self) -> Vec<&PatternCandidate> {
+        self.lines
+            .iter()
+            .filter(|c| c.passed_gate)
+            .take(PATTERN_BUDGET)
+            .collect()
+    }
+}
+
+/// P2-2 共用：单轮 pattern 配额（prompt「最多 5 条」与写库 take(5) 的同源常量，
+/// 评估的预算归一也用它——ocr PR#68 第二轮：配额在评估里重写一份必然漂移）。
+pub(crate) const PATTERN_BUDGET: usize = 5;
+
+/// P2-2 共用：巩固原料门槛的**默认值**（CONSOLIDATE_MIN_OBS_CHARS 未设时生效）。
+/// 评估题集完整性测试消费同一常量（ocr PR#68 第三轮：第二份拷贝会在生产默认值
+/// 调整时静默失效，评估测回生产从不产生的分布）。
+pub(crate) const CONSOLIDATE_MIN_OBS_CHARS_DEFAULT: usize = 70;
+
+/// P2-2 共用：剥离行首列表/序号标记（`- `、`* `、`1.`、`1、` 等组合）。
+/// 行首引用判定（parse_pattern_citation）与候选文本剥离（parse_pattern_reply）
+/// 共用同一谓词——两处集合不同步会漏剥或错剥（ocr PR#68 第三轮 high）。
+fn strip_list_markers(s: &str) -> &str {
+    let mut t = s.trim_start_matches(|c: char| c == '-' || c == '*' || c == '·' || c == '•' || c.is_whitespace());
+    loop {
+        let next = t
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == '、')
+            .trim_start();
+        if next.len() == t.len() {
+            break;
+        }
+        t = next;
+    }
+    t.trim_start_matches(|c: char| c.is_whitespace())
+}
+
+/// P2-2 共用：剥离前导的 `[N]`/`【N】` 批内索引 token——prompt 用 `[3] 规则…`
+/// 渲染观察，模型回显该格式时前导 `[3]` 是批次局部索引，落库后无意义且污染
+/// 检索（ocr PR#68 第三轮）。
+fn strip_leading_index(s: &str) -> &str {
+    let t = s.trim_start();
+    for (open, close) in [('[', ']'), ('【', '】')] {
+        if let Some(rest) = t.strip_prefix(open) {
+            if let Some(off) = rest.find(close) {
+                let inner = &rest[..off];
+                if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) && off <= 4 {
+                    return strip_leading_index(&rest[off + close.len_utf8()..]);
+                }
+            }
+        }
+    }
+    t
 }
 
 /// 会议实时状态机阶段（会议升级 Step3）。
@@ -2100,14 +2628,18 @@ impl AgentCore {
         pool
     }
 
-    /// Phase 6：圆桌 —— 单个分身就议题发表立场（供 run_roundtable / SSE 流式复用）
+    /// Phase 6：圆桌 —— 单个分身就议题发表立场（供 run_roundtable / SSE 流式复用）。
+    ///
+    /// P1-a：输出改为**立场卡 JSON**，由 [`StanceCard::parse`] 程序解析；
+    /// 解析失败自动降级为未结构化卡（原文保留），立场信息不丢。
+    /// 返回 (persona_id, 立场卡, provider 标签)。
     pub async fn persona_stance(
         &self,
         p: &crate::runtime::self_runtime::Persona,
         topic: &str,
         index: usize,
         pool: &[LlmConfig],
-    ) -> (String, String, String) {
+    ) -> (String, StanceCard, String) {
         let (client, provider_label) = match &p.llm {
             Some(c) => (c.clone(), "persona-configured".to_string()),
             None => {
@@ -2120,60 +2652,94 @@ impl AgentCore {
             "你是分身『{}』（{}）。请从你的角色视角独立发表观点，不要附和他人。",
             p.persona_id, p.display_name
         );
-        let user = format!("圆桌议题：{}\n请给出你的立场（2-4 句）。", topic);
+        let user = format!(
+            "圆桌议题：{}\n请独立思考后，只输出一个 JSON 对象（JSON 之外不要有任何文字）：\n{{\"stance\": \"支持/反对/中立/条件支持 四选一\", \"summary\": \"一句话概括你的立场\", \"key_reasons\": [\"最多三条关键理由\"], \"confidence\": 0到100的整数}}\n（本轮不提供记忆检索，不要编造任何证据或ID）",
+            topic
+        );
         let msgs = vec![
             crate::llm::Message { role: "system".to_string(), content: Some(sys), tool_calls: None, tool_call_id: None },
             crate::llm::Message { role: "user".to_string(), content: Some(user), tool_calls: None, tool_call_id: None },
         ];
         // 逐调用硬性超时：避免单个 provider 卡死（如重试退避叠加）拖垮整场圆桌。
         // 超时则该席返回占位立场，圆桌继续收敛，不让一个坏模型阻断其余模型。
-        let stance = match tokio::time::timeout(std::time::Duration::from_secs(45), client.chat(&msgs, &[])).await {
+        // 占位文本会走 StanceCard::parse 的降级路径，以未结构化卡保留。
+        let raw = match tokio::time::timeout(std::time::Duration::from_secs(45), client.chat(&msgs, &[])).await {
             Ok(Ok(r)) => r.text,
             Ok(Err(e)) => format!("(LLM 调用失败: {})", e),
             Err(_) => "(该分身 LLM 调用超时，已跳过其立场)".to_string(),
         };
-        (p.persona_id.clone(), stance, provider_label)
+        let card = StanceCard::from_raw(p.persona_id.clone(), p.display_name.clone(), raw);
+        (p.persona_id.clone(), card, provider_label)
     }
 
-    /// Phase 6：主席收敛共识
-    pub async fn chair_consensus(
+    /// Phase 6：主席附注（P1-a 降级，**非权威结论**）。
+    ///
+    /// 原 `chair_consensus` 把 N 方立场综合成一句话并作为唯一共识——《程序化汇合改造方案》
+    /// P1-a 起共识改由 [`aggregate_stances`] 程序聚合，本函数输出仅作为人类参考附注。
+    /// 失败 / 超时返回 None（附注可缺省，不再产生占位噪声文本）。
+    pub async fn chair_display_note(
         &self,
         topic: &str,
-        stances: &[(String, String)],
+        stances: &[StanceCard],
         chair_persona: Option<&str>,
-    ) -> String {
+    ) -> Option<String> {
         let chair_id = chair_persona.unwrap_or("default").to_string();
         let joined = stances
             .iter()
-            .map(|(id, s)| format!("【{}】{}", id, s))
+            .map(|c| {
+                // 结构化卡给摘要 + 规范立场；降级卡给原文（截 300 字防 prompt 膨胀）
+                let text = if c.structured {
+                    format!("{}（{}）", c.summary, c.stance)
+                } else {
+                    c.raw.chars().take(300).collect::<String>()
+                };
+                format!("【{}】{}", c.persona_id, text)
+            })
             .collect::<Vec<_>>()
             .join("\n");
-        let sys_chair = format!("你是圆桌主席（{}）。请综合各方立场，给出一句话共识结论。", chair_id);
-        let user_chair = format!("议题：{}\n各方立场：\n{}\n\n请给出共识结论。", topic, joined);
+        let sys_chair = format!(
+            "你是圆桌主席（{}）。请基于各方立场卡，用一两句话点评立场分布与主要分歧，供人类参考。\
+             这是参考附注，不是权威结论；不要替各方下最终结论。",
+            chair_id
+        );
+        let user_chair = format!("议题：{}\n各方立场卡：\n{}\n\n请给出主席附注。", topic, joined);
         let chair_msgs = vec![
             crate::llm::Message { role: "system".to_string(), content: Some(sys_chair), tool_calls: None, tool_call_id: None },
             crate::llm::Message { role: "user".to_string(), content: Some(user_chair), tool_calls: None, tool_call_id: None },
         ];
-        // 同样加硬性超时，避免主席收敛被全局 LLM 卡死。
+        // 附注是非权威增强，同样加硬性超时；失败降级为无附注，但**失败原因留痕**
+        // （ocr PR#66 评审）：持续 provider 故障与「主席无话可说」必须可区分。
         match tokio::time::timeout(std::time::Duration::from_secs(45), self.llm.chat(&chair_msgs, &[])).await {
-            Ok(Ok(r)) => r.text,
-            Ok(Err(e)) => format!("(主席收敛失败: {})", e),
-            Err(_) => "(主席收敛超时)".to_string(),
+            Ok(Ok(r)) if !r.text.trim().is_empty() => Some(r.text.trim().to_string()),
+            Ok(Ok(_)) => None, // 模型空响应：合法的「无附注」状态
+            Ok(Err(e)) => {
+                tracing::warn!(target = "roundtable", error = %e,
+                    "chair_display_note: LLM 调用失败，本次无主席附注");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(target = "roundtable",
+                    "chair_display_note: LLM 调用超时(45s)，本次无主席附注");
+                None
+            }
         }
     }
 
-    /// Phase 6：圆桌 —— 多分身就同一议题发表立场并收敛（收集式，供非流式调用 / tests）
+    /// Phase 6：圆桌 —— 多分身就同一议题发表立场并收敛（收集式，供非流式调用 / tests）。
+    ///
+    /// P1-a：`consensus` 为程序聚合摘要（权威），`display_note` 为主席附注（可缺省）。
     pub async fn run_roundtable(&self, topic: &str, chair_persona: Option<&str>) -> RoundtableResult {
         let mut personas = self.list_personas();
         personas.sort_by(|a, b| a.persona_id.cmp(&b.persona_id));
         let pool = self.llm_pool();
-        let mut stances: Vec<(String, String)> = Vec::new();
+        let mut stances: Vec<StanceCard> = Vec::new();
         for (i, p) in personas.iter().enumerate() {
-            let (id, stance, _prov) = self.persona_stance(p, topic, i, &pool).await;
-            stances.push((id, stance));
+            let (_id, card, _prov) = self.persona_stance(p, topic, i, &pool).await;
+            stances.push(card);
         }
-        let consensus = self.chair_consensus(topic, &stances, chair_persona).await;
-        RoundtableResult { stances, consensus }
+        let agg = aggregate_stances(&stances);
+        let display_note = self.chair_display_note(topic, &stances, chair_persona).await;
+        RoundtableResult { stances, consensus: agg.summary, display_note }
     }
 
     /// 从 session_id 解析调用者专属命名空间。
@@ -12745,7 +13311,7 @@ impl AgentCore {
     ///
     /// 以 admin 身份调用 memoria（系统维护任务，合法跨命名空间读取观察原料）。
     /// ns 隔离：每个 ns 独立游标、独立 pattern 库。
-    pub async fn consolidate(&self, ns: &str) -> String {
+    pub async fn consolidate(&self, ns: &str) -> ConsolidateOutcome {
         // 系统维护任务：admin/jarvis 身份与密钥必须配对（勿用聊天 agent_id + jarvis badge）。
         let mem_client = memoria_maintenance_client(&self.config.memoria_url, &self.mcp);
 
@@ -12757,7 +13323,7 @@ impl AgentCore {
         let min_obs_chars: usize = std::env::var("CONSOLIDATE_MIN_OBS_CHARS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(70);
+            .unwrap_or(CONSOLIDATE_MIN_OBS_CHARS_DEFAULT);
 
         // 1. 取游标
         let ds_raw = mem_client
@@ -12793,7 +13359,16 @@ impl AgentCore {
             .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
             .unwrap_or_default();
         if items.is_empty() {
-            return format!("consolidate[{}]: 无新观察（cursor={}）", ns, cursor_ts);
+            return ConsolidateOutcome {
+                ns: ns.to_string(),
+                status: ConsolidateStatus::NoInput,
+                patterns_added: 0,
+                observations: 0,
+                observations_visible: 0,
+                fetched: 0,
+                cursor: cursor_ts.clone(),
+                detail: format!("无新观察（cursor={}）", cursor_ts),
+            };
         }
 
         let skip_ner = std::env::var("CONSOLIDATE_SKIP_NER")
@@ -12804,7 +13379,11 @@ impl AgentCore {
             .unwrap_or(true);
 
         // 3. 质量过滤 + 推进游标用的 max_ts（整批，含不合格）
+        // P1-d：同步收集观察内存 ID（memoria memory_fetch_unconsolidated 返回 id 字段），
+        // 供 pattern 携带 evidence 指针回溯。
         let mut obs_lines: Vec<String> = Vec::new();
+        let mut obs_ids: Vec<String> = Vec::new();
+        let mut obs_ts: Vec<String> = Vec::new();
         let mut max_ts = cursor_ts.clone();
         let mut skipped = 0u64;
         for it in &items {
@@ -12820,47 +13399,106 @@ impl AgentCore {
             let c = c.trim();
             if Self::obs_ok_for_consolidate(c, min_obs_chars) {
                 obs_lines.push(c.to_string());
+                obs_ids.push(
+                    it.get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                );
+                obs_ts.push(
+                    it.get("created_at")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                );
             } else {
                 skipped += 1;
             }
         }
 
-        // 关键：先推进游标再跑 LLM，避免 LLM/NER 崩溃导致同批重复提炼污染 pattern
+        // 整批无合格原料的早退**必须先推进游标**（ocr PR#68 第五轮 high：推进
+        // 移到 prompt 构造之后，此早退发生在其前——同批垃圾会被永久重拉重滤）
+        if obs_lines.is_empty() && !items.is_empty() {
+            let _ = mem_client
+                .call(
+                    "dream_state_update",
+                    &serde_json::json!({
+                        "phase": "consolidate", "namespace": ns, "cursor_ts": max_ts, "items_out": 0
+                    }),
+                )
+                .await;
+        }
+        if obs_lines.is_empty() {
+            return ConsolidateOutcome {
+                ns: ns.to_string(),
+                status: ConsolidateStatus::NoInput,
+                patterns_added: 0,
+                observations: 0,
+                observations_visible: 0,
+                fetched: items.len(),
+                cursor: max_ts.clone(),
+                detail: format!(
+                    "本批 {} 条均不合格（跳过 {}，cursor→{}）",
+                    items.len(),
+                    skipped,
+                    max_ts
+                ),
+            };
+        }
+
+        // 4. LLM 提炼 ≤5 pattern（严格：只要可复用工程/运营规则）。
+        // P1-d：观察带序号喂给 LLM，要求每条 pattern 行末标注【依据: 序号】，
+        // 程序解析后映射回观察内存 ID 作为 evidence 指针（可回溯，防「pattern 凭空出现」）。
+        // P2-2：prompt 字面量收敛到 pattern_extraction_prompt（与评估共用同一来源，防漂移）；
+        // `included` = 6000 字窗口内实际可见的观察数，引用合法性以它为上界。
+        let (prompt, included) = AgentCore::pattern_extraction_prompt(
+            &format!("合格 {} / 本批拉取 {}，命名空间 {}", obs_lines.len(), items.len(), ns),
+            &obs_lines,
+        );
+        // 窗口截断留痕（ocr PR#68 第二轮）：游标在 LLM 之前已推进整批——窗口外的
+        // 观察被永久消费、永不提取，而事件 JSON 的 observations 报的是合格总数，
+        // 会让人误以为全部喂给了 LLM。默认 400 条×70 字 ≈ 30k 字，6000 字窗口
+        // 只装得下 ~70 条：这是常态而非边缘情况，必须 warn + detail 如实标注。
+        if included < obs_lines.len() {
+            tracing::warn!(target: "consolidate", ns = %ns,
+                visible = included, qualified = obs_lines.len(),
+                "本批观察超出 6000 字窗口：窗口外 {} 条延迟到后续轮次处理（游标推进至窗口边界）", obs_lines.len() - included);
+        }
+        let window_note = if included < obs_lines.len() {
+            format!("（窗口内 {}/{}，窗口外延迟到后续轮次）", included, obs_lines.len())
+        } else {
+            String::new()
+        };
+        // 关键：先推进游标再跑 LLM，避免 LLM/NER 崩溃导致同批重复提炼污染 pattern。
+        // 推进目标 = **窗口边界**（ocr PR#68 第四轮：整批 max_ts 会把 6000 字窗口
+        // 外的观察永久消费——常态下 ~28k 字批次只有 ~70 条可见，多数被静默丢弃；
+        // 游标只推到最后一条可见观察，窗口外留给下一轮 = 延迟而非丢失。同时间戳的
+        // 边界观察下一轮会重拉，属可接受的重复提取）
+        // 钳制进 [cursor_ts, max_ts] 并在空/漂移时回退 max_ts（ocr PR#68 第五轮
+        // high：obs_ts 缺 created_at 时为空串——空游标会让下轮全历史重拉、旧值
+        // 会原地踏步，宁丢窗口优化不失单调推进。同时间戳边界的契约见上方注释：
+        // memoria `created_at > since` 严格大于，同秒的未处理尾部观察会被跳过，
+        // 相比整窗丢弃已数量级收敛；行级水位需 memoria 侧支持，不在本 PR 范围）
+        let window_cursor: String = if included < obs_lines.len() {
+            let later = obs_ts
+                .get(included.saturating_sub(1))
+                .cloned()
+                .unwrap_or_default();
+            let ok = !later.is_empty()
+                && later.as_str() >= cursor_ts.as_str()
+                && later.as_str() <= max_ts.as_str();
+            if ok { later } else { max_ts.clone() }
+        } else {
+            max_ts.clone()
+        };
         let _ = mem_client
             .call(
                 "dream_state_update",
                 &serde_json::json!({
-                    "phase": "consolidate", "namespace": ns, "cursor_ts": max_ts, "items_out": 0
+                    "phase": "consolidate", "namespace": ns, "cursor_ts": window_cursor, "items_out": 0
                 }),
             )
             .await;
-
-        // 整批无合格原料
-        if obs_lines.is_empty() {
-            return format!(
-                "consolidate[{}]: 本批 {} 条均不合格（跳过 {}，cursor→{}）",
-                ns,
-                items.len(),
-                skipped,
-                max_ts
-            );
-        }
-
-        // 4. LLM 提炼 ≤5 pattern（严格：只要可复用工程/运营规则）
-        let obs_text = obs_lines.join("\n- ");
-        let prompt = format!(
-            "你是知识巩固引擎。只从观察中提炼**可长期复用**的高层规则（架构取舍、运维约束、业务偏好、排障经验）。\n\
-             硬性禁止写成 pattern：\n\
-             - 一次性会话过程、工具回显、文件路径流水账、cron 任务日志\n\
-             - 测试/冒烟/世界杯等无关话题\n\
-             - 复述某条观察原文、或过短空话\n\
-             每条模式一句话、具体可执行，最多 5 条。若无可提炼内容，只输出「无模式」。\n\n\
-             ## 待巩固观察（合格 {} / 本批拉取 {}，命名空间 {}）\n- {}",
-            obs_lines.len(),
-            items.len(),
-            ns,
-            obs_text.chars().take(6000).collect::<String>()
-        );
         let msg = crate::llm::Message {
             role: "system".to_string(),
             content: Some(prompt),
@@ -12869,56 +13507,117 @@ impl AgentCore {
         };
         let reply = match self.llm.chat(&[msg], &[]).await {
             Ok(r) => r.text.trim().to_string(),
-            Err(e) => return format!("consolidate[{}] LLM 失败: {}", ns, e),
+            Err(e) => {
+                return ConsolidateOutcome {
+                    ns: ns.to_string(),
+                    status: ConsolidateStatus::LlmError,
+                    patterns_added: 0,
+                    observations: obs_lines.len(),
+                    observations_visible: included,
+                    fetched: items.len(),
+                    // 与已持久化的游标一致（ocr PR#68 第五轮 high：事件载荷报
+                    // max_ts 而落库是 window_cursor，排障与对账会被误导）
+                    cursor: window_cursor.clone(),
+                    detail: format!("LLM 失败: {}{}", e, window_note),
+                }
+            }
         };
-        if reply.is_empty() || reply == "无模式" || (reply.contains("无模式") && reply.chars().count() < 20) {
-            return format!(
-                "consolidate[{}]: 无模式（合格观察 {}，跳过 {}，cursor→{}）",
-                ns,
-                obs_lines.len(),
-                skipped,
-                max_ts
-            );
+        // 5. 写回 pattern（≤5，再过一道写库过滤）。
+        // P2-2 共用管线 parse_pattern_reply（ocr PR#68：take(8)/引用解析/标记剥离/
+        // 门槛/take(5) 与「无模式」判定与评估共用同一实现，杜绝双份漂移）；
+        // 序号上界 `included`（6000 字窗口内实际可见数），窗口外引用一律无效。
+        let parsed = AgentCore::parse_pattern_reply(&reply, included);
+        if parsed.kind != PatternReplyKind::Valid {
+            // Empty 与 NoPatterns 分开上报（ocr PR#68 第三轮：枚举区分了却被折进
+            // 同一句「无模式」——空响应更像 provider 故障，值得单独观测）
+            let (status, reason) = match parsed.kind {
+                PatternReplyKind::Empty => (ConsolidateStatus::Empty, "空响应"),
+                _ => (ConsolidateStatus::NoPatterns, "无模式"),
+            };
+            return ConsolidateOutcome {
+                ns: ns.to_string(),
+                status,
+                patterns_added: 0,
+                observations: obs_lines.len(),
+                observations_visible: included,
+                fetched: items.len(),
+                cursor: window_cursor.clone(),
+                detail: format!(
+                    "{}（合格观察 {}，跳过 {}{}，cursor→{}）",
+                    reason,
+                    obs_lines.len(),
+                    skipped,
+                    window_note,
+                    window_cursor
+                ),
+            };
         }
 
-        // 5. 写回 pattern（≤5，再过一道写库过滤）
-        let patterns: Vec<&str> = reply
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .take(8) // 先多取，过滤后再截断
-            .collect();
-        let clean_patterns: Vec<String> = patterns
-            .iter()
-            .map(|p| {
-                p.trim_start_matches(|c: char| {
-                    c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' ' || c == '*'
-                })
-                .trim()
-                .to_string()
-            })
-            .filter(|p| Self::pattern_ok_for_consolidate(p))
-            .take(5)
-            .collect();
-
-        if clean_patterns.is_empty() {
-            return format!(
-                "consolidate[{}]: LLM 产出未过写库门槛（合格观察 {}，cursor→{}）",
-                ns,
-                obs_lines.len(),
-                max_ts
-            );
+        let valid_patterns = parsed.valid_patterns();
+        if valid_patterns.is_empty() {
+            // 诊断细分（ocr PR#68）：「引用前置导致正文为空」与「门槛拒绝」是不同
+            // 的修复动作，且前者的批次已被游标消费、不可重放——必须可辨别
+            let stripped_empty = parsed.lines.iter().filter(|c| c.text.is_empty()).count();
+            let gate_rejected = parsed
+                .lines
+                .iter()
+                .filter(|c| !c.text.is_empty() && !c.passed_gate)
+                .count();
+            return ConsolidateOutcome {
+                ns: ns.to_string(),
+                status: ConsolidateStatus::GateRejected,
+                patterns_added: 0,
+                observations: obs_lines.len(),
+                observations_visible: included,
+                fetched: items.len(),
+                cursor: window_cursor.clone(),
+                detail: format!(
+                    "LLM 产出未过写库门槛（候选 {}：门槛拒绝 {}，引用前置空正文 {}；合格观察 {}{}，cursor→{}）",
+                    parsed.lines.len(),
+                    gate_rejected,
+                    stripped_empty,
+                    obs_lines.len(),
+                    window_note,
+                    window_cursor
+                ),
+            };
         }
 
         // P2.2d：consolidate retain 路径 — LLM 抽取 signal tags 并随 memory_remember 持久化
+        let pattern_texts: Vec<String> = valid_patterns
+            .iter()
+            .map(|c| c.text.clone())
+            .collect();
         let signal_tags_by_idx = self
-            .llm_extract_signal_tags_batch(&clean_patterns)
+            .llm_extract_signal_tags_batch(&pattern_texts)
             .await;
 
         let mut written = 0u64;
-        for (i, clean) in clean_patterns.iter().enumerate() {
+        let mut write_failed = 0u64;
+        for (i, cand) in valid_patterns.iter().enumerate() {
+            // P1-d evidence 指针——**序号:ID 配对**（ocr PR#68：两个独立列表在去重/
+            // 截断/空 ID 过滤后位置错位，读者无法逐条回溯；配对一次成型，缺 ID 记 ?）
+            let mut seen = std::collections::BTreeSet::new();
+            let pairs: Vec<String> = cand
+                .cites
+                .iter()
+                .filter(|n| seen.insert(**n))
+                .take(5)
+                .map(|n| {
+                    let id = obs_ids
+                        .get(n.saturating_sub(1))
+                        .map(|s| s.as_str())
+                        .filter(|s| !s.is_empty());
+                    format!("{}:{}", n, id.unwrap_or("?"))
+                })
+                .collect();
+            let evidence = if pairs.is_empty() {
+                format!("依据观察:未标注（本批 {} 条候选）", obs_lines.len())
+            } else {
+                format!("依据观察:{}", pairs.join(","))
+            };
             let mut args = serde_json::json!({
-                "content": format!("[pattern] {} | ns={}", clean, ns),
+                "content": format!("[pattern] {} | ns={} | {}", cand.text, ns, evidence),
                 "tags": ["pattern", "auto_consolidated"],
                 "category": "pattern",
                 "confidence": 70,
@@ -12927,17 +13626,46 @@ impl AgentCore {
             if let Some(st) = signal_tags_by_idx.get(i) {
                 crate::text_signals::enrich_remember_args(&mut args, st);
             }
-            let _ = mem_client.call("memory_remember", &args).await;
-            written += 1;
+            // 写入结果如实计数（ocr PR#65 第五轮）：patterns_added 被事件 JSON/HTTP
+            // 响应当指标消费，memoria 写失败仍 +1 会持续虚高（游标已推进不重试）
+            match mem_client.call("memory_remember", &args).await {
+                Ok(text) => {
+                    // 正向成功判定（ocr PR#68 第四轮 high：McpClient::call 只返回
+                    // result.content[0].text，isError 在客户端边界已被丢弃、探不到；
+                    // 改用 memory_remember 的成功回执——{"status":"remembered","id":…}。
+                    // 无法识别的回执按失败计（指标宁欠勿溢）
+                    let stored = serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .map(|v| {
+                            v.get("status").and_then(|x| x.as_str()) == Some("remembered")
+                                || v.get("id").and_then(|x| x.as_str()).is_some()
+                        })
+                        .unwrap_or(false);
+                    if stored {
+                        written += 1;
+                    } else {
+                        write_failed += 1;
+                        tracing::warn!(target: "consolidate", ns = %ns,
+                            "pattern 写入未获成功回执（业务拒绝/未知格式，游标已推进不重试）：{}",
+                            text.chars().take(200).collect::<String>());
+                    }
+                }
+                Err(e) => {
+                    write_failed += 1;
+                    tracing::warn!(target: "consolidate", ns = %ns, error = %e,
+                        "pattern 写入 Memoria 失败（游标已推进，本条不重试）");
+                }
+            }
         }
 
         // 6. 回写本轮 items_out（游标已在 LLM 前推进）
         let _ = mem_client.call("dream_state_update", &serde_json::json!({
-            "phase": "consolidate", "namespace": ns, "cursor_ts": max_ts, "items_out": written
+            "phase": "consolidate", "namespace": ns, "cursor_ts": window_cursor, "items_out": written
         })).await;
 
         // 7. B 阶段：NER（默认跳过，避免大批 mention 拖垮进程）
         if written > 0 && !skip_ner {
+            let obs_text = obs_lines.join("\n- ");
             let entity_prompt = format!(
                 "你负责从以下观察和已提炼模式中识别实体（person/system/tool/concept/org/project/location/event）及关系。\
                  仅输出纯 JSON，不要任何前缀后缀。\
@@ -13190,15 +13918,33 @@ impl AgentCore {
             }
         }
 
-        format!(
-            "consolidate[{}]: 从 {} 条合格观察提炼 {} 条 pattern（本批拉取 {}，跳过 {}，cursor→{}）",
-            ns,
-            obs_lines.len(),
-            written,
-            items.len(),
-            skipped,
-            max_ts
-        )
+        ConsolidateOutcome {
+            ns: ns.to_string(),
+            status: if write_failed > 0 {
+                ConsolidateStatus::PartialWrite
+            } else {
+                ConsolidateStatus::Ok
+            },
+            patterns_added: written,
+            observations: obs_lines.len(),
+            observations_visible: included,
+            fetched: items.len(),
+            cursor: window_cursor.clone(),
+            detail: format!(
+                "从 {} 条合格观察提炼 {} 条 pattern（本批拉取 {}，跳过 {}{}{}，cursor→{}）",
+                obs_lines.len(),
+                written,
+                items.len(),
+                skipped,
+                if write_failed > 0 {
+                    format!("，{} 条写入 Memoria 失败", write_failed)
+                } else {
+                    String::new()
+                },
+                window_note,
+                window_cursor
+            ),
+        }
     }
 
     /// 记忆库系统维护：衰减循环（memory_decay）+ GFS 轮转备份（memory_backup）。
@@ -13243,7 +13989,135 @@ impl AgentCore {
     }
 
     /// 巩固原料门槛：挡短文本 / 测试 / 会话助理前缀 / cron 流水
-    fn obs_ok_for_consolidate(content: &str, min_chars: usize) -> bool {
+    /// P2-2 共用：知识巩固提炼 prompt 的**唯一**字面量来源——生产 consolidate 与评估
+    /// consolidate_eval 必须共用同一份（评估基线测的就是生产行为；两处复制粘贴必然
+    /// 漂移，届时历史基线测的就不是正在运行的 prompt，ocr PR#65 评审 high）。
+    /// `scope` 为「## 待巩固观察（…）」括号内的范围说明。
+    ///
+    /// 返回 `(prompt, 纳入观察数)`：**只渲染完整落在 6000 字窗口内的条目**，窗口外
+    /// 的既不出现也不可引用——「可见」与「可引用」严格一致（ocr PR#68：若渲染
+    /// take(6000) 全文，第 included+1 条会带合法 `[N]` 标记部分可见，其引用却被
+    /// 静默丢弃、evidence 退化为「未标注」）。首条超长时渲染其 6000 字截断并计 1；
+    /// 计数与渲染同源，无双重构造漂移。
+    pub(crate) fn pattern_extraction_prompt(scope: &str, obs_lines: &[String]) -> (String, usize) {
+        const WINDOW: usize = 6000;
+        let entries: Vec<String> = obs_lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("[{}] {}", i + 1, l))
+            .collect();
+        let mut included = 0usize;
+        let mut used = 0usize;
+        for (i, e) in entries.iter().enumerate() {
+            let len = e.chars().count() + if i > 0 { 3 } else { 0 };
+            if used + len > WINDOW {
+                break;
+            }
+            used += len;
+            included += 1;
+        }
+        let obs_text = if included == 0 {
+            entries
+                .first()
+                .map(|e| e.chars().take(WINDOW).collect::<String>())
+                .unwrap_or_default()
+        } else {
+            entries[..included].join("\n- ")
+        };
+        // 空题集返回 0（ocr PR#68 第三轮：max(1) 在无条目时给出伪上界，
+        // parse_pattern_reply 会接受指向不存在证据的引用）；首条超长才保 1
+        let included = if entries.is_empty() { 0 } else { included.max(1) };
+        (
+            format!(
+                "你是知识巩固引擎。只从观察中提炼**可长期复用**的高层规则（架构取舍、运维约束、业务偏好、排障经验）。\n\
+                 硬性禁止写成 pattern：\n\
+                 - 一次性会话过程、工具回显、文件路径流水账、cron 任务日志\n\
+                 - 测试/冒烟/世界杯等无关话题\n\
+                 - 复述某条观察原文、或过短空话\n\
+                 每条模式一行、一句话、具体可执行，最多 {} 条；行末必须标注支撑它的观察序号，格式如【依据: 1,3】。\n\
+                 若无可提炼内容，只输出「无模式」。\n\n\
+                 ## 待巩固观察（{}）\n- {}",
+                PATTERN_BUDGET, scope, obs_text
+            ),
+            included,
+        )
+    }
+
+    /// P1-d：解析 pattern 行末【依据: 序号,…】——引用区在首个 `】` 处严格截断，
+    /// 行尾后续数字（版本号/端口号/"见 5"/"窗口 1 分钟"）不会被误当引用
+    /// （ocr PR#65 评审：评估里这直接污染北极星指标，生产里污染 evidence 指针）。
+    /// `max_n` = 合法序号上界（观察总数）。返回 (去引用的 pattern 文本, 1-based 序号)。
+    /// **行首引用恢复**（ocr PR#68）：模型把标记放开头（`【依据: 1】 规则内容…`）时
+    /// 前缀为空，恢复闭括号之后的正文——否则引用回显风格输出会整批空文本，
+    /// 在游标已推进的前提下造成批次静默永久丢失。
+    pub(crate) fn parse_pattern_citation(line: &str, max_n: usize) -> (String, Vec<usize>) {
+        let Some(pos) = line.find("【依据") else {
+            return (line.trim().to_string(), Vec::new());
+        };
+        // 引用区严格截止到闭括号；**括号未闭合（prompt 漂移/行被截断）视为无引用**——
+        // 回退扫整行会让行尾所有数字（版本/端口/"1 分钟"）都变成伪引用
+        // （ocr PR#65 第二轮评审）
+        let Some(rel_end) = line[pos..].find('】') else {
+            return (line[..pos].trim().to_string(), Vec::new());
+        };
+        let cite = &line[pos..pos + rel_end + 3];
+        let nums: Vec<usize> = cite
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<usize>().ok())
+            .filter(|n| *n >= 1 && *n <= max_n)
+            .collect();
+        let after = &line[pos + rel_end + 3..];
+        // 列表标记先剥再判空前缀（ocr PR#68 第二轮；第三轮 high：剥离谓词与
+        // parse_pattern_reply 的后续剥离不同步——`1、【依据: 1】 …` 的顿号前缀
+        // 漏剥，行首恢复不触发、后续剥离成空、整行被丢）。共用同一谓词。
+        let prefix_core = strip_list_markers(&line[..pos]);
+        let text = if prefix_core.is_empty() && !after.trim().is_empty() {
+            // 行首引用：正文在闭括号之后（恢复，防整批空文本）
+            after.trim().to_string()
+        } else {
+            line[..pos].trim().to_string()
+        };
+        (text, nums)
+    }
+
+    /// P2-2 共用：LLM 回复 → pattern 候选的**唯一**管线（ocr PR#68：prompt 字面量
+    /// 收敛了，但 take(8)→引用解析→标记剥离→写库门槛→take(5) 与「无模式」判定
+    /// 仍是两处复制，配额/标记一改评估就测旧管线而基线仍宣称可比）。
+    /// 生产 consolidate 与 consolidate_eval 共用本入口。
+    pub(crate) fn parse_pattern_reply(reply: &str, max_n: usize) -> PatternReply {
+        let empty = reply.is_empty();
+        let no_patterns =
+            reply == "无模式" || (reply.contains("无模式") && reply.chars().count() < 20);
+        let mut lines: Vec<PatternCandidate> = Vec::new();
+        for line in reply
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .take(8)
+        {
+            let (text, cites) = AgentCore::parse_pattern_citation(line, max_n);
+            let text = strip_leading_index(strip_list_markers(&text)).to_string();
+            if text.is_empty() {
+                // 空正文行（如纯引用回显）保留占位以便诊断计数，但不过门槛
+                lines.push(PatternCandidate { text, cites, passed_gate: false });
+                continue;
+            }
+            let passed_gate = AgentCore::pattern_ok_for_consolidate(&text);
+            lines.push(PatternCandidate { text, cites, passed_gate });
+        }
+        let kind = if empty {
+            PatternReplyKind::Empty
+        } else if no_patterns {
+            PatternReplyKind::NoPatterns
+        } else {
+            PatternReplyKind::Valid
+        };
+        PatternReply { kind, lines }
+    }
+
+    /// 巩固原料门槛：挡短文本 / 测试 / 会话助理前缀 / cron 流水
+    pub(crate) fn obs_ok_for_consolidate(content: &str, min_chars: usize) -> bool {
         let c = content.trim();
         if c.chars().count() < min_chars {
             return false;
@@ -13270,7 +14144,7 @@ impl AgentCore {
     }
 
     /// pattern 写库门槛：挡空话 / 禁题 / 过短
-    fn pattern_ok_for_consolidate(p: &str) -> bool {
+    pub(crate) fn pattern_ok_for_consolidate(p: &str) -> bool {
         let t = p.trim();
         if t.chars().count() < 16 {
             return false;
@@ -15411,5 +16285,160 @@ mod step_citation_tests {
         assert_eq!(strip_step_citations("[步骤] 普通文本"), "[步骤] 普通文本");
         assert_eq!(strip_step_citations("步骤1 不带括号"), "步骤1 不带括号");
         assert_eq!(strip_step_citations("无标记回答"), "无标记回答");
+    }
+}
+
+
+#[cfg(test)]
+mod stance_card_tests {
+    use super::{aggregate_stances, StanceCard};
+
+    fn card(raw: &str) -> StanceCard {
+        StanceCard::from_raw("p1".into(), "分身一".into(), raw.into())
+    }
+
+    /// 围栏 JSON（最常见良好输出）正常解析为结构化卡
+    #[test]
+    fn fenced_json_parses() {
+        let c = card("```json\n{\"stance\":\"支持\",\"summary\":\"可行\",\"key_reasons\":[\"成本可控\"],\"confidence\":85}\n```");
+        assert!(c.structured);
+        assert_eq!(c.stance, "支持");
+        assert_eq!(c.summary, "可行");
+        assert_eq!(c.key_reasons, vec!["成本可控".to_string()]);
+        assert_eq!(c.confidence, Some(85));
+        assert!(c.citations.is_empty());
+    }
+
+    /// 正文夹杂花括号 + 前后 prose：配平扫描不吃无关括号（朴素首末切片必失败的场景）
+    #[test]
+    fn prose_and_braces_parse_balanced_object() {
+        let c = card("我认为 {从监管角度} 应该推进。\n{\"stance\":\"条件支持\",\"summary\":\"需先过审批\",\"confidence\":\"90\"}\n补充：见第 3 条");
+        assert!(c.structured, "应解析出配平对象: {}", c.stance);
+        assert_eq!(c.stance, "条件支持");
+        assert_eq!(c.confidence, Some(90)); // 数字字符串编码
+    }
+
+    /// 两个对象：取第一个可解析的配平候选
+    #[test]
+    fn two_objects_first_balanced_wins() {
+        let c = card("{\"stance\":\"中立\",\"summary\":\"先观察\"} 后续 {\"stance\":\"支持\"}");
+        assert!(c.structured);
+        assert_eq!(c.stance, "中立");
+    }
+
+    /// stance 空串 / 缺失 / 纯文本无 JSON → 全部降级未结构化，原文保留
+    #[test]
+    fn empty_or_missing_stance_degrades() {
+        for raw in [
+            "{\"stance\":\"\",\"summary\":\"x\"}",
+            "{\"summary\":\"没有立场字段\"}",
+            "这是纯文本回答，没有 JSON。",
+            "",
+        ] {
+            let c = card(raw);
+            assert!(!c.structured, "应降级: {raw}");
+            assert_eq!(c.stance, "未结构化");
+            assert_eq!(c.raw, raw);
+        }
+    }
+
+    /// 极性表：混合/双否定/无条件标记不得 180° 反转
+    #[test]
+    fn normalize_stance_polarity_matrix() {
+        let f = |s: &str| super::normalize_stance(s);
+        assert_eq!(f("条件不支持"), "反对");
+        assert_eq!(f("有条件下不支持"), "反对");
+        assert_eq!(f("反对条件支持"), "反对");
+        assert_eq!(f("不支持"), "反对");
+        assert_eq!(f("不反对，条件支持"), "条件支持");
+        assert_eq!(f("无条件支持"), "支持");
+        assert_eq!(f("支持（不设条件）"), "支持");
+        assert_eq!(f("支持，无附加条件"), "支持");
+        assert_eq!(f("中立"), "中立");
+        // 倾斜表态：极性优先于「中立」字面（ocr PR#66 第二轮）
+        assert_eq!(f("中立偏反对"), "反对");
+        assert_eq!(f("中立偏支持"), "支持");
+        assert_eq!(f("支持"), "支持");
+        // 未命中规范词 → 固定「其他」桶（不产生一次性碎键）
+        assert_eq!(f("Support"), "其他");
+        assert_eq!(f("倾向于认可"), "其他");
+        assert_eq!(f("需要更多数据"), "其他");
+    }
+
+    /// confidence 多编码 + clamp + 不可解码为 None。
+    /// 整数 1 = 1%（prompt 语义），真分数 0.9 = 90%（小数编码），1.0 边界 = 1
+    #[test]
+    fn confidence_encodings() {
+        assert_eq!(card("{\"stance\":\"支持\",\"confidence\":0.9}").confidence, Some(90));
+        assert_eq!(card("{\"stance\":\"支持\",\"confidence\":1}").confidence, Some(1));
+        assert_eq!(card("{\"stance\":\"支持\",\"confidence\":1.0}").confidence, Some(1));
+        assert_eq!(card("{\"stance\":\"支持\",\"confidence\":85.0}").confidence, Some(85));
+        assert_eq!(card("{\"stance\":\"支持\",\"confidence\":\"70\"}").confidence, Some(70));
+        assert_eq!(card("{\"stance\":\"支持\",\"confidence\":120}").confidence, Some(100));
+        assert_eq!(card("{\"stance\":\"支持\",\"confidence\":\"high\"}").confidence, None);
+    }
+
+    /// 字符串内花括号不破坏配平；无关小对象不劫持候选（含 stance 的对象优先）
+    #[test]
+    fn string_braces_and_stance_priority() {
+        // 字符串里的 } 提前归零会腰斩候选
+        let c = card("{\"stance\":\"支持\",\"summary\":\"含 } 花括号的摘要\",\"confidence\":50}");
+        assert!(c.structured, "字符串内花括号不应破坏解析");
+        assert_eq!(c.stance, "支持");
+        // 正文先出现无关对象 {"x":1}，真正的卡片在后——stance 优先
+        let c2 = card("先说 {\"x\":1} 无关的话，再给 {\"stance\":\"反对\",\"summary\":\"b\"}");
+        assert!(c2.structured, "应选中含 stance 的候选: {}", c2.stance);
+        assert_eq!(c2.stance, "反对");
+    }
+
+    /// key_reasons 限 3 条、每条限 120 字；非字符串元素丢弃
+    #[test]
+    fn key_reasons_bounded() {
+        let long: String = "长".repeat(500);
+        let c = card(&format!(
+            "{{\"stance\":\"支持\",\"key_reasons\":[\"{long}\",\"b\",\"c\",\"d\",42]}}"
+        ));
+        assert_eq!(c.key_reasons.len(), 3);
+        assert_eq!(c.key_reasons[0].chars().count(), 120);
+        assert_eq!(c.key_reasons[1], "b");
+    }
+
+    /// summary 超 200 字截断
+    #[test]
+    fn summary_capped() {
+        let long: String = "话".repeat(999);
+        let c = card(&format!("{{\"stance\":\"中立\",\"summary\":\"{long}\"}}"));
+        assert_eq!(c.summary.chars().count(), 200);
+    }
+
+    /// 聚合：分布统计 + 对立提示 + 降级计数 + 同票稳定排序（可复现）
+    #[test]
+    fn aggregate_distribution_and_divergence() {
+        let cards = vec![
+            card("{\"stance\":\"支持\",\"summary\":\"a\"}"),
+            card("{\"stance\":\"反对\",\"summary\":\"b\"}"),
+            card("{\"stance\":\"反对\",\"summary\":\"c\"}"),
+            card("{\"stance\":\"Support\",\"summary\":\"d\"}"), // → 其他
+            card("纯文本降级"),
+        ];
+        let agg = aggregate_stances(&cards);
+        assert_eq!(agg.total, 5);
+        assert_eq!(agg.structured, 4);
+        assert!(agg.summary.contains("反对 2"));
+        assert!(agg.summary.contains("支持 1"));
+        assert!(agg.summary.contains("其他 1"));
+        assert!(agg.summary.contains("1 份未结构化"));
+        assert!(agg.summary.contains("存在对立立场"));
+        // 同票时按立场名排序（稳定可复现）
+        assert!(agg.distribution.windows(2).all(|w| w[0].1 > w[1].1 || (w[0].1 == w[1].1 && w[0].0 <= w[1].0)));
+    }
+
+    /// 全降级输入：无结构化卡，提示均为降级原文
+    #[test]
+    fn aggregate_all_degraded() {
+        let agg = aggregate_stances(&[card("文本一"), card("文本二")]);
+        assert_eq!(agg.structured, 0);
+        assert!(agg.summary.contains("无结构化立场卡"));
+        assert!(agg.summary.contains("2 份未结构化"));
     }
 }
