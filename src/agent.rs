@@ -6020,44 +6020,77 @@ impl AgentCore {
 
     /// PFAiX 回答格式化修复：把组合执行产出的机器话（"执行结果：N/N 步骤成功" + 原始工具 JSON）
     /// 改写成用户易懂的中文自然语言。失败时回退原始 report，绝不把原始 JSON 直接甩给用户。
+    ///
+    /// P1-b（R2）：LLM 输入从「原文截 1500 字」改为**程序抽取的要点行**（确定性，不过 LLM），
+    /// 要求回答用 [步骤N] 标注数据来源；回答未引用任何步骤编号时打 warning（引用完整性检查）。
     async fn summarize_composition(
         &self,
         user_query: &str,
         step_results: &HashMap<u32, String>,
         report: &str,
     ) -> String {
-        // 按 step_id 升序稳定拼装工具原始数据（截断避免超长）
+        // 按 step_id 升序稳定拼装（P1-b：程序抽取要点，抽不到带数字的行才降级喂截断原文）
         let mut keys: Vec<&u32> = step_results.keys().collect();
         keys.sort();
         let mut tool_ctx = String::new();
         for (i, step_id) in keys.iter().enumerate() {
             let res = &step_results[*step_id];
-            // P1 修复：按字符截断而非字节切片，避免多字节 UTF-8（中文）在第 1500 字节处
-            // 落字符中间导致 panic。
-            let truncated: String = if res.chars().count() > 1500 {
-                res.chars().take(1500).collect()
-            } else {
-                res.to_string()
-            };
-            tool_ctx.push_str(&format!(
-                "\n[步骤 {}] (id={}):\n{}\n",
-                i + 1,
-                step_id,
-                truncated
-            ));
+            let (facts, total_lines) = Self::extract_step_facts(res);
+            match facts {
+                Some(lines) if !lines.is_empty() => {
+                    let incomplete = lines.len() < total_lines;
+                    tool_ctx.push_str(&format!(
+                        "\n[步骤 {}] (id={}) 要点摘录（含数字/实体的有效行共 {} 行，摘 {} 行）：\n",
+                        i + 1,
+                        step_id,
+                        total_lines,
+                        lines.len()
+                    ));
+                    for f in &lines {
+                        tool_ctx.push_str(&format!("- {}\n", f));
+                    }
+                    if incomplete {
+                        // 不完整时附**有界原文片段**（ocr PR#65 第五轮）：本函数返回值会
+                        // 替换 report，指向「原始结果」的引用是悬空的；清单型问题也不该
+                        // 只凭 5 行要点作答——原文片段直接随行，不依赖外部引用。
+                        const RAW_TAIL_CHARS: usize = 1200;
+                        let tail: String = res.chars().take(RAW_TAIL_CHARS).collect();
+                        tool_ctx.push_str(&format!(
+                            "（摘录不全，原文片段前 {} 字：）\n{}\n",
+                            RAW_TAIL_CHARS, tail
+                        ));
+                    }
+                }
+                _ => {
+                    // 无可抽取要点（纯文本无数字等）→ 降级保留截断原文（P1 修复：按字符截断防
+                    // 多字节 UTF-8 切半 panic）
+                    let truncated: String = if res.chars().count() > 1500 {
+                        res.chars().take(1500).collect()
+                    } else {
+                        res.to_string()
+                    };
+                    tool_ctx.push_str(&format!(
+                        "\n[步骤 {}] (id={}) 原始数据：\n{}\n",
+                        i + 1,
+                        step_id,
+                        truncated
+                    ));
+                }
+            }
         }
         let prompt = format!(
             "你是固废监管系统的查询助手。用户用中文提问，系统已通过多个工具步骤查到了结果。\n\
-             请基于下面的工具返回数据，用简洁的中文自然语言回答用户的原始问题。\n\
+             请基于下面的各步骤要点，用简洁的中文自然语言回答用户的原始问题。\n\
              要求：\n\
              1. 直接说结论和数据，不要复述执行过程，不要出现\"执行结果\"、\"最终结果\"等机器字眼。\n\
              2. 若数据为空（如查询结果 0 条），明确告诉用户「没有查到相关记录」，并简要解释可能原因，不要原样输出 JSON。\n\
-             3. 涉及的数字、车牌、企业名要原样保留，不要编造。\n\
-             4. 回答控制在 200 字以内。\n\
+             3. 涉及的数字、车牌、企业名要原样保留，不要编造；只使用要点中出现的数据。\n\
+             4. 回答控制在 400 字以内。\n\
+             5. 关键数据用 [步骤N] 标注来源（如 [步骤1]）。\n\
              \n\
              ## 用户的原始问题\n{}\n\
              \n\
-             ## 工具返回的原始数据{}",
+             ## 各步骤工具结果要点{}",
             user_query, tool_ctx
         );
 
@@ -6069,8 +6102,73 @@ impl AgentCore {
         };
 
         match self.llm.chat(&[msg], &[]).await {
-            Ok(r) if !r.text.trim().is_empty() => r.text.trim().to_string(),
+            Ok(r) if !r.text.trim().is_empty() => {
+                let answer = r.text.trim().to_string();
+                // P1-b 引用完整性检查：回答未引用任何步骤编号 → 可能是 LLM 自由发挥，告警留痕
+                if !answer.contains("步骤") {
+                    tracing::warn!(
+                        steps = ?keys,
+                        "P1-b: 组合执行回答未引用任何步骤编号（引用完整性检查），原始 report 可兜底核对"
+                    );
+                }
+                answer
+            }
             _ => report.to_string(), // LLM 失败/空响应 → 回退原始 report，绝不直接吐 JSON
+        }
+    }
+
+    /// P1-b（R2）：从工具原始输出中**确定性**抽取要点行（不调 LLM）。
+    ///
+    /// 选行规则（ocr PR#65 第三轮评审修订）：首条有内容的行作标题 + **数字行优先、
+    /// 非数字实体行补位**——只有一条 count 行 + 多条企业名/状态行时，纯数字规则会让
+    /// 模型永远看不到被省略的记录；补位保证实体行进入要点。各截 100 字，合计 ≤5 行、
+    /// 去重。**纯标点/括号行（pretty JSON 的 `{`、`[`）整行跳过**，不占预算。
+    /// 返回 `(Option<要点行>, 有内容的总行数)`；None = 无任何数字行（调用方降级喂
+    /// 截断原文）。行数供调用方生成截断声明。风格对齐审计 `summarize_args`：零语义加工。
+    fn extract_step_facts(res: &str) -> (Option<Vec<String>>, usize) {
+        let has_alnum = |s: &str| s.chars().any(|c| c.is_alphanumeric());
+        // 有内容总行数**先独立数完**（同谓词）——抽取循环凑满 5 条即 break，
+        // 若行数在同一循环里累加会停在 ~6 行，截断声明严重低报原文体量
+        let content_lines: Vec<&str> = res
+            .lines()
+            .map(|l| l.trim())
+            .filter(|t| !t.is_empty() && has_alnum(t))
+            .collect();
+        let total_lines = content_lines.len();
+        let mut facts: Vec<String> = Vec::new();
+        let mut push = |line: &str, facts: &mut Vec<String>| {
+            if facts.len() >= 5 {
+                return;
+            }
+            let one: String = line.chars().take(100).collect();
+            if !facts.contains(&one) {
+                facts.push(one);
+            }
+        };
+        if let Some(h) = content_lines.first() {
+            push(h, &mut facts);
+        }
+        let numeric: Vec<&&str> = content_lines
+            .iter()
+            .skip(1)
+            .filter(|l| l.bytes().any(|b| b.is_ascii_digit()))
+            .collect();
+        for l in &numeric {
+            push(l, &mut facts);
+        }
+        // 补位：数字行不足时纳入非数字实体行（企业名/状态/路径），保持原顺序
+        for l in content_lines.iter().skip(1) {
+            if !numeric.contains(&l) {
+                push(l, &mut facts);
+            }
+            if facts.len() >= 5 {
+                break;
+            }
+        }
+        if numeric.is_empty() {
+            (None, total_lines)
+        } else {
+            (Some(facts), total_lines)
         }
     }
 
@@ -6438,7 +6536,13 @@ impl AgentCore {
                 // 最近未覆盖消息（最终结果/最后决策）必须进结论，否则记忆不完整；
                 // 尾部总长 2000 字符封顶（缓存 stale 时 10% 历史可超数万字符，防结论膨胀）
                 Some((upto, text)) if !text.trim().is_empty() => {
-                    let mut out = text;
+                    // P1-c（R4）：复用摘要作结论底稿时强制携带来源声明——结论前半是机器摘要
+                    // 而非原文复述，后续召回/展示时人类可辨别可信度层级。
+                    let mut out = format!(
+                        "（声明：本结论前半部分来自机器摘要，覆盖本会话前 {upto} 轮，非原文复述；session={}）\n",
+                        session_id
+                    );
+                    out.push_str(&text);
                     if upto < history.len() {
                         out.push_str("\n\n## 会话尾部（未压缩原文）\n");
                         let mut tail_chars = 0usize;
@@ -7802,7 +7906,7 @@ impl AgentCore {
             if self.orchestration.cfg.tool_summary.enabled
                 && (_round as usize + 1) >= self.orchestration.cfg.tool_summary.start_round
             {
-                self.maybe_summarize_tool_outputs(&mut ctx.messages, &budget).await;
+                self.maybe_summarize_tool_outputs(session_id, &mut ctx.messages, &budget).await;
             }
             // Phase B：每轮工具执行后按字节预算截断陈旧 tool 输出（防跨轮载荷越滚越大）
             Self::squash_stale_tool_outputs(&mut ctx.messages);
@@ -8303,18 +8407,60 @@ impl AgentCore {
         }
     }
 
+    /// 解析摘要消息溯头条中的**丢弃量**（「原文 N 字」− 现存长度）——P1-b R3 无状态
+    /// 核算的数据源。字节算术：「原文 」7 字节，数字子串在「原文 」与「 字」之间
+    /// （ocr PR#65 第五轮 high：此前 p+3 切错位置，parse 恒失败、护栏恒 0）。
+    /// 格式契约由 `tool_summary_marker_round_trip` 单测锁死——MARKER 头格式变更须同步本解析。
+    fn tool_summary_discard_of(content: &str) -> u64 {
+        const MARKER: &str = "[工具结果摘要]";
+        if !content.starts_with(MARKER) {
+            return 0;
+        }
+        let Some(p) = content.find("原文 ") else {
+            return 0;
+        };
+        let rest = &content[p + "原文 ".len()..];
+        let Some(num_end) = rest.find(" 字") else {
+            return 0;
+        };
+        let Ok(orig) = rest[..num_end].parse::<u64>() else {
+            return 0;
+        };
+        orig.saturating_sub(content.chars().count() as u64)
+    }
+
     /// ADR-017 P3：工具结果 LLM 摘要（opt-in，默认关；开关关时本方法不进入热路径）。
     /// 只摘要 role=tool 且超过阈值的消息；每轮最多 `max_per_round` 条；
     /// 辅助 LLM 调用按估算计入同一 TurnBudget；摘要失败保留原文（由 squash 截断兜底）。
     /// `max_per_round: 0` 是显式语义「本轮不摘要」，此处直接返回，不静默改成 1；
     /// `threshold_chars: 0` 是显式语义「所有 tool 结果都摘要」（见配置文档）。
+    ///
+    /// P1-b（R3 护栏②，ocr PR#65 第四轮定稿——**无状态推导**）：
+    /// - 丢弃量不进任何跨调用台账，直接从 ctx.messages 推导：MARKER 消息的溯源头
+    ///   带「原文 N 字」，`N − 现存长度` 即该条丢弃量。无锁、无预占账/回滚、无
+    ///   取消恐慌残留、无并发同会话互相覆盖——check-then-act 整类问题不存在；
+    /// - 候选按**体积降序**处理（大载荷压缩收益最高，判定与扫描顺序无关）；
+    /// - **首条豁免**：上下文尚无已摘要消息时不设限——信息损耗风险来自**反复**
+    ///   摘要的累积，单条压缩且保留 2000 字原文头不构成该风险；这使 opt-in 层
+    ///   对其主用途（一条大载荷）可用，而非被 30% 数学自我否决；
+    /// - 累计护栏：`Σ丢弃(含本条投影) * 10 > 现存 tool 总量 * 3` 且总量 ≥ 12000
+    ///   才拒绝（分母含小条目与已摘要消息的保留部分——被保留的信息锚点）。
     async fn maybe_summarize_tool_outputs(
         &self,
+        session_id: &str,
         messages: &mut Vec<Message>,
         budget: &crate::orchestration::TurnBudget,
     ) {
         const MARKER: &str = "[工具结果摘要]";
         const SUMMARY_RESPONSE_EST: u64 = 200; // prompt 要求 <=800 字，预留响应估算
+        const SUMMARY_SHARE_CAP_NUM: u64 = 3; // 30%
+        const SUMMARY_SHARE_CAP_DEN: u64 = 10;
+        const SUMMARY_SHARE_FLOOR_CHARS: u64 = 12_000;
+        const RAW_RETAIN_CHARS: usize = 2000;
+        // 摘要保留量估计：prompt 约束 ≤800 字 + 溯源标记/原文头标注开销
+        const SUMMARY_RETAINED_EST: usize = 800;
+        const REPLACEMENT_OVERHEAD: usize = 100;
+        let retained_est = RAW_RETAIN_CHARS + SUMMARY_RETAINED_EST + REPLACEMENT_OVERHEAD;
         let cfg = &self.orchestration.cfg.tool_summary;
         if cfg.max_per_round == 0 {
             tracing::debug!(target = "orchestration.summary",
@@ -8328,18 +8474,47 @@ impl AgentCore {
             .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
             .sum::<usize>() as u64
             / 4;
+        // 无状态推导：已摘要消息的丢弃量（溯源头「原文 N 字」− 现存长度）。
+        // 解析在 [`Self::tool_summary_discard_of`]（往返契约由单测锁死）。
+        let mut lost_so_far: u64 = messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| Self::tool_summary_discard_of(m.content.as_deref().unwrap_or("")))
+            .sum();
+        let mut total_now: u64 = messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| m.content.as_ref().map(|c| c.chars().count()).unwrap_or(0) as u64)
+            .sum();
+        let mut any_summarized = lost_so_far > 0;
+        // 候选收集 + 体积降序（判定与扫描顺序无关；大载荷收益最高优先）
+        let mut candidates: Vec<(usize, usize)> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == "tool")
+            .filter_map(|(i, m)| {
+                let c = m.content.as_deref()?;
+                let chars = c.chars().count();
+                (!c.starts_with(MARKER) && chars > cfg.threshold_chars).then_some((i, chars))
+            })
+            .collect();
+        candidates.sort_by(|a, b| b.1.cmp(&a.1));
         let mut summarized_this_round = 0usize;
-        for m in messages.iter_mut().filter(|m| m.role == "tool") {
+        for (idx, chars) in candidates {
             if summarized_this_round >= cfg.max_per_round {
                 break;
             }
-            let Some(content) = m.content.as_ref() else {
-                continue;
-            };
-            // 单次字符计数复用：跳过判定/截断标记/日志都用同一值，避免对超长
-            // 输出重复全量扫描（ocr perf·low 修复）。
-            let chars = content.chars().count();
-            if content.starts_with(MARKER) || chars <= cfg.threshold_chars {
+            let content: String = messages[idx].content.clone().unwrap_or_default();
+            // 投影（无锁；首条豁免——见函数头注释）
+            let lost_delta_est = (chars as u64).saturating_sub(retained_est as u64);
+            if any_summarized
+                && total_now >= SUMMARY_SHARE_FLOOR_CHARS
+                && (lost_so_far + lost_delta_est) * SUMMARY_SHARE_CAP_DEN
+                    > total_now * SUMMARY_SHARE_CAP_NUM
+            {
+                tracing::info!(target: "orchestration.summary",
+                    session = %session_id, lost_so_far, total_now, incoming = chars,
+                    "工具摘要累计丢弃占比将超 30% 上限，本条保留原文（防长会话渐进信息丢失）");
                 continue;
             }
             // 上下文窗口保护：超长 tool 输出先截断到有界前缀再进 prompt——
@@ -8363,7 +8538,7 @@ impl AgentCore {
             if let Err(e) =
                 budget.check_token(req_est.saturating_add(next_loop_est + SUMMARY_RESPONSE_EST))
             {
-                tracing::warn!(target = "orchestration.summary", err = %e,
+                tracing::warn!(target: "orchestration.summary", err = %e,
                     "摘要预算不足（含下一主循环预留），保留原文");
                 break;
             }
@@ -8376,31 +8551,42 @@ impl AgentCore {
             // 辅助 LLM 调用走 routed_llm（与主循环同一套难度路由 + provider failover/retry），
             // 并计入 LLM 调用计数；chat_single 保证按预算估算执行单次调用（不进 Best-of-N）。
             self.metrics.inc_llm_calls();
+            let tool_call_id_snapshot = messages[idx].tool_call_id.clone();
             match self.routed_llm.chat_single(&req, &[]).await {
                 Ok(r) if !r.text.trim().is_empty() => {
                     let resp_est = (r.text.chars().count() as u64) / 4;
                     budget.record_token(req_est + resp_est);
                     self.metrics.inc_tool_summary();
                     summarized_this_round += 1;
-                    tracing::info!(target = "orchestration.summary",
-                        tool_call_id = ?m.tool_call_id,
+                    tracing::info!(target: "orchestration.summary",
+                        tool_call_id = ?tool_call_id_snapshot,
                         chars_before = chars,
                         chars_after = r.text.chars().count(),
                         "工具结果已 LLM 摘要");
                     // opt-in 摘要：保留 bounded 原文头部，防止后续轮次需要的关键事实
                     // 因摘要遗漏而永久丢失（摘要 + 原文头部仍然显著压缩超长输出）。
-                    const RAW_RETAIN_CHARS: usize = 2000;
+                    // P1-b（R3 护栏①）：摘要头部携带溯源信息（tool_call_id + 原始字数），
+                    // 明确该块是「不可信机器摘要」，原文另有保留——「原文 N 字」同时是
+                    // 无状态丢弃核算的数据源，格式变更须同步 discard_of 解析。
                     let raw_head: String = content.chars().take(RAW_RETAIN_CHARS).collect();
                     let truncated = content.chars().count() > RAW_RETAIN_CHARS;
-                    m.content = Some(format!(
-                        "{MARKER}\n{}\n\n[原文保留前{RAW_RETAIN_CHARS}字]\n{}{}",
+                    let replacement = format!(
+                        "{MARKER}(溯源: tool_call_id={:?}，原文 {chars} 字，摘要为 LLM 生成非原文)\n{}\n\n[原文保留前{RAW_RETAIN_CHARS}字]\n{}{}",
+                        tool_call_id_snapshot,
                         r.text,
                         raw_head,
                         if truncated { "…" } else { "" }
-                    ));
+                    );
+                    // 同轮账目同步（ocr PR#65 第五轮）：max_per_round>1 时后续候选
+                    // 必须看到本条的丢弃与体量变化，否则第 2 条仍按首条豁免放行
+                    let new_len = replacement.chars().count() as u64;
+                    lost_so_far += (chars as u64).saturating_sub(new_len);
+                    total_now = total_now - (chars as u64) + new_len;
+                    any_summarized = true;
+                    messages[idx].content = Some(replacement);
                 }
-                Ok(_) => tracing::warn!(target = "orchestration.summary", "摘要返回空文本，保留原文"),
-                Err(e) => tracing::warn!(target = "orchestration.summary", err = %e, "摘要失败，保留原文"),
+                Ok(_) => tracing::warn!(target: "orchestration.summary", "摘要返回空文本，保留原文"),
+                Err(e) => tracing::warn!(target: "orchestration.summary", err = %e, "摘要失败，保留原文"),
             }
         }
     }
@@ -12009,11 +12195,18 @@ impl AgentCore {
             .await
             .unwrap_or_default();
 
+        // P1-d（R5）/ocr PR#65 第四轮：**先解析完整 JSON、按记录边界截断**——直接对
+        // 字符切片会把 JSON 切成不可解析的残文，溯源行永远「条数未识别」；按记录
+        // 取前 k 条后，k 既是模型实际可见数也是可出具的真实计数（不多不少）。
+        let (data_head, n_entrance) = Self::truncate_json_records(&data, 3000);
+        let (stats_head, n_stats) = Self::truncate_json_records(&stats, 1000);
         let prompt = format!(
             "你是固废运营数据分析师。分析最近7天入厂数据，找出有意义的模式或异常。\
-             没有发现就输出'无异常'。每个发现一句话，最多3个。\n\n## 近7天数据\n{}\n\n## 本月统计\n{}",
-            data.chars().take(3000).collect::<String>(),
-            stats.chars().take(1000).collect::<String>(),
+             没有发现就输出'无异常'。每个发现一句话，最多3个。\n\n## 近7天数据（前 {} 条记录）\n{}\n\n## 本月统计（前 {} 条记录）\n{}",
+            n_entrance.map(|n| n.to_string()).unwrap_or_else(|| "原文截断 3000 字".into()),
+            data_head,
+            n_stats.map(|n| n.to_string()).unwrap_or_else(|| "原文截断 1000 字".into()),
+            stats_head,
         );
         let msg = crate::llm::Message {
             role: "system".to_string(),
@@ -12028,17 +12221,103 @@ impl AgentCore {
         if reply.is_empty() || reply == "无异常" {
             return "洞见: 无异常".to_string();
         }
+        // P1-d（R5）：content 首行为**程序生成**的统计行（确定性，可核对），LLM 洞见文本跟随其后；
+        // tags 强制携带数据窗口与来源——洞见可回溯到其数据面，而非凭空一句话。
+        // 条数统计只对可识别的 JSON 结构出具；未识别时如实写「条数未识别」，
+        // 不用行数冒充（嵌套/pretty JSON 的行数会虚高一个数量级）。
+        let fmt_n = |n: Option<usize>| match n {
+            Some(v) => format!("前 {} 条", v),
+            None => "条数未识别（原文截断）".to_string(),
+        };
+        let content = format!(
+            "[洞见] 数据窗口 {}~{}（7 天）；程序统计（分析窗口=喂给模型的记录切片）：入厂记录 {}、月统计 {}；源 query_entrance+query_monthly_stats\n{}",
+            week_ago, today, fmt_n(n_entrance), fmt_n(n_stats), reply
+        );
+        let mut tags = vec![
+            "insight".to_string(),
+            "auto_discovered".to_string(),
+            "insight:7d".to_string(),
+            format!("window:{}~{}", week_ago, today),
+        ];
+        if let Some(n) = n_entrance {
+            tags.push(format!("records:{}", n));
+        }
         let _ = self
             .mcp
             .call(
                 "memory_remember",
                 &serde_json::json!({
-                    "content": format!("[洞见] {} | {}~{}", reply, week_ago, today),
-                    "tags": ["insight", "auto_discovered"], "confidence": 70,
+                    "content": content,
+                    "tags": tags,
+                    "confidence": 70,
                 }),
             )
             .await;
         format!("洞见: {}", reply)
+    }
+
+    /// P1-d（R5）/ocr PR#65 第四、五轮：解析完整 JSON 并**按记录边界**取前 k 条，
+    /// 使 (喂给模型的切片, Some(k)) 永远自洽——k 是模型实际可见的记录数。
+    /// 对象包裹时**重建 envelope**（截断后的数组塞回原对象，total 等同级字段保留）；
+    /// 数组字段用「对象中第一个数组值字段」通用探测（records/sample_records 等不再
+    /// 落回字符截断）。不可解析时退化为字符截断并返回 None（调用方如实标注）。
+    fn truncate_json_records(s: &str, cap_chars: usize) -> (String, Option<usize>) {
+        let fallback = || -> (String, Option<usize>) {
+            (s.chars().take(cap_chars).collect(), None)
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(s.trim()) else {
+            return fallback();
+        };
+        // 定位记录数组：顶层数组，或对象中第一个数组值字段（通用，无键名白名单）
+        let (records, envelope_key): (&[serde_json::Value], Option<&str>) = if let Some(arr) =
+            v.as_array()
+        {
+            (arr.as_slice(), None)
+        } else if let Some(o) = v.as_object() {
+            match o.iter().find(|(_, x)| x.is_array()) {
+                Some((k, arr_val)) => (
+                    arr_val.as_array().map(|a| a.as_slice()).unwrap_or(&[]),
+                    Some(k.as_str()),
+                ),
+                None => (&[], None),
+            }
+        } else {
+            (&[], None)
+        };
+        if records.is_empty() && envelope_key.is_none() {
+            // 可解析但无记录数组（如聚合对象）：整体不超限时全量喂，超限按字符截断
+            let text = serde_json::to_string(&v).unwrap_or_default();
+            if text.chars().count() <= cap_chars {
+                return (text, None);
+            }
+            return fallback();
+        }
+        let mut used = 2usize; // "[]"
+        let mut kept: Vec<&serde_json::Value> = Vec::new();
+        for rec in records {
+            let serialized = serde_json::to_string(rec).unwrap_or_default();
+            let len = serialized.chars().count() + if kept.is_empty() { 0 } else { 1 };
+            if used + len > cap_chars {
+                break;
+            }
+            used += len;
+            kept.push(rec);
+        }
+        if kept.is_empty() {
+            return fallback();
+        }
+        let k = kept.len();
+        let kept_owned: Vec<serde_json::Value> = kept.into_iter().cloned().collect();
+        let rebuilt = match (&v, envelope_key) {
+            (serde_json::Value::Object(o), Some(key)) => {
+                // 重建 envelope：保留同级字段（total/count_by_day 等），替换记录数组
+                let mut m = o.clone();
+                m.insert(key.to_string(), serde_json::Value::Array(kept_owned));
+                serde_json::to_string(&serde_json::Value::Object(m)).unwrap_or_default()
+            }
+            _ => serde_json::to_string(&kept_owned).unwrap_or_default(),
+        };
+        (rebuilt, Some(k))
     }
 
     /// P2.2d：LLM 批量抽取 text_signals → `signal:*` tags（consolidate retain 路径）。
