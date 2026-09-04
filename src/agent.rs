@@ -451,6 +451,32 @@ pub struct RoundtableResult {
     pub consensus: String,
 }
 
+/// P1-d：consolidate 结构化结果（《程序化汇合改造方案》P1-d）。
+///
+/// 原 consolidate 返回人读 String，事件队列只能拿到转述文本。结构化后：
+/// 事件队列取字段拼 JSON summary（LLM 文本沉到 detail），HTTP/健康记录取 detail，
+/// 日志用 [`summary_line`](Self::summary_line)。
+pub struct ConsolidateOutcome {
+    pub ns: String,
+    /// 写回的 pattern 条数
+    pub patterns_added: u64,
+    /// 本批合格观察数（evidence 池）
+    pub observations: usize,
+    /// 本批拉取总数（含不合格）
+    pub fetched: usize,
+    /// 推进后的游标
+    pub cursor: String,
+    /// 人读摘要（不含 `consolidate[ns]:` 前缀）
+    pub detail: String,
+}
+
+impl ConsolidateOutcome {
+    /// 日志用单行（与历史日志格式一致）
+    pub fn summary_line(&self) -> String {
+        format!("consolidate[{}]: {}", self.ns, self.detail)
+    }
+}
+
 /// 会议实时状态机阶段（会议升级 Step3）。
 /// serde snake_case 序列化与前端 / 旧 meetings.json 字符串完全一致（ai_speaking / awaiting_humans / discussing / done），向后兼容。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -12256,7 +12282,7 @@ impl AgentCore {
     ///
     /// 以 admin 身份调用 memoria（系统维护任务，合法跨命名空间读取观察原料）。
     /// ns 隔离：每个 ns 独立游标、独立 pattern 库。
-    pub async fn consolidate(&self, ns: &str) -> String {
+    pub async fn consolidate(&self, ns: &str) -> ConsolidateOutcome {
         // 系统维护任务：admin/jarvis 身份与密钥必须配对（勿用聊天 agent_id + jarvis badge）。
         let mem_client = memoria_maintenance_client(&self.config.memoria_url, &self.mcp);
 
@@ -12304,7 +12330,14 @@ impl AgentCore {
             .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
             .unwrap_or_default();
         if items.is_empty() {
-            return format!("consolidate[{}]: 无新观察（cursor={}）", ns, cursor_ts);
+            return ConsolidateOutcome {
+                ns: ns.to_string(),
+                patterns_added: 0,
+                observations: 0,
+                fetched: 0,
+                cursor: cursor_ts.clone(),
+                detail: format!("无新观察（cursor={}）", cursor_ts),
+            };
         }
 
         let skip_ner = std::env::var("CONSOLIDATE_SKIP_NER")
@@ -12315,7 +12348,10 @@ impl AgentCore {
             .unwrap_or(true);
 
         // 3. 质量过滤 + 推进游标用的 max_ts（整批，含不合格）
+        // P1-d：同步收集观察内存 ID（memoria memory_fetch_unconsolidated 返回 id 字段），
+        // 供 pattern 携带 evidence 指针回溯。
         let mut obs_lines: Vec<String> = Vec::new();
+        let mut obs_ids: Vec<String> = Vec::new();
         let mut max_ts = cursor_ts.clone();
         let mut skipped = 0u64;
         for it in &items {
@@ -12331,6 +12367,12 @@ impl AgentCore {
             let c = c.trim();
             if Self::obs_ok_for_consolidate(c, min_obs_chars) {
                 obs_lines.push(c.to_string());
+                obs_ids.push(
+                    it.get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                );
             } else {
                 skipped += 1;
             }
@@ -12348,29 +12390,29 @@ impl AgentCore {
 
         // 整批无合格原料
         if obs_lines.is_empty() {
-            return format!(
-                "consolidate[{}]: 本批 {} 条均不合格（跳过 {}，cursor→{}）",
-                ns,
-                items.len(),
-                skipped,
-                max_ts
-            );
+            return ConsolidateOutcome {
+                ns: ns.to_string(),
+                patterns_added: 0,
+                observations: 0,
+                fetched: items.len(),
+                cursor: max_ts.clone(),
+                detail: format!(
+                    "本批 {} 条均不合格（跳过 {}，cursor→{}）",
+                    items.len(),
+                    skipped,
+                    max_ts
+                ),
+            };
         }
 
-        // 4. LLM 提炼 ≤5 pattern（严格：只要可复用工程/运营规则）
-        let obs_text = obs_lines.join("\n- ");
-        let prompt = format!(
-            "你是知识巩固引擎。只从观察中提炼**可长期复用**的高层规则（架构取舍、运维约束、业务偏好、排障经验）。\n\
-             硬性禁止写成 pattern：\n\
-             - 一次性会话过程、工具回显、文件路径流水账、cron 任务日志\n\
-             - 测试/冒烟/世界杯等无关话题\n\
-             - 复述某条观察原文、或过短空话\n\
-             每条模式一句话、具体可执行，最多 5 条。若无可提炼内容，只输出「无模式」。\n\n\
-             ## 待巩固观察（合格 {} / 本批拉取 {}，命名空间 {}）\n- {}",
-            obs_lines.len(),
-            items.len(),
-            ns,
-            obs_text.chars().take(6000).collect::<String>()
+        // 4. LLM 提炼 ≤5 pattern（严格：只要可复用工程/运营规则）。
+        // P1-d：观察带序号喂给 LLM，要求每条 pattern 行末标注【依据: 序号】，
+        // 程序解析后映射回观察内存 ID 作为 evidence 指针（可回溯，防「pattern 凭空出现」）。
+        // P2-2：prompt 字面量收敛到 pattern_extraction_prompt（与评估共用同一来源，防漂移）；
+        // `included` = 6000 字窗口内实际可见的观察数，引用合法性以它为上界。
+        let (prompt, included) = AgentCore::pattern_extraction_prompt(
+            &format!("合格 {} / 本批拉取 {}，命名空间 {}", obs_lines.len(), items.len(), ns),
+            &obs_lines,
         );
         let msg = crate::llm::Message {
             role: "system".to_string(),
@@ -12380,56 +12422,102 @@ impl AgentCore {
         };
         let reply = match self.llm.chat(&[msg], &[]).await {
             Ok(r) => r.text.trim().to_string(),
-            Err(e) => return format!("consolidate[{}] LLM 失败: {}", ns, e),
+            Err(e) => {
+                return ConsolidateOutcome {
+                    ns: ns.to_string(),
+                    patterns_added: 0,
+                    observations: obs_lines.len(),
+                    fetched: items.len(),
+                    cursor: max_ts.clone(),
+                    detail: format!("LLM 失败: {}", e),
+                }
+            }
         };
         if reply.is_empty() || reply == "无模式" || (reply.contains("无模式") && reply.chars().count() < 20) {
-            return format!(
-                "consolidate[{}]: 无模式（合格观察 {}，跳过 {}，cursor→{}）",
-                ns,
-                obs_lines.len(),
-                skipped,
-                max_ts
-            );
+            return ConsolidateOutcome {
+                ns: ns.to_string(),
+                patterns_added: 0,
+                observations: obs_lines.len(),
+                fetched: items.len(),
+                cursor: max_ts.clone(),
+                detail: format!(
+                    "无模式（合格观察 {}，跳过 {}，cursor→{}）",
+                    obs_lines.len(),
+                    skipped,
+                    max_ts
+                ),
+            };
         }
 
-        // 5. 写回 pattern（≤5，再过一道写库过滤）
-        let patterns: Vec<&str> = reply
+        // 5. 写回 pattern（≤5，再过一道写库过滤）。
+        // P1-d：共享引用解析器（引用区在 `】` 截断，行尾数字不误入）；序号上界用
+        // `included`（6000 字窗口内实际可见的观察数），窗口外观察的引用一律无效
+        // → 映射观察内存 ID（evidence 指针）
+        let clean_patterns: Vec<(String, Vec<usize>)> = reply
             .lines()
             .map(|l| l.trim())
             .filter(|l| !l.is_empty())
             .take(8) // 先多取，过滤后再截断
-            .collect();
-        let clean_patterns: Vec<String> = patterns
-            .iter()
-            .map(|p| {
-                p.trim_start_matches(|c: char| {
-                    c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' ' || c == '*'
-                })
-                .trim()
-                .to_string()
+            .map(|l| {
+                let (p, c) = AgentCore::parse_pattern_citation(l, included);
+                let p = p
+                    .trim_start_matches(|c: char| {
+                        c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' ' || c == '*'
+                    })
+                    .trim()
+                    .to_string();
+                (p, c)
             })
-            .filter(|p| Self::pattern_ok_for_consolidate(p))
+            .filter(|(p, _)| Self::pattern_ok_for_consolidate(p))
             .take(5)
             .collect();
 
         if clean_patterns.is_empty() {
-            return format!(
-                "consolidate[{}]: LLM 产出未过写库门槛（合格观察 {}，cursor→{}）",
-                ns,
-                obs_lines.len(),
-                max_ts
-            );
+            return ConsolidateOutcome {
+                ns: ns.to_string(),
+                patterns_added: 0,
+                observations: obs_lines.len(),
+                fetched: items.len(),
+                cursor: max_ts.clone(),
+                detail: format!(
+                    "LLM 产出未过写库门槛（合格观察 {}，cursor→{}）",
+                    obs_lines.len(),
+                    max_ts
+                ),
+            };
         }
 
         // P2.2d：consolidate retain 路径 — LLM 抽取 signal tags 并随 memory_remember 持久化
+        let pattern_texts: Vec<String> = clean_patterns
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect();
         let signal_tags_by_idx = self
-            .llm_extract_signal_tags_batch(&clean_patterns)
+            .llm_extract_signal_tags_batch(&pattern_texts)
             .await;
 
         let mut written = 0u64;
-        for (i, clean) in clean_patterns.iter().enumerate() {
+        let mut write_failed = 0u64;
+        for (i, (clean, cites)) in clean_patterns.iter().enumerate() {
+            // P1-d evidence 指针：序号 + 内存 ID（ID 截前 5 个防 content 膨胀）；
+            // 未标注依据时如实记「未标注」，不伪造可回溯性。
+            let cite_nums: Vec<String> = cites.iter().map(|n| n.to_string()).collect();
+            let cite_ids: Vec<String> = cites
+                .iter()
+                .filter_map(|n| obs_ids.get(n.saturating_sub(1)))
+                .filter(|s| !s.is_empty())
+                .take(5)
+                .cloned()
+                .collect();
+            let evidence = if cite_nums.is_empty() {
+                format!("依据观察:未标注（本批 {} 条候选）", obs_lines.len())
+            } else if cite_ids.is_empty() {
+                format!("依据观察:[{}]", cite_nums.join(","))
+            } else {
+                format!("依据观察:[{}]（id:{})", cite_nums.join(","), cite_ids.join(","))
+            };
             let mut args = serde_json::json!({
-                "content": format!("[pattern] {} | ns={}", clean, ns),
+                "content": format!("[pattern] {} | ns={} | {}", clean, ns, evidence),
                 "tags": ["pattern", "auto_consolidated"],
                 "category": "pattern",
                 "confidence": 70,
@@ -12438,8 +12526,16 @@ impl AgentCore {
             if let Some(st) = signal_tags_by_idx.get(i) {
                 crate::text_signals::enrich_remember_args(&mut args, st);
             }
-            let _ = mem_client.call("memory_remember", &args).await;
-            written += 1;
+            // 写入结果如实计数（ocr PR#65 第五轮）：patterns_added 被事件 JSON/HTTP
+            // 响应当指标消费，memoria 写失败仍 +1 会持续虚高（游标已推进不重试）
+            match mem_client.call("memory_remember", &args).await {
+                Ok(_) => written += 1,
+                Err(e) => {
+                    write_failed += 1;
+                    tracing::warn!(target: "consolidate", ns = %ns, error = %e,
+                        "pattern 写入 Memoria 失败（游标已推进，本条不重试）");
+                }
+            }
         }
 
         // 6. 回写本轮 items_out（游标已在 LLM 前推进）
@@ -12449,6 +12545,7 @@ impl AgentCore {
 
         // 7. B 阶段：NER（默认跳过，避免大批 mention 拖垮进程）
         if written > 0 && !skip_ner {
+            let obs_text = obs_lines.join("\n- ");
             let entity_prompt = format!(
                 "你负责从以下观察和已提炼模式中识别实体（person/system/tool/concept/org/project/location/event）及关系。\
                  仅输出纯 JSON，不要任何前缀后缀。\
@@ -12701,15 +12798,26 @@ impl AgentCore {
             }
         }
 
-        format!(
-            "consolidate[{}]: 从 {} 条合格观察提炼 {} 条 pattern（本批拉取 {}，跳过 {}，cursor→{}）",
-            ns,
-            obs_lines.len(),
-            written,
-            items.len(),
-            skipped,
-            max_ts
-        )
+        ConsolidateOutcome {
+            ns: ns.to_string(),
+            patterns_added: written,
+            observations: obs_lines.len(),
+            fetched: items.len(),
+            cursor: max_ts.clone(),
+            detail: format!(
+                "从 {} 条合格观察提炼 {} 条 pattern（本批拉取 {}，跳过 {}{}，cursor→{}）",
+                obs_lines.len(),
+                written,
+                items.len(),
+                skipped,
+                if write_failed > 0 {
+                    format!("，{} 条写入 Memoria 失败", write_failed)
+                } else {
+                    String::new()
+                },
+                max_ts
+            ),
+        }
     }
 
     /// 记忆库系统维护：衰减循环（memory_decay）+ GFS 轮转备份（memory_backup）。
@@ -12754,7 +12862,76 @@ impl AgentCore {
     }
 
     /// 巩固原料门槛：挡短文本 / 测试 / 会话助理前缀 / cron 流水
-    fn obs_ok_for_consolidate(content: &str, min_chars: usize) -> bool {
+    /// P2-2 共用：知识巩固提炼 prompt 的**唯一**字面量来源——生产 consolidate 与评估
+    /// consolidate_eval 必须共用同一份（评估基线测的就是生产行为；两处复制粘贴必然
+    /// 漂移，届时历史基线测的就不是正在运行的 prompt，ocr PR#65 评审 high）。
+    /// `scope` 为「## 待巩固观察（…）」括号内的范围说明。
+    ///
+    /// 返回 `(prompt, 纳入观察数)`：prompt 只喂前 6000 字，被截断在窗口外的观察
+    /// 模型从未见过——引用解析的 `max_n` 必须用**实际纳入数**而非全量数，否则
+    /// 幻觉序号会被记成「模型没看过的观察」的证据（ocr PR#65 第三轮评审）。
+    pub(crate) fn pattern_extraction_prompt(scope: &str, obs_lines: &[String]) -> (String, usize) {
+        let obs_text = obs_lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("[{}] {}", i + 1, l))
+            .collect::<Vec<_>>()
+            .join("\n- ");
+        // 数出完整落在 6000 字窗口内的观察条数（join 分隔符 3 字计入长度）
+        let mut included = 0usize;
+        let mut used = 0usize;
+        for (i, l) in obs_lines.iter().enumerate() {
+            let entry_len = format!("[{}] {}", i + 1, l).chars().count() + if i > 0 { 3 } else { 0 };
+            if used + entry_len > 6000 {
+                break;
+            }
+            used += entry_len;
+            included += 1;
+        }
+        let included = included.max(1); // 首条超长也至少纳入 1 条（prompt 行为与 take(6000) 一致：首条部分可见）
+        (
+            format!(
+                "你是知识巩固引擎。只从观察中提炼**可长期复用**的高层规则（架构取舍、运维约束、业务偏好、排障经验）。\n\
+                 硬性禁止写成 pattern：\n\
+                 - 一次性会话过程、工具回显、文件路径流水账、cron 任务日志\n\
+                 - 测试/冒烟/世界杯等无关话题\n\
+                 - 复述某条观察原文、或过短空话\n\
+                 每条模式一行、一句话、具体可执行，最多 5 条；行末必须标注支撑它的观察序号，格式如【依据: 1,3】。\n\
+                 若无可提炼内容，只输出「无模式」。\n\n\
+                 ## 待巩固观察（{}）\n- {}",
+                scope,
+                obs_text.chars().take(6000).collect::<String>()
+            ),
+            included,
+        )
+    }
+
+    /// P1-d：解析 pattern 行末【依据: 序号,…】——引用区在首个 `】` 处严格截断，
+    /// 行尾后续数字（版本号/端口号/"见 5"/"窗口 1 分钟"）不会被误当引用
+    /// （ocr PR#65 评审：评估里这直接污染北极星指标，生产里污染 evidence 指针）。
+    /// `max_n` = 合法序号上界（观察总数）。返回 (去引用的 pattern 文本, 1-based 序号)。
+    pub(crate) fn parse_pattern_citation(line: &str, max_n: usize) -> (String, Vec<usize>) {
+        let Some(pos) = line.find("【依据") else {
+            return (line.trim().to_string(), Vec::new());
+        };
+        // 引用区严格截止到闭括号；**括号未闭合（prompt 漂移/行被截断）视为无引用**——
+        // 回退扫整行会让行尾所有数字（版本/端口/"1 分钟"）都变成伪引用
+        // （ocr PR#65 第二轮评审）
+        let Some(rel_end) = line[pos..].find('】') else {
+            return (line[..pos].trim().to_string(), Vec::new());
+        };
+        let cite = &line[pos..pos + rel_end + 3];
+        let nums: Vec<usize> = cite
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<usize>().ok())
+            .filter(|n| *n >= 1 && *n <= max_n)
+            .collect();
+        (line[..pos].trim().to_string(), nums)
+    }
+
+    /// 巩固原料门槛：挡短文本 / 测试 / 会话助理前缀 / cron 流水
+    pub(crate) fn obs_ok_for_consolidate(content: &str, min_chars: usize) -> bool {
         let c = content.trim();
         if c.chars().count() < min_chars {
             return false;
@@ -12781,7 +12958,7 @@ impl AgentCore {
     }
 
     /// pattern 写库门槛：挡空话 / 禁题 / 过短
-    fn pattern_ok_for_consolidate(p: &str) -> bool {
+    pub(crate) fn pattern_ok_for_consolidate(p: &str) -> bool {
         let t = p.trim();
         if t.chars().count() < 16 {
             return false;

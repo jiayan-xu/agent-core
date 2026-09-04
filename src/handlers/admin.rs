@@ -16,6 +16,45 @@ use crate::auth::authenticate;
 use crate::handlers::approval::is_admin;
 use crate::state::{record_dream_health, AppState};
 
+/// P2-2：consolidate 固定评估（POST /api/admin/consolidate_eval）——《程序化汇合改造方案》§8 P2。
+///
+/// 在固定题集（10 例：6 正例 + 4 prompt 禁区负例）上真实调用一次提炼 LLM 并程序判分，
+/// 北极星指标 = `positive_hit_rate`；报告落盘 `data/consolidate_eval/` 供跨次比较，
+/// 为 P3 的 prompt 离线进化提供可比基线。消耗一次 LLM 调用，仅限 admin 手动触发。
+pub(crate) async fn handle_admin_consolidate_eval(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if !is_admin(&headers, &st).await {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "需要 admin 权限"})),
+        )
+            .into_response();
+    }
+    // 解串行：克隆 Arc 后释放全局锁（评估含 LLM 调用，可能耗时数十秒）
+    let agent = {
+        let g = st.agent.lock().await;
+        g.as_ref().map(|a| a.clone())
+    };
+    let Some(agent) = agent else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "agent 尚未就绪"})),
+        )
+            .into_response();
+    };
+    let ns = format!("agent/{}", agent.config.identity.agent_id);
+    match agent_core::consolidate_eval::run_consolidate_eval(&agent, &ns).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
 pub(crate) async fn handle_admin_consolidate(
     State(st): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -62,7 +101,7 @@ pub(crate) async fn handle_admin_consolidate(
     let mut results = Vec::new();
     for ns in &ns_list {
         let res = agent.consolidate(ns).await;
-        results.push(serde_json::json!({"ns": ns, "result": res}));
+        results.push(serde_json::json!({"ns": ns, "result": res.detail, "patterns_added": res.patterns_added, "observations": res.observations}));
     }
     // PR5 自驱：手动 consolidate 后可选元进化（追平时默认关，防拖垮）
     let skip_meta = std::env::var("CONSOLIDATE_SKIP_META")

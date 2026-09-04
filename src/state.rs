@@ -297,11 +297,26 @@ impl Consciousness {
             // 内层预算超时（外层 TICK 已有 600s watchdog），避免单次 consolidate 卡住整轮
             let res = tokio::time::timeout(Duration::from_secs(300), agent.consolidate(ns)).await;
             match res {
-                Ok(summary) => {
-                    let line = format!("consolidate[{}]: {}", ns, summary);
+                Ok(outcome) => {
+                    // P1-d：BackgroundEvent.summary 改为**结构化 JSON**（patterns_added 等字段
+                    // 可被事件消费方直接读取，LLM 人读文本沉入 detail）——不再用一句转述文本
+                    // 当事件载荷。
+                    let line = outcome.summary_line();
                     tracing::info!(target: "consciousness", "{}", line);
-                    results_json.push(serde_json::json!({"ns": ns, "result": summary}));
-                    out.push(BackgroundEvent::new("consolidate", line));
+                    results_json.push(serde_json::json!({
+                        "ns": outcome.ns, "result": outcome.detail,
+                        "patterns_added": outcome.patterns_added,
+                        "observations": outcome.observations,
+                    }));
+                    let structured = serde_json::json!({
+                        "kind": "consolidate", "ns": outcome.ns,
+                        "patterns_added": outcome.patterns_added,
+                        "observations": outcome.observations,
+                        "fetched": outcome.fetched,
+                        "cursor": outcome.cursor,
+                        "detail": outcome.detail,
+                    });
+                    out.push(BackgroundEvent::new("consolidate", structured.to_string()));
                 }
                 Err(_) => {
                     tracing::warn!(target: "consciousness_watchdog", ns = %ns, "A4: consolidate 超时(>300s)跳过");
