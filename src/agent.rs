@@ -467,7 +467,9 @@ pub struct StanceCard {
     /// 关键理由（结构化时 ≤3 条）。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub key_reasons: Vec<String>,
-    /// 证据引用 ID（LLM 自报，无则空；本方案不校验其真实性，仅透传回溯）。
+    /// 证据引用 ID。**预留字段：当前恒为空**——persona_stance 调用不提供证据池
+    /// （无检索上下文），任何非空值都必然是模型编造的伪溯源，正是本方案要消灭的
+    /// 失败模式（ocr PR#65 第三轮评审）。接入 persona 记忆检索后再启用。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub citations: Vec<String>,
     /// 置信度 0-100（仅结构化卡存在）。
@@ -507,10 +509,12 @@ impl StanceCard {
             return fallback(raw);
         };
         let norm = normalize_stance(stance_raw);
-        let summary = v
+        // summary 硬限长（200 字）：模型无视「一句话」要求时防主席附注 prompt 与
+        // memoria 载荷被单卡膨胀（ocr PR#65 第三轮评审）
+        let summary: String = v
             .get("summary")
             .and_then(|x| x.as_str())
-            .map(|s| s.trim().to_string())
+            .map(|s| s.trim().chars().take(200).collect::<String>())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| stance_raw.trim().chars().take(80).collect());
         let key_reasons: Vec<String> = v
@@ -553,22 +557,24 @@ impl StanceCard {
 }
 
 /// 立场词规范化：仅包含词匹配，零 LLM。
-/// 命中顺序的三重防误判（ocr PR#65 评审）：
-/// 1. 「无条件/不设条件/无附加条件 + 支持」先于「条件支持」判定——否则
-///    "无条件支持"会被反向归成「条件支持」（180° 极性反转，污染分布与对立提示）；
-/// 2. 「不支持」先于「支持」——双否定不落进支持桶；
-/// 3. 未命中任何规范词时保留原文（截 16 字），不强行归四类。
+/// 命中顺序（ocr PR#65 多轮评审收敛）：
+/// 1. 显式反对先行：「反对（且非『不反对』）/不支持」优先于一切含「支持」
+///    的分支——否则「条件不支持」「反对条件支持」等混合标记会被归成
+///    「条件支持」（180° 极性反转）；
+/// 2. 「无条件/不设条件/无附加条件 + 支持」不落「条件支持」；
+/// 3. 「不支持」天然含「支持」子串，由反对分支先截胡；
+/// 4. 未命中任何规范词时保留原文（截 16 字），不强行归四类。
 fn normalize_stance(s: &str) -> String {
     let t = s.trim();
     let unconditional = t.contains("无条件") || t.contains("不设条件") || t.contains("无附加条件");
+    let opposes =
+        (t.contains("反对") && !t.contains("不反对")) || t.contains("不支持");
     if t.contains("中立") {
         "中立".to_string()
-    } else if t.contains("条件") && t.contains("支持") && !unconditional && !t.contains("不支持") {
-        // 「不支持」守卫：条件不支持/有条件下不支持 必须落「反对」而非被「条件支持」
-        // 截胡（180° 极性反转，ocr PR#65 第二轮评审）
-        "条件支持".to_string()
-    } else if t.contains("反对") || t.contains("不支持") {
+    } else if opposes {
         "反对".to_string()
+    } else if t.contains("条件") && t.contains("支持") && !unconditional {
+        "条件支持".to_string()
     } else if t.contains("支持") {
         "支持".to_string()
     } else {
@@ -2285,7 +2291,7 @@ impl AgentCore {
             p.persona_id, p.display_name
         );
         let user = format!(
-            "圆桌议题：{}\n请独立思考后，只输出一个 JSON 对象（JSON 之外不要有任何文字）：\n{{\"stance\": \"支持/反对/中立/条件支持 四选一\", \"summary\": \"一句话概括你的立场\", \"key_reasons\": [\"最多三条关键理由\"], \"citations\": [\"支撑立场的证据或记忆ID，没有就用空数组\"], \"confidence\": 0到100的整数}}",
+            "圆桌议题：{}\n请独立思考后，只输出一个 JSON 对象（JSON 之外不要有任何文字）：\n{{\"stance\": \"支持/反对/中立/条件支持 四选一\", \"summary\": \"一句话概括你的立场\", \"key_reasons\": [\"最多三条关键理由\"], \"confidence\": 0到100的整数}}\n（本轮不提供记忆检索，不要编造任何证据或ID）",
             topic
         );
         let msgs = vec![
@@ -6346,62 +6352,56 @@ impl AgentCore {
 
     /// P1-b（R2）：从工具原始输出中**确定性**抽取要点行（不调 LLM）。
     ///
-    /// 规则：首条有内容的行（表头/结论行）+ 含 ASCII 数字的行（数据行），各截 100 字，
-    /// 合计 ≤5 行、去重。**纯标点/括号行（如 pretty-print JSON 的 `{`、`[`、`},`）整行
-    /// 跳过**——既不当中文要点也不占 ≤5 行预算（ocr PR#65 评审：否则首条"事实"是
-    /// 字面量 `{`，且挤掉真正的数据行）。
-    /// 返回 `(Option<要点行>, 有内容的总行数)`；None 表示抽不到含数字的数据行
-    /// （调用方降级喂截断原文）。行数供调用方生成截断声明。
-    /// 风格对齐审计 `summarize_args`：纯截断与过滤，零语义加工。
+    /// 选行规则（ocr PR#65 第三轮评审修订）：首条有内容的行作标题 + **数字行优先、
+    /// 非数字实体行补位**——只有一条 count 行 + 多条企业名/状态行时，纯数字规则会让
+    /// 模型永远看不到被省略的记录；补位保证实体行进入要点。各截 100 字，合计 ≤5 行、
+    /// 去重。**纯标点/括号行（pretty JSON 的 `{`、`[`）整行跳过**，不占预算。
+    /// 返回 `(Option<要点行>, 有内容的总行数)`；None = 无任何数字行（调用方降级喂
+    /// 截断原文）。行数供调用方生成截断声明。风格对齐审计 `summarize_args`：零语义加工。
     fn extract_step_facts(res: &str) -> (Option<Vec<String>>, usize) {
         let has_alnum = |s: &str| s.chars().any(|c| c.is_alphanumeric());
-        // 有内容总行数**先独立数完**（同谓词：非空且含字母数字）——抽取循环
-        // 凑满 5 条即 break，若行数在同一循环里累加会停在 ~6 行，
-        // 截断声明严重低报原文体量（ocr PR#65 第二轮评审）
-        let total_lines = res
+        // 有内容总行数**先独立数完**（同谓词）——抽取循环凑满 5 条即 break，
+        // 若行数在同一循环里累加会停在 ~6 行，截断声明严重低报原文体量
+        let content_lines: Vec<&str> = res
             .lines()
-            .filter(|l| {
-                let t = l.trim();
-                !t.is_empty() && has_alnum(t)
-            })
-            .count();
+            .map(|l| l.trim())
+            .filter(|t| !t.is_empty() && has_alnum(t))
+            .collect();
+        let total_lines = content_lines.len();
         let mut facts: Vec<String> = Vec::new();
-        let push = |line: &str, facts: &mut Vec<String>| {
-            let t = line.trim();
-            if t.is_empty() || facts.len() >= 5 {
+        let mut push = |line: &str, facts: &mut Vec<String>| {
+            if facts.len() >= 5 {
                 return;
             }
-            let one: String = t.chars().take(100).collect();
+            let one: String = line.chars().take(100).collect();
             if !facts.contains(&one) {
                 facts.push(one);
             }
         };
-        let mut headline_done = false;
-        for line in res.lines() {
-            let t = line.trim();
-            if t.is_empty() || !has_alnum(t) {
-                continue;
-            }
-            if !headline_done {
-                push(t, &mut facts);
-                headline_done = true;
-                continue;
-            }
-            if t.bytes().any(|b| b.is_ascii_digit()) {
-                push(t, &mut facts);
+        if let Some(h) = content_lines.first() {
+            push(h, &mut facts);
+        }
+        let numeric: Vec<&&str> = content_lines
+            .iter()
+            .skip(1)
+            .filter(|l| l.bytes().any(|b| b.is_ascii_digit()))
+            .collect();
+        for l in &numeric {
+            push(l, &mut facts);
+        }
+        // 补位：数字行不足时纳入非数字实体行（企业名/状态/路径），保持原顺序
+        for l in content_lines.iter().skip(1) {
+            if !numeric.contains(&l) {
+                push(l, &mut facts);
             }
             if facts.len() >= 5 {
                 break;
             }
         }
-        let has_data = facts
-            .iter()
-            .skip(1)
-            .any(|f| f.bytes().any(|b| b.is_ascii_digit()));
-        if has_data {
-            (Some(facts), total_lines)
-        } else {
+        if numeric.is_empty() {
             (None, total_lines)
+        } else {
+            (Some(facts), total_lines)
         }
     }
 
@@ -8640,21 +8640,20 @@ impl AgentCore {
         }
     }
 
-    /// ADR-017 P3：工具结果 LLM 摘要（opt-in，默认关；开关关时本方法不进入热路径）。
-    /// 只摘要 role=tool 且超过阈值的消息；每轮最多 `max_per_round` 条；
-    /// 辅助 LLM 调用按估算计入同一 TurnBudget；摘要失败保留原文（由 squash 截断兜底）。
-    /// `max_per_round: 0` 是显式语义「本轮不摘要」，此处直接返回，不静默改成 1；
-    /// `threshold_chars: 0` 是显式语义「所有 tool 结果都摘要」（见配置文档）。
+    /// P1-b（R3 护栏②）：单会话累计「丢弃占比」上限 30%。
     ///
-    /// P1-b（R3 护栏②）：单会话累计「丢弃占比」上限 30%。分子 = 台账累计的丢弃字符
-    /// （摘要成功后原文扣除保留头部）；分母 = **本次调用时 ctx.messages 里全部 tool
-    /// 消息的现存体量快照**（含小条目与已摘要消息的保留部分——它们是被保留的信息
-    /// 锚点）。用快照而非累计分母：同一条消息在多轮间不会被重复入账推高分母
-    /// （否则按轮数 N 变相放宽上限，ocr PR#65 第二轮评审）。
+    /// 记账模型（ocr PR#65 第三轮评审修订）：
+    /// - 分子 `lost` = 累计丢弃字符。丢弃量按「原文 − 保留头部(2000) − 摘要实际
+    ///   保留量(≤800，投影时按上限估计) − 标记开销」计——摘要按 prompt 约束保留了
+    ///   数值/实体/结论，不是零信息，计入保留量后护栏是**节流**而非整体关停；
+    /// - 分母 = **每个候选现算**的 ctx.messages 里 tool 消息现存体量（同轮先前
+    ///   摘要替换过的消息按替换后体积计），不用一次性快照——max_per_round>1 时
+    ///   后续候选仍用压缩前分母会绕过上限；
+    /// - **预占账-回滚**：投影通过即在锁内预占 `lost += delta`，LLM 失败回滚为
+    ///   原值、成功按实际摘要长度重算——check-then-act 不原子会让并发同会话
+    ///   双双通过投影、实际丢弃超限。
     /// 投影 `lost' * 10 > total_now * 3` 且 `total_now ≥ 12000` 才拒绝。
-    /// 锁纪律对齐 `maybe_history_summary`：计数快照读取后**先释放锁再 await LLM**，
-    /// 成功后在短暂重取锁内记账——否则共享 AgentCore 上所有并发会话的摘要阶段
-    /// 被慢 provider 串行化。
+    /// 锁纪律对齐 `maybe_history_summary`：投影/记账在短锁内完成，LLM await 不持锁。
     async fn maybe_summarize_tool_outputs(
         &self,
         session_id: &str,
@@ -8667,8 +8666,12 @@ impl AgentCore {
         const SUMMARY_SHARE_CAP_DEN: u64 = 10;
         const SUMMARY_SHARE_FLOOR_CHARS: u64 = 12_000;
         const RAW_RETAIN_CHARS: usize = 2000;
+        // 摘要保留量估计：prompt 约束 ≤800 字 + 溯源标记/原文头标注开销
+        const SUMMARY_RETAINED_EST: usize = 800;
+        const REPLACEMENT_OVERHEAD: usize = 100;
         // 台账容量上限：对齐 history_summary_cache 的 `len() >= 200 { clear() }` 约定
         const LEDGER_MAX_ENTRIES: usize = 200;
+        let retained_est = RAW_RETAIN_CHARS + SUMMARY_RETAINED_EST + REPLACEMENT_OVERHEAD;
         let cfg = &self.orchestration.cfg.tool_summary;
         if cfg.max_per_round == 0 {
             tracing::debug!(target: "orchestration.summary",
@@ -8682,43 +8685,57 @@ impl AgentCore {
             .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
             .sum::<usize>() as u64
             / 4;
-        // 分母快照：当前上下文里全部 tool 消息的现存体量（本方法自身消息不会被计入，
-        // 因为 filter 的都是 role=tool）
-        let total_now: u64 = messages
-            .iter()
-            .filter(|m| m.role == "tool")
-            .map(|m| m.content.as_ref().map(|c| c.chars().count()).unwrap_or(0) as u64)
-            .sum();
+        let tool_total_now = |msgs: &Vec<Message>| -> u64 {
+            msgs.iter()
+                .filter(|m| m.role == "tool")
+                .map(|m| m.content.as_ref().map(|c| c.chars().count()).unwrap_or(0) as u64)
+                .sum()
+        };
         let mut summarized_this_round = 0usize;
-        for m in messages.iter_mut().filter(|m| m.role == "tool") {
+        // 索引循环：分母现算需要不可变借用 messages，与 iter_mut 的可变借用互斥，
+        // 故用下标顺序借用（候选内容克隆一份，替换写回时不再持有旧借用）
+        for idx in 0..messages.len() {
             if summarized_this_round >= cfg.max_per_round {
                 break;
             }
-            let Some(content) = m.content.as_ref() else {
-                continue;
+            let (is_candidate, chars) = {
+                let m = &messages[idx];
+                match (m.role == "tool", m.content.as_deref()) {
+                    (false, _) => (false, 0),
+                    (true, None) => (false, 0),
+                    (true, Some(content)) => {
+                        let chars = content.chars().count();
+                        // 已摘要消息：其丢弃量已在成功当轮入账，现存体积已在分母现算中体现
+                        (!content.starts_with(MARKER) && chars > cfg.threshold_chars, chars)
+                    }
+                }
             };
-            // 单次字符计数复用：跳过判定/截断标记/日志都用同一值，避免对超长
-            // 输出重复全量扫描（ocr perf·low 修复）。
-            let chars = content.chars().count();
-            // 已摘要消息：其丢弃量已在成功当轮入账，现存体积已在 total_now 体现
-            if content.starts_with(MARKER) || chars <= cfg.threshold_chars {
+            if !is_candidate {
                 continue;
             }
-            // 投影检查用的分子快照（锁在此释放，LLM await 期间不持锁）
-            let lost = {
+            let content: String = messages[idx].content.clone().unwrap_or_default();
+            // 投影 + 预占账（同一短锁内原子完成）；LLM await 不持锁
+            let lost_delta_est = (chars as u64).saturating_sub(retained_est as u64);
+            let total_now = tool_total_now(&messages);
+            let (lost_before, claimed) = {
                 let mut g = self.tool_summary_ledger.lock().await;
                 if g.len() >= LEDGER_MAX_ENTRIES {
                     g.clear();
                 }
-                *g.entry(session_id.to_string()).or_insert(0)
+                let lost = *g.entry(session_id.to_string()).or_insert(0);
+                let proj_lost = lost + lost_delta_est;
+                if total_now >= SUMMARY_SHARE_FLOOR_CHARS
+                    && proj_lost * SUMMARY_SHARE_CAP_DEN > total_now * SUMMARY_SHARE_CAP_NUM
+                {
+                    (lost, false)
+                } else {
+                    *g.entry(session_id.to_string()).or_insert(0) += lost_delta_est;
+                    (lost, true)
+                }
             };
-            let lost_delta = (chars as u64).saturating_sub(RAW_RETAIN_CHARS as u64);
-            let proj_lost = lost + lost_delta;
-            if total_now >= SUMMARY_SHARE_FLOOR_CHARS
-                && proj_lost * SUMMARY_SHARE_CAP_DEN > total_now * SUMMARY_SHARE_CAP_NUM
-            {
+            if !claimed {
                 tracing::info!(target: "orchestration.summary",
-                    session = %session_id, lost, total_now, incoming = chars,
+                    session = %session_id, lost = lost_before, total_now, incoming = chars,
                     "工具摘要累计丢弃占比将超 30% 上限，本条保留原文（防长会话渐进信息丢失）");
                 continue;
             }
@@ -8745,6 +8762,9 @@ impl AgentCore {
             {
                 tracing::warn!(target: "orchestration.summary", err = %e,
                     "摘要预算不足（含下一主循环预留），保留原文");
+                // 预算拒绝也回滚预占账
+                let mut g = self.tool_summary_ledger.lock().await;
+                *g.entry(session_id.to_string()).or_insert(0) = lost_before;
                 break;
             }
             let req = vec![Message {
@@ -8756,6 +8776,7 @@ impl AgentCore {
             // 辅助 LLM 调用走 routed_llm（与主循环同一套难度路由 + provider failover/retry），
             // 并计入 LLM 调用计数；chat_single 保证按预算估算执行单次调用（不进 Best-of-N）。
             self.metrics.inc_llm_calls();
+            let tool_call_id_snapshot = messages[idx].tool_call_id.clone();
             match self.routed_llm.chat_single(&req, &[]).await {
                 Ok(r) if !r.text.trim().is_empty() => {
                     let resp_est = (r.text.chars().count() as u64) / 4;
@@ -8763,7 +8784,7 @@ impl AgentCore {
                     self.metrics.inc_tool_summary();
                     summarized_this_round += 1;
                     tracing::info!(target: "orchestration.summary",
-                        tool_call_id = ?m.tool_call_id,
+                        tool_call_id = ?tool_call_id_snapshot,
                         chars_before = chars,
                         chars_after = r.text.chars().count(),
                         "工具结果已 LLM 摘要");
@@ -8771,21 +8792,32 @@ impl AgentCore {
                     // 因摘要遗漏而永久丢失（摘要 + 原文头部仍然显著压缩超长输出）。
                     // P1-b（R3 护栏①）：摘要头部携带溯源信息（tool_call_id + 原始字数），
                     // 明确该块是「不可信机器摘要」，原文另有保留。
+                    let summary_len = r.text.chars().count().min(SUMMARY_RETAINED_EST);
                     let raw_head: String = content.chars().take(RAW_RETAIN_CHARS).collect();
                     let truncated = content.chars().count() > RAW_RETAIN_CHARS;
-                    m.content = Some(format!(
+                    messages[idx].content = Some(format!(
                         "{MARKER}(溯源: tool_call_id={:?}，原文 {chars} 字，摘要为 LLM 生成非原文)\n{}\n\n[原文保留前{RAW_RETAIN_CHARS}字]\n{}{}",
-                        m.tool_call_id,
+                        tool_call_id_snapshot,
                         r.text,
                         raw_head,
                         if truncated { "…" } else { "" }
                     ));
-                    // 成功记账：分子 += 实际丢弃（原文 - 保留头部）；分母是快照无需累计
+                    // 成功：按实际摘要长度重算丢弃量（绝对值写入，避免估计误差累积）
+                    let lost_delta_actual =
+                        (chars as u64).saturating_sub((RAW_RETAIN_CHARS + summary_len + REPLACEMENT_OVERHEAD) as u64);
                     let mut g = self.tool_summary_ledger.lock().await;
-                    *g.entry(session_id.to_string()).or_insert(0) += lost_delta;
+                    *g.entry(session_id.to_string()).or_insert(0) = lost_before + lost_delta_actual;
                 }
-                Ok(_) => tracing::warn!(target: "orchestration.summary", "摘要返回空文本，保留原文"),
-                Err(e) => tracing::warn!(target: "orchestration.summary", err = %e, "摘要失败，保留原文"),
+                Ok(_) => {
+                    tracing::warn!(target: "orchestration.summary", "摘要返回空文本，保留原文");
+                    let mut g = self.tool_summary_ledger.lock().await;
+                    *g.entry(session_id.to_string()).or_insert(0) = lost_before;
+                }
+                Err(e) => {
+                    tracing::warn!(target: "orchestration.summary", err = %e, "摘要失败，保留原文");
+                    let mut g = self.tool_summary_ledger.lock().await;
+                    *g.entry(session_id.to_string()).or_insert(0) = lost_before;
+                }
             }
         }
     }
@@ -12454,8 +12486,9 @@ impl AgentCore {
     }
 
     /// P1-d（R5）：确定性统计工具返回的记录条数——JSON 数组、或含 items/data/results/
-    /// rows/list 数组字段的对象取长度；**其余格式返回 None（条数未识别）**。
-    /// 行数对嵌套/pretty JSON 会虚高一个数量级，宁缺毋滥（ocr PR#65 评审）。
+    /// rows/list 数组字段的对象取长度（**识别的空数组返回 Some(0)**，与顶层空数组一致）；
+    /// **其余格式返回 None（条数未识别）**。行数对嵌套/pretty JSON 会虚高一个数量级，
+    /// 宁缺毋滥（ocr PR#65 评审）。
     fn count_data_records(s: &str) -> Option<usize> {
         let count_array = |v: &serde_json::Value| -> Option<usize> {
             v.as_array().map(|a| a.len())
@@ -12468,9 +12501,7 @@ impl AgentCore {
             for key in ["items", "data", "results", "rows", "list"] {
                 if let Some(arr) = o.get(key) {
                     if let Some(n) = count_array(arr) {
-                        if n > 0 {
-                            return Some(n);
-                        }
+                        return Some(n);
                     }
                 }
             }
@@ -12819,16 +12850,11 @@ impl AgentCore {
         // 4. LLM 提炼 ≤5 pattern（严格：只要可复用工程/运营规则）。
         // P1-d：观察带序号喂给 LLM，要求每条 pattern 行末标注【依据: 序号】，
         // 程序解析后映射回观察内存 ID 作为 evidence 指针（可回溯，防「pattern 凭空出现」）。
-        // P2-2：prompt 字面量收敛到 pattern_extraction_prompt（与评估共用同一来源，防漂移）。
-        let obs_text = obs_lines
-            .iter()
-            .enumerate()
-            .map(|(i, l)| format!("[{}] {}", i + 1, l))
-            .collect::<Vec<_>>()
-            .join("\n- ");
-        let prompt = AgentCore::pattern_extraction_prompt(
+        // P2-2：prompt 字面量收敛到 pattern_extraction_prompt（与评估共用同一来源，防漂移）；
+        // `included` = 6000 字窗口内实际可见的观察数，引用合法性以它为上界。
+        let (prompt, included) = AgentCore::pattern_extraction_prompt(
             &format!("合格 {} / 本批拉取 {}，命名空间 {}", obs_lines.len(), items.len(), ns),
-            &obs_text,
+            &obs_lines,
         );
         let msg = crate::llm::Message {
             role: "system".to_string(),
@@ -12866,14 +12892,16 @@ impl AgentCore {
         }
 
         // 5. 写回 pattern（≤5，再过一道写库过滤）。
-        // P1-d：共享引用解析器（引用区在 `】` 截断，行尾数字不误入）→ 映射观察内存 ID
+        // P1-d：共享引用解析器（引用区在 `】` 截断，行尾数字不误入）；序号上界用
+        // `included`（6000 字窗口内实际可见的观察数），窗口外观察的引用一律无效
+        // → 映射观察内存 ID（evidence 指针）
         let clean_patterns: Vec<(String, Vec<usize>)> = reply
             .lines()
             .map(|l| l.trim())
             .filter(|l| !l.is_empty())
             .take(8) // 先多取，过滤后再截断
             .map(|l| {
-                let (p, c) = AgentCore::parse_pattern_citation(l, obs_lines.len());
+                let (p, c) = AgentCore::parse_pattern_citation(l, included);
                 let p = p
                     .trim_start_matches(|c: char| {
                         c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' ' || c == '*'
@@ -12950,6 +12978,7 @@ impl AgentCore {
 
         // 7. B 阶段：NER（默认跳过，避免大批 mention 拖垮进程）
         if written > 0 && !skip_ner {
+            let obs_text = obs_lines.join("\n- ");
             let entity_prompt = format!(
                 "你负责从以下观察和已提炼模式中识别实体（person/system/tool/concept/org/project/location/event）及关系。\
                  仅输出纯 JSON，不要任何前缀后缀。\
@@ -13265,18 +13294,43 @@ impl AgentCore {
     /// consolidate_eval 必须共用同一份（评估基线测的就是生产行为；两处复制粘贴必然
     /// 漂移，届时历史基线测的就不是正在运行的 prompt，ocr PR#65 评审 high）。
     /// `scope` 为「## 待巩固观察（…）」括号内的范围说明。
-    pub(crate) fn pattern_extraction_prompt(scope: &str, obs_text: &str) -> String {
-        format!(
-            "你是知识巩固引擎。只从观察中提炼**可长期复用**的高层规则（架构取舍、运维约束、业务偏好、排障经验）。\n\
-             硬性禁止写成 pattern：\n\
-             - 一次性会话过程、工具回显、文件路径流水账、cron 任务日志\n\
-             - 测试/冒烟/世界杯等无关话题\n\
-             - 复述某条观察原文、或过短空话\n\
-             每条模式一行、一句话、具体可执行，最多 5 条；行末必须标注支撑它的观察序号，格式如【依据: 1,3】。\n\
-             若无可提炼内容，只输出「无模式」。\n\n\
-             ## 待巩固观察（{}）\n- {}",
-            scope,
-            obs_text.chars().take(6000).collect::<String>()
+    ///
+    /// 返回 `(prompt, 纳入观察数)`：prompt 只喂前 6000 字，被截断在窗口外的观察
+    /// 模型从未见过——引用解析的 `max_n` 必须用**实际纳入数**而非全量数，否则
+    /// 幻觉序号会被记成「模型没看过的观察」的证据（ocr PR#65 第三轮评审）。
+    pub(crate) fn pattern_extraction_prompt(scope: &str, obs_lines: &[String]) -> (String, usize) {
+        let obs_text = obs_lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("[{}] {}", i + 1, l))
+            .collect::<Vec<_>>()
+            .join("\n- ");
+        // 数出完整落在 6000 字窗口内的观察条数（join 分隔符 3 字计入长度）
+        let mut included = 0usize;
+        let mut used = 0usize;
+        for (i, l) in obs_lines.iter().enumerate() {
+            let entry_len = format!("[{}] {}", i + 1, l).chars().count() + if i > 0 { 3 } else { 0 };
+            if used + entry_len > 6000 {
+                break;
+            }
+            used += entry_len;
+            included += 1;
+        }
+        let included = included.max(1); // 首条超长也至少纳入 1 条（prompt 行为与 take(6000) 一致：首条部分可见）
+        (
+            format!(
+                "你是知识巩固引擎。只从观察中提炼**可长期复用**的高层规则（架构取舍、运维约束、业务偏好、排障经验）。\n\
+                 硬性禁止写成 pattern：\n\
+                 - 一次性会话过程、工具回显、文件路径流水账、cron 任务日志\n\
+                 - 测试/冒烟/世界杯等无关话题\n\
+                 - 复述某条观察原文、或过短空话\n\
+                 每条模式一行、一句话、具体可执行，最多 5 条；行末必须标注支撑它的观察序号，格式如【依据: 1,3】。\n\
+                 若无可提炼内容，只输出「无模式」。\n\n\
+                 ## 待巩固观察（{}）\n- {}",
+                scope,
+                obs_text.chars().take(6000).collect::<String>()
+            ),
+            included,
         )
     }
 

@@ -145,16 +145,13 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
     let positives = EVAL_SET.iter().filter(|c| c.expect_pattern).count();
     let negatives = EVAL_SET.len() - positives;
 
-    // 与生产相同的 prompt（共享字面量）+ 编号观察；仅原料与范围说明换成评估题集
-    let obs_text = EVAL_SET
-        .iter()
-        .enumerate()
-        .map(|(i, c)| format!("[{}] {}", i + 1, c.obs))
-        .collect::<Vec<_>>()
-        .join("\n- ");
-    let prompt = AgentCore::pattern_extraction_prompt(
-        &format!("评估题集：正例 {} / 负例 {}，命名空间 {}", positives, negatives, ns),
-        &obs_text,
+    // 与生产相同的 prompt（共享字面量）+ 编号观察。scope 用**中性表述**（只报条数与
+    // 命名空间）——「正例 6/负例 4」会向被测模型泄露评估结构，使其比生产更保守，
+    // 压低 hit_rate 且对不同措辞敏感度不同（ocr PR#65 第三轮评审）。
+    let obs_lines: Vec<String> = EVAL_SET.iter().map(|c| c.obs.to_string()).collect();
+    let (prompt, included) = AgentCore::pattern_extraction_prompt(
+        &format!("候选观察 {} 条，命名空间 {}", EVAL_SET.len(), ns),
+        &obs_lines,
     );
     let msg = crate::llm::Message {
         role: "system".to_string(),
@@ -176,7 +173,8 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
     let no_patterns =
         reply == "无模式" || (reply.contains("无模式") && reply.chars().count() < 20);
 
-    // 解析：与生产同规则（take(8) 候选 → 过门槛 → take(5)），引用解析共享 parse_pattern_citation
+    // 解析：与生产同规则（take(8) 候选 → 过门槛 → take(5)），引用解析共享
+    // parse_pattern_citation；序号上界 = `included`（6000 字窗口内实际可见数）
     let mut findings: Vec<PatternFinding> = Vec::new();
     for line in reply
         .lines()
@@ -184,7 +182,7 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
         .filter(|l| !l.is_empty())
         .take(8)
     {
-        let (text, cites) = AgentCore::parse_pattern_citation(line, EVAL_SET.len());
+        let (text, cites) = AgentCore::parse_pattern_citation(line, included);
         let text = text
             .trim_start_matches(|c: char| {
                 c.is_numeric() || c == '.' || c == '-' || c == '、' || c == ' ' || c == '*'
@@ -313,8 +311,12 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
 /// 读取历史评估的基线序列（跨次比较用；按文件名时间戳升序）。
 /// **只返回 `outcome=ok` 且版本等于当前题集的报告**——空回复/无模式轮没有基线意义，
 /// 跨题集版本的数字不可比（见 EVAL_SET_VERSION）。
+/// 三类跳过都留痕（ocr PR#65 第三轮评审）：读文件/解析失败与字段缺失 warn（可能
+/// 是 serde 字段名漂移或报告损坏，值得人看一眼）；版本不匹配 debug + 汇总一行——
+/// 否则「20 份报告全部损坏」与「从未跑过评估」返回同一个空 Vec，调用方无从区分。
 pub fn list_past_hit_rates() -> Vec<(String, u32, f64)> {
     let mut out: Vec<(String, u32, f64)> = Vec::new();
+    let mut skipped_version = 0u32;
     let dir = std::path::Path::new("data/consolidate_eval");
     let mut names: Vec<_> = std::fs::read_dir(dir)
         .map(|rd| {
@@ -326,28 +328,46 @@ pub fn list_past_hit_rates() -> Vec<(String, u32, f64)> {
         .unwrap_or_default();
     names.sort();
     for path in names {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                if v["outcome"].as_str() != Some("ok") {
-                    continue;
-                }
-                let version = v["eval_set_version"].as_u64().unwrap_or(0) as u32;
-                if version != EVAL_SET_VERSION {
-                    continue;
-                }
-                // 字段缺失/不可解析 → **丢弃该记录**，不得默认 0.0——伪造的 0.0 与
-                // 真实最差分不可区分，会毒化 P3 的 keep/discard 基线
-                // （ocr PR#65 第二轮评审）
-                let Some(rate) = v["positive_hit_rate"].as_f64() else {
-                    continue;
-                };
-                let ts = v["ts"]
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| path.display().to_string());
-                out.push((ts, version, rate));
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(target: "consolidate_eval", path = %path.display(), error = %e,
+                    "P2-2: 基线报告读取失败，已跳过");
+                continue;
             }
+        };
+        let v = match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(target: "consolidate_eval", path = %path.display(), error = %e,
+                    "P2-2: 基线报告 JSON 解析失败，已跳过");
+                continue;
+            }
+        };
+        if v["outcome"].as_str() != Some("ok") {
+            continue;
         }
+        let version = v["eval_set_version"].as_u64().unwrap_or(0) as u32;
+        if version != EVAL_SET_VERSION {
+            skipped_version += 1;
+            continue;
+        }
+        // 字段缺失/不可解析 → **丢弃该记录并 warn**，不得默认 0.0——伪造的 0.0 与
+        // 真实最差分不可区分，会毒化 P3 的 keep/discard 基线
+        let Some(rate) = v["positive_hit_rate"].as_f64() else {
+            tracing::warn!(target: "consolidate_eval", path = %path.display(),
+                "P2-2: 基线报告缺 positive_hit_rate 字段（serde 字段名漂移？），已跳过");
+            continue;
+        };
+        let ts = v["ts"]
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        out.push((ts, version, rate));
+    }
+    if skipped_version > 0 {
+        tracing::debug!(target: "consolidate_eval", count = skipped_version,
+            "P2-2: {} 份基线报告因题集版本不匹配被排除（预期行为：跨版本不可比）", skipped_version);
     }
     out
 }
