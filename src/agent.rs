@@ -496,8 +496,13 @@ impl StanceCard {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw[start..=end]) else {
             return fallback(raw);
         };
-        // stance 必须是字符串；缺失视为解析失败（宁可降级也不猜）。
-        let Some(stance_raw) = v.get("stance").and_then(|x| x.as_str()) else {
+        // stance 必须是非空字符串；缺失**或空串**（模型常见空值输出）都视为解析
+        // 失败走降级——否则分布里会出现空键残缺文本（ocr PR#65 第五轮）。
+        let Some(stance_raw) = v
+            .get("stance")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.trim().is_empty())
+        else {
             return fallback(raw);
         };
         let norm = normalize_stance(stance_raw);
@@ -6270,23 +6275,27 @@ impl AgentCore {
             let (facts, total_lines) = Self::extract_step_facts(res);
             match facts {
                 Some(lines) if !lines.is_empty() => {
-                    // 措辞（ocr PR#65 第四轮）：N 是「有效行」数（非空且含字母数字），
-                    // 不是记录数也不是文件行数；不完整声明只在确有省略时给出
                     let incomplete = lines.len() < total_lines;
                     tool_ctx.push_str(&format!(
-                        "\n[步骤 {}] (id={}) 要点摘录（含数字/实体的有效行共 {} 行，此处摘 {} 行{}）：\n",
+                        "\n[步骤 {}] (id={}) 要点摘录（含数字/实体的有效行共 {} 行，摘 {} 行）：\n",
                         i + 1,
                         step_id,
                         total_lines,
-                        lines.len(),
-                        if incomplete {
-                            "，未列出的行请回答「详见原始结果」，不要臆测总量"
-                        } else {
-                            ""
-                        }
+                        lines.len()
                     ));
                     for f in &lines {
                         tool_ctx.push_str(&format!("- {}\n", f));
+                    }
+                    if incomplete {
+                        // 不完整时附**有界原文片段**（ocr PR#65 第五轮）：本函数返回值会
+                        // 替换 report，指向「原始结果」的引用是悬空的；清单型问题也不该
+                        // 只凭 5 行要点作答——原文片段直接随行，不依赖外部引用。
+                        const RAW_TAIL_CHARS: usize = 1200;
+                        let tail: String = res.chars().take(RAW_TAIL_CHARS).collect();
+                        tool_ctx.push_str(&format!(
+                            "（摘录不全，原文片段前 {} 字：）\n{}\n",
+                            RAW_TAIL_CHARS, tail
+                        ));
                     }
                 }
                 _ => {
@@ -8635,6 +8644,28 @@ impl AgentCore {
         }
     }
 
+    /// 解析摘要消息溯头条中的**丢弃量**（「原文 N 字」− 现存长度）——P1-b R3 无状态
+    /// 核算的数据源。字节算术：「原文 」7 字节，数字子串在「原文 」与「 字」之间
+    /// （ocr PR#65 第五轮 high：此前 p+3 切错位置，parse 恒失败、护栏恒 0）。
+    /// 格式契约由 `tool_summary_marker_round_trip` 单测锁死——MARKER 头格式变更须同步本解析。
+    fn tool_summary_discard_of(content: &str) -> u64 {
+        const MARKER: &str = "[工具结果摘要]";
+        if !content.starts_with(MARKER) {
+            return 0;
+        }
+        let Some(p) = content.find("原文 ") else {
+            return 0;
+        };
+        let rest = &content[p + "原文 ".len()..];
+        let Some(num_end) = rest.find(" 字") else {
+            return 0;
+        };
+        let Ok(orig) = rest[..num_end].parse::<u64>() else {
+            return 0;
+        };
+        orig.saturating_sub(content.chars().count() as u64)
+    }
+
     /// ADR-017 P3：工具结果 LLM 摘要（opt-in，默认关；开关关时本方法不进入热路径）。
     /// 只摘要 role=tool 且超过阈值的消息；每轮最多 `max_per_round` 条；
     /// 辅助 LLM 调用按估算计入同一 TurnBudget；摘要失败保留原文（由 squash 截断兜底）。
@@ -8680,29 +8711,19 @@ impl AgentCore {
             .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
             .sum::<usize>() as u64
             / 4;
-        // 无状态推导：已摘要消息的丢弃量（溯源头「原文 N 字」− 现存长度）
-        let discard_of = |content: &str| -> u64 {
-            if !content.starts_with(MARKER) {
-                return 0;
-            }
-            let orig = content
-                .find("原文 ")
-                .and_then(|p| content[p + 3..].find(" 字").map(|e| p + 3 + e))
-                .and_then(|end| content[..end].parse::<u64>().ok())
-                .unwrap_or(0);
-            orig.saturating_sub(content.chars().count() as u64)
-        };
-        let lost_so_far: u64 = messages
+        // 无状态推导：已摘要消息的丢弃量（溯源头「原文 N 字」− 现存长度）。
+        // 解析在 [`Self::tool_summary_discard_of`]（往返契约由单测锁死）。
+        let mut lost_so_far: u64 = messages
             .iter()
             .filter(|m| m.role == "tool")
-            .map(|m| discard_of(m.content.as_deref().unwrap_or("")))
+            .map(|m| Self::tool_summary_discard_of(m.content.as_deref().unwrap_or("")))
             .sum();
-        let total_now: u64 = messages
+        let mut total_now: u64 = messages
             .iter()
             .filter(|m| m.role == "tool")
             .map(|m| m.content.as_ref().map(|c| c.chars().count()).unwrap_or(0) as u64)
             .sum();
-        let any_summarized = lost_so_far > 0;
+        let mut any_summarized = lost_so_far > 0;
         // 候选收集 + 体积降序（判定与扫描顺序无关；大载荷收益最高优先）
         let mut candidates: Vec<(usize, usize)> = messages
             .iter()
@@ -8786,13 +8807,20 @@ impl AgentCore {
                     // 无状态丢弃核算的数据源，格式变更须同步 discard_of 解析。
                     let raw_head: String = content.chars().take(RAW_RETAIN_CHARS).collect();
                     let truncated = content.chars().count() > RAW_RETAIN_CHARS;
-                    messages[idx].content = Some(format!(
+                    let replacement = format!(
                         "{MARKER}(溯源: tool_call_id={:?}，原文 {chars} 字，摘要为 LLM 生成非原文)\n{}\n\n[原文保留前{RAW_RETAIN_CHARS}字]\n{}{}",
                         tool_call_id_snapshot,
                         r.text,
                         raw_head,
                         if truncated { "…" } else { "" }
-                    ));
+                    );
+                    // 同轮账目同步（ocr PR#65 第五轮）：max_per_round>1 时后续候选
+                    // 必须看到本条的丢弃与体量变化，否则第 2 条仍按首条豁免放行
+                    let new_len = replacement.chars().count() as u64;
+                    lost_so_far += (chars as u64).saturating_sub(new_len);
+                    total_now = total_now - (chars as u64) + new_len;
+                    any_summarized = true;
+                    messages[idx].content = Some(replacement);
                 }
                 Ok(_) => tracing::warn!(target: "orchestration.summary", "摘要返回空文本，保留原文"),
                 Err(e) => tracing::warn!(target: "orchestration.summary", err = %e, "摘要失败，保留原文"),
@@ -12465,10 +12493,11 @@ impl AgentCore {
         format!("洞见: {}", reply)
     }
 
-    /// P1-d（R5）/ocr PR#65 第四轮：解析完整 JSON 并**按记录边界**取前 k 条拼回 JSON 文本，
-    /// 使 (喂给模型的切片, Some(k)) 永远自洽——k 是模型实际可见的记录数，也是统计行
-    /// 出具的数。支持顶层数组与 items/data/results/rows/list 字段；不可解析时退化为
-    /// 字符截断并返回 None（调用方如实写「条数未识别」）。
+    /// P1-d（R5）/ocr PR#65 第四、五轮：解析完整 JSON 并**按记录边界**取前 k 条，
+    /// 使 (喂给模型的切片, Some(k)) 永远自洽——k 是模型实际可见的记录数。
+    /// 对象包裹时**重建 envelope**（截断后的数组塞回原对象，total 等同级字段保留）；
+    /// 数组字段用「对象中第一个数组值字段」通用探测（records/sample_records 等不再
+    /// 落回字符截断）。不可解析时退化为字符截断并返回 None（调用方如实标注）。
     fn truncate_json_records(s: &str, cap_chars: usize) -> (String, Option<usize>) {
         let fallback = || -> (String, Option<usize>) {
             (s.chars().take(cap_chars).collect(), None)
@@ -12476,24 +12505,31 @@ impl AgentCore {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(s.trim()) else {
             return fallback();
         };
-        let records: Option<&Vec<serde_json::Value>> = v
-            .as_array()
-            .or_else(|| {
-                v.as_object().and_then(|o| {
-                    ["items", "data", "results", "rows", "list"]
-                        .iter()
-                        .find_map(|k| o.get(*k).and_then(|x| x.as_array()))
-                })
-            });
-        let Some(records) = records else {
-            // 可解析但非记录数组（如聚合对象）：整体不超限时全量喂，超限按字段截断
+        // 定位记录数组：顶层数组，或对象中第一个数组值字段（通用，无键名白名单）
+        let (records, envelope_key): (&[serde_json::Value], Option<&str>) = if let Some(arr) =
+            v.as_array()
+        {
+            (arr.as_slice(), None)
+        } else if let Some(o) = v.as_object() {
+            match o.iter().find(|(_, x)| x.is_array()) {
+                Some((k, arr_val)) => (
+                    arr_val.as_array().map(|a| a.as_slice()).unwrap_or(&[]),
+                    Some(k.as_str()),
+                ),
+                None => (&[], None),
+            }
+        } else {
+            (&[], None)
+        };
+        if records.is_empty() && envelope_key.is_none() {
+            // 可解析但无记录数组（如聚合对象）：整体不超限时全量喂，超限按字符截断
             let text = serde_json::to_string(&v).unwrap_or_default();
             if text.chars().count() <= cap_chars {
                 return (text, None);
             }
             return fallback();
-        };
-        let mut used = 2usize; // "[]""
+        }
+        let mut used = 2usize; // "[]"
         let mut kept: Vec<&serde_json::Value> = Vec::new();
         for rec in records {
             let serialized = serde_json::to_string(rec).unwrap_or_default();
@@ -12504,13 +12540,21 @@ impl AgentCore {
             used += len;
             kept.push(rec);
         }
-        // 全部记录都放不下（单条超限）→ 至少保 1 条 + 字符截断，计数未知
         if kept.is_empty() {
             return fallback();
         }
         let k = kept.len();
-        let text = serde_json::to_string(&kept).unwrap_or_default();
-        (text, Some(k))
+        let kept_owned: Vec<serde_json::Value> = kept.into_iter().cloned().collect();
+        let rebuilt = match (&v, envelope_key) {
+            (serde_json::Value::Object(o), Some(key)) => {
+                // 重建 envelope：保留同级字段（total/count_by_day 等），替换记录数组
+                let mut m = o.clone();
+                m.insert(key.to_string(), serde_json::Value::Array(kept_owned));
+                serde_json::to_string(&serde_json::Value::Object(m)).unwrap_or_default()
+            }
+            _ => serde_json::to_string(&kept_owned).unwrap_or_default(),
+        };
+        (rebuilt, Some(k))
     }
 
     /// P2.2d：LLM 批量抽取 text_signals → `signal:*` tags（consolidate retain 路径）。
@@ -12943,6 +12987,7 @@ impl AgentCore {
             .await;
 
         let mut written = 0u64;
+        let mut write_failed = 0u64;
         for (i, (clean, cites)) in clean_patterns.iter().enumerate() {
             // P1-d evidence 指针：序号 + 内存 ID（ID 截前 5 个防 content 膨胀）；
             // 未标注依据时如实记「未标注」，不伪造可回溯性。
@@ -12971,8 +13016,16 @@ impl AgentCore {
             if let Some(st) = signal_tags_by_idx.get(i) {
                 crate::text_signals::enrich_remember_args(&mut args, st);
             }
-            let _ = mem_client.call("memory_remember", &args).await;
-            written += 1;
+            // 写入结果如实计数（ocr PR#65 第五轮）：patterns_added 被事件 JSON/HTTP
+            // 响应当指标消费，memoria 写失败仍 +1 会持续虚高（游标已推进不重试）
+            match mem_client.call("memory_remember", &args).await {
+                Ok(_) => written += 1,
+                Err(e) => {
+                    write_failed += 1;
+                    tracing::warn!(target: "consolidate", ns = %ns, error = %e,
+                        "pattern 写入 Memoria 失败（游标已推进，本条不重试）");
+                }
+            }
         }
 
         // 6. 回写本轮 items_out（游标已在 LLM 前推进）
@@ -13242,11 +13295,16 @@ impl AgentCore {
             fetched: items.len(),
             cursor: max_ts.clone(),
             detail: format!(
-                "从 {} 条合格观察提炼 {} 条 pattern（本批拉取 {}，跳过 {}，cursor→{}）",
+                "从 {} 条合格观察提炼 {} 条 pattern（本批拉取 {}，跳过 {}{}，cursor→{}）",
                 obs_lines.len(),
                 written,
                 items.len(),
                 skipped,
+                if write_failed > 0 {
+                    format!("，{} 条写入 Memoria 失败", write_failed)
+                } else {
+                    String::new()
+                },
                 max_ts
             ),
         }
@@ -15372,3 +15430,29 @@ mod whitelist_v11_tests {
     }
 }
 
+
+#[cfg(test)]
+mod tool_summary_accounting_tests {
+    use super::AgentCore;
+
+    /// P1-b R3 无状态核算的往返契约（ocr PR#65 第五轮）：构造 MARKER 头 →
+    /// tool_summary_discard_of 必须还原「原文 N 字 − 现存长度」。MARKER 头
+    /// 格式变更而忘记同步解析时，本测试先红。
+    #[test]
+    fn tool_summary_marker_round_trip() {
+        // 与 maybe_summarize_tool_outputs 成功分支的替换模板一致的头部
+        let content = "[工具结果摘要](溯源: tool_call_id=Some(\"tc-1\")，原文 16000 字，摘要为 LLM 生成非原文)\n这里是摘要正文。\n\n[原文保留前2000字]\n原始内容开头……";
+        let cur = content.chars().count() as u64;
+        assert_eq!(AgentCore::tool_summary_discard_of(content), 16000 - cur);
+
+        // 非 MARKER 消息：0
+        assert_eq!(AgentCore::tool_summary_discard_of("普通工具输出，无标记"), 0);
+        // MARKER 但头部破损（无「原文 N 字」）：0，不 panic
+        assert_eq!(AgentCore::tool_summary_discard_of("[工具结果摘要] 头部信息缺失"), 0);
+        // 数字非整数 / 超长：0
+        assert_eq!(
+            AgentCore::tool_summary_discard_of("[工具结果摘要](溯源: tool_call_id=None，原文 abc 字，摘要为 LLM 生成非原文)\n正文"),
+            0
+        );
+    }
+}

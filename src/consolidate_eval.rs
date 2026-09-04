@@ -130,7 +130,11 @@ pub struct EvalReport {
     pub patterns_valid: usize,
     /// 被有效 pattern 引用的正例数
     pub positive_hits: usize,
-    /// **北极星指标**：positive_hits / cases_positive（仅 outcome=ok 有意义）
+    /// **北极星指标**：`min(hits, 5) / min(positives, 5)`——生产 prompt 与写库都
+    /// 限额 5 条 pattern，按正例总数归一时 6 正例的可达上限是 5/6≈0.83，顶部
+    /// 变化会把「覆盖质量」与「多例合并行为」混在一起（ocr PR#65 第五轮）；
+    /// 按预算归一后 1.0 = 5 个不同正例各有 pattern 覆盖，合并超额不 inflate。
+    /// 第 6+ 个正例的覆盖仍可从 case_results 逐例读出。
     pub positive_hit_rate: f64,
     /// 次级指标：过门槛 pattern 文本包含正例关键词的正例数
     pub keyword_hits: usize,
@@ -283,10 +287,15 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
         outcome,
         patterns_valid: valid.len(),
         positive_hits,
-        positive_hit_rate: if positives > 0 {
-            positive_hits as f64 / positives as f64
-        } else {
-            0.0
+        positive_hit_rate: {
+            // 与生产预算一致的单轮 pattern 上限
+            const PATTERN_BUDGET: usize = 5;
+            let denom = positives.min(PATTERN_BUDGET);
+            if denom > 0 {
+                positive_hits.min(PATTERN_BUDGET) as f64 / denom as f64
+            } else {
+                0.0
+            }
         },
         keyword_hits,
         negative_leaks,
@@ -349,8 +358,12 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
 /// 或报告损坏，值得人看一眼）；版本不匹配 debug + 汇总一行——否则「20 份报告
 /// 全部损坏」与「从未跑过评估」返回同一个空 Vec，调用方无从区分。
 pub fn list_past_hit_rates() -> Vec<(String, u32, String, f64)> {
+    /// 上限：只读最近 `limit` 份报告（倒序早停）——报告无清理机制，全量重读
+    /// 会随历史次数线性变贵（ocr PR#65 第五轮）
+    const READ_LIMIT: usize = 50;
     let mut out: Vec<(String, u32, String, f64)> = Vec::new();
     let mut skipped_version = 0u32;
+    let mut skipped_outcome = 0u32;
     let dir = std::path::Path::new("data/consolidate_eval");
     let mut names: Vec<_> = std::fs::read_dir(dir)
         .map(|rd| {
@@ -361,7 +374,11 @@ pub fn list_past_hit_rates() -> Vec<(String, u32, String, f64)> {
         })
         .unwrap_or_default();
     names.sort();
-    for path in names {
+    // 倒序（新→旧）早停：只需最近 READ_LIMIT 份有效基线，不重读全部历史
+    for path in names.into_iter().rev() {
+        if out.len() >= READ_LIMIT {
+            break;
+        }
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
@@ -379,6 +396,7 @@ pub fn list_past_hit_rates() -> Vec<(String, u32, String, f64)> {
             }
         };
         if v["outcome"].as_str() != Some("ok") {
+            skipped_outcome += 1;
             continue;
         }
         let version = v["eval_set_version"].as_u64().unwrap_or(0) as u32;
@@ -400,9 +418,15 @@ pub fn list_past_hit_rates() -> Vec<(String, u32, String, f64)> {
         let ns = v["ns"].as_str().map(|s| s.to_string()).unwrap_or_default();
         out.push((ts, version, ns, rate));
     }
-    if skipped_version > 0 {
-        tracing::debug!(target: "consolidate_eval", count = skipped_version,
-            "P2-2: {} 份基线报告因题集版本不匹配被排除（预期行为：跨版本不可比）", skipped_version);
+    if skipped_version > 0 || skipped_outcome > 0 {
+        // outcome!=ok 的跳过也留痕（ocr PR#65 第五轮）：近期全部轮次都是
+        // gate_rejected/empty_reply 时，空序列必须是「可诊断的」而非与
+        // 「从未评估」不可区分——这正是题集想拦的 prompt 回归形态
+        tracing::debug!(target: "consolidate_eval",
+            version_skipped = skipped_version, outcome_skipped = skipped_outcome,
+            "P2-2: 基线读取跳过统计（版本不匹配/非 ok 结果）；若 outcome_skipped 持续增长需排查 prompt 回归");
     }
+    // 语义上按时间升序返回（读取顺序是新的在前）
+    out.reverse();
     out
 }
