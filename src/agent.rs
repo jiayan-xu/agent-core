@@ -456,12 +456,46 @@ pub struct RoundtableResult {
 /// 原 consolidate 返回人读 String，事件队列只能拿到转述文本。结构化后：
 /// 事件队列取字段拼 JSON summary（LLM 文本沉到 detail），HTTP/健康记录取 detail，
 /// 日志用 [`summary_line`](Self::summary_line)。
+/// P1-d/P2：consolidate 结果的机器可读状态（ocr PR#68 第四轮：字符串状态会
+/// 漏更新文档/打错字；枚举 + serde 让消费方可穷举匹配）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsolidateStatus {
+    /// 正常写回
+    Ok,
+    /// memoria 零观察（最常见的空转 tick——与「LLM 看到合格输入但提炼不出」
+    /// 必须可区分，后者才是 prompt 回归信号）
+    NoInput,
+    /// LLM 调用失败
+    LlmError,
+    /// 模型空响应
+    Empty,
+    /// 模型明说无模式
+    NoPatterns,
+    /// 候选全被写库门槛拒绝
+    GateRejected,
+    /// 部分写入失败
+    PartialWrite,
+}
+
+impl ConsolidateStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConsolidateStatus::Ok => "ok",
+            ConsolidateStatus::NoInput => "no_input",
+            ConsolidateStatus::LlmError => "llm_error",
+            ConsolidateStatus::Empty => "empty",
+            ConsolidateStatus::NoPatterns => "no_patterns",
+            ConsolidateStatus::GateRejected => "gate_rejected",
+            ConsolidateStatus::PartialWrite => "partial_write",
+        }
+    }
+}
+
 pub struct ConsolidateOutcome {
     pub ns: String,
-    /// 机器可读状态（ocr PR#68 第三轮：LLM 失败/空响应/无模式/门槛拒绝/部分写失败
-    /// 此前只能从 detail 中文文本猜，事件 JSON 与 /health.dream 无法编程区分）：
-    /// ok / llm_error / empty / no_patterns / gate_rejected
-    pub status: &'static str,
+    /// 机器可读状态（ocr PR#68 第三轮引入、第四轮枚举化；见 ConsolidateStatus）
+    pub status: ConsolidateStatus,
     /// 写回的 pattern 条数
     pub patterns_added: u64,
     /// 本批合格观察数（evidence 池）
@@ -12419,7 +12453,7 @@ impl AgentCore {
         if items.is_empty() {
             return ConsolidateOutcome {
                 ns: ns.to_string(),
-                status: "no_patterns",
+                status: ConsolidateStatus::NoInput,
                 patterns_added: 0,
                 observations: 0,
                 observations_visible: 0,
@@ -12441,6 +12475,7 @@ impl AgentCore {
         // 供 pattern 携带 evidence 指针回溯。
         let mut obs_lines: Vec<String> = Vec::new();
         let mut obs_ids: Vec<String> = Vec::new();
+        let mut obs_ts: Vec<String> = Vec::new();
         let mut max_ts = cursor_ts.clone();
         let mut skipped = 0u64;
         for it in &items {
@@ -12462,26 +12497,24 @@ impl AgentCore {
                         .unwrap_or("")
                         .to_string(),
                 );
+                obs_ts.push(
+                    it.get("created_at")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                );
             } else {
                 skipped += 1;
             }
         }
 
-        // 关键：先推进游标再跑 LLM，避免 LLM/NER 崩溃导致同批重复提炼污染 pattern
-        let _ = mem_client
-            .call(
-                "dream_state_update",
-                &serde_json::json!({
-                    "phase": "consolidate", "namespace": ns, "cursor_ts": max_ts, "items_out": 0
-                }),
-            )
-            .await;
+        // （游标推进移至 prompt 构造之后：见 window_cursor——ocr PR#68 第四轮）
 
         // 整批无合格原料
         if obs_lines.is_empty() {
             return ConsolidateOutcome {
                 ns: ns.to_string(),
-                status: "no_patterns",
+                status: ConsolidateStatus::NoInput,
                 patterns_added: 0,
                 observations: 0,
                 observations_visible: 0,
@@ -12519,6 +12552,28 @@ impl AgentCore {
         } else {
             String::new()
         };
+        // 关键：先推进游标再跑 LLM，避免 LLM/NER 崩溃导致同批重复提炼污染 pattern。
+        // 推进目标 = **窗口边界**（ocr PR#68 第四轮：整批 max_ts 会把 6000 字窗口
+        // 外的观察永久消费——常态下 ~28k 字批次只有 ~70 条可见，多数被静默丢弃；
+        // 游标只推到最后一条可见观察，窗口外留给下一轮 = 延迟而非丢失。同时间戳的
+        // 边界观察下一轮会重拉，属可接受的重复提取）
+        let window_cursor: String = if included < obs_lines.len() {
+            let later = obs_ts
+                .get(included.saturating_sub(1))
+                .cloned()
+                .unwrap_or_default();
+            if later.as_str() > max_ts.as_str() { max_ts.clone() } else { later }
+        } else {
+            max_ts.clone()
+        };
+        let _ = mem_client
+            .call(
+                "dream_state_update",
+                &serde_json::json!({
+                    "phase": "consolidate", "namespace": ns, "cursor_ts": window_cursor, "items_out": 0
+                }),
+            )
+            .await;
         let msg = crate::llm::Message {
             role: "system".to_string(),
             content: Some(prompt),
@@ -12530,7 +12585,7 @@ impl AgentCore {
             Err(e) => {
                 return ConsolidateOutcome {
                     ns: ns.to_string(),
-                    status: "llm_error",
+                    status: ConsolidateStatus::LlmError,
                     patterns_added: 0,
                     observations: obs_lines.len(),
                     observations_visible: included,
@@ -12549,8 +12604,8 @@ impl AgentCore {
             // Empty 与 NoPatterns 分开上报（ocr PR#68 第三轮：枚举区分了却被折进
             // 同一句「无模式」——空响应更像 provider 故障，值得单独观测）
             let (status, reason) = match parsed.kind {
-                PatternReplyKind::Empty => ("empty", "空响应"),
-                _ => ("no_patterns", "无模式"),
+                PatternReplyKind::Empty => (ConsolidateStatus::Empty, "空响应"),
+                _ => (ConsolidateStatus::NoPatterns, "无模式"),
             };
             return ConsolidateOutcome {
                 ns: ns.to_string(),
@@ -12559,14 +12614,14 @@ impl AgentCore {
                 observations: obs_lines.len(),
                 observations_visible: included,
                 fetched: items.len(),
-                cursor: max_ts.clone(),
+                cursor: window_cursor.clone(),
                 detail: format!(
                     "{}（合格观察 {}，跳过 {}{}，cursor→{}）",
                     reason,
                     obs_lines.len(),
                     skipped,
                     window_note,
-                    max_ts
+                    window_cursor
                 ),
             };
         }
@@ -12583,12 +12638,12 @@ impl AgentCore {
                 .count();
             return ConsolidateOutcome {
                 ns: ns.to_string(),
-                status: "gate_rejected",
+                status: ConsolidateStatus::GateRejected,
                 patterns_added: 0,
                 observations: obs_lines.len(),
                 observations_visible: included,
                 fetched: items.len(),
-                cursor: max_ts.clone(),
+                cursor: window_cursor.clone(),
                 detail: format!(
                     "LLM 产出未过写库门槛（候选 {}：门槛拒绝 {}，引用前置空正文 {}；合格观察 {}{}，cursor→{}）",
                     parsed.lines.len(),
@@ -12596,7 +12651,7 @@ impl AgentCore {
                     stripped_empty,
                     obs_lines.len(),
                     window_note,
-                    max_ts
+                    window_cursor
                 ),
             };
         }
@@ -12648,24 +12703,24 @@ impl AgentCore {
             // 响应当指标消费，memoria 写失败仍 +1 会持续虚高（游标已推进不重试）
             match mem_client.call("memory_remember", &args).await {
                 Ok(text) => {
-                    // MCP isError 结果以 Ok 文本返回（ocr PR#68 第三轮：transport Ok
-                    // 不等于业务成功——参数/配额/ns 策略拒绝都在 result.isError 里）
-                    let business_err = serde_json::from_str::<serde_json::Value>(&text)
+                    // 正向成功判定（ocr PR#68 第四轮 high：McpClient::call 只返回
+                    // result.content[0].text，isError 在客户端边界已被丢弃、探不到；
+                    // 改用 memory_remember 的成功回执——{"status":"remembered","id":…}。
+                    // 无法识别的回执按失败计（指标宁欠勿溢）
+                    let stored = serde_json::from_str::<serde_json::Value>(&text)
                         .ok()
-                        .and_then(|v| {
-                            v.get("result")
-                                .or(Some(&v))
-                                .and_then(|r| r.get("isError"))
-                                .and_then(|b| b.as_bool())
+                        .map(|v| {
+                            v.get("status").and_then(|x| x.as_str()) == Some("remembered")
+                                || v.get("id").and_then(|x| x.as_str()).is_some()
                         })
                         .unwrap_or(false);
-                    if business_err {
+                    if stored {
+                        written += 1;
+                    } else {
                         write_failed += 1;
                         tracing::warn!(target: "consolidate", ns = %ns,
-                            "pattern 写入被 Memoria 业务拒绝（isError，游标已推进不重试）：{}",
+                            "pattern 写入未获成功回执（业务拒绝/未知格式，游标已推进不重试）：{}",
                             text.chars().take(200).collect::<String>());
-                    } else {
-                        written += 1;
                     }
                 }
                 Err(e) => {
@@ -12678,7 +12733,7 @@ impl AgentCore {
 
         // 6. 回写本轮 items_out（游标已在 LLM 前推进）
         let _ = mem_client.call("dream_state_update", &serde_json::json!({
-            "phase": "consolidate", "namespace": ns, "cursor_ts": max_ts, "items_out": written
+            "phase": "consolidate", "namespace": ns, "cursor_ts": window_cursor, "items_out": written
         })).await;
 
         // 7. B 阶段：NER（默认跳过，避免大批 mention 拖垮进程）
@@ -12938,12 +12993,16 @@ impl AgentCore {
 
         ConsolidateOutcome {
             ns: ns.to_string(),
-            status: if write_failed > 0 { "partial_write" } else { "ok" },
+            status: if write_failed > 0 {
+                ConsolidateStatus::PartialWrite
+            } else {
+                ConsolidateStatus::Ok
+            },
             patterns_added: written,
             observations: obs_lines.len(),
             observations_visible: included,
             fetched: items.len(),
-            cursor: max_ts.clone(),
+            cursor: window_cursor.clone(),
             detail: format!(
                 "从 {} 条合格观察提炼 {} 条 pattern（本批拉取 {}，跳过 {}{}{}，cursor→{}）",
                 obs_lines.len(),
@@ -12956,7 +13015,7 @@ impl AgentCore {
                     String::new()
                 },
                 window_note,
-                max_ts
+                window_cursor
             ),
         }
     }

@@ -29,6 +29,9 @@ use crate::agent::{AgentCore, PatternReplyKind, CONSOLIDATE_MIN_OBS_CHARS_DEFAUL
 /// `list_past_hit_rates` 按版本过滤，P3 进化循环不会把跨版本数字当序列比较。
 pub const EVAL_SET_VERSION: u32 = 2;
 
+/// v2 题集内容指纹（eval_set_content_fingerprint 锁定；改用例须同步递增版本与指纹）
+pub const EVAL_SET_V2_FINGERPRINT: u64 = 6055525382911605762;
+
 /// 评估用例。`expect_pattern=false` 的观察是 prompt 禁区样本（理想行为：不被引用）。
 struct EvalCase {
     obs: &'static str,
@@ -113,9 +116,41 @@ pub struct CaseResult {
     pub leaked: bool,
 }
 
+/// P2-2：评估结果的类型化状态（ocr PR#68 第四轮：字符串两端（写 match arm 与
+/// 读侧 != "ok"）各自打字/改名会静默丢弃全部基线——枚举 + serde 保持磁盘
+/// JSON 字节不变的同时让生产/消费对编译期可查）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalOutcome {
+    Ok,
+    NoPatterns,
+    GateRejected,
+    EmptyReply,
+}
+
+impl EvalOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EvalOutcome::Ok => "ok",
+            EvalOutcome::NoPatterns => "no_patterns",
+            EvalOutcome::GateRejected => "gate_rejected",
+            EvalOutcome::EmptyReply => "empty_reply",
+        }
+    }
+}
+
+impl std::fmt::Display for EvalOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// 评估报告（JSON 序列化后原子落盘，供跨次比较）
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EvalReport {
+    /// 产生本报告的模型/路由（ocr PR#68 第四轮：config.llm 可变，换模型或温度
+    /// 的两轮 v2 之间的 hit_rate 变化与 prompt 回归无法区分——必须随报告落盘）
+    pub model: String,
     pub ns: String,
     pub eval_set_version: u32,
     /// 6000 字窗口内实际可见的观察数（< 题集大小时尾部用例从未展示给模型——
@@ -123,9 +158,7 @@ pub struct EvalReport {
     pub observations_visible: usize,
     pub cases_positive: usize,
     pub cases_negative: usize,
-    /// ok：有有效 pattern，hit_rate 可比；no_patterns：模型明说无模式；
-    /// gate_rejected：有候选但全部未过写库门槛；empty_reply：模型空响应
-    pub outcome: String,
+    pub outcome: EvalOutcome,
     /// 过写库门槛（pattern_ok_for_consolidate）的 pattern 数（与生产一致：先 take(8) 后 take(5)）
     pub patterns_valid: usize,
     /// 被有效 pattern 引用的正例数
@@ -148,7 +181,14 @@ pub struct EvalReport {
 
 /// 纯评分函数（ocr PR#68：评分与 LLM 调用解耦，回归测试不花真实调用）。
 /// `included` = pattern_extraction_prompt 返回的可见观察数（引用上界）。
-fn score_reply(reply: &str, included: usize, ns: &str, duration_ms: u64, ts: String) -> EvalReport {
+fn score_reply(
+    reply: &str,
+    included: usize,
+    ns: &str,
+    model: &str,
+    duration_ms: u64,
+    ts: String,
+) -> EvalReport {
     let positives = EVAL_SET.iter().filter(|c| c.expect_pattern).count();
     let negatives = EVAL_SET.len() - positives;
     let parsed = AgentCore::parse_pattern_reply(reply, included);
@@ -206,15 +246,15 @@ fn score_reply(reply: &str, included: usize, ns: &str, duration_ms: u64, ts: Str
     let negative_leaks = case_results.iter().filter(|r| r.leaked).count();
     let patterns_missing_citations = valid.iter().filter(|f| f.cites.is_empty()).count();
     let outcome = match parsed.kind {
-        PatternReplyKind::Empty => "empty_reply",
-        PatternReplyKind::NoPatterns => "no_patterns",
-        PatternReplyKind::Valid if valid.is_empty() => "gate_rejected",
-        PatternReplyKind::Valid => "ok",
-    }
-    .to_string();
+        PatternReplyKind::Empty => EvalOutcome::EmptyReply,
+        PatternReplyKind::NoPatterns => EvalOutcome::NoPatterns,
+        PatternReplyKind::Valid if valid.is_empty() => EvalOutcome::GateRejected,
+        PatternReplyKind::Valid => EvalOutcome::Ok,
+    };
     let denom = positives.min(PATTERN_BUDGET);
     EvalReport {
         ns: ns.to_string(),
+        model: model.to_string(),
         eval_set_version: EVAL_SET_VERSION,
         observations_visible: included,
         cases_positive: positives,
@@ -273,7 +313,12 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
         .to_string();
 
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
-    let report = score_reply(&reply, included, ns, started.elapsed().as_millis() as u64, ts);
+    let model = format!(
+        "{}@{}",
+        agent.config.llm.model,
+        agent.config.llm.base_url
+    );
+    let report = score_reply(&reply, included, ns, &model, started.elapsed().as_millis() as u64, ts);
 
     // 原子落盘 data/consolidate_eval/<毫秒时间戳>.json：tmp + rename（对齐仓库
     // write_meetings_file / experience_memo 约定）。整块 fs I/O 在 spawn_blocking
@@ -321,7 +366,7 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
 /// **只返回 `outcome=ok` 且版本等于当前题集的报告**；元组携带 `ns`（P3 消费方按
 /// ns 分组后再比较，防 agent_id 变更/多实例混序列）。
 /// 异步封装（ocr PR#68）：内部 fs 全在 spawn_blocking，async 调用方直用即可。
-pub async fn list_past_hit_rates() -> Vec<(String, u32, String, f64)> {
+pub async fn list_past_hit_rates() -> Vec<(String, u32, String, String, f64)> {
     let dir = std::path::PathBuf::from("data/consolidate_eval");
     match tokio::task::spawn_blocking(move || list_past_hit_rates_blocking(&dir)).await {
         Ok(v) => v,
@@ -337,11 +382,11 @@ pub async fn list_past_hit_rates() -> Vec<(String, u32, String, f64)> {
 /// 否则「20 份报告全部损坏」与「从未跑过评估」返回同一个空 Vec，调用方无从区分。
 /// **read_dir 失败区分 ErrorKind**：NotFound = 合法空（从未评估）；其他错误
 /// （权限/句柄耗尽/CWD 漂移）warn 留痕而非静默当空（ocr PR#68）。
-fn list_past_hit_rates_blocking(dir: &std::path::Path) -> Vec<(String, u32, String, f64)> {
+fn list_past_hit_rates_blocking(dir: &std::path::Path) -> Vec<(String, u32, String, String, f64)> {
     /// 只收最近 N 份**有效**基线（倒序早停）；全部被跳过时会扫完全部历史——
     /// 这是刻意的：连续 gate_rejected 正是要暴露的回归形态，不能提前停
     const READ_LIMIT: usize = 50;
-    let mut out: Vec<(String, u32, String, f64)> = Vec::new();
+    let mut out: Vec<(String, u32, String, String, f64)> = Vec::new();
     let mut skipped_version = 0u32;
     let mut skipped_outcome = 0u32;
     let mut skipped_window = 0u32;
@@ -383,7 +428,7 @@ fn list_past_hit_rates_blocking(dir: &std::path::Path) -> Vec<(String, u32, Stri
                 continue;
             }
         };
-        if rep.outcome != "ok" {
+        if rep.outcome != EvalOutcome::Ok {
             skipped_outcome += 1;
             continue;
         }
@@ -399,7 +444,7 @@ fn list_past_hit_rates_blocking(dir: &std::path::Path) -> Vec<(String, u32, Stri
         }
         let rate = rep.positive_hit_rate;
         let ts = rep.ts;
-        out.push((ts, rep.eval_set_version, rep.ns, rate));
+        out.push((ts, rep.eval_set_version, rep.ns, rep.model, rate));
     }
     if skipped_version > 0 || skipped_outcome > 0 || skipped_window > 0 {
         tracing::debug!(target: "consolidate_eval",
@@ -426,9 +471,28 @@ mod tests {
                 "用例 {} 未过生产原料门槛（≥{} 字）：{}",
                 i + 1,
                 CONSOLIDATE_MIN_OBS_CHARS_DEFAULT,
-                &c.obs[..30.min(c.obs.len())]
+                c.obs.chars().take(30).collect::<String>()
             );
         }
+    }
+
+    /// 题集内容指纹（ocr PR#68 第四轮：版本递增纯靠手动——改用例忘 bump 时新旧
+    /// 运行混进同一基线序列。指纹 = 逐用例 hash(obs, expect, keywords)，与
+    /// EVAL_SET_VERSION 配对快照；改内容必须同时递增版本并更新本常量）
+    #[test]
+    fn eval_set_content_fingerprint() {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for c in EVAL_SET {
+            c.obs.hash(&mut h);
+            c.expect_pattern.hash(&mut h);
+            c.keywords.hash(&mut h);
+        }
+        let fp = h.finish();
+        assert_eq!(
+            fp, EVAL_SET_V2_FINGERPRINT,
+            "EVAL_SET 内容变更但指纹不匹配：递增 EVAL_SET_VERSION 并同步更新指纹常量"
+        );
     }
 
     /// 题集必须完整落进 6000 字窗口（尾部用例不可见会结构性压低指标）
@@ -440,14 +504,14 @@ mod tests {
     }
 
     fn score(reply: &str) -> EvalReport {
-        score_reply(reply, EVAL_SET.len(), "agent/test", 0, "t".into())
+        score_reply(reply, EVAL_SET.len(), "agent/test", "test-model", 0, "t".into())
     }
 
     /// 引用→命中映射：正例被引用计 hit；窗口外序号被管线丢弃不计伪命中
     #[test]
     fn citation_to_hit_mapping() {
         let r = score("规则甲条文内容足够长可以稳定通过写库门槛的【依据: 1,3】\n规则乙条文内容同样写得足够长能通过写库门槛【依据: 99】");
-        assert_eq!(r.outcome, "ok");
+        assert_eq!(r.outcome, EvalOutcome::Ok);
         assert!(r.case_results[0].cited, "正例 1 应命中");
         assert!(r.case_results[2].cited, "正例 3 应命中");
         // 直接断言管线不变量（ocr PR#68 第三轮：index==99 对枚举构造恒不可达，
@@ -471,9 +535,9 @@ mod tests {
     /// outcome 三态：无模式 / 门槛拒绝 / 空
     #[test]
     fn outcome_classification() {
-        assert_eq!(score("").outcome, "empty_reply");
-        assert_eq!(score("无模式").outcome, "no_patterns");
-        assert_eq!(score("太短").outcome, "gate_rejected");
+        assert_eq!(score("").outcome, EvalOutcome::EmptyReply);
+        assert_eq!(score("无模式").outcome, EvalOutcome::NoPatterns);
+        assert_eq!(score("太短").outcome, EvalOutcome::GateRejected);
     }
 
     /// 北极星按预算归一：6 正例、5 条各覆盖一个不同正例 → 1.0（不含并水分）
@@ -483,7 +547,7 @@ mod tests {
             .map(|n| format!("第{n}条规则的内容写得足够具体足够长可以稳定通过写库门槛【依据: {n}】"))
             .collect();
         let r = score(&lines.join("\n"));
-        assert_eq!(r.outcome, "ok");
+        assert_eq!(r.outcome, EvalOutcome::Ok);
         assert_eq!(r.positive_hits, 5);
         assert!((r.positive_hit_rate - 1.0).abs() < 1e-9);
     }
@@ -500,19 +564,20 @@ mod tests {
             "ns":"agent/a","eval_set_version":EVAL_SET_VERSION,"observations_visible":EVAL_SET.len(),
             "cases_positive":6,"cases_negative":4,"outcome":"ok","patterns_valid":5,
             "positive_hits":4,"positive_hit_rate":0.8,"keyword_hits":5,"negative_leaks":0,
-            "patterns_missing_citations":0,"duration_ms":1,"patterns":[],"case_results":[],"ts":"t1"});
+            "patterns_missing_citations":0,"duration_ms":1,"patterns":[],"case_results":[],"ts":"t1","model":"m1"});
         let old_ver = serde_json::json!({
             "ns":"agent/a","eval_set_version":1,"observations_visible":EVAL_SET.len(),
             "cases_positive":6,"cases_negative":4,"outcome":"ok","patterns_valid":5,
             "positive_hits":5,"positive_hit_rate":0.9,"keyword_hits":6,"negative_leaks":0,
-            "patterns_missing_citations":0,"duration_ms":1,"patterns":[],"case_results":[],"ts":"t0"});
+            "patterns_missing_citations":0,"duration_ms":1,"patterns":[],"case_results":[],"ts":"t0","model":"m1"});
         std::fs::write(tmp.join("a.json"), ok.to_string()).unwrap();
         std::fs::write(tmp.join("b.json"), old_ver.to_string()).unwrap();
         std::fs::write(tmp.join("c.json"), "{broken").unwrap();
         let v = list_past_hit_rates_blocking(&tmp);
         assert_eq!(v.len(), 1, "只收当前版本且损坏跳过");
         assert_eq!(v[0].2, "agent/a");
-        assert!((v[0].3 - 0.8).abs() < 1e-9);
+        assert_eq!(v[0].3, "m1");
+        assert!((v[0].4 - 0.8).abs() < 1e-9);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
