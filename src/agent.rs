@@ -6037,7 +6037,11 @@ impl AgentCore {
             let res = &step_results[*step_id];
             let (facts, total_lines, truncated) = Self::extract_step_facts(res);
             match facts {
-                Some(lines) if !lines.is_empty() => {
+                // **多行输出**才走要点路径；单行（MCP 工具的主流形态：compact 单行
+                // JSON）要点就是原文前 100 字的前缀，叠加 600 字片段反而比旧的
+                // 1500 字原文少 ~60% 数据且切断在 JSON token 中间
+                // （ocr PR#67 第三轮）——直接原文截断
+                Some(lines) if !lines.is_empty() && total_lines > 1 => {
                     let incomplete = truncated;
                     tool_ctx.push_str(&format!(
                         "\n[步骤 {}] (id={}) 要点摘录（含数字/实体的有效行共 {} 行，摘 {} 行{}）：\n",
@@ -6063,7 +6067,7 @@ impl AgentCore {
                     }
                 }
                 _ => {
-                    // 无可抽取要点（纯文本无数字等）→ 降级保留截断原文（P1 修复：按字符截断防
+                    // 单行输出 / 无可抽取要点 → 保留截断原文（P1 修复：按字符截断防
                     // 多字节 UTF-8 切半 panic）
                     let truncated: String = if res.chars().count() > 1500 {
                         res.chars().take(1500).collect()
@@ -6105,11 +6109,21 @@ impl AgentCore {
         match self.llm.chat(&[msg], &[]).await {
             Ok(r) if !r.text.trim().is_empty() => {
                 let answer = r.text.trim().to_string();
-                // P1-b 引用完整性检查：回答未引用任何步骤编号 → 可能是 LLM 自由发挥，告警留痕
-                if !answer.contains("步骤") {
+                // P1-b 引用完整性检查（ocr PR#67 第三轮）：必须出现**带括号的步骤标签**
+                // （[步骤N]）——裸「步骤」二字被自然语言提及/复述 prompt 满足，不构成引用
+                let has_step_tag = answer
+                    .match_indices("[步骤")
+                    .any(|(i, _)| {
+                        answer[i + 3..]
+                            .trim_start()
+                            .chars()
+                            .next()
+                            .map_or(false, |c| c.is_ascii_digit())
+                    });
+                if !has_step_tag {
                     tracing::warn!(
                         steps = ?keys,
-                        "P1-b: 组合执行回答未引用任何步骤编号（引用完整性检查），原始 report 可兜底核对"
+                        "P1-b: 组合执行回答未引用任何 [步骤N] 标签（引用完整性检查），原始 report 可兜底核对"
                     );
                 }
                 answer
@@ -8410,9 +8424,17 @@ impl AgentCore {
                 remaining = remaining.saturating_sub(saved);
                 truncated_any = true;
             } else if c.len() > SHORT_MARKER.len() {
-                // 短消息：截断反而变长（marker 比原文大）→ 整条替换为短标记
-                let saved = c.len() - SHORT_MARKER.len();
-                messages[i].content = Some(SHORT_MARKER.to_string());
+                // 短消息：截断反而变长（marker 比原文大）→ 整条替换为短标记。
+                // 已摘要消息保留 MARKER 前缀（ocr PR#67 第三轮）：整条变 "(truncated)"
+                // 会丢掉「此消息被摘要过」的痕迹，让 any_summarized 判定失效、
+                // 首条豁免在长会话里复活、30% 累计护栏被绕过
+                let replacement = if c.starts_with("[工具结果摘要]") {
+                    format!("[工具结果摘要]{}", SHORT_MARKER)
+                } else {
+                    SHORT_MARKER.to_string()
+                };
+                let saved = c.len().saturating_sub(replacement.len());
+                messages[i].content = Some(replacement);
                 remaining = remaining.saturating_sub(saved);
                 truncated_any = true;
             }
@@ -8431,17 +8453,21 @@ impl AgentCore {
         if !content.starts_with(MARKER) {
             return 0;
         }
-        // squash 免疫（ocr PR#67 第二轮收窄）：squash 的截断标记是**后缀拼接**
-        // （head + TRUNC_MARKER）或整条替换为 SHORT_MARKER——用 ends_with/全等精确
-        // 匹配；contains 太宽，正文或摘要里出现这个短语就会误免疫。
-        if content.ends_with("…(output truncated: too long)") || content.trim() == "(truncated)" {
+        // 头部被 squash 整条压缩为短标记（无「原文 N 字」可解析）→ 0；
+        // **头部仍可解析时即使带 squash 后缀也照常计算**（ocr PR#67 第三轮 high：
+        // 一律免疫会让 lost 在后续轮清零、30% 上限反复重置，渐进丢弃超出预期——
+        // 宁可把 squash 的截断量保守地计入分子、让上限更早触发，不可反向）
+        if content.trim() == "[工具结果摘要](truncated)" {
             return 0;
         }
-        let Some(p) = content.find("原文 ") else {
+        // 溯源头把固定的核算字段「原文 N 字」放在最前（free-form 的 tool_call_id
+        // 之前，ocr PR#67 第三轮：id 内含「原文…字」会劫持首个匹配）
+        let Some(p) = content[MARKER.len()..].find("原文 ") else {
             return 0;
         };
-        let rest = &content[p + "原文 ".len()..];
-        let Some(num_end) = rest.find(" 字") else {
+        let abs_p = MARKER.len() + p;
+        let rest = &content[abs_p + "原文 ".len()..];
+        let Some(num_end) = rest.find(" 字，") else {
             return 0;
         };
         let Ok(orig) = rest[..num_end].parse::<u64>() else {
@@ -8595,15 +8621,14 @@ impl AgentCore {
                         chars_before = chars,
                         chars_after = r.text.chars().count(),
                         "工具结果已 LLM 摘要");
-                    // opt-in 摘要：保留 bounded 原文头部，防止后续轮次需要的关键事实
-                    // 因摘要遗漏而永久丢失（摘要 + 原文头部仍然显著压缩超长输出）。
-                    // P1-b（R3 护栏①）：摘要头部携带溯源信息（tool_call_id + 原始字数），
-                    // 明确该块是「不可信机器摘要」，原文另有保留——「原文 N 字」同时是
-                    // 无状态丢弃核算的数据源，格式变更须同步 discard_of 解析。
+                    // 溯源头：固定的核算字段「原文 N 字」**放在最前**（free-form 的
+                    // tool_call_id 之前，ocr PR#67 第三轮：id 内含「原文…字」会劫持
+                    // discard_of 的首个匹配）；「原文 N 字，」同时是无状态丢弃核算的
+                    // 数据源，格式变更须同步 discard_of 解析与往返单测。
                     let raw_head: String = content.chars().take(RAW_RETAIN_CHARS).collect();
                     let truncated = content.chars().count() > RAW_RETAIN_CHARS;
                     let replacement = format!(
-                        "{MARKER}(溯源: tool_call_id={:?}，原文 {chars} 字，摘要为 LLM 生成非原文)\n{}\n\n[原文保留前{RAW_RETAIN_CHARS}字]\n{}{}",
+                        "{MARKER}(溯源: 原文 {chars} 字，tool_call_id={:?}，摘要为 LLM 生成非原文)\n{}\n\n[原文保留前{RAW_RETAIN_CHARS}字]\n{}{}",
                         tool_call_id_snapshot,
                         r.text,
                         raw_head,
@@ -12230,14 +12255,26 @@ impl AgentCore {
         // P1-d（R5）/ocr PR#65 第四轮：**先解析完整 JSON、按记录边界截断**——直接对
         // 字符切片会把 JSON 切成不可解析的残文，溯源行永远「条数未识别」；按记录
         // 取前 k 条后，k 既是模型实际可见数也是可出具的真实计数（不多不少）。
-        let (data_head, n_entrance) = Self::truncate_json_records(&data, 3000);
-        let (stats_head, n_stats) = Self::truncate_json_records(&stats, 1000);
+        let (data_head, n_entrance, k1) = Self::truncate_json_records(&data, 3000);
+        let (stats_head, n_stats, k2) = Self::truncate_json_records(&stats, 1000);
+        // 措辞按成因分型（ocr PR#67 第三轮）：None ≠ 一定截断——无法解析 / 无记录
+        // 数组透传 / 超窗截断是三种不同状态，伪溯源（给透传标「截断」）与漏标都要避免
+        let fmt_scope = |n: Option<usize>, kind: &str, cap: usize| -> String {
+            match n {
+                Some(v) => format!("前 {} 条记录", v),
+                None => match kind {
+                    "no_array" => "无记录数组（未截断全量）".to_string(),
+                    "unparsed" => "非 JSON 原文截断".to_string(),
+                    _ => format!("超窗字符截断（前 {} 字）", cap),
+                },
+            }
+        };
         let prompt = format!(
             "你是固废运营数据分析师。分析最近7天入厂数据，找出有意义的模式或异常。\
-             没有发现就输出'无异常'。每个发现一句话，最多3个。\n\n## 近7天数据（前 {} 条记录）\n{}\n\n## 本月统计（前 {} 条记录）\n{}",
-            n_entrance.map(|n| n.to_string()).unwrap_or_else(|| "原文截断 3000 字".into()),
+             没有发现就输出'无异常'。每个发现一句话，最多3个。\n\n## 近7天数据（{}）\n{}\n\n## 本月统计（{}）\n{}",
+            fmt_scope(n_entrance, k1, 3000),
             data_head,
-            n_stats.map(|n| n.to_string()).unwrap_or_else(|| "原文截断 1000 字".into()),
+            fmt_scope(n_stats, k2, 1000),
             stats_head,
         );
         let msg = crate::llm::Message {
@@ -12257,13 +12294,9 @@ impl AgentCore {
         // tags 强制携带数据窗口与来源——洞见可回溯到其数据面，而非凭空一句话。
         // 条数统计只对可识别的 JSON 结构出具；未识别时如实写「条数未识别」，
         // 不用行数冒充（嵌套/pretty JSON 的行数会虚高一个数量级）。
-        let fmt_n = |n: Option<usize>| match n {
-            Some(v) => format!("前 {} 条", v),
-            None => "条数未识别（原文截断）".to_string(),
-        };
         let content = format!(
             "[洞见] 数据窗口 {}~{}（7 天）；程序统计（分析窗口=喂给模型的记录切片）：入厂记录 {}、月统计 {}；源 query_entrance+query_monthly_stats\n{}",
-            week_ago, today, fmt_n(n_entrance), fmt_n(n_stats), reply
+            week_ago, today, fmt_scope(n_entrance, k1, 3000), fmt_scope(n_stats, k2, 1000), reply
         );
         let mut tags = vec![
             "insight".to_string(),
@@ -12293,12 +12326,15 @@ impl AgentCore {
     /// 对象包裹时**重建 envelope**（截断后的数组塞回原对象，total 等同级字段保留）；
     /// 数组字段用「对象中第一个数组值字段」通用探测（records/sample_records 等不再
     /// 落回字符截断）。不可解析时退化为字符截断并返回 None（调用方如实标注）。
-    fn truncate_json_records(s: &str, cap_chars: usize) -> (String, Option<usize>) {
-        let fallback = || -> (String, Option<usize>) {
-            (s.chars().take(cap_chars).collect(), None)
+    fn truncate_json_records(s: &str, cap_chars: usize) -> (String, Option<usize>, &'static str) {
+        // kind ∈ records / no_array / unparsed / truncated（ocr PR#67 第三轮：None 的
+        // 成因不同——无法解析 / 无记录数组未截断 / 超窗字符截断，调用方措辞须分型，
+        // 否则会给「无截断的透传」标注「截断 3000 字」的伪溯源）
+        let fallback = |kind: &'static str| -> (String, Option<usize>, &'static str) {
+            (s.chars().take(cap_chars).collect(), None, kind)
         };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(s.trim()) else {
-            return fallback();
+            return fallback("unparsed");
         };
         // 定位记录数组：顶层数组，或对象中**元素数最多的数组字段**——serde_json 的
         // Map 是 BTreeMap（键按字母序），「第一个数组字段」会按字母序误选小数组
@@ -12335,15 +12371,15 @@ impl AgentCore {
         // 识别但为空的记录数组（**含顶层空数组**，ocr PR#67 第二轮：早退分支只查
         // envelope_key.is_none 会把 `[]` 当「无记录数组」吞掉）→ Some(0)
         if records.is_empty() && v.is_array() {
-            return ("[]".to_string(), Some(0));
+            return ("[]".to_string(), Some(0), "records");
         }
         if records.is_empty() && envelope_key.is_none() {
             // 可解析但无记录数组（如聚合对象）：整体不超限时全量喂，超限按字符截断
             let text = serde_json::to_string(&v).unwrap_or_default();
             if text.chars().count() <= cap_chars {
-                return (text, None);
+                return (text, None, "no_array");
             }
-            return fallback();
+            return fallback("truncated");
         }
         // 预算必须涵盖 **envelope 开销**（键名/引号/花括号/同级字段 total/sql/message
         // 等全部计入序列化结果）——只预留 "[]" 2 字会让重建结果超出 cap 任意倍，
@@ -12360,7 +12396,7 @@ impl AgentCore {
             _ => 0,
         };
         if envelope_base >= cap_chars {
-            return fallback(); // envelope 自身就超限（同级字段过长）：字符截断兜底
+            return fallback("truncated"); // envelope 自身就超限（同级字段过长）：字符截断兜底
         }
         // 识别但为空的记录数组 → Some(0)（与顶层空数组一致；ocr PR#65 第五轮语义，
         // 拆分时一度丢失）：不得误报「条数未识别」
@@ -12374,9 +12410,9 @@ impl AgentCore {
                 _ => "[]".to_string(),
             };
             if rebuilt.chars().count() <= cap_chars {
-                return (rebuilt, Some(0));
+                return (rebuilt, Some(0), "records");
             }
-            return fallback();
+            return fallback("truncated");
         }
         let budget = cap_chars - envelope_base;
         let mut used = 2usize; // "[]"
@@ -12391,7 +12427,7 @@ impl AgentCore {
             kept.push(rec);
         }
         if kept.is_empty() {
-            return fallback();
+            return fallback("truncated");
         }
         let k = kept.len();
         let kept_owned: Vec<serde_json::Value> = kept.into_iter().cloned().collect();
@@ -12404,7 +12440,7 @@ impl AgentCore {
             }
             _ => serde_json::to_string(&kept_owned).unwrap_or_default(),
         };
-        (rebuilt, Some(k))
+        (rebuilt, Some(k), "records")
     }
 
     /// P2.2d：LLM 批量抽取 text_signals → `signal:*` tags（consolidate retain 路径）。
@@ -15139,18 +15175,26 @@ mod tool_summary_accounting_tests {
     /// 格式变更而忘记同步解析时，本测试先红。
     #[test]
     fn tool_summary_marker_round_trip() {
-        // 与 maybe_summarize_tool_outputs 成功分支的替换模板一致的头部
-        let content = "[工具结果摘要](溯源: tool_call_id=Some(\"tc-1\")，原文 16000 字，摘要为 LLM 生成非原文)\n这里是摘要正文。\n\n[原文保留前2000字]\n原始内容开头……";
+        // 与 maybe_summarize_tool_outputs 成功分支的替换模板一致（核算字段在最前）
+        let content = "[工具结果摘要](溯源: 原文 16000 字，tool_call_id=Some(\"tc-1\")，摘要为 LLM 生成非原文)\n这里是摘要正文。\n\n[原文保留前2000字]\n原始内容开头……";
         let cur = content.chars().count() as u64;
         assert_eq!(AgentCore::tool_summary_discard_of(content), 16000 - cur);
+
+        // squash 后缀（截断标记拼接在尾部）但头部仍可解析 → **照常计算**
+        // （ocr PR#67 第三轮 high：一律免疫会让累计护栏反复重置）
+        let squashed = format!("{}…(output truncated: too long)", &content[..200.min(content.len())]);
+        let cur2 = squashed.chars().count() as u64;
+        assert_eq!(AgentCore::tool_summary_discard_of(&squashed), 16000 - cur2);
 
         // 非 MARKER 消息：0
         assert_eq!(AgentCore::tool_summary_discard_of("普通工具输出，无标记"), 0);
         // MARKER 但头部破损（无「原文 N 字」）：0，不 panic
         assert_eq!(AgentCore::tool_summary_discard_of("[工具结果摘要] 头部信息缺失"), 0);
-        // 数字非整数 / 超长：0
+        // squash 整条压缩为带 MARKER 的短标记（无可解析头部）：0
+        assert_eq!(AgentCore::tool_summary_discard_of("[工具结果摘要](truncated)"), 0);
+        // 数字非整数：0
         assert_eq!(
-            AgentCore::tool_summary_discard_of("[工具结果摘要](溯源: tool_call_id=None，原文 abc 字，摘要为 LLM 生成非原文)\n正文"),
+            AgentCore::tool_summary_discard_of("[工具结果摘要](溯源: 原文 abc 字，tool_call_id=None，摘要为 LLM 生成非原文)\n正文"),
             0
         );
     }
@@ -15208,7 +15252,7 @@ mod extraction_helpers_tests {
     #[test]
     fn truncate_records_top_level_array() {
         let raw = r#"[{"id":1},{"id":2},{"id":3}]"#;
-        let (text, k) = AgentCore::truncate_json_records(raw, 20);
+        let (text, k, kind) = AgentCore::truncate_json_records(raw, 20);
         // 8+9 字两条 + [] 2 = 19 ≤ 20，第三条超限 → k=2
         assert_eq!(k, Some(2));
         assert!(text.starts_with("["));
@@ -15221,7 +15265,7 @@ mod extraction_helpers_tests {
         let raw = r#"{"total":500,"items":[{"id":1},{"id":2},{"id":3}]}"#;
         // envelope 基底 {"items":[],"total":500} = 25 字；cap 40 → 记录预算 15，
         // 容 1 条（8 字）；重建 33 字 ≤ 40
-        let (text, k) = AgentCore::truncate_json_records(raw, 40);
+        let (text, k, kind) = AgentCore::truncate_json_records(raw, 40);
         assert!(text.contains("\"total\":500"), "envelope 同级字段保留");
         assert!(text.chars().count() <= 40, "重建结果必须 ≤ cap：{text}");
         assert_eq!(k, Some(1));
@@ -15231,19 +15275,21 @@ mod extraction_helpers_tests {
     #[test]
     fn truncate_records_picks_largest_array() {
         let raw = r#"{"alerts":[{"a":1}],"records":[{"id":1},{"id":2},{"id":3}]}"#;
-        let (_, k) = AgentCore::truncate_json_records(raw, 200);
+        let (_, k, _) = AgentCore::truncate_json_records(raw, 200);
         assert_eq!(k, Some(3), "应选 records（3 条）而非 alerts（1 条）");
     }
 
     /// 空数组 / 非 JSON / 聚合对象：None 或全量，不产生伪计数
     #[test]
     fn truncate_records_degenerate_inputs() {
-        let (_, k) = AgentCore::truncate_json_records(r#"{"items":[]}"#, 100);
+        let (_, k, _) = AgentCore::truncate_json_records(r#"{"items":[]}"#, 100);
         assert_eq!(k, Some(0));
-        let (_, k2) = AgentCore::truncate_json_records("不是 JSON", 100);
+        let (_, k2, kind2) = AgentCore::truncate_json_records("不是 JSON", 100);
         assert_eq!(k2, None);
-        let (text, k3) = AgentCore::truncate_json_records(r#"{"ok":true}"#, 100);
+        assert_eq!(kind2, "unparsed");
+        let (text, k3, kind3) = AgentCore::truncate_json_records(r#"{"ok":true}"#, 100);
         assert!(text.contains("ok"));
         assert_eq!(k3, None);
+        assert_eq!(kind3, "no_array");
     }
 }
