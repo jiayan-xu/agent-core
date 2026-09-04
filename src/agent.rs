@@ -500,7 +500,7 @@ pub struct ConsolidateOutcome {
     pub patterns_added: u64,
     /// 本批合格观察数（evidence 池）
     pub observations: usize,
-    /// 6000 字窗口内实际喂给 LLM 的观察数（窗口外已被游标消费——与 observations
+    /// 6000 字窗口内实际喂给 LLM 的观察数（窗口外延迟到后续轮次——与 observations
     /// 的差值即被静默消费量，消费方必须可辨别，ocr PR#68 第三轮）
     pub observations_visible: usize,
     /// 本批拉取总数（含不合格）
@@ -12554,10 +12554,10 @@ impl AgentCore {
         if included < obs_lines.len() {
             tracing::warn!(target: "consolidate", ns = %ns,
                 visible = included, qualified = obs_lines.len(),
-                "本批观察超出 6000 字窗口：窗口外 {} 条已被游标消费、本次不提取", obs_lines.len() - included);
+                "本批观察超出 6000 字窗口：窗口外 {} 条延迟到后续轮次处理（游标推进至窗口边界）", obs_lines.len() - included);
         }
         let window_note = if included < obs_lines.len() {
-            format!("（窗口内 {}/{}，窗口外已被游标消费）", included, obs_lines.len())
+            format!("（窗口内 {}/{}，窗口外延迟到后续轮次）", included, obs_lines.len())
         } else {
             String::new()
         };
