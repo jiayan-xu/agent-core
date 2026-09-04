@@ -487,7 +487,6 @@ impl StanceCard {
     /// 把好卡静默降级）；③全部失败降级未结构化卡（原文完整保留，绝不丢立场），
     /// 失败切片 debug 留痕可观测。
     pub fn from_raw(persona_id: String, display_name: String, raw: String) -> StanceCard {
-        const UNSTRUCTURED: &str = "未结构化";
         // raw 反膨胀上限（ocr PR#66 第二轮）：截断加标，立场可回溯性保留在前 4000 字
         const RAW_CAP: usize = 4000;
         let clamp_raw = |raw: &str| -> (String, bool) {
@@ -505,7 +504,7 @@ impl StanceCard {
             StanceCard {
                 persona_id: persona_id.clone(),
                 display_name: display_name.clone(),
-                stance: UNSTRUCTURED.to_string(),
+                stance: STANCE_UNSTRUCTURED.to_string(),
                 summary: raw.lines().next().unwrap_or("").trim().chars().take(80).collect(),
                 key_reasons: Vec::new(),
                 citations: Vec::new(),
@@ -622,10 +621,12 @@ impl StanceCard {
         if let Ok(serde_json::Value::Object(o)) = serde_json::from_str::<serde_json::Value>(cleaned) {
             return Some(serde_json::Value::Object(o));
         }
-        // ② 配平扫描：深度归零处截断候选，逐个尝试（正文含无关 { } 或多个对象时，
-        // 朴素「首 { 到末 }」切片必失败）。**游离 `}` 在深度 0 时忽略**；未闭合的
-        // 尾部 `{` 自然不产出候选；**字符串字面量内的花括号不计数**（ocr PR#66
-        // 第三轮：`{"a":"}"}` 的字符串 `}` 会提前归零、候选被腰斩），转义符跳过
+        // ② 配平扫描（两遍，ocr PR#66 第四轮）：A 遍全文配平——正文里未配平的
+        // `{` 会把深度永久抬高、`"` 奇数次会卡在 in_string，好卡零候选；A 遍为空
+        // 时 B 遍**按行重置状态**（JSON 对象几乎总在单行内，prose 花括号不跨行
+        // 污染；多行 pretty JSON 已由 ① 的整串直解覆盖）。字符串字面量内的花括号
+        // 不计数（第三轮），转义符跳过。
+        let scan = |per_line_reset: bool| -> Vec<(usize, usize)> {
         let bytes = raw.as_bytes();
         let mut candidates: Vec<(usize, usize)> = Vec::new();
         let mut depth: i32 = 0;
@@ -665,15 +666,49 @@ impl StanceCard {
             if candidates.len() >= 8 {
                 break; // 防极端输出（如一串单独花括号）拖慢扫描
             }
+            if per_line_reset && *b == b'\n' {
+                // 行结束重置（B 遍）：未配平的花括号/未闭合引号不跨行污染
+                depth = 0;
+                start = None;
+                in_string = false;
+                escaped = false;
+            }
         }
-        // 候选优先级（ocr PR#66 第三轮）：**首个含 stance 键的对象** > 首个对象 >
+            candidates
+        };
+        let candidates = {
+            let a = scan(false);
+            if a.is_empty() {
+                let b = scan(true);
+                if !b.is_empty() {
+                    tracing::debug!(target = "roundtable", persona = %persona_id,
+                        "全文配平扫描零候选，按行重置后命中 {} 个（正文含未配平花括号/引号）", b.len());
+                }
+                b
+            } else {
+                a
+            }
+        };
+        if candidates.is_empty() {
+            tracing::debug!(target = "roundtable", persona = %persona_id,
+                "立场卡 JSON 候选为零（无配平对象），降级未结构化");
+        }
+        // 候选优先级（ocr PR#66 第三轮）：**首个含可用 stance 的对象** > 首个对象 >
         // 任何可解析值——正文先出现无关小对象（{"x":1}）时不再劫持解析结果
         let mut first_object: Option<serde_json::Value> = None;
         let mut first_any: Option<serde_json::Value> = None;
         for (s, e) in candidates {
             match serde_json::from_str::<serde_json::Value>(&raw[s..=e]) {
                 Ok(v) => {
-                    if v.get("stance").is_some() {
+                    // 候选优先级键是**可用的 stance**（非空字符串，与 from_raw 下游
+                    // 契约一致，ocr PR#66 第四轮）：`{"stance":""}` 占位对象不该
+                    // 立即命中、让后面的好卡失去机会）
+                    let usable_stance = v
+                        .get("stance")
+                        .and_then(|x| x.as_str())
+                        .map(|x| !x.trim().is_empty())
+                        .unwrap_or(false);
+                    if usable_stance {
                         return Some(v);
                     }
                     if v.is_object() && first_object.is_none() {
@@ -691,6 +726,15 @@ impl StanceCard {
     }
 }
 
+/// P1-a：立场桶名单一来源（ocr PR#66 第四轮：字面量散在 UNSTRUCTURED/
+/// normalize_stance/aggregate_stances 三处，改名会静默废掉对立提示与降级分支）。
+pub(crate) const STANCE_SUPPORT: &str = "支持";
+pub(crate) const STANCE_OPPOSE: &str = "反对";
+pub(crate) const STANCE_NEUTRAL: &str = "中立";
+pub(crate) const STANCE_CONDITIONAL: &str = "条件支持";
+pub(crate) const STANCE_OTHER: &str = "其他";
+pub(crate) const STANCE_UNSTRUCTURED: &str = "未结构化";
+
 /// 立场词规范化：仅包含词匹配，零 LLM。
 /// 命中顺序（ocr PR#66 两轮评审收敛）：
 /// 1. **显式极性倾斜优先于「中立」字面**：「中立偏反对/不支持但保持中立」归
@@ -706,15 +750,15 @@ fn normalize_stance(s: &str) -> String {
     let pos = t.contains("支持");
     let neg = (t.contains("反对") && !t.contains("不反对")) || t.contains("不支持");
     if neg {
-        "反对".to_string()
+        STANCE_OPPOSE.to_string()
     } else if pos && t.contains("条件") && !unconditional {
-        "条件支持".to_string()
+        STANCE_CONDITIONAL.to_string()
     } else if pos {
-        "支持".to_string()
+        STANCE_SUPPORT.to_string()
     } else if t.contains("中立") {
-        "中立".to_string()
+        STANCE_NEUTRAL.to_string()
     } else {
-        "其他".to_string()
+        STANCE_OTHER.to_string()
     }
 }
 
@@ -758,8 +802,19 @@ pub fn aggregate_stances(cards: &[StanceCard]) -> StanceAggregate {
     if structured < total {
         summary.push_str(&format!("，其中 {} 份未结构化已降级保留原文", total - structured));
     }
-    let has = |k: &str| distribution.iter().any(|(s, _)| *s == k);
-    if has("支持") && has("反对") {
+    // 对立提示（ocr PR#66 第四轮释义）：**条件支持计入支持侧**——半支持与反对
+    // 并存同样是有待人类裁决的分歧；桶名用常量防改名漂移。
+    let supportive = distribution
+        .iter()
+        .filter(|(s, _)| *s == STANCE_SUPPORT || *s == STANCE_CONDITIONAL)
+        .map(|(_, n)| n)
+        .sum::<usize>();
+    let opposing = distribution
+        .iter()
+        .filter(|(s, _)| *s == STANCE_OPPOSE)
+        .map(|(_, n)| n)
+        .sum::<usize>();
+    if supportive > 0 && opposing > 0 {
         summary.push_str("；存在对立立场，分歧详见各方立场卡");
     }
     StanceAggregate { total, structured, distribution, summary }
