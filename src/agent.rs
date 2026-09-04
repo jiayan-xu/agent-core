@@ -313,6 +313,52 @@ pub enum ContinuationVerdict {
 }
 
 /// Agent 核心
+/// P1-b R3：工具摘要标记——无状态核算的承重契约（ocr PR#67 第五轮：字面量散在
+/// writer/discard_of/squash/测试夹具四处独立拷贝，模板漂移会让核算静默归零且
+/// 测试仍绿；收敛为单一常量 + 单一构造器，往返测试直接消费生产构造器）。
+pub(crate) const TOOL_SUMMARY_MARKER: &str = "[工具结果摘要]";
+
+/// 构造摘要消息的核算头：固定的「原文 N 字，」在最前（free-form 的 tool_call_id
+/// 之前）。writer 与 round-trip 测试共用——测试测的就是生产写出的东西。
+pub(crate) fn tool_summary_header(orig_chars: usize, tool_call_id: &Option<String>) -> String {
+    format!(
+        "{TOOL_SUMMARY_MARKER}(溯源: 原文 {orig_chars} 字，tool_call_id={tool_call_id:?}，摘要为 LLM 生成非原文)"
+    )
+}
+
+/// P1-b：剥除回答中的 `[步骤N]` 内部引用标记（ocr PR#67 第五轮：标记是给完整性
+/// 检查用的内部契约，回答本身直接作为用户可见回复——机器字眼违反同一 prompt
+/// 的第 1 条；检查通过后标记已完成使命）。
+fn strip_step_citations(answer: &str) -> String {
+    let mut out = String::with_capacity(answer.len());
+    let mut it = answer.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        if answer[i..].starts_with("[步骤") {
+            let rest = &answer[i + "[步骤".len()..];
+            let digits_end = rest
+                .find(|ch: char| !ch.is_ascii_digit())
+                .unwrap_or(rest.len());
+            if digits_end > 0 && rest[digits_end..].starts_with(']') {
+                let mut skip = "[步骤".len() + digits_end + 1;
+                if rest[digits_end + 1..].starts_with(' ') {
+                    skip += 1;
+                }
+                while let Some(&(j, _)) = it.peek() {
+                    if j < i + skip {
+                        it.next();
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+
 pub struct AgentCore {
     pub config: AgentConfig,
     pub mcp: McpClient,              // Memoria MCP（主）
@@ -6129,7 +6175,8 @@ impl AgentCore {
                         "P1-b: 组合执行回答未引用任何 [步骤N] 标签（引用完整性检查），原始 report 可兜底核对"
                     );
                 }
-                answer
+                // 检查完成后剥除内部标记：回答直接作为用户可见回复
+                strip_step_citations(&answer)
             }
             _ => report.to_string(), // LLM 失败/空响应 → 回退原始 report，绝不直接吐 JSON
         }
@@ -8431,8 +8478,8 @@ impl AgentCore {
                 // 已摘要消息保留 MARKER 前缀（ocr PR#67 第三轮）：整条变 "(truncated)"
                 // 会丢掉「此消息被摘要过」的痕迹，让 any_summarized 判定失效、
                 // 首条豁免在长会话里复活、30% 累计护栏被绕过
-                let replacement = if c.starts_with("[工具结果摘要]") {
-                    format!("[工具结果摘要]{}", SHORT_MARKER)
+                let replacement = if c.starts_with(TOOL_SUMMARY_MARKER) {
+                    format!("{}{}", TOOL_SUMMARY_MARKER, SHORT_MARKER)
                 } else {
                     SHORT_MARKER.to_string()
                 };
@@ -8452,7 +8499,7 @@ impl AgentCore {
     /// （ocr PR#65 第五轮 high：此前 p+3 切错位置，parse 恒失败、护栏恒 0）。
     /// 格式契约由 `tool_summary_marker_round_trip` 单测锁死——MARKER 头格式变更须同步本解析。
     fn tool_summary_discard_of(content: &str) -> u64 {
-        const MARKER: &str = "[工具结果摘要]";
+        const MARKER: &str = TOOL_SUMMARY_MARKER;
         if !content.starts_with(MARKER) {
             return 0;
         }
@@ -8501,7 +8548,7 @@ impl AgentCore {
         messages: &mut Vec<Message>,
         budget: &crate::orchestration::TurnBudget,
     ) {
-        const MARKER: &str = "[工具结果摘要]";
+        const MARKER: &str = TOOL_SUMMARY_MARKER;
         const SUMMARY_RESPONSE_EST: u64 = 200; // prompt 要求 <=800 字，预留响应估算
         const SUMMARY_SHARE_CAP_NUM: u64 = 3; // 30%
         const SUMMARY_SHARE_CAP_DEN: u64 = 10;
@@ -8631,8 +8678,8 @@ impl AgentCore {
                     let raw_head: String = content.chars().take(RAW_RETAIN_CHARS).collect();
                     let truncated = content.chars().count() > RAW_RETAIN_CHARS;
                     let replacement = format!(
-                        "{MARKER}(溯源: 原文 {chars} 字，tool_call_id={:?}，摘要为 LLM 生成非原文)\n{}\n\n[原文保留前{RAW_RETAIN_CHARS}字]\n{}{}",
-                        tool_call_id_snapshot,
+                        "{}\n{}\n\n[原文保留前{RAW_RETAIN_CHARS}字]\n{}{}",
+                        tool_summary_header(chars, &tool_call_id_snapshot),
                         r.text,
                         raw_head,
                         if truncated { "…" } else { "" }
@@ -12354,15 +12401,26 @@ impl AgentCore {
         // Map 是 BTreeMap（键按字母序），「第一个数组字段」会按字母序误选小数组
         // （records vs alerts / data vs records），对 k 出具自信的错误统计
         // （ocr PR#67）；并列时按序列化长度、再按键名排序保证确定性。
+        let records_are_objects = |a: &[serde_json::Value]| a.is_empty() || a.iter().all(|v| v.is_object());
         let (records, envelope_key): (&[serde_json::Value], Option<&str>) = if let Some(arr) =
             v.as_array()
         {
-            (arr.as_slice(), None)
+            if records_are_objects(arr) {
+                (arr.as_slice(), None)
+            } else {
+                (&[], None)
+            }
         } else if let Some(o) = v.as_object() {
             let mut arrays: Vec<(&String, &Vec<serde_json::Value>, usize)> = o
                 .iter()
                 .filter_map(|(k, x)| {
                     let a = x.as_array()?;
+                    // **元素必须是对象**（ocr PR#67 第五轮：`{"columns":[...6 个字符串],
+                    // "rows":[...]}` 里 columns 按元素数取胜，对列名出具「前 6 条记录」
+                    // 的伪溯源——正是 P1-d 要消灭的失败类）
+                    if !a.is_empty() && !a.iter().all(|v| v.is_object()) {
+                        return None;
+                    }
                     // 序列化长度**预计算**（ocr PR#67 第二轮：comparator 里 to_string
                     // 每次比较重复序列化，大数组排序是 O(n·log n) 次全量序列化）
                     let ser_len = serde_json::to_string(a).unwrap_or_default().len();
@@ -15311,5 +15369,21 @@ mod extraction_helpers_tests {
         assert!(text.contains("ok"));
         assert_eq!(k3, None);
         assert_eq!(kind3, "no_array");
+    }
+}
+
+#[cfg(test)]
+mod step_citation_tests {
+    use super::strip_step_citations;
+
+    /// [步骤N] 标记剥除（含多标记、带空格、非标记文本不动）
+    #[test]
+    fn strips_step_tokens() {
+        assert_eq!(strip_step_citations("结果如[步骤1]，共 3 条"), "结果如，共 3 条");
+        assert_eq!(strip_step_citations("[步骤2] 数据在[步骤1]"), "数据在");
+        // 非法形态（无数字/未闭合）原样保留
+        assert_eq!(strip_step_citations("[步骤] 普通文本"), "[步骤] 普通文本");
+        assert_eq!(strip_step_citations("步骤1 不带括号"), "步骤1 不带括号");
+        assert_eq!(strip_step_citations("无标记回答"), "无标记回答");
     }
 }
