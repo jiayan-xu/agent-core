@@ -566,22 +566,23 @@ impl StanceCard {
         }
         // confidence 宽容解码（ocr PR#66 评审）：u64 / f64（≤1 视为百分比小数）/ 数字
         // 字符串三种常见编码都接受，越界 clamp 100，无法解码 debug 留痕
-        // confidence 宽容解码（ocr PR#66 第二轮）：u64/f64/数字字符串三种编码走
-        // **同一条**归一规则（≤1 视为百分比小数 ×100，否则原值；clamp 100）——
-        // 此前 u64 的 1 是 1% 而 f64 的 1.0 是 100%，同一语义两种结果
-        let normalize_conf = |n: u64| -> u64 { if n <= 1 { n * 100 } else { n } };
+        // confidence 宽容解码（ocr PR#66 第三轮收口）：prompt 明确要求 0-100 **整数**，
+        // 所以整数 1 就是 1%——小数换算只在真分数区间 (0,1) 生效（0.9→90），
+        // u64/f64/数字字符串三种编码走同一条规则
+        let normalize_conf = |n: u64| -> u64 { n };
+        let from_float = |f: f64| -> u64 {
+            if f > 0.0 && f < 1.0 {
+                (f * 100.0).round() as u64
+            } else {
+                f.round() as u64
+            }
+        };
         let confidence = v.get("confidence").and_then(|x| {
             let n = x
                 .as_u64()
                 .map(normalize_conf)
-                .or_else(|| {
-                    x.as_f64().map(|f| if f <= 1.0 { (f * 100.0).round() as u64 } else { f.round() as u64 })
-                })
-                .or_else(|| {
-                    x.as_str()
-                        .and_then(|s| s.trim().parse::<f64>().ok())
-                        .map(|f| if f <= 1.0 { (f * 100.0).round() as u64 } else { f.round() as u64 })
-                });
+                .or_else(|| x.as_f64().map(from_float))
+                .or_else(|| x.as_str().and_then(|s| s.trim().parse::<f64>().ok()).map(from_float));
             if n.is_none() {
                 tracing::debug!(target = "roundtable", persona = %persona_id,
                     value = %x, "confidence 无法解码（非数字/数字字符串），置空");
@@ -622,15 +623,28 @@ impl StanceCard {
             return Some(serde_json::Value::Object(o));
         }
         // ② 配平扫描：深度归零处截断候选，逐个尝试（正文含无关 { } 或多个对象时，
-        // 朴素「首 { 到末 }」切片必失败）。**游离 `}` 在深度 0 时忽略**（前导噪声
-        // 花括号否则会把深度打成负数、吞掉后面真正的对象）；未闭合的尾部 `{`
-        // 自然不产出候选
+        // 朴素「首 { 到末 }」切片必失败）。**游离 `}` 在深度 0 时忽略**；未闭合的
+        // 尾部 `{` 自然不产出候选；**字符串字面量内的花括号不计数**（ocr PR#66
+        // 第三轮：`{"a":"}"}` 的字符串 `}` 会提前归零、候选被腰斩），转义符跳过
         let bytes = raw.as_bytes();
         let mut candidates: Vec<(usize, usize)> = Vec::new();
         let mut depth: i32 = 0;
         let mut start: Option<usize> = None;
+        let mut in_string = false;
+        let mut escaped = false;
         for (i, b) in bytes.iter().enumerate() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if *b == b'\\' {
+                    escaped = true;
+                } else if *b == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
             match b {
+                b'"' => in_string = true,
                 b'{' => {
                     if depth == 0 {
                         start = Some(i);
@@ -652,15 +666,28 @@ impl StanceCard {
                 break; // 防极端输出（如一串单独花括号）拖慢扫描
             }
         }
+        // 候选优先级（ocr PR#66 第三轮）：**首个含 stance 键的对象** > 首个对象 >
+        // 任何可解析值——正文先出现无关小对象（{"x":1}）时不再劫持解析结果
+        let mut first_object: Option<serde_json::Value> = None;
+        let mut first_any: Option<serde_json::Value> = None;
         for (s, e) in candidates {
             match serde_json::from_str::<serde_json::Value>(&raw[s..=e]) {
-                Ok(v) => return Some(v),
+                Ok(v) => {
+                    if v.get("stance").is_some() {
+                        return Some(v);
+                    }
+                    if v.is_object() && first_object.is_none() {
+                        first_object = Some(v);
+                    } else if first_any.is_none() {
+                        first_any = Some(v);
+                    }
+                }
                 Err(err) => tracing::debug!(target = "roundtable", persona = %persona_id,
                     slice_len = e - s + 1, error = %err,
                     "立场卡 JSON 候选切片解析失败，尝试下一个"),
             }
         }
-        None
+        first_object.or(first_any)
     }
 }
 
@@ -15178,14 +15205,30 @@ mod stance_card_tests {
         assert_eq!(f("需要更多数据"), "其他");
     }
 
-    /// confidence 多编码 + clamp + 不可解码为 None
+    /// confidence 多编码 + clamp + 不可解码为 None。
+    /// 整数 1 = 1%（prompt 语义），真分数 0.9 = 90%（小数编码），1.0 边界 = 1
     #[test]
     fn confidence_encodings() {
         assert_eq!(card("{\"stance\":\"支持\",\"confidence\":0.9}").confidence, Some(90));
+        assert_eq!(card("{\"stance\":\"支持\",\"confidence\":1}").confidence, Some(1));
+        assert_eq!(card("{\"stance\":\"支持\",\"confidence\":1.0}").confidence, Some(1));
         assert_eq!(card("{\"stance\":\"支持\",\"confidence\":85.0}").confidence, Some(85));
         assert_eq!(card("{\"stance\":\"支持\",\"confidence\":\"70\"}").confidence, Some(70));
         assert_eq!(card("{\"stance\":\"支持\",\"confidence\":120}").confidence, Some(100));
         assert_eq!(card("{\"stance\":\"支持\",\"confidence\":\"high\"}").confidence, None);
+    }
+
+    /// 字符串内花括号不破坏配平；无关小对象不劫持候选（含 stance 的对象优先）
+    #[test]
+    fn string_braces_and_stance_priority() {
+        // 字符串里的 } 提前归零会腰斩候选
+        let c = card("{\"stance\":\"支持\",\"summary\":\"含 } 花括号的摘要\",\"confidence\":50}");
+        assert!(c.structured, "字符串内花括号不应破坏解析");
+        assert_eq!(c.stance, "支持");
+        // 正文先出现无关对象 {"x":1}，真正的卡片在后——stance 优先
+        let c2 = card("先说 {\"x\":1} 无关的话，再给 {\"stance\":\"反对\",\"summary\":\"b\"}");
+        assert!(c2.structured, "应选中含 stance 的候选: {}", c2.stance);
+        assert_eq!(c2.stance, "反对");
     }
 
     /// key_reasons 限 3 条、每条限 120 字；非字符串元素丢弃
