@@ -443,12 +443,195 @@ impl InboxCache {
     }
 }
 
-/// Phase 6：圆桌结果
+/// P1-a：圆桌立场卡——分身立场的结构化表示（《程序化汇合改造方案》P1-a）。
+///
+/// LLM 原始回答经 [`StanceCard::parse`] 程序解析生成；解析失败时 `structured=false`
+/// **降级保留原文**（stance 记为「未结构化」），立场信息永不丢弃。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StanceCard {
+    pub persona_id: String,
+    pub display_name: String,
+    /// 规范化立场：支持 / 反对 / 中立 / 条件支持；解析失败为「未结构化」。
+    /// 规范化仅做包含词匹配（中立 → 条件支持 → 反对/不支持 → 支持），不交 LLM。
+    pub stance: String,
+    /// 一句话立场摘要（结构化时取 LLM 的 summary 字段；降级时截取原文首行）。
+    pub summary: String,
+    /// 关键理由（结构化时 ≤3 条）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub key_reasons: Vec<String>,
+    /// 证据引用 ID。**预留字段：当前恒为空**——persona_stance 调用不提供证据池
+    /// （无检索上下文），任何非空值都必然是模型编造的伪溯源，正是本方案要消灭的
+    /// 失败模式（ocr PR#65 第三轮评审）。接入 persona 记忆检索后再启用。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub citations: Vec<String>,
+    /// 置信度 0-100（仅结构化卡存在）。
+    pub confidence: Option<u8>,
+    /// 原始回答全文（可回溯；未结构化卡的内容主体）。
+    pub raw: String,
+    /// 是否成功解析为结构化立场卡。
+    pub structured: bool,
+}
+
+impl StanceCard {
+    /// 从 LLM 原始回答构建立场卡：宽容解析 JSON（首个 `{` 到最后一个 `}`），
+    /// 任何失败都降级为未结构化卡（原文完整保留，绝不丢立场）。
+    fn parse(persona_id: String, display_name: String, raw: String) -> StanceCard {
+        const UNSTRUCTURED: &str = "未结构化";
+        let fallback = |raw: String| StanceCard {
+            persona_id: persona_id.clone(),
+            display_name: display_name.clone(),
+            stance: UNSTRUCTURED.to_string(),
+            summary: raw.lines().next().unwrap_or("").trim().chars().take(80).collect(),
+            key_reasons: Vec::new(),
+            citations: Vec::new(),
+            confidence: None,
+            raw: raw.clone(),
+            structured: false,
+        };
+        let Some(start) = raw.find('{') else { return fallback(raw) };
+        let Some(end) = raw.rfind('}') else { return fallback(raw) };
+        if end < start {
+            return fallback(raw);
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw[start..=end]) else {
+            return fallback(raw);
+        };
+        // stance 必须是非空字符串；缺失**或空串**（模型常见空值输出）都视为解析
+        // 失败走降级——否则分布里会出现空键残缺文本（ocr PR#65 第五轮）。
+        let Some(stance_raw) = v
+            .get("stance")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return fallback(raw);
+        };
+        let norm = normalize_stance(stance_raw);
+        // summary 硬限长（200 字）：模型无视「一句话」要求时防主席附注 prompt 与
+        // memoria 载荷被单卡膨胀（ocr PR#65 第三轮评审）
+        let summary: String = v
+            .get("summary")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().chars().take(200).collect::<String>())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| stance_raw.trim().chars().take(80).collect());
+        let key_reasons: Vec<String> = v
+            .get("key_reasons")
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| r.as_str())
+                    .map(|r| r.trim().to_string())
+                    .filter(|r| !r.is_empty())
+                    .take(3)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // citations：**解析即丢弃**（ocr PR#65 第四轮）——本调用不提供证据池，任何
+        // 非空值必为编造伪溯源；模型仍输出该键时 debug 记录（将来接 persona 记忆
+        // 检索时可据此评估启用价值），字段恒空进 SSE/载荷。
+        if v.get("citations").and_then(|x| x.as_array()).map(|a| !a.is_empty()).unwrap_or(false) {
+            tracing::debug!(target = "roundtable",
+                persona = %persona_id,
+                "分身输出了 citations（无证据池，已丢弃防伪溯源；接记忆检索后可评估启用）");
+        }
+        let confidence = v.get("confidence").and_then(|x| x.as_u64()).map(|c| c.min(100) as u8);
+        StanceCard {
+            persona_id,
+            display_name,
+            stance: norm,
+            summary,
+            key_reasons,
+            citations: Vec::new(),
+            confidence,
+            raw,
+            structured: true,
+        }
+    }
+}
+
+/// 立场词规范化：仅包含词匹配，零 LLM。
+/// 命中顺序（ocr PR#65 多轮评审收敛）：
+/// 1. 显式反对先行：「反对（且非『不反对』）/不支持」优先于一切含「支持」
+///    的分支——否则「条件不支持」「反对条件支持」等混合标记会被归成
+///    「条件支持」（180° 极性反转）；
+/// 2. 「无条件/不设条件/无附加条件 + 支持」不落「条件支持」；
+/// 3. 「不支持」天然含「支持」子串，由反对分支先截胡；
+/// 4. 未命中任何规范词时保留原文（截 16 字），不强行归四类。
+fn normalize_stance(s: &str) -> String {
+    let t = s.trim();
+    let unconditional = t.contains("无条件") || t.contains("不设条件") || t.contains("无附加条件");
+    let opposes =
+        (t.contains("反对") && !t.contains("不反对")) || t.contains("不支持");
+    if t.contains("中立") {
+        "中立".to_string()
+    } else if opposes {
+        "反对".to_string()
+    } else if t.contains("条件") && t.contains("支持") && !unconditional {
+        "条件支持".to_string()
+    } else if t.contains("支持") {
+        "支持".to_string()
+    } else {
+        t.chars().take(16).collect()
+    }
+}
+
+/// P1-a：程序聚合结果——共识结论的唯一权威来源（替代原主席一句话综合）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StanceAggregate {
+    /// 立场卡总数
+    pub total: usize,
+    /// 其中结构化卡数（降级卡计入总数但不参与分布统计）
+    pub structured: usize,
+    /// 立场分布（仅结构化卡，票数降序）
+    pub distribution: Vec<(String, usize)>,
+    /// 单行程序摘要：会议记录 `consensus` 字段与 memoria 首行共用
+    pub summary: String,
+}
+
+/// P1-a：程序化汇合立场卡（确定性，无 LLM 参与）。
+///
+/// 分布统计只计结构化卡；降级卡单列提示。存在对立立场（支持 vs 反对）时
+/// 在摘要末尾追加分歧提示——分歧的细节由立场卡行承载，不做 LLM 裁决。
+pub fn aggregate_stances(cards: &[StanceCard]) -> StanceAggregate {
+    let total = cards.len();
+    let mut dist: std::collections::BTreeMap<String, usize> = Default::default();
+    for c in cards.iter().filter(|c| c.structured) {
+        *dist.entry(c.stance.clone()).or_insert(0) += 1;
+    }
+    let structured: usize = dist.values().sum();
+    let mut distribution: Vec<(String, usize)> = dist.into_iter().collect();
+    // 票数降序；同票按立场名稳定排序（保证同一输入永远同一输出——程序化汇合的可复现要求）
+    distribution.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let dist_text = distribution
+        .iter()
+        .map(|(k, n)| format!("{} {}", k, n))
+        .collect::<Vec<_>>()
+        .join("、");
+    let mut summary = if structured > 0 {
+        format!("立场分布：{}（共 {} 席）", dist_text, total)
+    } else {
+        format!("立场分布：无结构化立场卡（共 {} 席，均为降级原文）", total)
+    };
+    if structured < total {
+        summary.push_str(&format!("，其中 {} 份未结构化已降级保留原文", total - structured));
+    }
+    let has = |k: &str| distribution.iter().any(|(s, _)| *s == k);
+    if has("支持") && has("反对") {
+        summary.push_str("；存在对立立场，分歧详见各方立场卡");
+    }
+    StanceAggregate { total, structured, distribution, summary }
+}
+
+/// Phase 6：圆桌结果。
+/// P1-a 起 `consensus` 为**程序聚合摘要**（[`aggregate_stances`]），主席 LLM 一句话
+/// 降级为 `display_note` 附注（非权威，可缺省）。
 pub struct RoundtableResult {
-    /// 各分身立场：(persona_id, stance)
-    pub stances: Vec<(String, String)>,
-    /// 主席收敛结论
+    /// 各分身立场卡（结构化 / 降级原文）
+    pub stances: Vec<StanceCard>,
+    /// 程序聚合的立场分布摘要（权威共识表示）
     pub consensus: String,
+    /// 主席附注（LLM 生成，非权威结论；失败/超时为 None）
+    pub display_note: Option<String>,
 }
 
 /// 会议实时状态机阶段（会议升级 Step3）。
@@ -2048,14 +2231,18 @@ impl AgentCore {
         pool
     }
 
-    /// Phase 6：圆桌 —— 单个分身就议题发表立场（供 run_roundtable / SSE 流式复用）
+    /// Phase 6：圆桌 —— 单个分身就议题发表立场（供 run_roundtable / SSE 流式复用）。
+    ///
+    /// P1-a：输出改为**立场卡 JSON**，由 [`StanceCard::parse`] 程序解析；
+    /// 解析失败自动降级为未结构化卡（原文保留），立场信息不丢。
+    /// 返回 (persona_id, 立场卡, provider 标签)。
     pub async fn persona_stance(
         &self,
         p: &crate::runtime::self_runtime::Persona,
         topic: &str,
         index: usize,
         pool: &[LlmConfig],
-    ) -> (String, String, String) {
+    ) -> (String, StanceCard, String) {
         let (client, provider_label) = match &p.llm {
             Some(c) => (c.clone(), "persona-configured".to_string()),
             None => {
@@ -2068,60 +2255,83 @@ impl AgentCore {
             "你是分身『{}』（{}）。请从你的角色视角独立发表观点，不要附和他人。",
             p.persona_id, p.display_name
         );
-        let user = format!("圆桌议题：{}\n请给出你的立场（2-4 句）。", topic);
+        let user = format!(
+            "圆桌议题：{}\n请独立思考后，只输出一个 JSON 对象（JSON 之外不要有任何文字）：\n{{\"stance\": \"支持/反对/中立/条件支持 四选一\", \"summary\": \"一句话概括你的立场\", \"key_reasons\": [\"最多三条关键理由\"], \"confidence\": 0到100的整数}}\n（本轮不提供记忆检索，不要编造任何证据或ID）",
+            topic
+        );
         let msgs = vec![
             crate::llm::Message { role: "system".to_string(), content: Some(sys), tool_calls: None, tool_call_id: None },
             crate::llm::Message { role: "user".to_string(), content: Some(user), tool_calls: None, tool_call_id: None },
         ];
         // 逐调用硬性超时：避免单个 provider 卡死（如重试退避叠加）拖垮整场圆桌。
         // 超时则该席返回占位立场，圆桌继续收敛，不让一个坏模型阻断其余模型。
-        let stance = match tokio::time::timeout(std::time::Duration::from_secs(45), client.chat(&msgs, &[])).await {
+        // 占位文本会走 StanceCard::parse 的降级路径，以未结构化卡保留。
+        let raw = match tokio::time::timeout(std::time::Duration::from_secs(45), client.chat(&msgs, &[])).await {
             Ok(Ok(r)) => r.text,
             Ok(Err(e)) => format!("(LLM 调用失败: {})", e),
             Err(_) => "(该分身 LLM 调用超时，已跳过其立场)".to_string(),
         };
-        (p.persona_id.clone(), stance, provider_label)
+        let card = StanceCard::parse(p.persona_id.clone(), p.display_name.clone(), raw);
+        (p.persona_id.clone(), card, provider_label)
     }
 
-    /// Phase 6：主席收敛共识
-    pub async fn chair_consensus(
+    /// Phase 6：主席附注（P1-a 降级，**非权威结论**）。
+    ///
+    /// 原 `chair_consensus` 把 N 方立场综合成一句话并作为唯一共识——《程序化汇合改造方案》
+    /// P1-a 起共识改由 [`aggregate_stances`] 程序聚合，本函数输出仅作为人类参考附注。
+    /// 失败 / 超时返回 None（附注可缺省，不再产生占位噪声文本）。
+    pub async fn chair_display_note(
         &self,
         topic: &str,
-        stances: &[(String, String)],
+        stances: &[StanceCard],
         chair_persona: Option<&str>,
-    ) -> String {
+    ) -> Option<String> {
         let chair_id = chair_persona.unwrap_or("default").to_string();
         let joined = stances
             .iter()
-            .map(|(id, s)| format!("【{}】{}", id, s))
+            .map(|c| {
+                // 结构化卡给摘要 + 规范立场；降级卡给原文（截 300 字防 prompt 膨胀）
+                let text = if c.structured {
+                    format!("{}（{}）", c.summary, c.stance)
+                } else {
+                    c.raw.chars().take(300).collect::<String>()
+                };
+                format!("【{}】{}", c.persona_id, text)
+            })
             .collect::<Vec<_>>()
             .join("\n");
-        let sys_chair = format!("你是圆桌主席（{}）。请综合各方立场，给出一句话共识结论。", chair_id);
-        let user_chair = format!("议题：{}\n各方立场：\n{}\n\n请给出共识结论。", topic, joined);
+        let sys_chair = format!(
+            "你是圆桌主席（{}）。请基于各方立场卡，用一两句话点评立场分布与主要分歧，供人类参考。\
+             这是参考附注，不是权威结论；不要替各方下最终结论。",
+            chair_id
+        );
+        let user_chair = format!("议题：{}\n各方立场卡：\n{}\n\n请给出主席附注。", topic, joined);
         let chair_msgs = vec![
             crate::llm::Message { role: "system".to_string(), content: Some(sys_chair), tool_calls: None, tool_call_id: None },
             crate::llm::Message { role: "user".to_string(), content: Some(user_chair), tool_calls: None, tool_call_id: None },
         ];
-        // 同样加硬性超时，避免主席收敛被全局 LLM 卡死。
+        // 附注是非权威增强，同样加硬性超时；失败静默降级为无附注。
         match tokio::time::timeout(std::time::Duration::from_secs(45), self.llm.chat(&chair_msgs, &[])).await {
-            Ok(Ok(r)) => r.text,
-            Ok(Err(e)) => format!("(主席收敛失败: {})", e),
-            Err(_) => "(主席收敛超时)".to_string(),
+            Ok(Ok(r)) if !r.text.trim().is_empty() => Some(r.text.trim().to_string()),
+            _ => None,
         }
     }
 
-    /// Phase 6：圆桌 —— 多分身就同一议题发表立场并收敛（收集式，供非流式调用 / tests）
+    /// Phase 6：圆桌 —— 多分身就同一议题发表立场并收敛（收集式，供非流式调用 / tests）。
+    ///
+    /// P1-a：`consensus` 为程序聚合摘要（权威），`display_note` 为主席附注（可缺省）。
     pub async fn run_roundtable(&self, topic: &str, chair_persona: Option<&str>) -> RoundtableResult {
         let mut personas = self.list_personas();
         personas.sort_by(|a, b| a.persona_id.cmp(&b.persona_id));
         let pool = self.llm_pool();
-        let mut stances: Vec<(String, String)> = Vec::new();
+        let mut stances: Vec<StanceCard> = Vec::new();
         for (i, p) in personas.iter().enumerate() {
-            let (id, stance, _prov) = self.persona_stance(p, topic, i, &pool).await;
-            stances.push((id, stance));
+            let (_id, card, _prov) = self.persona_stance(p, topic, i, &pool).await;
+            stances.push(card);
         }
-        let consensus = self.chair_consensus(topic, &stances, chair_persona).await;
-        RoundtableResult { stances, consensus }
+        let agg = aggregate_stances(&stances);
+        let display_note = self.chair_display_note(topic, &stances, chair_persona).await;
+        RoundtableResult { stances, consensus: agg.summary, display_note }
     }
 
     /// 从 session_id 解析调用者专属命名空间。
