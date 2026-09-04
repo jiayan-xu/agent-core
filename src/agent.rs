@@ -6035,16 +6035,17 @@ impl AgentCore {
         let mut tool_ctx = String::new();
         for (i, step_id) in keys.iter().enumerate() {
             let res = &step_results[*step_id];
-            let (facts, total_lines) = Self::extract_step_facts(res);
+            let (facts, total_lines, truncated) = Self::extract_step_facts(res);
             match facts {
                 Some(lines) if !lines.is_empty() => {
-                    let incomplete = lines.len() < total_lines;
+                    let incomplete = truncated;
                     tool_ctx.push_str(&format!(
-                        "\n[步骤 {}] (id={}) 要点摘录（含数字/实体的有效行共 {} 行，摘 {} 行）：\n",
+                        "\n[步骤 {}] (id={}) 要点摘录（含数字/实体的有效行共 {} 行，摘 {} 行{}）：\n",
                         i + 1,
                         step_id,
                         total_lines,
-                        lines.len()
+                        lines.len(),
+                        if incomplete { "，部分行超长已截断或省略" } else { "" }
                     ));
                     for f in &lines {
                         tool_ctx.push_str(&format!("- {}\n", f));
@@ -6119,22 +6120,24 @@ impl AgentCore {
 
     /// P1-b（R2）：从工具原始输出中**确定性**抽取要点行（不调 LLM）。
     ///
-    /// 选行规则（ocr PR#65 第三轮评审修订）：首条有内容的行作标题 + **数字行优先、
-    /// 非数字实体行补位**——只有一条 count 行 + 多条企业名/状态行时，纯数字规则会让
-    /// 模型永远看不到被省略的记录；补位保证实体行进入要点。各截 100 字，合计 ≤5 行、
-    /// 去重。**纯标点/括号行（pretty JSON 的 `{`、`[`）整行跳过**，不占预算。
-    /// 返回 `(Option<要点行>, 有内容的总行数)`；None = 无任何数字行（调用方降级喂
-    /// 截断原文）。行数供调用方生成截断声明。风格对齐审计 `summarize_args`：零语义加工。
-    fn extract_step_facts(res: &str) -> (Option<Vec<String>>, usize) {
+    /// 选行规则（ocr PR#65/67 评审修订）：首条有内容的行作标题 + **数字行优先、
+    /// 非数字实体行补位**；各截 100 字，合计 ≤5 行、去重；纯标点/括号行整行跳过。
+    /// 「有数字」判定**含标题行**——单行计数结果（`{"count":42}` / 「共 3 条」）
+    /// 正是本函数要服务的场景，skip(1) 会把它踢回原文截断路径（ocr PR#67）。
+    /// 返回 `(Option<要点行>, 有内容总行数, 是否不完整)`；None = 无任何数字行。
+    /// `truncated` = 行数有省略**或任一行超 100 字被截**——只比行数会漏掉「5 行内
+    /// 每行巨长、全被截断却宣称完整摘录」的场景（ocr PR#67 high），那是 P1-b
+    /// 要消灭的静默丢失且带着相反的溯源声明。
+    fn extract_step_facts(res: &str) -> (Option<Vec<String>>, usize, bool) {
         let has_alnum = |s: &str| s.chars().any(|c| c.is_alphanumeric());
-        // 有内容总行数**先独立数完**（同谓词）——抽取循环凑满 5 条即 break，
-        // 若行数在同一循环里累加会停在 ~6 行，截断声明严重低报原文体量
+        // 有内容总行数先独立数完（同谓词）——抽取循环凑满 5 条即 break
         let content_lines: Vec<&str> = res
             .lines()
             .map(|l| l.trim())
             .filter(|t| !t.is_empty() && has_alnum(t))
             .collect();
         let total_lines = content_lines.len();
+        let any_line_cut = content_lines.iter().any(|l| l.chars().count() > 100);
         let mut facts: Vec<String> = Vec::new();
         let mut push = |line: &str, facts: &mut Vec<String>| {
             if facts.len() >= 5 {
@@ -6165,10 +6168,13 @@ impl AgentCore {
                 break;
             }
         }
-        if numeric.is_empty() {
-            (None, total_lines)
+        // 含数字判定含标题行（ocr PR#67：单行计数结果不落空）
+        let has_digit = facts.iter().any(|f| f.bytes().any(|b| b.is_ascii_digit()));
+        let truncated = any_line_cut || facts.len() < total_lines;
+        if has_digit {
+            (Some(facts), total_lines, truncated)
         } else {
-            (Some(facts), total_lines)
+            (None, total_lines, truncated)
         }
     }
 
@@ -6538,8 +6544,11 @@ impl AgentCore {
                 Some((upto, text)) if !text.trim().is_empty() => {
                     // P1-c（R4）：复用摘要作结论底稿时强制携带来源声明——结论前半是机器摘要
                     // 而非原文复述，后续召回/展示时人类可辨别可信度层级。
+                    // upto 是**消息条数**（user+assistant+tool 混计），非轮次数——
+                    // 按轮声称会虚报约 2-3 倍覆盖面（ocr PR#67）。
+                    let rounds = upto / 2;
                     let mut out = format!(
-                        "（声明：本结论前半部分来自机器摘要，覆盖本会话前 {upto} 轮，非原文复述；session={}）\n",
+                        "（声明：本结论前半部分来自机器摘要，覆盖本会话前 {upto} 条历史消息（约 {rounds} 轮对话），非原文复述；session={}）\n",
                         session_id
                     );
                     out.push_str(&text);
@@ -8414,6 +8423,13 @@ impl AgentCore {
     fn tool_summary_discard_of(content: &str) -> u64 {
         const MARKER: &str = "[工具结果摘要]";
         if !content.starts_with(MARKER) {
+            return 0;
+        }
+        // squash 免疫（ocr PR#67）：squash_stale_tool_outputs 会在摘要之后再次截断同一条
+        // 消息（保留 MARKER 头）；此时「原文 N 字 − 现存长度」混入了 squash 的截断量，
+        // 长会话里会让 30% 上限永久误触发、opt-in 摘要器对最大载荷自动关闭。
+        // 检测到 squash 截断标记即放弃本条的丢弃核算（返回 0，宁松勿谎）。
+        if content.contains("output truncated") {
             return 0;
         }
         let Some(p) = content.find("原文 ") else {
@@ -12268,17 +12284,27 @@ impl AgentCore {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(s.trim()) else {
             return fallback();
         };
-        // 定位记录数组：顶层数组，或对象中第一个数组值字段（通用，无键名白名单）
+        // 定位记录数组：顶层数组，或对象中**元素数最多的数组字段**——serde_json 的
+        // Map 是 BTreeMap（键按字母序），「第一个数组字段」会按字母序误选小数组
+        // （records vs alerts / data vs records），对 k 出具自信的错误统计
+        // （ocr PR#67）；并列时按序列化长度、再按键名排序保证确定性。
         let (records, envelope_key): (&[serde_json::Value], Option<&str>) = if let Some(arr) =
             v.as_array()
         {
             (arr.as_slice(), None)
         } else if let Some(o) = v.as_object() {
-            match o.iter().find(|(_, x)| x.is_array()) {
-                Some((k, arr_val)) => (
-                    arr_val.as_array().map(|a| a.as_slice()).unwrap_or(&[]),
-                    Some(k.as_str()),
-                ),
+            let mut arrays: Vec<(&String, &Vec<serde_json::Value>)> = o
+                .iter()
+                .filter_map(|(k, x)| x.as_array().map(|a| (k, a)))
+                .collect();
+            arrays.sort_by(|a, b| {
+                b.1.len()
+                    .cmp(&a.1.len())
+                    .then_with(|| serde_json::to_string(b.1).unwrap_or_default().len().cmp(&serde_json::to_string(a.1).unwrap_or_default().len()))
+                    .then_with(|| a.0.cmp(b.0))
+            });
+            match arrays.first() {
+                Some((k, arr)) => (arr.as_slice(), Some(k.as_str())),
                 None => (&[], None),
             }
         } else {
@@ -12292,12 +12318,46 @@ impl AgentCore {
             }
             return fallback();
         }
+        // 预算必须涵盖 **envelope 开销**（键名/引号/花括号/同级字段 total/sql/message
+        // 等全部计入序列化结果）——只预留 "[]" 2 字会让重建结果超出 cap 任意倍，
+        // 3000/1000 上限名存实亡（ocr PR#67）
+        let envelope_base: usize = match (&v, envelope_key) {
+            (serde_json::Value::Object(o), Some(key)) => {
+                let mut m = o.clone();
+                m.insert(key.to_string(), serde_json::Value::Array(Vec::new()));
+                serde_json::to_string(&serde_json::Value::Object(m))
+                    .unwrap_or_default()
+                    .chars()
+                    .count()
+            }
+            _ => 0,
+        };
+        if envelope_base >= cap_chars {
+            return fallback(); // envelope 自身就超限（同级字段过长）：字符截断兜底
+        }
+        // 识别但为空的记录数组 → Some(0)（与顶层空数组一致；ocr PR#65 第五轮语义，
+        // 拆分时一度丢失）：不得误报「条数未识别」
+        if records.is_empty() {
+            let rebuilt = match (&v, envelope_key) {
+                (serde_json::Value::Object(o), Some(key)) => {
+                    let mut m = o.clone();
+                    m.insert(key.to_string(), serde_json::Value::Array(Vec::new()));
+                    serde_json::to_string(&serde_json::Value::Object(m)).unwrap_or_default()
+                }
+                _ => "[]".to_string(),
+            };
+            if rebuilt.chars().count() <= cap_chars {
+                return (rebuilt, Some(0));
+            }
+            return fallback();
+        }
+        let budget = cap_chars - envelope_base;
         let mut used = 2usize; // "[]"
         let mut kept: Vec<&serde_json::Value> = Vec::new();
         for rec in records {
             let serialized = serde_json::to_string(rec).unwrap_or_default();
             let len = serialized.chars().count() + if kept.is_empty() { 0 } else { 1 };
-            if used + len > cap_chars {
+            if used + len > budget {
                 break;
             }
             used += len;
@@ -15066,5 +15126,97 @@ mod tool_summary_accounting_tests {
             AgentCore::tool_summary_discard_of("[工具结果摘要](溯源: tool_call_id=None，原文 abc 字，摘要为 LLM 生成非原文)\n正文"),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod extraction_helpers_tests {
+    use super::AgentCore;
+
+    /// extract_step_facts：标题/数字优先/实体补位/纯标点跳过/单行计数/截断标志
+    #[test]
+    fn extract_facts_rules() {
+        // 数字行优先 + 实体行补位 + 纯标点行不占预算
+        let raw = "{\n  \"total\": 3,\n  安徽皖A12345 已过期,\n  [\"x\"],\n  车牌 皖B67890 正常,\n  企业 联合环保 在册,\n  备注 行六,\n";
+        let (facts, total, trunc) = AgentCore::extract_step_facts(raw);
+        let f = facts.expect("有数字行应 Some");
+        assert!(total >= 5);
+        assert!(trunc); // 行数超过 5 被省略
+        assert!(f.len() <= 5);
+        assert!(f.iter().any(|x| x.contains("皖A12345")));
+        // 纯标点行 { / ["x"] 不在要点里
+        assert!(!f.iter().any(|x| x.trim() == "{"));
+    }
+
+    /// 单行计数结果（ocr PR#67：标题行含数字即成立，不再落回原文截断）
+    #[test]
+    fn extract_facts_single_line_count() {
+        let (facts, total, trunc) = AgentCore::extract_step_facts("查询成功，共 3 条记录");
+        assert_eq!(total, 1);
+        assert!(!trunc);
+        let f = facts.expect("标题行含数字应 Some");
+        assert_eq!(f, vec!["查询成功，共 3 条记录".to_string()]);
+    }
+
+    /// 无任何数字 → None（调用方降级原文截断）
+    #[test]
+    fn extract_facts_no_digits_none() {
+        let (facts, _, _) = AgentCore::extract_step_facts("只有文字没有数字的输出");
+        assert!(facts.is_none());
+    }
+
+    /// 单行巨长被 100 字截断 → truncated=true（ocr PR#67 high：只比行数会漏掉）
+    #[test]
+    fn extract_facts_long_line_marks_truncated() {
+        let long: String = "行".repeat(500);
+        let raw = format!("共 2 条\n{long}");
+        let (facts, total, trunc) = AgentCore::extract_step_facts(&raw);
+        assert_eq!(total, 2);
+        assert!(facts.is_some());
+        assert!(trunc, "单行被截断必须标记不完整");
+        assert!(facts.unwrap()[1].chars().count() == 100);
+    }
+
+    /// truncate_json_records：顶层数组按记录边界、k=可见数
+    #[test]
+    fn truncate_records_top_level_array() {
+        let raw = r#"[{"id":1},{"id":2},{"id":3}]"#;
+        let (text, k) = AgentCore::truncate_json_records(raw, 20);
+        // 8+9 字两条 + [] 2 = 19 ≤ 20，第三条超限 → k=2
+        assert_eq!(k, Some(2));
+        assert!(text.starts_with("["));
+        assert!(text.contains("\"id\":1"));
+    }
+
+    /// envelope 重建：同级字段保留、总长不超 cap（ocr PR#67 预算修复）
+    #[test]
+    fn truncate_records_envelope_budget() {
+        let raw = r#"{"total":500,"items":[{"id":1},{"id":2},{"id":3}]}"#;
+        // envelope 基底 {"items":[],"total":500} = 25 字；cap 40 → 记录预算 15，
+        // 容 1 条（8 字）；重建 33 字 ≤ 40
+        let (text, k) = AgentCore::truncate_json_records(raw, 40);
+        assert!(text.contains("\"total\":500"), "envelope 同级字段保留");
+        assert!(text.chars().count() <= 40, "重建结果必须 ≤ cap：{text}");
+        assert_eq!(k, Some(1));
+    }
+
+    /// 多数组字段选**元素最多**的（BTreeMap 字母序陷阱，ocr PR#67）
+    #[test]
+    fn truncate_records_picks_largest_array() {
+        let raw = r#"{"alerts":[{"a":1}],"records":[{"id":1},{"id":2},{"id":3}]}"#;
+        let (_, k) = AgentCore::truncate_json_records(raw, 200);
+        assert_eq!(k, Some(3), "应选 records（3 条）而非 alerts（1 条）");
+    }
+
+    /// 空数组 / 非 JSON / 聚合对象：None 或全量，不产生伪计数
+    #[test]
+    fn truncate_records_degenerate_inputs() {
+        let (_, k) = AgentCore::truncate_json_records(r#"{"items":[]}"#, 100);
+        assert_eq!(k, Some(0));
+        let (_, k2) = AgentCore::truncate_json_records("不是 JSON", 100);
+        assert_eq!(k2, None);
+        let (text, k3) = AgentCore::truncate_json_records(r#"{"ok":true}"#, 100);
+        assert!(text.contains("ok"));
+        assert_eq!(k3, None);
     }
 }
