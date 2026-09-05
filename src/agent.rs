@@ -6727,7 +6727,7 @@ impl AgentCore {
             tool_call_id: None,
         };
 
-        match self.llm.chat_batch(&[msg], &[]).await {
+        match self.llm.chat(&[msg], &[]).await {
             Ok(r) if !r.text.trim().is_empty() => {
                 let answer = r.text.trim().to_string();
                 // P1-b 引用完整性检查（ocr PR#67 第三轮）：必须出现**带括号的步骤标签**
@@ -7288,7 +7288,7 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         };
-        match self.llm.chat_batch(&[msg], &[]).await {
+        match self.llm.chat(&[msg], &[]).await {
             Ok(r) if !r.text.trim().is_empty() => Some(r.text.trim().to_string()),
             _ => None,
         }
@@ -7629,7 +7629,7 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         };
-        match self.llm.chat_batch(&[msg], &[]).await {
+        match self.llm.chat(&[msg], &[]).await {
             Ok(r) if !r.text.trim().is_empty() => Some(Self::parse_summary_output(&r.text)),
             Ok(_) => None,
             Err(e) => {
@@ -13109,7 +13109,7 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         };
-        match self.llm.chat_batch(&[msg], &[]).await {
+        match self.llm.chat(&[msg], &[]).await {
             Ok(reply) => {
                 let items = crate::text_signals::parse_llm_signal_array(reply.text.trim());
                 crate::text_signals::map_llm_signals_by_index(&items, texts.len())
@@ -13133,7 +13133,7 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         };
-        match self.llm.chat_batch(&[msg], &[]).await {
+        match self.llm.chat(&[msg], &[]).await {
             Ok(reply) => {
                 let items = crate::text_signals::parse_llm_signal_array(reply.text.trim());
                 items

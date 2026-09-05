@@ -1431,13 +1431,18 @@ impl LlmClient {
     }
 
     /// 慢批次调用（ocr PR#70 排障引入）：请求级 300s 覆盖 Client 的 60s。
-    /// 适用对象是**推理模型 + 长 prompt 的后台提炼**——deepseek-v4-pro 对
-    /// 6 条观察的提炼实测 53s，consolidate（6000 字窗口）/ 评估题集 / 洞见 /
-    /// 历史压缩稳定超 60s，2026-08-19 起这些链路持续以
-    /// "LLM json: error decoding response body"（body 中途被掐）失败。
-    /// 用户面交互调用请继续用 [`Self::chat`]（60s + failover 足够）。
+    /// 适用对象是**后台提炼链路**——deepseek-v4-pro 对 6 条观察的提炼实测
+    /// 53s，consolidate 主提炼/评估题集/洞见/信号标签批抽/元进化稳定超 60s，
+    /// 2026-08-19 起这些链路持续以 "LLM json: error decoding response body"
+    /// （body 中途被掐）失败。
+    ///
+    /// **确定性 300s 上界**（ocr PR#70 第二轮）：单次尝试、不重试、不进
+    /// fallback——300s 若计入重试×failover 最坏放大到 15-25 分钟，且每个
+    /// 尝试占一个信号量槽位会饿死交互流量。失败即返回，由调用方的下一
+    /// 个 tick/下一次手动触发重试（后台链路天然幂等重试）。
+    /// 用户面交互调用请继续用 [`Self::chat`]（60s + 重试 + failover）。
     pub async fn chat_batch(&self, messages: &[Message], tools: &[ToolDef]) -> Result<LlmResponse, String> {
-        self.chat_impl(messages, tools, None, Some(Duration::from_secs(300)))
+        self.chat_impl_no_retry(messages, tools, Duration::from_secs(300))
             .await
     }
 
@@ -1448,6 +1453,101 @@ impl LlmClient {
     /// chat_with_max_tokens 是唯一传入 Some 的入口，其内部用同一 cap 覆盖
     /// 配置（with_max_tokens_override），两者不可能漂移（ocr maintainability·low
     /// 修复：文档如实描述，不夸大为类型级保证）。
+    /// [`chat_batch`] 的实现：单 provider 单次尝试 + 请求级超时（无重试无
+    /// fallback，见 chat_batch 文档）。与 chat_impl 共享 sanitize/信号量。
+    async fn chat_impl_no_retry(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        req_timeout: Duration,
+    ) -> Result<LlmResponse, String> {
+        let sanitized = sanitize_messages(messages);
+        let messages: &[Message] = &sanitized;
+        let url = format!(
+            "{}{}",
+            self.config.base_url.trim_end_matches('/'),
+            self.config.chat_path
+        );
+        let mut body = serde_json::json!({
+            "model": self.config.model,
+            "messages": messages,
+            "max_tokens": self.config.max_tokens,
+            "temperature": self.config.temperature,
+        });
+        if !tools.is_empty() {
+            body["tools"] =
+                serde_json::to_value(tools).map_err(|e| format!("tools json: {}", e))?;
+        }
+        let _permit = llm_semaphore()
+            .acquire()
+            .await
+            .expect("llm semaphore closed");
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(req_timeout)
+            .json(&body)
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .send()
+            .await
+            .map_err(|e| format!("LLM transport: {}", e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "LLM HTTP {}: {}",
+                status.as_u16(),
+                err_body.chars().take(200).collect::<String>()
+            ));
+        }
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("LLM json: {}", e))?;
+        let choice = data["choices"][0]
+            .as_object()
+            .ok_or("LLM returned no choices")?
+            .clone();
+        let message = choice
+            .get("message")
+            .and_then(|m| m.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let text = message
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        // tool_calls 解析与 chat_impl 同构（id/name/arguments JSON 字符串）
+        let tool_calls = message
+            .get("tool_calls")
+            .and_then(|tc| tc.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|tc| {
+                        let id = tc["id"].as_str()?.to_string();
+                        let name = tc["function"]["name"].as_str()?.to_string();
+                        let args_str = tc["function"]["arguments"].as_str()?;
+                        let arguments: serde_json::Value =
+                            serde_json::from_str(args_str).ok()?;
+                        Some(ToolCall { id, name, arguments })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let usage = data.get("usage").and_then(|u| {
+            Some(LlmUsage {
+                prompt_tokens: u.get("prompt_tokens")?.as_u64()?,
+                completion_tokens: u.get("completion_tokens")?.as_u64()?,
+                total_tokens: u
+                    .get("total_tokens")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(0),
+            })
+        });
+        Ok(LlmResponse { text, tool_calls, usage })
+    }
+
     async fn chat_impl(
         &self,
         messages: &[Message],
