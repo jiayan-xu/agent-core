@@ -1465,7 +1465,26 @@ impl LlmClient {
         attempts: u32,
     ) -> Result<LlmResponse, String> {
         let sanitized = sanitize_messages(messages);
-        let messages: &[Message] = &sanitized;
+        // Zhipu 兼容（2026-09-05 GLM 切换排障）：单条 system 消息（无 user）
+        // 被 Zhipu API 拒绝（code 1214「messages 参数非法」）；DeepSeek 不限。
+        // 全局兼容层：仅有 system 时将 role 转为 user——单 system 消息的
+        // 语义与单 user 等价（完整自包含指令），不需要额外分层。
+        let compat_messages: Vec<Message> = if sanitized.iter().all(|m| m.role != "user") && !sanitized.is_empty()
+        {
+            sanitized
+                .iter()
+                .map(|m| {
+                    let mut cloned = m.clone();
+                    if cloned.role == "system" {
+                        cloned.role = "user".to_string();
+                    }
+                    cloned
+                })
+                .collect::<Vec<_>>()
+        } else {
+            sanitized.iter().map(|m| m.clone()).collect::<Vec<_>>()
+        };
+        let messages: &[Message] = &compat_messages;
         let url = format!(
             "{}{}",
             self.config.base_url.trim_end_matches('/'),
@@ -1586,7 +1605,23 @@ impl LlmClient {
     ) -> Result<LlmResponse, String> {
         // 传输层脱敏：user 消息凭证打码后再上送（不改历史/存储）
         let sanitized = sanitize_messages(messages);
-        let messages: &[Message] = &sanitized;
+        // Zhipu 兼容（chat_impl_bounded 同款）：单条 system 消息转 user
+        let compat_messages: Vec<Message> = if sanitized.iter().all(|m| m.role != "user") && !sanitized.is_empty()
+        {
+            sanitized
+                .iter()
+                .map(|m| {
+                    let mut cloned = m.clone();
+                    if cloned.role == "system" {
+                        cloned.role = "user".to_string();
+                    }
+                    cloned
+                })
+                .collect::<Vec<_>>()
+        } else {
+            sanitized.iter().map(|m| m.clone()).collect::<Vec<_>>()
+        };
+        let messages: &[Message] = &compat_messages;
         // 主 Provider + 备用 Provider 列表
         let mut providers: Vec<LlmProvider> = Vec::new();
         providers.push(LlmProvider {
