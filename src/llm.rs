@@ -1377,8 +1377,14 @@ impl LlmClient {
     }
 
     pub fn new(config: LlmConfig) -> Self {
+        // Client 级保持 60s 总超时 + 10s 连接超时（ocr PR#70 评审：全局放宽到 300s
+        // 会把重试×failover 最坏情况放大到 ~15 分钟、信号量槽位占用 ×5、连接黑洞
+        // 场景废掉 failover）。**慢批次调用**（consolidate 提炼/评估/洞见等推理
+        // 模型长 prompt，实测 6 条观察 53s > 60s）经 [`Self::chat_batch`] 的
+        // 请求级 300s 覆盖，不放大其余路径。
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("reqwest Client::build");
         LlmClient { client, config }
@@ -1410,7 +1416,7 @@ impl LlmClient {
             return Err("bootstrap max_tokens 必须大于 0".to_string());
         }
         self.with_max_tokens_override(max_tokens)
-            .chat_impl(messages, tools, Some(max_tokens))
+            .chat_impl(messages, tools, Some(max_tokens), None)
             .await
     }
 
@@ -1421,7 +1427,24 @@ impl LlmClient {
         messages: &[Message],
         tools: &[ToolDef],
     ) -> Result<LlmResponse, String> {
-        self.chat_impl(messages, tools, None).await
+        self.chat_impl(messages, tools, None, None).await
+    }
+
+    /// 慢批次调用（ocr PR#70 排障引入）：请求级 300s 覆盖 Client 的 60s。
+    /// 适用对象是**后台提炼链路**——deepseek-v4-pro 对 6 条观察的提炼实测
+    /// 53s，consolidate 主提炼/评估题集/洞见/信号标签批抽/元进化稳定超 60s，
+    /// 2026-08-19 起这些链路持续以 "LLM json: error decoding response body"
+    /// （body 中途被掐）失败。
+    ///
+    /// **有界尝试**（ocr PR#70 第二/三轮收敛）：最多 2 次（单次请求级
+    /// ≤150s，合计 ≤300s + 2s 间隔）、不进 fallback——按次 300s × 重试 ×
+    /// failover 的最坏放大不可接受；而纯单次又不安全：consolidate 的 dream
+    /// 游标在 LLM 调用**之前**推进，一次瞬时失败（超时/429/5xx）会永久消费
+    /// 整个观察窗口。2×150s 保留瞬时容错且总时长仍落在 state.rs 420s 外层
+    /// 预算内。用户面交互调用请继续用 [`Self::chat`]（60s + 重试 + failover）。
+    pub async fn chat_batch(&self, messages: &[Message], tools: &[ToolDef]) -> Result<LlmResponse, String> {
+        self.chat_impl_bounded(messages, tools, Duration::from_secs(150), 2)
+            .await
     }
 
     /// chat 的实现体；`budget: Option<u32>` 把「预算化模式」与「截断告警判定
@@ -1431,11 +1454,135 @@ impl LlmClient {
     /// chat_with_max_tokens 是唯一传入 Some 的入口，其内部用同一 cap 覆盖
     /// 配置（with_max_tokens_override），两者不可能漂移（ocr maintainability·low
     /// 修复：文档如实描述，不夸大为类型级保证）。
+    /// [`chat_batch`] 的实现：单 provider 有界尝试 + 请求级超时（无
+    /// fallback，见 chat_batch 文档）。与 chat_impl 共享 sanitize/信号量；
+    /// 信号量槽位在整个重试序列中只占一个（防多批次并发时放大占用）。
+    async fn chat_impl_bounded(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        req_timeout: Duration,
+        attempts: u32,
+    ) -> Result<LlmResponse, String> {
+        let sanitized = sanitize_messages(messages);
+        let messages: &[Message] = &sanitized;
+        let url = format!(
+            "{}{}",
+            self.config.base_url.trim_end_matches('/'),
+            self.config.chat_path
+        );
+        let mut body = serde_json::json!({
+            "model": self.config.model,
+            "messages": messages,
+            "max_tokens": self.config.max_tokens,
+            "temperature": self.config.temperature,
+        });
+        if !tools.is_empty() {
+            body["tools"] =
+                serde_json::to_value(tools).map_err(|e| format!("tools json: {}", e))?;
+        }
+        let _permit = llm_semaphore()
+            .acquire()
+            .await
+            .expect("llm semaphore closed");
+        let mut last_err = String::new();
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            let resp = match self
+                .client
+                .post(&url)
+                .timeout(req_timeout)
+                .json(&body)
+                .header("Authorization", format!("Bearer {}", self.config.api_key))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format!("LLM transport: {}", e);
+                    tracing::warn!(target: "agent.llm", attempt, error = %msg,
+                        "chat_batch 尝试失败");
+                    last_err = msg;
+                    continue;
+                }
+            };
+            return Self::parse_llm_http(resp).await.map_err(|e| {
+                tracing::warn!(target: "agent.llm", attempt, error = %e,
+                    "chat_batch 尝试失败");
+                e
+            });
+        }
+        Err(last_err)
+    }
+
+    /// 非流式单响应解析（chat_impl_bounded 与 chat_impl 共用语义：
+    /// 状态码检查 → JSON → choices[0].message → LlmResponse）。
+    async fn parse_llm_http(resp: reqwest::Response) -> Result<LlmResponse, String> {
+        let status = resp.status();
+        if !status.is_success() {
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "LLM HTTP {}: {}",
+                status.as_u16(),
+                err_body.chars().take(200).collect::<String>()
+            ));
+        }
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("LLM json: {}", e))?;
+        let choice = data["choices"][0]
+            .as_object()
+            .ok_or("LLM returned no choices")?
+            .clone();
+        let message = choice
+            .get("message")
+            .and_then(|m| m.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let text = message
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        // tool_calls 解析与 chat_impl 同构（id/name/arguments JSON 字符串）
+        let tool_calls = message
+            .get("tool_calls")
+            .and_then(|tc| tc.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|tc| {
+                        let id = tc["id"].as_str()?.to_string();
+                        let name = tc["function"]["name"].as_str()?.to_string();
+                        let args_str = tc["function"]["arguments"].as_str()?;
+                        let arguments: serde_json::Value =
+                            serde_json::from_str(args_str).ok()?;
+                        Some(ToolCall { id, name, arguments })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let usage = data.get("usage").and_then(|u| {
+            Some(LlmUsage {
+                prompt_tokens: u.get("prompt_tokens")?.as_u64()?,
+                completion_tokens: u.get("completion_tokens")?.as_u64()?,
+                total_tokens: u
+                    .get("total_tokens")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(0),
+            })
+        });
+        Ok(LlmResponse { text, tool_calls, usage })
+    }
+
     async fn chat_impl(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
         budget: Option<u32>,
+        req_timeout: Option<Duration>,
     ) -> Result<LlmResponse, String> {
         // 传输层脱敏：user 消息凭证打码后再上送（不改历史/存储）
         let sanitized = sanitize_messages(messages);
@@ -1499,10 +1646,13 @@ impl LlmClient {
                     .acquire()
                     .await
                     .expect("llm semaphore closed");
-                let resp_result = self
-                    .client
-                    .post(&url)
-                    .json(&body)
+                // 请求级超时覆盖（ocr PR#70：慢批次经 chat_batch 放宽到 300s，
+                // 其余调用维持 Client 级 60s）
+                let mut rb = self.client.post(&url).json(&body);
+                if let Some(t) = req_timeout {
+                    rb = rb.timeout(t);
+                }
+                let resp_result = rb
                     .header("Authorization", format!("Bearer {}", api_key))
                     .send()
                     .await;

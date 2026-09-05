@@ -12924,7 +12924,7 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         };
-        let reply = match self.llm.chat(&[msg], &[]).await {
+        let reply = match self.llm.chat_batch(&[msg], &[]).await {
             Ok(r) => r.text.trim().to_string(),
             Err(e) => return format!("洞见失败: {}", e),
         };
@@ -13505,7 +13505,7 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         };
-        let reply = match self.llm.chat(&[msg], &[]).await {
+        let reply = match self.llm.chat_batch(&[msg], &[]).await {
             Ok(r) => r.text.trim().to_string(),
             Err(e) => {
                 return ConsolidateOutcome {
@@ -13680,7 +13680,7 @@ impl AgentCore {
                 tool_calls: None,
                 tool_call_id: None,
             };
-            if let Ok(ner_reply) = self.llm.chat(&[msg2], &[]).await {
+            if let Ok(ner_reply) = self.llm.chat_batch(&[msg2], &[]).await {
                 let ner_text = ner_reply.text.trim().to_string();
                 // 解析 JSON（尝试直接解析，失败则查找最外层 {}）
                 let ner_json: Option<serde_json::Value> =
@@ -13877,7 +13877,7 @@ impl AgentCore {
                         tool_calls: None,
                         tool_call_id: None,
                     };
-                    if let Ok(evo_reply) = self.llm.chat(&[msg3], &[]).await {
+                    if let Ok(evo_reply) = self.llm.chat_batch(&[msg3], &[]).await {
                         let pairs = crate::memory_evolve::parse_evolution_array(&evo_reply.text);
                         for (eid, ectx) in pairs {
                             // 仅演化本批次内的 id（防御 LLM 编造 id 跨批）

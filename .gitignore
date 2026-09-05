@@ -74,3 +74,4 @@ meetings.json
 *.goodbak
 # 本机 Cursor 本地规则（含 ~/.dsh 路径与本地运维约定，不进公开仓库）
 .cursor/
+target-deploy/
