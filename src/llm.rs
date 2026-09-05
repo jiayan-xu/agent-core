@@ -1436,13 +1436,14 @@ impl LlmClient {
     /// 2026-08-19 起这些链路持续以 "LLM json: error decoding response body"
     /// （body 中途被掐）失败。
     ///
-    /// **确定性 300s 上界**（ocr PR#70 第二轮）：单次尝试、不重试、不进
-    /// fallback——300s 若计入重试×failover 最坏放大到 15-25 分钟，且每个
-    /// 尝试占一个信号量槽位会饿死交互流量。失败即返回，由调用方的下一
-    /// 个 tick/下一次手动触发重试（后台链路天然幂等重试）。
-    /// 用户面交互调用请继续用 [`Self::chat`]（60s + 重试 + failover）。
+    /// **有界尝试**（ocr PR#70 第二/三轮收敛）：最多 2 次（单次请求级
+    /// ≤150s，合计 ≤300s + 2s 间隔）、不进 fallback——按次 300s × 重试 ×
+    /// failover 的最坏放大不可接受；而纯单次又不安全：consolidate 的 dream
+    /// 游标在 LLM 调用**之前**推进，一次瞬时失败（超时/429/5xx）会永久消费
+    /// 整个观察窗口。2×150s 保留瞬时容错且总时长仍落在 state.rs 420s 外层
+    /// 预算内。用户面交互调用请继续用 [`Self::chat`]（60s + 重试 + failover）。
     pub async fn chat_batch(&self, messages: &[Message], tools: &[ToolDef]) -> Result<LlmResponse, String> {
-        self.chat_impl_no_retry(messages, tools, Duration::from_secs(300))
+        self.chat_impl_bounded(messages, tools, Duration::from_secs(150), 2)
             .await
     }
 
@@ -1453,13 +1454,15 @@ impl LlmClient {
     /// chat_with_max_tokens 是唯一传入 Some 的入口，其内部用同一 cap 覆盖
     /// 配置（with_max_tokens_override），两者不可能漂移（ocr maintainability·low
     /// 修复：文档如实描述，不夸大为类型级保证）。
-    /// [`chat_batch`] 的实现：单 provider 单次尝试 + 请求级超时（无重试无
-    /// fallback，见 chat_batch 文档）。与 chat_impl 共享 sanitize/信号量。
-    async fn chat_impl_no_retry(
+    /// [`chat_batch`] 的实现：单 provider 有界尝试 + 请求级超时（无
+    /// fallback，见 chat_batch 文档）。与 chat_impl 共享 sanitize/信号量；
+    /// 信号量槽位在整个重试序列中只占一个（防多批次并发时放大占用）。
+    async fn chat_impl_bounded(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
         req_timeout: Duration,
+        attempts: u32,
     ) -> Result<LlmResponse, String> {
         let sanitized = sanitize_messages(messages);
         let messages: &[Message] = &sanitized;
@@ -1482,15 +1485,41 @@ impl LlmClient {
             .acquire()
             .await
             .expect("llm semaphore closed");
-        let resp = self
-            .client
-            .post(&url)
-            .timeout(req_timeout)
-            .json(&body)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .send()
-            .await
-            .map_err(|e| format!("LLM transport: {}", e))?;
+        let mut last_err = String::new();
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            let resp = match self
+                .client
+                .post(&url)
+                .timeout(req_timeout)
+                .json(&body)
+                .header("Authorization", format!("Bearer {}", self.config.api_key))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format!("LLM transport: {}", e);
+                    tracing::warn!(target: "agent.llm", attempt, error = %msg,
+                        "chat_batch 尝试失败");
+                    last_err = msg;
+                    continue;
+                }
+            };
+            return Self::parse_llm_http(resp).await.map_err(|e| {
+                tracing::warn!(target: "agent.llm", attempt, error = %e,
+                    "chat_batch 尝试失败");
+                e
+            });
+        }
+        Err(last_err)
+    }
+
+    /// 非流式单响应解析（chat_impl_bounded 与 chat_impl 共用语义：
+    /// 状态码检查 → JSON → choices[0].message → LlmResponse）。
+    async fn parse_llm_http(resp: reqwest::Response) -> Result<LlmResponse, String> {
         let status = resp.status();
         if !status.is_success() {
             let err_body = resp.text().await.unwrap_or_default();
