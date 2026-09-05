@@ -553,11 +553,26 @@ impl StanceCard {
         };
         let fallback = |raw: String| {
             let (raw_kept, raw_truncated) = clamp_raw(&raw);
+            // 首条**有内容**的行作摘要（issue #69：盲取首行会取到
+            // ```json 围栏/空行/花括号行），全为噪声则空串
+            let summary = raw
+                .lines()
+                .map(|l| l.trim())
+                .find(|l| {
+                    !l.is_empty()
+                        && !l.starts_with("```")
+                        && !l.starts_with('{')
+                        && !l.starts_with('}')
+                })
+                .unwrap_or("")
+                .chars()
+                .take(80)
+                .collect();
             StanceCard {
                 persona_id: persona_id.clone(),
                 display_name: display_name.clone(),
                 stance: STANCE_UNSTRUCTURED.to_string(),
-                summary: raw.lines().next().unwrap_or("").trim().chars().take(80).collect(),
+                summary,
                 key_reasons: Vec::new(),
                 citations: Vec::new(),
                 confidence: None,
@@ -633,7 +648,16 @@ impl StanceCard {
                 .as_u64()
                 .map(normalize_conf)
                 .or_else(|| x.as_f64().map(from_float))
-                .or_else(|| x.as_str().and_then(|s| s.trim().parse::<f64>().ok()).map(from_float));
+                .or_else(|| {
+                    x.as_str().and_then(|s| {
+                        let t = s.trim();
+                        // nan/inf 字符串不是合法置信度（issue #69：parse 会接受）
+                        if t.is_empty() || t.to_lowercase().contains("n") {
+                            return None;
+                        }
+                        t.parse::<f64>().ok().map(from_float)
+                    })
+                });
             if n.is_none() {
                 tracing::debug!(target = "roundtable", persona = %persona_id,
                     value = %x, "confidence 无法解码（非数字/数字字符串），置空");
@@ -909,6 +933,12 @@ pub enum ConsolidateStatus {
     GateRejected,
     /// 部分写入失败
     PartialWrite,
+    /// memoria 写入全失败（I/O 故障，非模型质量问题——issue #74 评审：
+    /// 伪装成 GateRejected 会让 I/O 告警被当模型信号误读）
+    WriteFailed,
+    /// memoria 读取失败（存储层故障，非 LLM 问题、也非正常空转——
+    /// issue #74 评审：伪装成 LlmError/NoInput 都会触发错误排障方向）
+    ReadError,
 }
 
 impl ConsolidateStatus {
@@ -921,6 +951,8 @@ impl ConsolidateStatus {
             ConsolidateStatus::NoPatterns => "no_patterns",
             ConsolidateStatus::GateRejected => "gate_rejected",
             ConsolidateStatus::PartialWrite => "partial_write",
+            ConsolidateStatus::WriteFailed => "write_failed",
+            ConsolidateStatus::ReadError => "read_error",
         }
     }
 }
@@ -1016,14 +1048,22 @@ fn strip_list_markers(s: &str) -> &str {
 /// P2-2 共用：剥离前导的 `[N]`/`【N】` 批内索引 token——prompt 用 `[3] 规则…`
 /// 渲染观察，模型回显该格式时前导 `[3]` 是批次局部索引，落库后无意义且污染
 /// 检索（ocr PR#68 第三轮）。
-fn strip_leading_index(s: &str) -> &str {
+fn strip_leading_index(s: &str, max_n: usize) -> &str {
     let t = s.trim_start();
     for (open, close) in [('[', ']'), ('【', '】')] {
         if let Some(rest) = t.strip_prefix(open) {
             if let Some(off) = rest.find(close) {
                 let inner = &rest[..off];
-                if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) && off <= 4 {
-                    return strip_leading_index(&rest[off + close.len_utf8()..]);
+                // 序号合法性对齐 parse_pattern_citation（1..=max_n，issue #74
+                // 评审：位数上限只是巧合——CONSOLIDATE_MIN_OBS_CHARS 调低后
+                // [100] 级索引会被渲染进 prompt；年份 [2026] 则因超界天然豁免）
+                if !inner.is_empty()
+                    && inner.chars().all(|c| c.is_ascii_digit())
+                {
+                    let n: usize = inner.parse().unwrap_or(0);
+                    if n >= 1 && n <= max_n {
+                        return strip_leading_index(&rest[off + close.len_utf8()..], max_n);
+                    }
                 }
             }
         }
@@ -13345,6 +13385,8 @@ impl AgentCore {
             .unwrap_or_else(|| "1970-01-01T00:00:00".to_string());
 
         // 2. 拉原料（多拉一点，过滤后仍够 LLM 用）
+        // 读取失败与零观察分开上报（issue #69：二者同报 NoInput 会让
+        // memoria 故障在聚合里伪装成安静的夜晚）
         let raw = mem_client
             .call(
                 "memory_fetch_unconsolidated",
@@ -13352,22 +13394,58 @@ impl AgentCore {
                     "since": cursor_ts, "limit": fetch_limit, "namespace": ns
                 }),
             )
-            .await
-            .unwrap_or_default();
+            .await;
+        let mut read_failed = false;
+        let raw = match &raw {
+            Err(e) => {
+                // transport/JSON-RPC 层失败
+                tracing::warn!(target: "consolidate", ns = %ns, error = %e,
+                    "memory_fetch_unconsolidated 读取失败");
+                read_failed = true;
+                String::new()
+            }
+            Ok(text) => {
+                // MCP isError 结果以 Ok(text) 返回（isError 在客户端边界被丢弃）——
+                // 无法解析为 {"items":[...]} 的回执按读失败计（issue #74 评审：
+                // 否则 memoria 存储故障仍伪装成安静的夜晚，与写侧成功回执
+                // 校验同理）
+                match serde_json::from_str::<serde_json::Value>(text.trim())
+                    .ok()
+                    .and_then(|v| {
+                        v.get("items")
+                            .and_then(|i| i.as_array())
+                            .map(|a| a.len())
+                    }) {
+                    Some(_) => text.clone(),
+                    _ => {
+                        tracing::warn!(target: "consolidate", ns = %ns,
+                            "memory_fetch_unconsolidated 回执无 items 字段（业务失败/未知格式），按读失败计：{}",
+                            text.chars().take(200).collect::<String>());
+                        read_failed = true;
+                        String::new()
+                    }
+                }
+            }
+        };
         let items: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&raw)
             .ok()
             .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
             .unwrap_or_default();
         if items.is_empty() {
+            let (status, reason) = if read_failed {
+                (ConsolidateStatus::ReadError, "memoria 读取失败")
+            } else {
+                (ConsolidateStatus::NoInput, "无新观察")
+            };
             return ConsolidateOutcome {
                 ns: ns.to_string(),
-                status: ConsolidateStatus::NoInput,
+                status,
                 patterns_added: 0,
                 observations: 0,
                 observations_visible: 0,
                 fetched: 0,
                 cursor: cursor_ts.clone(),
-                detail: format!("无新观察（cursor={}）", cursor_ts),
+                detail: format!("{}（cursor={}）", reason, cursor_ts),
             };
         }
 
@@ -13921,7 +13999,13 @@ impl AgentCore {
         ConsolidateOutcome {
             ns: ns.to_string(),
             status: if write_failed > 0 {
-                ConsolidateStatus::PartialWrite
+                // 区分「全部写失败」（memoria I/O 故障，独立状态而非伪装
+                // GateRejected）与「部分失败」（issue #74 评审）
+                if written == 0 {
+                    ConsolidateStatus::WriteFailed
+                } else {
+                    ConsolidateStatus::PartialWrite
+                }
             } else {
                 ConsolidateStatus::Ok
             },
@@ -14097,7 +14181,7 @@ impl AgentCore {
             .take(8)
         {
             let (text, cites) = AgentCore::parse_pattern_citation(line, max_n);
-            let text = strip_leading_index(strip_list_markers(&text)).to_string();
+            let text = strip_leading_index(strip_list_markers(&text), max_n).to_string();
             if text.is_empty() {
                 // 空正文行（如纯引用回显）保留占位以便诊断计数，但不过门槛
                 lines.push(PatternCandidate { text, cites, passed_gate: false });

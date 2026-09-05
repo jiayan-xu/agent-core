@@ -341,8 +341,23 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
                 std::fs::create_dir_all(&dir)?;
                 let final_path = dir.join(format!("{}.json", file_ts));
                 let tmp_path = dir.join(format!("{}.json.tmp", file_ts));
-                std::fs::write(&tmp_path, &report_json)
+                // 持有**写句柄**写+sync 后 rename（issue #74 评审：File::open
+                // 只读句柄在 Windows 上 FlushFileBuffers 会 Access Denied，
+                // 且 tmp 泄漏；对齐 write_meetings_file 的写句柄 sync 约定）
+                std::fs::File::create(&tmp_path)
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        f.write_all(report_json.as_bytes())?;
+                        f.sync_all()?;
+                        Ok(())
+                    })
                     .and_then(|_| std::fs::rename(&tmp_path, &final_path))
+                    .inspect_err(|_| {
+                        // 失败路径 best-effort 清理 tmp（issue #74 评审：否则
+                        // 每次瞬态失败泄漏一个 .json.tmp；对齐
+                        // write_meetings_file round-24 #4 的清理约定）
+                        let _ = std::fs::remove_file(&tmp_path);
+                    })
             })
             .await;
             match res {
@@ -445,6 +460,11 @@ fn list_past_hit_rates_blocking(dir: &std::path::Path) -> Vec<(String, u32, Stri
         // 该轮 hit_rate 被结构性压低，与完整轮不可比
         if rep.observations_visible < EVAL_SET.len() {
             skipped_window += 1;
+            // 窗口截断轮是模块自定义的最需暴露状态（结构性压低）——warn
+            // 而非静默计数（issue #69）
+            tracing::warn!(target: "consolidate_eval", path = %path.display(),
+                visible = rep.observations_visible, total = EVAL_SET.len(),
+                "P2-2: 基线报告为窗口截断轮（尾部用例未展示），已从基线序列剔除");
             continue;
         }
         let rate = rep.positive_hit_rate;
@@ -506,6 +526,14 @@ mod tests {
         let obs: Vec<String> = EVAL_SET.iter().map(|c| c.obs.to_string()).collect();
         let (_, included) = AgentCore::pattern_extraction_prompt("test", &obs);
         assert_eq!(included, EVAL_SET.len());
+    }
+
+    /// 预算钉值（issue #74 评审：与自身 import 比较是恒真断言；钉住文档值
+    /// 5——PATTERN_BUDGET 任何变更都会在此逼出对评估归一/prompt 预算的
+    /// 显式复查）
+    #[test]
+    fn budget_pinned_to_documented_value() {
+        assert_eq!(PATTERN_BUDGET, 5, "预算变更需同步复查评估归一与 prompt 模板");
     }
 
     fn score(reply: &str) -> EvalReport {
