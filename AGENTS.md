@@ -33,6 +33,9 @@ public branch is `master` only.
    `git config core.hooksPath .githooks` to activate it. It blocks direct-to-master, wrong-remote,
    branch-deletion, and `.NO_PUSH` checkouts; on feature branches it also runs ocr-review
    (OCR_GATE=1 blocks on findings).
+7. **After opening a PR, poll CI in the foreground** (`gh pr checks --watch`). Do not end the
+   turn and leave "waiting for CI" to the user. Report immediately when green; if red, enter the
+   fix loop at once. See `docs/PR_PROCESS.md` §2 item 5 / §3.4.
 
 ## Privacy history
 On 2026-07-08 the repo was scrubbed: admin key rotated, agent API key rotated, hardcoded
