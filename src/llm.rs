@@ -1377,8 +1377,14 @@ impl LlmClient {
     }
 
     pub fn new(config: LlmConfig) -> Self {
+        // 300s 总超时（2026-09-05 排障定值）：deepseek-v4-pro 是推理模型，
+        // 6 条观察的提炼实测 53s、10 条评估与夜间 consolidate（6000 字窗口）
+        // 稳定超 60s——旧 60s 超时让这两条链路自 2026-08-19 起持续以
+        // "LLM json: error decoding response body"（body 读取中途被掐）失败。
+        // 上界由外层看门狗兜底：consolidate 300s（state.rs）、圆桌 45s
+        // （persona/chair 各自 tokio::timeout）、聊天循环有轮预算。
         let client = Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(300))
             .build()
             .expect("reqwest Client::build");
         LlmClient { client, config }
