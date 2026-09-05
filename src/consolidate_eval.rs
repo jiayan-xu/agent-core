@@ -352,6 +352,12 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
                         Ok(())
                     })
                     .and_then(|_| std::fs::rename(&tmp_path, &final_path))
+                    .inspect_err(|_| {
+                        // 失败路径 best-effort 清理 tmp（issue #74 评审：否则
+                        // 每次瞬态失败泄漏一个 .json.tmp；对齐
+                        // write_meetings_file round-24 #4 的清理约定）
+                        let _ = std::fs::remove_file(&tmp_path);
+                    })
             })
             .await;
             match res {
@@ -522,11 +528,12 @@ mod tests {
         assert_eq!(included, EVAL_SET.len());
     }
 
-    /// 预算常量同源：本文件 take(PATTERN_BUDGET) 与 agent.rs 的配额是同一个值
-    /// （issue #69：内联数字与常量脱同步时本测试先红）
+    /// 预算钉值（issue #74 评审：与自身 import 比较是恒真断言；钉住文档值
+    /// 5——PATTERN_BUDGET 任何变更都会在此逼出对评估归一/prompt 预算的
+    /// 显式复查）
     #[test]
-    fn budget_constant_syncs() {
-        assert_eq!(PATTERN_BUDGET, crate::agent::PATTERN_BUDGET);
+    fn budget_pinned_to_documented_value() {
+        assert_eq!(PATTERN_BUDGET, 5, "预算变更需同步复查评估归一与 prompt 模板");
     }
 
     fn score(reply: &str) -> EvalReport {

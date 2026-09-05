@@ -13395,12 +13395,38 @@ impl AgentCore {
                 }),
             )
             .await;
-        if let Err(e) = &raw {
-            tracing::warn!(target: "consolidate", ns = %ns, error = %e,
-                "memory_fetch_unconsolidated 读取失败");
-        }
-        let read_failed = raw.is_err();
-        let raw = raw.unwrap_or_default();
+        let mut read_failed = false;
+        let raw = match &raw {
+            Err(e) => {
+                // transport/JSON-RPC 层失败
+                tracing::warn!(target: "consolidate", ns = %ns, error = %e,
+                    "memory_fetch_unconsolidated 读取失败");
+                read_failed = true;
+                String::new()
+            }
+            Ok(text) => {
+                // MCP isError 结果以 Ok(text) 返回（isError 在客户端边界被丢弃）——
+                // 无法解析为 {"items":[...]} 的回执按读失败计（issue #74 评审：
+                // 否则 memoria 存储故障仍伪装成安静的夜晚，与写侧成功回执
+                // 校验同理）
+                match serde_json::from_str::<serde_json::Value>(text.trim())
+                    .ok()
+                    .and_then(|v| {
+                        v.get("items")
+                            .and_then(|i| i.as_array())
+                            .map(|a| a.len())
+                    }) {
+                    Some(_) => text.clone(),
+                    _ => {
+                        tracing::warn!(target: "consolidate", ns = %ns,
+                            "memory_fetch_unconsolidated 回执无 items 字段（业务失败/未知格式），按读失败计：{}",
+                            text.chars().take(200).collect::<String>());
+                        read_failed = true;
+                        String::new()
+                    }
+                }
+            }
+        };
         let items: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&raw)
             .ok()
             .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
