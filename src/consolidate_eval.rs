@@ -342,6 +342,11 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
                 let final_path = dir.join(format!("{}.json", file_ts));
                 let tmp_path = dir.join(format!("{}.json.tmp", file_ts));
                 std::fs::write(&tmp_path, &report_json)
+                    .and_then(|_| {
+                        // write 后 fsync 再 rename：补齐 write_meetings_file 约定
+                        // 的掉电安全（issue #69：此前注释声称对齐约定但缺此步）
+                        std::fs::File::open(&tmp_path).and_then(|f| f.sync_all())
+                    })
                     .and_then(|_| std::fs::rename(&tmp_path, &final_path))
             })
             .await;
@@ -445,6 +450,11 @@ fn list_past_hit_rates_blocking(dir: &std::path::Path) -> Vec<(String, u32, Stri
         // 该轮 hit_rate 被结构性压低，与完整轮不可比
         if rep.observations_visible < EVAL_SET.len() {
             skipped_window += 1;
+            // 窗口截断轮是模块自定义的最需暴露状态（结构性压低）——warn
+            // 而非静默计数（issue #69）
+            tracing::warn!(target: "consolidate_eval", path = %path.display(),
+                visible = rep.observations_visible, total = EVAL_SET.len(),
+                "P2-2: 基线报告为窗口截断轮（尾部用例未展示），已从基线序列剔除");
             continue;
         }
         let rate = rep.positive_hit_rate;
@@ -506,6 +516,13 @@ mod tests {
         let obs: Vec<String> = EVAL_SET.iter().map(|c| c.obs.to_string()).collect();
         let (_, included) = AgentCore::pattern_extraction_prompt("test", &obs);
         assert_eq!(included, EVAL_SET.len());
+    }
+
+    /// 预算常量同源：本文件 take(PATTERN_BUDGET) 与 agent.rs 的配额是同一个值
+    /// （issue #69：内联数字与常量脱同步时本测试先红）
+    #[test]
+    fn budget_constant_syncs() {
+        assert_eq!(PATTERN_BUDGET, crate::agent::PATTERN_BUDGET);
     }
 
     fn score(reply: &str) -> EvalReport {

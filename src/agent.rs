@@ -553,11 +553,26 @@ impl StanceCard {
         };
         let fallback = |raw: String| {
             let (raw_kept, raw_truncated) = clamp_raw(&raw);
+            // 首条**有内容**的行作摘要（issue #69：盲取首行会取到
+            // ```json 围栏/空行/花括号行），全为噪声则空串
+            let summary = raw
+                .lines()
+                .map(|l| l.trim())
+                .find(|l| {
+                    !l.is_empty()
+                        && !l.starts_with("```")
+                        && !l.starts_with('{')
+                        && !l.starts_with('}')
+                })
+                .unwrap_or("")
+                .chars()
+                .take(80)
+                .collect();
             StanceCard {
                 persona_id: persona_id.clone(),
                 display_name: display_name.clone(),
                 stance: STANCE_UNSTRUCTURED.to_string(),
-                summary: raw.lines().next().unwrap_or("").trim().chars().take(80).collect(),
+                summary,
                 key_reasons: Vec::new(),
                 citations: Vec::new(),
                 confidence: None,
@@ -633,7 +648,16 @@ impl StanceCard {
                 .as_u64()
                 .map(normalize_conf)
                 .or_else(|| x.as_f64().map(from_float))
-                .or_else(|| x.as_str().and_then(|s| s.trim().parse::<f64>().ok()).map(from_float));
+                .or_else(|| {
+                    x.as_str().and_then(|s| {
+                        let t = s.trim();
+                        // nan/inf 字符串不是合法置信度（issue #69：parse 会接受）
+                        if t.is_empty() || t.to_lowercase().contains("n") {
+                            return None;
+                        }
+                        t.parse::<f64>().ok().map(from_float)
+                    })
+                });
             if n.is_none() {
                 tracing::debug!(target = "roundtable", persona = %persona_id,
                     value = %x, "confidence 无法解码（非数字/数字字符串），置空");
@@ -1022,7 +1046,12 @@ fn strip_leading_index(s: &str) -> &str {
         if let Some(rest) = t.strip_prefix(open) {
             if let Some(off) = rest.find(close) {
                 let inner = &rest[..off];
-                if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) && off <= 4 {
+                // 仅剥 1-2 位序号（issue #69：剥任意 ≤4 位数字会把
+                // 「[2026] 年度规则…」这类年份/大编号当索引误剥）
+                if !inner.is_empty()
+                    && inner.chars().all(|c| c.is_ascii_digit())
+                    && inner.chars().count() <= 2
+                {
                     return strip_leading_index(&rest[off + close.len_utf8()..]);
                 }
             }
@@ -13345,6 +13374,8 @@ impl AgentCore {
             .unwrap_or_else(|| "1970-01-01T00:00:00".to_string());
 
         // 2. 拉原料（多拉一点，过滤后仍够 LLM 用）
+        // 读取失败与零观察分开上报（issue #69：二者同报 NoInput 会让
+        // memoria 故障在聚合里伪装成安静的夜晚）
         let raw = mem_client
             .call(
                 "memory_fetch_unconsolidated",
@@ -13352,22 +13383,32 @@ impl AgentCore {
                     "since": cursor_ts, "limit": fetch_limit, "namespace": ns
                 }),
             )
-            .await
-            .unwrap_or_default();
+            .await;
+        if let Err(e) = &raw {
+            tracing::warn!(target: "consolidate", ns = %ns, error = %e,
+                "memory_fetch_unconsolidated 读取失败");
+        }
+        let read_failed = raw.is_err();
+        let raw = raw.unwrap_or_default();
         let items: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&raw)
             .ok()
             .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
             .unwrap_or_default();
         if items.is_empty() {
+            let (status, reason) = if read_failed {
+                (ConsolidateStatus::LlmError, "memoria 读取失败") // 复用故障态：非正常空转
+            } else {
+                (ConsolidateStatus::NoInput, "无新观察")
+            };
             return ConsolidateOutcome {
                 ns: ns.to_string(),
-                status: ConsolidateStatus::NoInput,
+                status,
                 patterns_added: 0,
                 observations: 0,
                 observations_visible: 0,
                 fetched: 0,
                 cursor: cursor_ts.clone(),
-                detail: format!("无新观察（cursor={}）", cursor_ts),
+                detail: format!("{}（cursor={}）", reason, cursor_ts),
             };
         }
 
@@ -13921,7 +13962,13 @@ impl AgentCore {
         ConsolidateOutcome {
             ns: ns.to_string(),
             status: if write_failed > 0 {
-                ConsolidateStatus::PartialWrite
+                // 区分「全部写失败」（0 成功，持久化结果等同门槛拒绝）
+                // 与「部分失败」（issue #69：二者严重度不同）
+                if written == 0 {
+                    ConsolidateStatus::GateRejected
+                } else {
+                    ConsolidateStatus::PartialWrite
+                }
             } else {
                 ConsolidateStatus::Ok
             },
