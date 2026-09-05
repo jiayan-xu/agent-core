@@ -55,6 +55,46 @@ pub(crate) async fn handle_admin_consolidate_eval(
     }
 }
 
+/// P3：prompt 离线进化（POST /api/admin/prompt_evolve）
+///
+/// 变异 → 评估 → 保留/丢弃循环。消耗 budget × 2 次 LLM 调用（~4 分钟 @budget=3）。
+/// 仅 admin 手动触发；进化结果不自动进生产（需 POST /api/admin/prompt_adopt 采纳）。
+pub(crate) async fn handle_admin_prompt_evolve(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<agent_core::prompt_evolver::EvolutionConfig>>,
+) -> axum::response::Response {
+    if !is_admin(&headers, &st).await {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "需要 admin 权限"})),
+        )
+            .into_response();
+    }
+    let agent = {
+        let g = st.agent.lock().await;
+        g.as_ref().map(|a| a.clone())
+    };
+    let Some(agent) = agent else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "agent 尚未就绪"})),
+        )
+            .into_response();
+    };
+    let config = body
+        .map(|Json(c)| c)
+        .unwrap_or_default();
+    match agent_core::prompt_evolver::run_evolution(&agent, config).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
 pub(crate) async fn handle_admin_consolidate(
     State(st): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,

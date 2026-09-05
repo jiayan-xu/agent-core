@@ -16,6 +16,7 @@ pub mod checkpoint;
 pub mod checkpoint_recovery; // 战略罗盘「持久执行深化」：checkpoint 恢复核心（可纯内存 e2e 测试）
 pub mod composer;
 pub mod consolidate_eval; // P2-2：consolidate 固定评估集（固定题集 + 北极星指标，为 P3 进化铺路）
+pub mod prompt_evolver; // P3：prompt 离线进化循环（autoresearch 协议：变异→评估→保留/丢弃）
 pub mod degrade;
 pub mod harness;
 pub mod llm;
