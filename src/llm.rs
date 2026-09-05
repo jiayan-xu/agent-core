@@ -1469,20 +1469,29 @@ impl LlmClient {
         // 被 Zhipu API 拒绝（code 1214「messages 参数非法」）；DeepSeek 不限。
         // 全局兼容层：仅有 system 时将 role 转为 user——单 system 消息的
         // 语义与单 user 等价（完整自包含指令），不需要额外分层。
-        let compat_messages: Vec<Message> = if sanitized.iter().all(|m| m.role != "user") && !sanitized.is_empty()
+        // Zhipu 兼容（2026-09-05 GLM 切换排障）：单条 system 消息（无 user）
+        // 被 Zhipu API 拒绝（code 1214「messages 参数非法」）；DeepSeek 不限。
+        // 全局兼容层：仅有 system 时将 role 转为 user——单 system 消息的
+        // 语义与单 user 等价（完整自包含指令），不需要额外分层。
+        // Cow 化（ocr PR#73 评审）：常见路径（已含 user）零克隆直通，
+        // 仅转换分支（单条 system，payload 小）按需分配。
+        let compat_messages: Cow<'_, [Message]> = if sanitized.iter().all(|m| m.role != "user")
+            && !sanitized.is_empty()
         {
-            sanitized
-                .iter()
-                .map(|m| {
-                    let mut cloned = m.clone();
-                    if cloned.role == "system" {
-                        cloned.role = "user".to_string();
-                    }
-                    cloned
-                })
-                .collect::<Vec<_>>()
+            Cow::Owned(
+                sanitized
+                    .iter()
+                    .map(|m| {
+                        let mut cloned = m.clone();
+                        if cloned.role == "system" {
+                            cloned.role = "user".to_string();
+                        }
+                        cloned
+                    })
+                    .collect(),
+            )
         } else {
-            sanitized.iter().map(|m| m.clone()).collect::<Vec<_>>()
+            Cow::Borrowed(&sanitized)
         };
         let messages: &[Message] = &compat_messages;
         let url = format!(
@@ -1606,20 +1615,29 @@ impl LlmClient {
         // 传输层脱敏：user 消息凭证打码后再上送（不改历史/存储）
         let sanitized = sanitize_messages(messages);
         // Zhipu 兼容（chat_impl_bounded 同款）：单条 system 消息转 user
-        let compat_messages: Vec<Message> = if sanitized.iter().all(|m| m.role != "user") && !sanitized.is_empty()
+        // Zhipu 兼容（2026-09-05 GLM 切换排障）：单条 system 消息（无 user）
+        // 被 Zhipu API 拒绝（code 1214「messages 参数非法」）；DeepSeek 不限。
+        // 全局兼容层：仅有 system 时将 role 转为 user——单 system 消息的
+        // 语义与单 user 等价（完整自包含指令），不需要额外分层。
+        // Cow 化（ocr PR#73 评审）：常见路径（已含 user）零克隆直通，
+        // 仅转换分支（单条 system，payload 小）按需分配。
+        let compat_messages: Cow<'_, [Message]> = if sanitized.iter().all(|m| m.role != "user")
+            && !sanitized.is_empty()
         {
-            sanitized
-                .iter()
-                .map(|m| {
-                    let mut cloned = m.clone();
-                    if cloned.role == "system" {
-                        cloned.role = "user".to_string();
-                    }
-                    cloned
-                })
-                .collect::<Vec<_>>()
+            Cow::Owned(
+                sanitized
+                    .iter()
+                    .map(|m| {
+                        let mut cloned = m.clone();
+                        if cloned.role == "system" {
+                            cloned.role = "user".to_string();
+                        }
+                        cloned
+                    })
+                    .collect(),
+            )
         } else {
-            sanitized.iter().map(|m| m.clone()).collect::<Vec<_>>()
+            Cow::Borrowed(&sanitized)
         };
         let messages: &[Message] = &compat_messages;
         // 主 Provider + 备用 Provider 列表
