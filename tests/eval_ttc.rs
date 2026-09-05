@@ -222,6 +222,7 @@ async fn eval_ttc_single_vs_selfconsistency_delta_pp() {
         let baseline = LlmResponse {
             text: single.text.clone(),
             tool_calls: vec![],
+            usage: None,
         };
         let ttc_resp = routed.chat_ttc(&[msg(t.prompt)], &baseline, &ttc).await;
 

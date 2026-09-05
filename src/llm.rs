@@ -225,6 +225,19 @@ impl RoutedLlm {
         }
     }
 
+    /// ADR-017：bootstrap 首请求的预算化调用（首轮输出预算覆盖）。
+    /// bootstrap 工具面恒非空，因此不进入 Best-of-N（与上方 BoN/tools 隔离策略一致）。
+    pub async fn chat_budgeted(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        max_tokens: u32,
+    ) -> Result<LlmResponse, String> {
+        let d = classify_difficulty(&self.policy, messages).await;
+        let selected = self.select(d);
+        selected.chat_with_max_tokens(messages, tools, max_tokens).await
+    }
+
     async fn chat_best_of_n(
         &self,
         base: &LlmClient,
@@ -903,6 +916,31 @@ pub struct ToolCall {
 pub struct LlmResponse {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    /// 上游 usage（OpenAI 兼容 `usage` 字段；provider 未返回时为 None）。
+    /// P2-D：预算记账真值来源——有 usage 时 BudgetTracker 走 accurate 记账，
+    /// 不再依赖 chars/4 估算（估算对中文任务系统性偏低）。
+    pub usage: Option<LlmUsage>,
+}
+
+/// LLM 用量（OpenAI 兼容 usage 结构）
+#[derive(Debug, Clone, Copy)]
+pub struct LlmUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl LlmUsage {
+    /// 有效总量（bug·medium 第二轮）：total>0 用 total（权威）；否则回落
+    /// prompt+completion（部分 provider 只报分项）——saturating 防溢出。
+    /// 消费端（budget 记账）统一走此方法，杜绝 total=0 时记 0 的低估。
+    pub fn effective_total(&self) -> u64 {
+        if self.total_tokens > 0 {
+            self.total_tokens
+        } else {
+            self.prompt_tokens.saturating_add(self.completion_tokens)
+        }
+    }
 }
 
 /// DeepSeek DSML 工具调用文本泄露解析（task 650）。
@@ -1305,6 +1343,20 @@ impl LlmClient {
         LlmClient { client, config }
     }
 
+    /// ADR-017：运行时覆盖 max_tokens 的单次调用（flash bootstrap 首请求用）。
+    /// clone 后覆盖字段，不改动 &self 配置——promote 后下一次调用自动恢复原值，
+    /// 杜绝「首轮预算残留整会话」。
+    pub async fn chat_with_max_tokens(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        max_tokens: u32,
+    ) -> Result<LlmResponse, String> {
+        let mut client = self.clone();
+        client.config.max_tokens = max_tokens;
+        client.chat(messages, tools).await
+    }
+
     /// 发送聊天请求，返回响应（带重试 + failover）
     #[tracing::instrument(skip_all, fields(model = %self.config.model, provider = %self.config.base_url, tool_count = tools.len()))]
     pub async fn chat(
@@ -1444,8 +1496,45 @@ impl LlmClient {
                             tracing::info!(failover_to = %model, provider_index = idx, "LLM provider failover（主 Provider 失败）");
                         }
 
+                        // P2-D：提取上游 usage（OpenAI 兼容 `usage` 字段）——
+                        // 预算记账真值来源；provider 未返回时 None（回落估算）。
+                        // token 兼容整数/字符串编码（bug·medium 第十轮：部分
+                        // provider 序列化为 JSON 字符串）
+                        let parse_token = |v: &serde_json::Value| -> u64 {
+                            v.as_u64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                                .unwrap_or(0)
+                        };
+                        let usage = data
+                            .get("usage")
+                            .and_then(|u| u.as_object())
+                            .map(|u| LlmUsage {
+                                prompt_tokens: u
+                                    .get("prompt_tokens")
+                                    .map(parse_token)
+                                    .unwrap_or(0),
+                                completion_tokens: u
+                                    .get("completion_tokens")
+                                    .map(parse_token)
+                                    .unwrap_or(0),
+                                total_tokens: u
+                                    .get("total_tokens")
+                                    .map(parse_token)
+                                    .unwrap_or(0),
+                            })
+                            // bug·low（第一轮）：total=0 但 prompt/completion 有值
+                            // 的 provider 响应不应整体丢弃——任一维度 >0 即有效
+                            // saturating 求和（bug·medium 第三轮：三个 u64 来自
+                            // 不可信上游 JSON，debug 模式直接相加可能溢出 panic）
+                            .filter(|u| {
+                                u.prompt_tokens
+                                    .saturating_add(u.completion_tokens)
+                                    .saturating_add(u.total_tokens)
+                                    > 0
+                            });
+
                         // task 650：DeepSeek DSML 文本泄露 → 回填 structured tool_calls
-                        return Ok(apply_dsml_fallback(LlmResponse { text, tool_calls }));
+                        return Ok(apply_dsml_fallback(LlmResponse { text, tool_calls, usage }));
                     }
                     Err(e) => {
                         let msg = format!("连接失败: {}", e);
@@ -1705,6 +1794,7 @@ mod routing_tests {
         let c = LlmResponse {
             text: String::new(),
             tool_calls: vec![],
+            usage: None,
         };
         let s = score_heuristic(&c, false);
         assert!(s.is_infinite() && s.is_sign_negative());
@@ -1715,6 +1805,7 @@ mod routing_tests {
         let c = LlmResponse {
             text: "```rust\nfn main() {}\n```".to_string(),
             tool_calls: vec![],
+            usage: None,
         };
         assert!(score_heuristic(&c, true) > 0.0);
     }
@@ -1726,10 +1817,12 @@ mod routing_tests {
         let concise = LlmResponse {
             text: "步骤如下：\n1. 打开配置\n2. 修改端口\n3. 重启服务".to_string(),
             tool_calls: vec![],
+            usage: None,
         };
         let verbose = LlmResponse {
             text: "关于这个问题，我想说的是，其实有很多种方法可以考虑，通常我们会从多个角度去想，比如说第一个方面，第二个方面，第三个方面，总之大家都觉得这个事情比较复杂，需要慢慢来，不能着急，因为着急容易出错，所以我们还是要稳妥一点比较好，当然这也取决于具体情况。".to_string(),
             tool_calls: vec![],
+            usage: None,
         };
         assert!(
             score_heuristic(&concise, false) > score_heuristic(&verbose, false),
@@ -1743,10 +1836,12 @@ mod routing_tests {
         let moderate = LlmResponse {
             text: "a".repeat(600),
             tool_calls: vec![],
+            usage: None,
         };
         let bloated = LlmResponse {
             text: "b".repeat(3000),
             tool_calls: vec![],
+            usage: None,
         };
         // 同等无结构情况下，超长不应显著优于中等（长度权重被压制）
         let delta = score_heuristic(&bloated, false) - score_heuristic(&moderate, false);
@@ -1924,6 +2019,7 @@ mod dsml_tests {
         let filled = apply_dsml_fallback(LlmResponse {
             text: text.clone(),
             tool_calls: vec![],
+            usage: None,
         });
         assert_eq!(filled.tool_calls.len(), 1);
         assert!(!filled.text.contains("DSML"));
@@ -1935,6 +2031,7 @@ mod dsml_tests {
                 name: "already_there".into(),
                 arguments: serde_json::json!({}),
             }],
+            usage: None,
         });
         assert_eq!(keep.tool_calls.len(), 1);
         assert_eq!(keep.tool_calls[0].name, "already_there");
@@ -2065,5 +2162,16 @@ mod sanitize_messages_tests {
         let out = sanitize_messages(&msgs);
         assert!(matches!(out, Cow::Borrowed(_)), "tool 消息不在脱敏范围，应走 Borrowed");
         assert_eq!(out[0].content.as_ref().unwrap(), "result sk-abc1234567890abcdefgh");
+    }
+
+    #[test]
+    fn effective_total_fallback_logic() {
+        // P2-D：total>0 用 total；否则回落 prompt+completion（saturating）
+        let u1 = LlmUsage { prompt_tokens: 100, completion_tokens: 50, total_tokens: 200 };
+        assert_eq!(u1.effective_total(), 200);
+        let u2 = LlmUsage { prompt_tokens: 100, completion_tokens: 50, total_tokens: 0 };
+        assert_eq!(u2.effective_total(), 150);
+        let u3 = LlmUsage { prompt_tokens: u64::MAX, completion_tokens: u64::MAX, total_tokens: 0 };
+        assert_eq!(u3.effective_total(), u64::MAX); // saturating 不溢出
     }
 }

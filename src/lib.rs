@@ -18,6 +18,7 @@ pub mod harness;
 pub mod llm;
 pub mod mcp_client;
 pub mod namespace;
+pub mod orchestration; // ADR-017：LLM 编排层 v2（flash 锚定引导 + Plan-Act-Reflect，默认 OFF）
 pub mod file_checkpoint;
 pub mod quota;
 pub mod sandbox;

@@ -2,6 +2,44 @@
 
 ## 2026-08-13
 
+### v0.10.0 · P2 收尾（usage 真值记账 + 会话→根 ns 沉淀任务，新能力发版锚点）
+- **改动**：
+  - P2-D estimate_tokens 精度：`LlmResponse` +usage（OpenAI 兼容解析，兼容
+    整数/字符串 token 编码）；`BudgetTracker::record_turn_accurate`（total 真值
+    记账，替代 chars/4 估算——估算对中文任务系统性偏低）；接线 meta_evolve
+    optimize_prompt + code_evolve propose_fn→handlers/evolve 真值优先、估算回落；
+    `LlmUsage::effective_total`（total 权威、回落 prompt+completion saturating）。
+  - P2-E 会话→根 ns 沉淀：`record_experience_memo` 双写改**单写**（热路径省一次
+    写）+ RECORDED_NS 登记集（落盘持久化跨重启、原子写、成功才置位 restore、
+    按 root_ns 节流 600s + collect 前全量兜底、跨 agent 前缀隔离）；record 路径
+    顺带节流沉淀保证根 ns 及时性。
+- **效果**：预算记账不再被中文任务低估（护栏真值化）；第二样本源写入成本减半
+  且根 ns 全局经验不依赖 meta-evolution 触发；ocr-review 11 轮 40+ 条意见全修
+  （含 bug·high×5/security 与维护性项）。
+- **动机**：对照文档 §3 P2 剩余两项收尾，借鉴系列（P0→P1→P2）全部落地。
+
+## 2026-08-13
+
+### v0.9.0 · P2-2 黑板持久化（SharedState → blackboard_<hash>.json 断线协作续跑，新能力发版锚点）
+- **改动**：
+  - `SharedState::save`：受控写三件套（快照一致性写锁内 clone + tmp 唯一后缀
+    pid+seq+随机段 + fsync+rename），unix 下 0600 权限；错误路径清理 tmp（Windows
+    句柄先 drop 再删）。
+  - `SharedState::load` + LoadStatus（Loaded/Missing/Corrupted/Unreadable）：版本号
+    恢复（乐观锁不回退）；逐值 value_allowed + 键数/总量双上限恢复；根级/version/
+    data 类型严格校验；InvalidData→Corrupted；大小预检防整读巨文件；TTL 24h 过期
+    清理（mtime 不可得跳过防误删）。
+  - `dispatch_with_timeout` +save_path：每 stage 完成后落盘（stage 间恢复点）。
+  - maybe_compose：黑板身份 = user_id+session_id 双维度 FNV-1a 哈希文件名（不嵌
+    可读会话信息，长度前缀保单射）；current_dir 失败显式降级仅内存；损坏/不可读
+    文件备份（.corrupted/.unreadable.<ms>.<pid>.<seq>）。
+- **效果**：多 agent 协作黑板断线/崩溃后同会话可续跑（stage 级恢复点），不丢中间
+  产物；ocr-review 18 轮 40+ 条意见全修（含 bug·high×2/security·medium×4）。
+- **动机**：对照文档 §3 P2-2 剩余增量（SharedState 纯内存进程重启即丢），复用
+  P1-B 已验证的持久化三件套模式。
+
+## 2026-08-13
+
 ### v0.8.0 · P1 三项落地（/refine 样本池 + 持久子 agent + RLM 上下文外置，新能力发版锚点）
 - **改动**：
   - P1-A（/refine 合成点）：新增 `src/experience_memo.rs`，工具失败教训结构化沉淀

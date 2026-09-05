@@ -181,6 +181,7 @@ async fn eval_verifier_single_vs_guided_delta_pp() {
         let baseline = LlmResponse {
             text: single.text.clone(),
             tool_calls: vec![],
+            usage: None,
         };
         let guided = routed.chat_verifier_guided(&[msg(t.prompt)], &baseline, &ttc).await;
 

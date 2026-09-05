@@ -985,6 +985,7 @@ pub(crate) async fn build_agent(
         multiagent: config.multiagent.clone(),
         ttc: config.ttc.clone(),
         intake_filter: config.intake_filter.clone().unwrap_or_default(),
+        orchestration: config.orchestration.clone().unwrap_or_default(),
     };
     // A1 (OpenClaw 吸收): 记录启动并判定是否进入 safe_mode（崩溃循环保护）。
     // 返回 (启动记录 id, 是否需抑制危险/未分类/外发工具自动执行)。

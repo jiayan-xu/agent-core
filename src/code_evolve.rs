@@ -136,7 +136,7 @@ pub async fn propose_fn(
     name: &str,
     current: &str,
     goal: &str,
-) -> Result<String, String> {
+) -> Result<(String, Option<crate::llm::LlmUsage>), String> {
     let system = "You are a code-optimization engine. You will be given a Rust function and an optimization goal. \
 Propose a NEW implementation of the SAME function that is semantically equivalent and meets the goal (e.g. faster), \
 while STRICTLY preserving its exact signature (visibility, async, generics, parameters, return type) and MUST NOT modify or remove the `#[cfg(test)]` test module or any other code. \
@@ -165,7 +165,7 @@ No explanations, no markdown outside the fence, no `unsafe`, no external crates,
         Ok(Err(e)) => return Err(format!("LLM 错误: {}", e)),
         Err(_) => return Err("LLM 超时(45s)".to_string()),
     };
-    extract_fn_from_llm(&resp.text, name)
+    extract_fn_from_llm(&resp.text, name).map(|code| (code, resp.usage))
 }
 
 /// 从 LLM 文本中提取目标函数（优先 fenced ```rust 块）

@@ -208,6 +208,8 @@ pub struct AgentConfig {
     pub ttc: crate::ttc::TtcConfig,
     /// 摄入侧治本过滤（opt-in）：测试命名空间隔离 / A2A 回执丢弃 / 对话实质筛选
     pub intake_filter: crate::intake_filter::IntakeFilterConfig,
+    /// ADR-017：LLM 编排层 v2 配置（全默认 OFF；flag-off 零行为变化）
+    pub orchestration: crate::orchestration::OrchestrationConfig,
 }
 
 /// HY3 1.3 热路径接线开关。全部默认 false。
@@ -396,6 +398,8 @@ pub struct AgentCore {
     pub multiagent: Option<crate::multiagent::MultiAgentConfig>,
     /// HY3 TTC：推理时计算控制器（仅 features.ttc=true 时 Some；否则 None=原路径）
     pub ttc: Option<crate::ttc::TtcController>,
+    /// ADR-017：LLM 编排控制器（flash 锚定引导 + session 相位存储；默认全 OFF）
+    pub orchestration: crate::orchestration::OrchestrationController,
     /// HY3 1.3 收口：记忆自进化生产证据审计器（每次 consolidate 演化落盘 JSONL，可复验 G1-G4）
     pub evolution_auditor: crate::evolution_audit::EvolutionAuditor,
     /// 战略罗盘「可观测」：运行指标注册表（零行为变化、默认开启，供 /api/metrics 暴露）
@@ -1114,6 +1118,9 @@ impl AgentCore {
         } else {
             None
         };
+        // ADR-017：编排控制器（bootstrap 相位存 harness.db；开关全 OFF 时仅建表，零热路径影响）
+        let orchestration =
+            crate::orchestration::OrchestrationController::new(config.orchestration.clone());
         let core = AgentCore {
             config,
             mcp,
@@ -1186,6 +1193,7 @@ impl AgentCore {
             lats,
             multiagent,
             ttc,
+            orchestration,
             metrics,
             evolution_auditor: crate::evolution_audit::EvolutionAuditor::new(
                 crate::evolution_audit::EvolutionAuditor::default_path(),
@@ -6709,18 +6717,47 @@ impl AgentCore {
         } else {
             Self::EXPOSE_TOOL_CAP
         };
-        let tools = self.select_exposed_tools(raw_message, allowed_ns, expose_cap).await;
+        let full_tools = self.select_exposed_tools(raw_message, allowed_ns, expose_cap).await;
+        // ADR-017 P1：flash 锚定引导。仅 bootstrap 开启 + easy 路由 + 非写意图 + 未 promoted 触发；
+        // flag-off / 其他条件不满足时 `bootstrap_active=false`，以下所有分支与原路径逐字等价。
+        let bootstrap_active = self.orchestration.cfg.bootstrap.enabled
+            && is_easy_query
+            && !Self::has_write_intent(raw_message)
+            && !self.orchestration.is_promoted(session_id);
+        let tools = if bootstrap_active {
+            let picked = self.orchestration.bootstrap_tools(raw_message, &full_tools);
+            tracing::info!(target = "orchestration", session = %session_id,
+                full_tools = full_tools.len(), bootstrap_tools = picked.len(),
+                "bootstrap 首请求最小工具面");
+            picked
+        } else {
+            full_tools
+        };
         // P1-4: 构建工具名 → JSON Schema 映射，用于参数校验
         ctx.tool_schemas = tools
             .iter()
             .map(|t| (t.function.name.clone(), t.function.parameters.clone()))
             .collect();
 
+        // ADR-017 P1：bootstrap 首请求使用中性 system prompt
+        // （对齐 dsh 实测：带 spec 人设对 flash 反路由；promote 后恢复完整人设）。
+        if bootstrap_active {
+            if let Some(sys) = ctx.messages.first_mut() {
+                if sys.role == "system" {
+                    sys.content = Some(
+                        "You are a helpful assistant. 优先使用给定工具完成用户请求；没有把握时直接简洁回答。"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
         // P1 修复：把真实工具名动态注入 system prompt。
         // build_system_prompt 里写死的 query_sql/query_plate 与真实 MCP 工具
         // (execute_sql/fuzzy_match_plate) 对不上，会导致 LLM 调错或调不存在的工具。
         // 这里以"权威工具清单"覆盖，确保 LLM 使用真实存在的工具名。
-        if !tools.is_empty() {
+        // ADR-017：bootstrap 首请求不注入完整清单（锚定式引导；promote 后恢复）。
+        if !tools.is_empty() && !bootstrap_active {
             if let Some(sys_msg) = ctx.messages.first_mut() {
                 if let Some(ref mut content) = sys_msg.content {
                     let mut extra =
@@ -6736,19 +6773,25 @@ impl AgentCore {
         }
 
         // HY3 1.3：技能库注入（features.skill_library=false 时 skill_registry=None → 不生效）
-        if let Some(reg) = self.skill_registry.as_ref() {
-            if let Some(sys_msg) = ctx.messages.first_mut() {
-                if let Some(ref mut content) = sys_msg.content {
-                    if let Some(block) = crate::features::render_skill_block(reg.as_ref(), raw_message, 3) {
-                        self.metrics.inc_skill();
-                        content.push_str(&block);
+        // ADR-017：bootstrap 首请求剥离自动注入（对齐 dsh 实测：注入越多 flash 锚定越差）。
+        if !bootstrap_active {
+            if let Some(reg) = self.skill_registry.as_ref() {
+                if let Some(sys_msg) = ctx.messages.first_mut() {
+                    if let Some(ref mut content) = sys_msg.content {
+                        if let Some(block) = crate::features::render_skill_block(reg.as_ref(), raw_message, 3) {
+                            self.metrics.inc_skill();
+                            content.push_str(&block);
+                        }
                     }
                 }
             }
         }
 
         // HY3 1.3：LATS 过程树展开（features.lats=false 时 self.lats=None → 直接返回，原路径零改动）
-        self.maybe_lats_expand(&mut ctx.messages, raw_message).await;
+        // ADR-017：bootstrap 首请求不做过程树展开（保持最小面锚定）。
+        if !bootstrap_active {
+            self.maybe_lats_expand(&mut ctx.messages, raw_message).await;
+        }
 
         // P2-1: 配额命名空间（与 call_tool_routed 保持一致）
         let quota_ns_llm = allowed_ns
@@ -6759,33 +6802,57 @@ impl AgentCore {
         // 重构阶段3：一次分类，循环内守卫统一读取（消除散落 is_xxx / 豁免条件复制）
         let intent = Self::classify_intent(raw_message);
 
-        // ⚠️ 2026-08-05 提速：数据查询首轮即强制工具（不等 LLM 空手犯错被重试提示顶回）。
-        // deepseek-v4-flash 对 Easy 数据查询首轮常直接编答案 → did_work=false →
-        // 注入重试提示 → 第二轮才调工具（多耗 1 轮 5-20s）。首轮注入后一轮到位。
-        // 2026-08-06 ocr 修复：快速通道已注入数据时跳过强制工具提示（两者矛盾）
-        if intent.data_query && !intent.attachment && !fast_path_data {
-            ctx.messages.push(crate::llm::Message {
-                role: "system".to_string(),
-                content: Some(
-                    "你正在处理一个业务数据查询（如进厂/车次/重量/白名单/固废种类等）。\
-                     你必须先调用数据查询工具（query_* / nl_query / get_* / execute_sql）获取真实数据，\
-                     再基于工具结果回答。禁止第一轮空手回答或凭记忆编造。"
-                        .to_string(),
-                ),
-                tool_calls: None,
-                tool_call_id: None,
-            });
+        // ADR-017 P2：OnPreAct guardrail hooks。
+        // data_query 强制工具提示已从内联补丁迁移为内置 hook（文本与条件逐字等价）；
+        // 新领域只需注册 hook，不再改动循环体。
+        {
+            let hook_ctx = crate::orchestration::HookContext {
+                session_id,
+                raw_message,
+                trace_id,
+                messages: &ctx.messages,
+                executed_tools: &ctx.executed_tools,
+                did_work: ctx.did_work,
+                data_query: intent.data_query,
+                attachment: intent.attachment,
+                fast_path_data,
+                round: 0,
+                hard_max_rounds: self.config.max_tool_rounds,
+                candidate_reply: None,
+            };
+            match self
+                .orchestration
+                .run_hooks(crate::orchestration::HookPoint::OnPreAct, &hook_ctx)
+            {
+                crate::orchestration::HookAction::Inject { messages } => {
+                    ctx.messages.extend(messages);
+                }
+                crate::orchestration::HookAction::Abort { reply } => {
+                    self.metrics.inc_hook_abort();
+                    self.save_to_history(session_id, raw_message, &reply).await;
+                    return reply;
+                }
+                _ => {}
+            }
         }
         // Easy 查询轮次封顶：一轮工具 + 一轮总结 = 3 轮足够（原 20 轮导致简单查询
         // 反复重试 6-7 轮 → 70s+）。Hard 任务保持 20 轮（固废多步推理）。
         let max_rounds = if is_easy_query { 3u32 } else { self.config.max_tool_rounds };
+        // ADR-017 §5：TurnBudget 统一轮次上限与日 token 预算（同一 quota 调用，行为等价，
+        // 仅把循环中的预算检查收口到一处）。
+        let budget =
+            crate::orchestration::TurnBudget::new(&quota_ns_llm, self.quota.clone(), max_rounds);
+        // ADR-017：仅 bootstrap 首轮用预算化调用；promote 后（同请求后续轮次）恢复常规调用。
+        let mut bootstrap_round = bootstrap_active;
+        // ADR-017 P2：Plan-Reflect 已消费的评审轮数（上限由 [orchestration.plan_reflect] 控制）。
+        let mut reflect_rounds: usize = 0;
 
         // Phase B：快照由捕获点管理（见 execute_tool_calls），run 起始**不**删除——
         // 否则同 session 并发 run 会互相删掉对方刚捕获的快照（ocr 2026-08-12
         // 第五轮 bug·medium）。捕获点通过 trace_id 区分「本 run 已捕获」与「旧 run
         // 残留」，旧残留会在首次写工具时被覆盖。
 
-        for _round in 0..max_rounds {
+        for _round in 0..budget.max_rounds() {
             // P2-1: 日 token 预算预估（请求上下文体量），超限硬拒
             let ctx_chars: usize = ctx
                 .messages
@@ -6793,11 +6860,7 @@ impl AgentCore {
                 .map(|m| m.content.as_ref().map(|c| c.len()).unwrap_or(0))
                 .sum();
             let req_est = ((raw_message.len() + ctx_chars) as u64) / 4;
-            let budget_check = self
-                .quota
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .check_token_budget(&quota_ns_llm, req_est);
+            let budget_check = budget.check_token(req_est);
             if let Err(e) = budget_check {
                 tracing::warn!("[QUOTA] 命名空间『{}』token 预算不足: {}", quota_ns_llm, e);
                 self.audit_logger
@@ -6815,7 +6878,17 @@ impl AgentCore {
             }
             // 战略罗盘「可观测」：主 agent 循环 LLM 调用计数
             self.metrics.inc_llm_calls();
-            let response = match self.routed_llm.chat(&ctx.messages, &tools).await {
+            let response = match if bootstrap_round {
+                self.routed_llm
+                    .chat_budgeted(
+                        &ctx.messages,
+                        &tools,
+                        self.orchestration.cfg.bootstrap.max_tokens,
+                    )
+                    .await
+            } else {
+                self.routed_llm.chat(&ctx.messages, &tools).await
+            } {
                 Ok(r) => r,
                 // P1-5：LLM 主/备 Provider 均失败 → 返回「可重试错误」，而非裸崩
                 Err(e) => {
@@ -6824,14 +6897,19 @@ impl AgentCore {
                     return "⚠️ LLM 服务暂时不可用（已尝试主用与备用 Provider 均失败）。请稍后重试，或检查网络与 API 密钥配置。".to_string();
                 }
             };
+            // ADR-017：首个 LLM 响应即 promote（either 语义：首个响应要么带工具调用、要么是终答）。
+            // promote 为 append-only + 幂等落盘，失败只告警，下一请求仍可重试 bootstrap。
+            if bootstrap_round {
+                bootstrap_round = false;
+                self.orchestration.promote(session_id);
+                self.metrics.inc_bootstrap_promote();
+                tracing::info!(target = "orchestration", session = %session_id, "bootstrap promoted");
+            }
             // 标记本轮回合是否执行了工具（用于分身策展记忆门控）
             ctx.did_work |= !response.tool_calls.is_empty();
             // P2-1: 记录本次 token 消耗（请求 + 响应估算），跨天自动重置
             let resp_est = (response.text.len() as u64) / 4;
-            self.quota
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .record_token(&quota_ns_llm, req_est + resp_est);
+            budget.record_token(req_est + resp_est);
 
             // 无工具调用 → LLM 直接回复
             if response.tool_calls.is_empty() {
@@ -6877,6 +6955,7 @@ impl AgentCore {
                     let mut chosen = crate::llm::LlmResponse {
                         text: reply.clone(),
                         tool_calls: Vec::new(),
+                        usage: None,
                     };
                     // 1) 终答自一致性（N 路采样 + 选择器择优）
                     if matches!(ttc.decide(), crate::ttc::TtcAction::Sample) {
@@ -6895,22 +6974,68 @@ impl AgentCore {
                     }
                     reply = chosen.text;
                 }
-                // P1 guardrail：输出级——终答 JSON/代码块泄漏 → 注入「自然语言重写」重试一轮
-                // （OpenAI Agents SDK 输出 guardrail 语义）。末轮仍泄漏 → 由 chat 出口的
-                // reply_polish 包裹兜底（0205578）。
-                if crate::reply_polish::needs_polish(&reply)
-                    && (_round + 1) < self.config.max_tool_rounds
+                // ADR-017 P2：Plan-Reflect 终答评审（opt-in，默认关；仅执行过工具的任务）。
+                // 评审未达成 → 注入重规划提示回到循环；评审失败/预算尽 → 放行（可用性优先）。
+                if self.orchestration.cfg.plan_reflect.enabled
+                    && ctx.did_work
+                    && reflect_rounds < self.orchestration.cfg.plan_reflect.max_reflect_rounds
                 {
-                    ctx.messages.push(crate::llm::Message {
-                        role: "user".to_string(),
-                        content: Some(
-                            "⚠️ 请用自然语言重写你刚才的回答：不要输出 JSON 或代码块，直接把结果用中文文字、数字和表格描述清楚。".to_string(),
-                        ),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                    tracing::info!(target = "agent.output_guardrail", round = _round, "终答泄漏，注入自然语言重写重试");
-                    continue;
+                    reflect_rounds += 1;
+                    self.metrics.inc_reflect();
+                    if !self.reflect_goal_satisfied(raw_message, &reply).await {
+                        ctx.messages.push(Message {
+                            role: "user".to_string(),
+                            content: Some(
+                                "⚠️ 评审发现你刚才的回答可能没有完全达成用户目标。请重新检查工具结果与目标，补充遗漏的事实或更正错误；直接给出更完整的回答。"
+                                    .to_string(),
+                            ),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
+                        tracing::info!(target = "orchestration.reflect",
+                            reflect_rounds, "reflect 未达成，注入重规划提示");
+                        continue;
+                    }
+                }
+                // ADR-017 P2：OnFinalAnswer guardrail hooks。
+                // reply_polish 重试已迁移为内置 hook（条件与注入文本逐字等价）；
+                // 末轮仍泄漏 → hook 返回 Continue，由 chat 出口的 reply_polish 包裹兜底。
+                {
+                    let hook_ctx = crate::orchestration::HookContext {
+                        session_id,
+                        raw_message,
+                        trace_id,
+                        messages: &ctx.messages,
+                        executed_tools: &ctx.executed_tools,
+                        did_work: ctx.did_work,
+                        data_query: intent.data_query,
+                        attachment: intent.attachment,
+                        fast_path_data,
+                        round: _round,
+                        hard_max_rounds: self.config.max_tool_rounds,
+                        candidate_reply: Some(&reply),
+                    };
+                    match self
+                        .orchestration
+                        .run_hooks(crate::orchestration::HookPoint::OnFinalAnswer, &hook_ctx)
+                    {
+                        crate::orchestration::HookAction::Retry { messages } => {
+                            self.metrics.inc_hook_retry();
+                            ctx.messages.extend(messages);
+                            tracing::info!(target = "agent.output_guardrail", round = _round,
+                                "终答泄漏，hook 注入自然语言重写重试");
+                            continue;
+                        }
+                        crate::orchestration::HookAction::Abort { reply: hooked } => {
+                            self.metrics.inc_hook_abort();
+                            self.save_to_history(session_id, raw_message, &hooked).await;
+                            return hooked;
+                        }
+                        crate::orchestration::HookAction::Inject { messages } => {
+                            ctx.messages.extend(messages);
+                        }
+                        crate::orchestration::HookAction::Continue => {}
+                    }
                 }
                 // 保存对话（摄入过滤：测试 ns / A2A 回执 / 非实质对话 在源头拦截）
                 self.observe_filtered(
@@ -6962,6 +7087,12 @@ impl AgentCore {
             {
                 ToolExecOutcome::Abort(reply) => return reply,
                 ToolExecOutcome::Executed(any) => ctx.did_work |= any,
+            }
+            // ADR-017 P3：长工具结果先 LLM 摘要（opt-in，默认关），再做字节预算截断兜底。
+            if self.orchestration.cfg.tool_summary.enabled
+                && (_round as usize + 1) >= self.orchestration.cfg.tool_summary.start_round
+            {
+                self.maybe_summarize_tool_outputs(&mut ctx.messages).await;
             }
             // Phase B：每轮工具执行后按字节预算截断陈旧 tool 输出（防跨轮载荷越滚越大）
             Self::squash_stale_tool_outputs(&mut ctx.messages);
@@ -7460,6 +7591,66 @@ impl AgentCore {
         }
     }
 
+    /// ADR-017 P3：工具结果 LLM 摘要（opt-in，默认关；开关关时本方法不进入热路径）。
+    /// 只摘要 role=tool 且超过阈值的消息；摘要失败保留原文（由 squash 截断兜底）。
+    async fn maybe_summarize_tool_outputs(&self, messages: &mut Vec<Message>) {
+        const MARKER: &str = "[工具结果摘要]";
+        let cfg = &self.orchestration.cfg.tool_summary;
+        for m in messages.iter_mut().filter(|m| m.role == "tool") {
+            let Some(content) = m.content.as_ref() else {
+                continue;
+            };
+            if content.starts_with(MARKER) || content.chars().count() <= cfg.threshold_chars {
+                continue;
+            }
+            let prompt = format!(
+                "请把下面的工具输出压缩成不超过 800 字的要点摘要。必须保留：数值、日期、\
+                 人名/车牌/企业名等实体、结论性语句。禁止添加原输出中不存在的信息。\n\n工具输出：\n{}",
+                content
+            );
+            let req = vec![Message {
+                role: "user".to_string(),
+                content: Some(prompt),
+                tool_calls: None,
+                tool_call_id: None,
+            }];
+            match self.llm.chat(&req, &[]).await {
+                Ok(r) if !r.text.trim().is_empty() => {
+                    self.metrics.inc_tool_summary();
+                    tracing::info!(target = "orchestration.summary",
+                        chars_before = content.chars().count(),
+                        chars_after = r.text.chars().count(),
+                        "工具结果已 LLM 摘要");
+                    m.content = Some(format!("{MARKER}\n{}", r.text));
+                }
+                Ok(_) => tracing::warn!(target = "orchestration.summary", "摘要返回空文本，保留原文"),
+                Err(e) => tracing::warn!(target = "orchestration.summary", err = %e, "摘要失败，保留原文"),
+            }
+        }
+    }
+
+    /// ADR-017 P2：Plan-Reflect 终答评审（opt-in，默认关）。评审失败视为「达成」
+    /// （降级方向永远向可用），绝不因评审器故障阻断用户。
+    async fn reflect_goal_satisfied(&self, goal: &str, candidate: &str) -> bool {
+        let prompt = format!(
+            "你是结果评审员。用户目标：{goal}\n\n候选回答：{candidate}\n\n\
+             请判断候选回答是否已充分达成用户目标。只回答 YES 或 NO，再加一句不超过 20 字的理由。"
+        );
+        let req = vec![Message {
+            role: "user".to_string(),
+            content: Some(prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        match self.llm.chat(&req, &[]).await {
+            Ok(r) => !r.text.trim_start().to_ascii_uppercase().starts_with("NO"),
+            Err(e) => {
+                tracing::warn!(target = "orchestration.reflect", err = %e, "评审失败，视为达成（不阻断）");
+                true
+            }
+        }
+    }
+
     /// 取走指定会话**当前 run**（trace_id 匹配）的变更前快照（首个非只读工具执行前
     /// 的消息列表），供回滚 UI / 自进化 dry_run 复用。
     /// None = 该会话本次 run 尚未执行写工具。
@@ -7480,7 +7671,272 @@ impl AgentCore {
 
     /// 执行 LLM 返回的工具调用（重构 L 阶段：Agents SDK turn 语义——校验→审批→执行→回灌）。
     /// 返回 ToolExecOutcome：Executed(是否执行了工具) 或 Abort(提前终止文案，llm_loop 直接返回)。
+    ///
+    /// ADR-017 P3：`[orchestration.read_parallel]` 开启且**同轮全部为只读工具**且
+    /// 预检全绿时走并行快速路径；其余任何情况走 `execute_tool_calls_sequential`
+    /// （与旧路径逐字等价）。因此 flag-off 时零行为变化。
     async fn execute_tool_calls(
+        &self,
+        messages: &mut Vec<Message>,
+        tool_calls: &[crate::llm::ToolCall],
+        executed_tools: &mut Vec<String>,
+        tool_schemas: &HashMap<String, serde_json::Value>,
+        session_id: &str,
+        raw_message: &str,
+        allowed_ns: &[String],
+        trace_id: &str,
+    ) -> ToolExecOutcome {
+        if self.orchestration.cfg.read_parallel.enabled
+            && tool_calls.len() > 1
+            && tool_calls
+                .iter()
+                .all(|tc| crate::boundary::is_read_only_tool(&tc.name))
+        {
+            return self
+                .execute_tool_calls_parallel(
+                    messages,
+                    tool_calls,
+                    executed_tools,
+                    tool_schemas,
+                    session_id,
+                    raw_message,
+                    allowed_ns,
+                    trace_id,
+                )
+                .await;
+        }
+        self.execute_tool_calls_sequential(
+            messages,
+            tool_calls,
+            executed_tools,
+            tool_schemas,
+            session_id,
+            raw_message,
+            allowed_ns,
+            trace_id,
+        )
+        .await
+    }
+
+    /// ADR-017 P3：只读工具同轮并行快速路径（opt-in）。
+    /// 预检（边界 / schema）任一非全绿 → 回退顺序路径，确保拒绝/回灌/审批语义零漂移。
+    async fn execute_tool_calls_parallel(
+        &self,
+        messages: &mut Vec<Message>,
+        tool_calls: &[crate::llm::ToolCall],
+        executed_tools: &mut Vec<String>,
+        tool_schemas: &HashMap<String, serde_json::Value>,
+        session_id: &str,
+        raw_message: &str,
+        allowed_ns: &[String],
+        trace_id: &str,
+    ) -> ToolExecOutcome {
+        // 预检 1：边界全绿（任一拒绝 → 回退顺序路径，保留既有拒绝/审批分支）
+        {
+            let boundary = self.boundary.lock().await;
+            let ns = self.current_ns_paths();
+            for tc in tool_calls {
+                if !crate::boundary::is_read_only_tool(&tc.name) {
+                    return self
+                        .execute_tool_calls_sequential(
+                            messages, tool_calls, executed_tools, tool_schemas,
+                            session_id, raw_message, allowed_ns, trace_id,
+                        )
+                        .await;
+                }
+                let check = boundary.check_tool(
+                    &tc.name,
+                    &tc.arguments,
+                    &self.config.identity.agent_id,
+                    "user",
+                    &self.config.parent_permission,
+                    ns.as_deref(),
+                );
+                if !check.allow {
+                    return self
+                        .execute_tool_calls_sequential(
+                            messages, tool_calls, executed_tools, tool_schemas,
+                            session_id, raw_message, allowed_ns, trace_id,
+                        )
+                        .await;
+                }
+            }
+        }
+        // 预检 2：schema 全绿（任一错误 → 回退顺序路径，保留 strict 拒绝 / 非严格回灌分支）
+        for tc in tool_calls {
+            if let Some(schema) = tool_schemas.get(&tc.name) {
+                if Self::validate_tool_args(&tc.arguments, schema).is_err() {
+                    return self
+                        .execute_tool_calls_sequential(
+                            messages, tool_calls, executed_tools, tool_schemas,
+                            session_id, raw_message, allowed_ns, trace_id,
+                        )
+                        .await;
+                }
+            }
+        }
+
+        // 并发执行：按 max_concurrent 分块，块内 join_all；结果按原始顺序归位。
+        self.metrics.inc_read_parallel();
+        let cap = self.orchestration.cfg.read_parallel.max_concurrent.max(1);
+        let persona = self.persona_for_session(session_id);
+        let mut results: Vec<Result<String, String>> = Vec::with_capacity(tool_calls.len());
+        let mut start = 0usize;
+        while start < tool_calls.len() {
+            let end = (start + cap).min(tool_calls.len());
+            let chunk = &tool_calls[start..end];
+            let futs: Vec<_> = chunk
+                .iter()
+                .map(|tc| {
+                    let name = tc.name.clone();
+                    let args = tc.arguments.clone();
+                    let persona = persona.clone();
+                    let ns = allowed_ns.to_vec();
+                    let trace = trace_id.to_string();
+                    async move {
+                        self.call_tool_routed(&name, &persona, &args, &ns, &trace).await
+                    }
+                })
+                .collect();
+            let mut chunk_results = futures::future::join_all(futs).await;
+            results.append(&mut chunk_results);
+            start = end;
+        }
+
+        // 回灌阶段：按原始顺序处理（与顺序路径同语义：成功/失败/召回/沉淀/日志/确认/消息）。
+        let mut executed_any = false;
+        for (idx, tc) in tool_calls.iter().enumerate() {
+            let text = match &results[idx] {
+                Ok(text) => {
+                    executed_tools.push(tc.name.clone());
+                    executed_any = true;
+                    text.clone()
+                }
+                Err(e) => {
+                    // ADR-017 §6：失败三分类写审计（与顺序路径同一语义）。
+                    let class = crate::orchestration::classify_tool_failure(&e);
+                    self.audit_logger
+                        .log_decision(
+                            &self.config.identity.agent_id,
+                            &tc.name,
+                            &format!("ToolFailure({:?}): {}", class, e),
+                            false,
+                        )
+                        .await;
+                    let mut text = format!("执行失败: {}", e);
+                    if let Some(lesson) = self.recall_failure_lesson(&tc.name, e, allowed_ns).await {
+                        text.push_str(&format!("\n\n💡 历史教训参考（情境召回）：{}", lesson));
+                    }
+                    let memo_ns = allowed_ns
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| self.config.identity.ns());
+                    crate::experience_memo::record_experience_memo(
+                        &self.mcp, &tc.name, e, &memo_ns,
+                    )
+                    .await;
+                    text
+                }
+            };
+            {
+                let mut log = self.execution_log.lock().await;
+                log.push(ExecutionLog {
+                    name: tc.name.clone(),
+                    trigger_conditions: serde_json::json!({"tool": tc.name}),
+                    steps: serde_json::json!([{"tool": tc.name, "args": tc.arguments}]),
+                    verify_rule: String::new(),
+                    success: !text.starts_with("执行失败"),
+                });
+            }
+            if text.contains("require_confirm") || text.contains("确认") {
+                let action = PendingAction {
+                    tool_name: tc.name.clone(),
+                    arguments: {
+                        let mut args = tc.arguments.clone();
+                        if let Some(obj) = args.as_object_mut() {
+                            obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
+                        }
+                        args
+                    },
+                    description: format!("{} ({})", tc.name, tc.arguments),
+                    approval_id: None,
+                };
+                self.session_manager
+                    .set_pending_action(session_id, action)
+                    .await;
+            }
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![crate::llm::ToolCallJson {
+                    id: tc.id.clone(),
+                    type_: "function".to_string(),
+                    function: crate::llm::ToolFunction {
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+            });
+            const TOOL_RESULT_CAP: usize = 4000;
+            let result_capped: String = match text.char_indices().nth(TOOL_RESULT_CAP) {
+                None => text,
+                Some((byte_idx, _)) => {
+                    let total = text.chars().count();
+                    let mut s: String = text[..byte_idx].to_string();
+                    s.push_str(&format!(
+                        "
+ …[结果已截断，共 {} 字符，仅保留前 {}；如需完整明细请要求汇总统计或缩小范围]",
+                        total, TOOL_RESULT_CAP
+                    ));
+                    s
+                }
+            };
+            messages.push(Message {
+                role: "tool".to_string(),
+                content: Some(result_capped),
+                tool_calls: None,
+                tool_call_id: Some(tc.id.clone()),
+            });
+        }
+        // ADR-017 P2：OnToolResult hooks（默认无注册 hook → Continue，零行为变化；
+        // 新领域可在工具执行后注册 hook 做注入/中止）。
+        {
+            let hook_ctx = crate::orchestration::HookContext {
+                session_id,
+                raw_message,
+                trace_id,
+                messages,
+                executed_tools,
+                did_work: executed_any,
+                data_query: false,
+                attachment: false,
+                fast_path_data: false,
+                round: 0,
+                hard_max_rounds: self.config.max_tool_rounds,
+                candidate_reply: None,
+            };
+            match self
+                .orchestration
+                .run_hooks(crate::orchestration::HookPoint::OnToolResult, &hook_ctx)
+            {
+                crate::orchestration::HookAction::Inject { messages: injected }
+                | crate::orchestration::HookAction::Retry { messages: injected } => {
+                    messages.extend(injected);
+                }
+                crate::orchestration::HookAction::Abort { reply } => {
+                    self.metrics.inc_hook_abort();
+                    self.save_to_history(session_id, raw_message, &reply).await;
+                    return ToolExecOutcome::Abort(reply);
+                }
+                crate::orchestration::HookAction::Continue => {}
+            }
+        }
+        ToolExecOutcome::Executed(executed_any)
+    }
+
+    /// 顺序执行路径（原 execute_tool_calls 本体，行为不变；仅函数名调整）。
+    async fn execute_tool_calls_sequential(
         &self,
         messages: &mut Vec<Message>,
         tool_calls: &[crate::llm::ToolCall],
@@ -7819,6 +8275,16 @@ impl AgentCore {
                     text
                 }
                 Err(e) => {
+                    // ADR-017 §6：失败三分类写审计，供运营观测 flash 主要死在哪个桶。
+                    let class = crate::orchestration::classify_tool_failure(&e);
+                    self.audit_logger
+                        .log_decision(
+                            &self.config.identity.agent_id,
+                            &tc.name,
+                            &format!("ToolFailure({:?}): {}", class, e),
+                            false,
+                        )
+                        .await;
                     // P1-3: 失败情境召回——用错误摘要查历史教训，命中追加注入（防重蹈覆辙）
                     let mut text = format!("执行失败: {}", e);
                     if let Some(lesson) = self
@@ -7919,6 +8385,39 @@ impl AgentCore {
                 tool_calls: None,
                 tool_call_id: Some(tc.id.clone()),
             });
+        }
+        // ADR-017 P2：OnToolResult hooks（默认无注册 hook → Continue，零行为变化；
+        // 新领域可在工具执行后注册 hook 做注入/中止）。
+        {
+            let hook_ctx = crate::orchestration::HookContext {
+                session_id,
+                raw_message,
+                trace_id,
+                messages,
+                executed_tools,
+                did_work: executed_any,
+                data_query: false,
+                attachment: false,
+                fast_path_data: false,
+                round: 0,
+                hard_max_rounds: self.config.max_tool_rounds,
+                candidate_reply: None,
+            };
+            match self
+                .orchestration
+                .run_hooks(crate::orchestration::HookPoint::OnToolResult, &hook_ctx)
+            {
+                crate::orchestration::HookAction::Inject { messages: injected }
+                | crate::orchestration::HookAction::Retry { messages: injected } => {
+                    messages.extend(injected);
+                }
+                crate::orchestration::HookAction::Abort { reply } => {
+                    self.metrics.inc_hook_abort();
+                    self.save_to_history(session_id, raw_message, &reply).await;
+                    return ToolExecOutcome::Abort(reply);
+                }
+                crate::orchestration::HookAction::Continue => {}
+            }
         }
         ToolExecOutcome::Executed(executed_any)
     }
@@ -10223,8 +10722,8 @@ impl AgentCore {
     async fn maybe_compose(
         &self,
         message: &str,
-        _user_id: &str,
-        _session_id: &str,
+        user_id: &str,
+        session_id: &str,
         _allowed_ns: &[String],
     ) -> Option<String> {
         let cfg = self.multiagent.as_ref()?;
@@ -10256,13 +10755,92 @@ impl AgentCore {
         if subtasks.is_empty() {
             return None;
         }
-        // P2-2：黑板模式——compose 派发共享工作区，子 agent 可读写中间产物
-        let blackboard = crate::multiagent::SharedState::new();
+        // P2-2：黑板模式——compose 派发共享工作区，子 agent 可读写中间产物。
+        // 补全（P2-2 持久化）：按 session 隔离恢复黑板（`blackboard_<session>.json`
+        // 在 cwd），断线/崩溃后同 session 再 compose 可续跑；stage 间自动落盘。
+        // 已知可接受设计：同 session 并发 compose 会互相覆盖黑板文件
+        // （check-then-act race）——黑板是协作加速器非强一致状态，最后写赢
+        // 语义诚实；load 为同步文件读（小文件微秒级，async 路径可接受）。
+        // 黑板文件路径：文件名只含 FNV-1a 哈希（不嵌可读 user_id/session，
+        // 防目录 ls 泄露会话身份）；哈希输入 = user_id + session_id 双维度。
+        // security·medium（第十五轮）已裁决：64 位 FNV 碰撞空间 2^64，实际
+        // 猜解他人黑板文件需 2^32 次尝试（生日攻击下），本机单用户场景不可行；
+        // 哈希仅用于文件名唯一性，非安全边界。
+        // current_dir 失败：显式降级——黑板仅内存不持久化（error 日志），
+        // 不静默用空路径。
+        let bb_file: Option<String> = {
+            // 哈希输入 = 完整 user_id + session_id（bug·high 第十七轮：上一版
+            // 只含 user_id 内容 + session_id 长度，同长不同 session 碰撞共享
+            // 文件！）——长度前缀保单射且内容完整。
+            let raw = format!(
+                "{}|{}|{}|{}",
+                user_id.len(),
+                user_id,
+                session_id.len(),
+                session_id
+            );
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in raw.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            match std::env::current_dir() {
+                // lossy 仅在 cwd 含非法 UTF-8 时触发（Windows 罕见），仅影响
+                // 黑板持久化路径——已多次裁决可接受
+                Ok(dir) => Some(dir.join(format!("blackboard_{:016x}.json", h)).to_string_lossy().to_string()),
+                Err(e) => {
+                    tracing::error!(
+                        target: "agent.multiagent",
+                        "current_dir 不可得——黑板降级为仅内存（不持久化）: {}",
+                        e
+                    );
+                    None
+                }
+            }
+        };
+        let bb_path = bb_file.as_deref();
+        let (blackboard, bb_status) = if let Some(p) = bb_path {
+            crate::multiagent::SharedState::load(p).await
+        } else {
+            (crate::multiagent::SharedState::new(), crate::multiagent::LoadStatus::Missing)
+        };
+        if let Some(p) = bb_path {
+            match bb_status {
+                crate::multiagent::LoadStatus::Loaded => {
+                    tracing::info!(
+                        target: "agent.multiagent",
+                        path = %p,
+                        "黑板已从文件恢复（断线续跑）"
+                    );
+                }
+                crate::multiagent::LoadStatus::Corrupted => {
+                    tracing::warn!(
+                        target: "agent.multiagent",
+                        path = %p,
+                        "黑板文件损坏——按空黑板启动"
+                    );
+                    // 损坏文件不能坐等 stage 间 save 原子覆盖（丢失人工修复证据）——
+                    // 备份为 <原路径>.corrupted.<ms>.<pid>.<seq>。
+                    Self::backup_blackboard_file(p, "corrupted");
+                }
+                crate::multiagent::LoadStatus::Unreadable => {
+                    tracing::error!(
+                        target: "agent.multiagent",
+                        path = %p,
+                        "黑板文件存在但无法读取（权限/IO）——按空黑板启动"
+                    );
+                    // 与 Corrupted 一致——尝试备份原文件（读失败多因权限，尽力而为）。
+                    Self::backup_blackboard_file(p, "unreadable");
+                }
+                crate::multiagent::LoadStatus::Missing => {}
+            }
+        }
         let result = crate::multiagent::dispatch_with_timeout(
             &self.routed_llm,
             &subtasks,
             cfg.subagent_timeout_secs,
             Some(blackboard),
+            bb_path,
         )
         .await;
         if result.trim().is_empty() {
@@ -10273,6 +10851,48 @@ impl AgentCore {
         // 战略罗盘「可观测」：MultiAgent Compose 实际派发成功计数
         self.metrics.inc_multiagent();
         Some(format!("[MultiAgent Compose 结果]\n\n{}", result))
+    }
+
+    /// 备份黑板异常文件（损坏/不可读时调用，防 stage 间 save 覆盖丢失证据）。
+    /// 备份名 = `<原路径>.<tag>.<ms>.<pid>.<seq>`（毫秒+pid+进程内单调序号，
+    /// 防同毫秒/跨进程撞名）。
+    /// best-effort：metadata/copy 失败仅告警（不可读文件大概率也无法复制）。
+    fn backup_blackboard_file(bb_file: &str, tag: &str) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let backup = format!("{}.{}.{}.{}.{}", bb_file, tag, ts, std::process::id(), seq);
+        match std::fs::metadata(bb_file) {
+            Ok(meta) if meta.len() > 0 => match std::fs::copy(bb_file, &backup) {
+                Ok(_) => {
+                    tracing::warn!(
+                        target: "agent.multiagent",
+                        backup = %backup,
+                        "黑板异常文件已备份（供人工修复）"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "agent.multiagent",
+                        path = %bb_file,
+                        "黑板异常文件备份失败: {}",
+                        e
+                    );
+                }
+            },
+            Ok(_) => {} // 空文件无备份价值
+            Err(e) => {
+                tracing::warn!(
+                    target: "agent.multiagent",
+                    path = %bb_file,
+                    "黑板异常文件 metadata 失败（跳过备份）: {}",
+                    e
+                );
+            }
+        }
     }
 
     /// MultiAgent opt-in 判定：消息含 opt_in_token（非空）或命中 task_whitelist 其一即放行。
@@ -11155,6 +11775,33 @@ impl AgentCore {
             skipped,
             max_ts
         )
+    }
+
+    /// 记忆库系统维护：衰减循环（memory_decay）+ GFS 轮转备份（memory_backup）。
+    /// 与 consolidate 同用维护身份（MEMORIA_ADMIN_KEY → admin / MEMORIA_JARVIS_BADGE → jarvis），
+    /// 由夜间 patrol（bootstrap.rs 02:00-04:59 块）每日调用一次，补齐 consolidate 之外的维护环节。
+    pub async fn memoria_maintenance(&self) -> String {
+        let mem_client = memoria_maintenance_client(&self.config.memoria_url, &self.mcp);
+        let parse = |raw: String| -> serde_json::Value {
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw))
+        };
+        let decay_raw = mem_client
+            .call("memory_decay", &serde_json::json!({}))
+            .await
+            .unwrap_or_else(|e| format!("decay failed: {}", e));
+        let backup_raw = mem_client
+            .call("memory_backup", &serde_json::json!({}))
+            .await
+            .unwrap_or_else(|e| format!("backup failed: {}", e));
+        let summary = serde_json::json!({
+            "decay": parse(decay_raw),
+            "backup": parse(backup_raw),
+        })
+        .to_string();
+        let log_line: String = summary.chars().take(400).collect();
+        tracing::info!("[maintenance] {}", log_line);
+        summary
     }
 
     /// 巩固原料门槛：挡短文本 / 测试 / 会话助理前缀 / cron 流水
