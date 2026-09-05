@@ -341,11 +341,15 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
                 std::fs::create_dir_all(&dir)?;
                 let final_path = dir.join(format!("{}.json", file_ts));
                 let tmp_path = dir.join(format!("{}.json.tmp", file_ts));
-                std::fs::write(&tmp_path, &report_json)
-                    .and_then(|_| {
-                        // write 后 fsync 再 rename：补齐 write_meetings_file 约定
-                        // 的掉电安全（issue #69：此前注释声称对齐约定但缺此步）
-                        std::fs::File::open(&tmp_path).and_then(|f| f.sync_all())
+                // 持有**写句柄**写+sync 后 rename（issue #74 评审：File::open
+                // 只读句柄在 Windows 上 FlushFileBuffers 会 Access Denied，
+                // 且 tmp 泄漏；对齐 write_meetings_file 的写句柄 sync 约定）
+                std::fs::File::create(&tmp_path)
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        f.write_all(report_json.as_bytes())?;
+                        f.sync_all()?;
+                        Ok(())
                     })
                     .and_then(|_| std::fs::rename(&tmp_path, &final_path))
             })

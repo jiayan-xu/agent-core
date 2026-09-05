@@ -933,6 +933,12 @@ pub enum ConsolidateStatus {
     GateRejected,
     /// 部分写入失败
     PartialWrite,
+    /// memoria 写入全失败（I/O 故障，非模型质量问题——issue #74 评审：
+    /// 伪装成 GateRejected 会让 I/O 告警被当模型信号误读）
+    WriteFailed,
+    /// memoria 读取失败（存储层故障，非 LLM 问题、也非正常空转——
+    /// issue #74 评审：伪装成 LlmError/NoInput 都会触发错误排障方向）
+    ReadError,
 }
 
 impl ConsolidateStatus {
@@ -945,6 +951,8 @@ impl ConsolidateStatus {
             ConsolidateStatus::NoPatterns => "no_patterns",
             ConsolidateStatus::GateRejected => "gate_rejected",
             ConsolidateStatus::PartialWrite => "partial_write",
+            ConsolidateStatus::WriteFailed => "write_failed",
+            ConsolidateStatus::ReadError => "read_error",
         }
     }
 }
@@ -1040,19 +1048,22 @@ fn strip_list_markers(s: &str) -> &str {
 /// P2-2 共用：剥离前导的 `[N]`/`【N】` 批内索引 token——prompt 用 `[3] 规则…`
 /// 渲染观察，模型回显该格式时前导 `[3]` 是批次局部索引，落库后无意义且污染
 /// 检索（ocr PR#68 第三轮）。
-fn strip_leading_index(s: &str) -> &str {
+fn strip_leading_index(s: &str, max_n: usize) -> &str {
     let t = s.trim_start();
     for (open, close) in [('[', ']'), ('【', '】')] {
         if let Some(rest) = t.strip_prefix(open) {
             if let Some(off) = rest.find(close) {
                 let inner = &rest[..off];
-                // 仅剥 1-2 位序号（issue #69：剥任意 ≤4 位数字会把
-                // 「[2026] 年度规则…」这类年份/大编号当索引误剥）
+                // 序号合法性对齐 parse_pattern_citation（1..=max_n，issue #74
+                // 评审：位数上限只是巧合——CONSOLIDATE_MIN_OBS_CHARS 调低后
+                // [100] 级索引会被渲染进 prompt；年份 [2026] 则因超界天然豁免）
                 if !inner.is_empty()
                     && inner.chars().all(|c| c.is_ascii_digit())
-                    && inner.chars().count() <= 2
                 {
-                    return strip_leading_index(&rest[off + close.len_utf8()..]);
+                    let n: usize = inner.parse().unwrap_or(0);
+                    if n >= 1 && n <= max_n {
+                        return strip_leading_index(&rest[off + close.len_utf8()..], max_n);
+                    }
                 }
             }
         }
@@ -13396,7 +13407,7 @@ impl AgentCore {
             .unwrap_or_default();
         if items.is_empty() {
             let (status, reason) = if read_failed {
-                (ConsolidateStatus::LlmError, "memoria 读取失败") // 复用故障态：非正常空转
+                (ConsolidateStatus::ReadError, "memoria 读取失败")
             } else {
                 (ConsolidateStatus::NoInput, "无新观察")
             };
@@ -13962,10 +13973,10 @@ impl AgentCore {
         ConsolidateOutcome {
             ns: ns.to_string(),
             status: if write_failed > 0 {
-                // 区分「全部写失败」（0 成功，持久化结果等同门槛拒绝）
-                // 与「部分失败」（issue #69：二者严重度不同）
+                // 区分「全部写失败」（memoria I/O 故障，独立状态而非伪装
+                // GateRejected）与「部分失败」（issue #74 评审）
                 if written == 0 {
-                    ConsolidateStatus::GateRejected
+                    ConsolidateStatus::WriteFailed
                 } else {
                     ConsolidateStatus::PartialWrite
                 }
@@ -14144,7 +14155,7 @@ impl AgentCore {
             .take(8)
         {
             let (text, cites) = AgentCore::parse_pattern_citation(line, max_n);
-            let text = strip_leading_index(strip_list_markers(&text)).to_string();
+            let text = strip_leading_index(strip_list_markers(&text), max_n).to_string();
             if text.is_empty() {
                 // 空正文行（如纯引用回显）保留占位以便诊断计数，但不过门槛
                 lines.push(PatternCandidate { text, cites, passed_gate: false });
