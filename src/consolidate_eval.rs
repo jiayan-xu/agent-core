@@ -305,7 +305,7 @@ pub async fn run_consolidate_eval(agent: &AgentCore, ns: &str) -> Result<EvalRep
     };
     let reply = agent
         .llm
-        .chat(&[msg], &[])
+        .chat_batch(&[msg], &[])
         .await
         .map_err(|e| format!("评估 LLM 调用失败: {}", e))?
         .text

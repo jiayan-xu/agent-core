@@ -295,7 +295,10 @@ impl Consciousness {
             let ns = &ns_list[idx];
             tracing::info!(target: "consciousness", ns = %ns, cursor = idx, "A4: 空闲 tick 推进 consolidation round-robin");
             // 内层预算超时（外层 TICK 已有 600s watchdog），避免单次 consolidate 卡住整轮
-            let res = tokio::time::timeout(Duration::from_secs(300), agent.consolidate(ns)).await;
+            // 420s > 内层批次请求级 300s（ocr PR#70：外层若 ≤ 内层，慢 LLM 先撞外层
+            // watchdog，类型化 LlmError 路径被绕过成 "consolidate 超时跳过"，
+            // 且 chat_impl 的重试/failover 没机会跑）
+            let res = tokio::time::timeout(Duration::from_secs(420), agent.consolidate(ns)).await;
             match res {
                 Ok(outcome) => {
                     // P1-d：BackgroundEvent.summary 改为**结构化 JSON**（patterns_added 等字段

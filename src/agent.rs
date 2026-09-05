@@ -6727,7 +6727,7 @@ impl AgentCore {
             tool_call_id: None,
         };
 
-        match self.llm.chat(&[msg], &[]).await {
+        match self.llm.chat_batch(&[msg], &[]).await {
             Ok(r) if !r.text.trim().is_empty() => {
                 let answer = r.text.trim().to_string();
                 // P1-b 引用完整性检查（ocr PR#67 第三轮）：必须出现**带括号的步骤标签**
@@ -7288,7 +7288,7 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         };
-        match self.llm.chat(&[msg], &[]).await {
+        match self.llm.chat_batch(&[msg], &[]).await {
             Ok(r) if !r.text.trim().is_empty() => Some(r.text.trim().to_string()),
             _ => None,
         }
@@ -7629,7 +7629,7 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         };
-        match self.llm.chat(&[msg], &[]).await {
+        match self.llm.chat_batch(&[msg], &[]).await {
             Ok(r) if !r.text.trim().is_empty() => Some(Self::parse_summary_output(&r.text)),
             Ok(_) => None,
             Err(e) => {
@@ -12924,7 +12924,7 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         };
-        let reply = match self.llm.chat(&[msg], &[]).await {
+        let reply = match self.llm.chat_batch(&[msg], &[]).await {
             Ok(r) => r.text.trim().to_string(),
             Err(e) => return format!("洞见失败: {}", e),
         };
@@ -13109,7 +13109,7 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         };
-        match self.llm.chat(&[msg], &[]).await {
+        match self.llm.chat_batch(&[msg], &[]).await {
             Ok(reply) => {
                 let items = crate::text_signals::parse_llm_signal_array(reply.text.trim());
                 crate::text_signals::map_llm_signals_by_index(&items, texts.len())
@@ -13133,7 +13133,7 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         };
-        match self.llm.chat(&[msg], &[]).await {
+        match self.llm.chat_batch(&[msg], &[]).await {
             Ok(reply) => {
                 let items = crate::text_signals::parse_llm_signal_array(reply.text.trim());
                 items
@@ -13505,7 +13505,7 @@ impl AgentCore {
             tool_calls: None,
             tool_call_id: None,
         };
-        let reply = match self.llm.chat(&[msg], &[]).await {
+        let reply = match self.llm.chat_batch(&[msg], &[]).await {
             Ok(r) => r.text.trim().to_string(),
             Err(e) => {
                 return ConsolidateOutcome {
@@ -13680,7 +13680,7 @@ impl AgentCore {
                 tool_calls: None,
                 tool_call_id: None,
             };
-            if let Ok(ner_reply) = self.llm.chat(&[msg2], &[]).await {
+            if let Ok(ner_reply) = self.llm.chat_batch(&[msg2], &[]).await {
                 let ner_text = ner_reply.text.trim().to_string();
                 // 解析 JSON（尝试直接解析，失败则查找最外层 {}）
                 let ner_json: Option<serde_json::Value> =
@@ -13877,7 +13877,7 @@ impl AgentCore {
                         tool_calls: None,
                         tool_call_id: None,
                     };
-                    if let Ok(evo_reply) = self.llm.chat(&[msg3], &[]).await {
+                    if let Ok(evo_reply) = self.llm.chat_batch(&[msg3], &[]).await {
                         let pairs = crate::memory_evolve::parse_evolution_array(&evo_reply.text);
                         for (eid, ectx) in pairs {
                             // 仅演化本批次内的 id（防御 LLM 编造 id 跨批）
