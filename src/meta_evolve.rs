@@ -806,7 +806,7 @@ impl MetaEvolver {
         // 统一在根 ns `agent/{id}` 检索全局经验（与 recall_failure_lesson 一致）。
         let root_ns = format!("agent/{}", self.agent_id);
         crate::experience_memo::sediment_to_root(mem_client, &root_ns).await;
-        let memos = crate::experience_memo::collect_memo_samples(mem_client, &root_ns, limit).await;
+        let memos = crate::experience_memo::collect_memo_samples(mem_client, &root_ns, limit, true).await;
         // 去重键：change_type + old_value 复合（仅 old_value 会误并不同样本，
         // bug·low——同错误文本可能来自不同工具/场景，change_type 承载工具名）
         let mut known: std::collections::HashSet<(String, String)> = samples

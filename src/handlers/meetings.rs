@@ -15,7 +15,7 @@ use axum::Json;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 
-use agent_core::agent::{AgentCore, EventKind, MeetingEvent};
+use agent_core::agent::{aggregate_stances, AgentCore, EventKind, MeetingEvent, StanceCard};
 
 use crate::auth::authenticate;
 use crate::handlers::approval::is_admin;
@@ -1115,28 +1115,38 @@ pub(crate) async fn handle_panel_discuss(
             personas.retain(|p| ids.contains(&p.persona_id));
         }
         let pool = agent.llm_pool();
-        let mut stances: Vec<(String, String)> = Vec::new();
+        let mut stances: Vec<StanceCard> = Vec::new();
         for (i, p) in personas.iter().enumerate() {
-            let (id, stance, prov) = agent.persona_stance(p, &topic_c, i, &pool).await;
+            let (id, card, prov) = agent.persona_stance(p, &topic_c, i, &pool).await;
+            // P1-a：SSE stance 事件保留原字段（persona_id/display_name/stance=原文/provider），
+            // 新增 stance_card 结构化字段——旧前端读原字段不受影响，新前端可直接用卡。
             let payload = serde_json::json!({
                 "persona_id": id,
                 "display_name": p.display_name,
-                "stance": stance,
+                "stance": card.raw,
                 "provider": prov,
+                "stance_card": card,
             });
             let _ = tx.send(Ok(SseEvent::default().event("stance").data(payload.to_string())));
-            stances.push((id, stance));
+            stances.push(card);
         }
-        let consensus = agent.chair_consensus(&topic_c, &stances, chair_c.as_deref()).await;
+        // P1-a：共识 = 程序聚合的立场分布（权威）；主席 LLM 输出降级为 display_note 附注（非权威，可缺省）。
+        let agg = aggregate_stances(&stances);
+        let display_note = agent.chair_display_note(&topic_c, &stances, chair_c.as_deref()).await;
         let _ = tx.send(Ok(SseEvent::default().event("consensus").data(
-            serde_json::json!({ "consensus": consensus }).to_string(),
+            serde_json::json!({
+                "consensus": agg.summary,
+                "distribution": agg.distribution,
+                "display_note": display_note,
+            })
+            .to_string(),
         )));
         // 回填会议记录（共识 + 状态机跃迁），并把收敛结果实时广播给订阅端：
         // - 终态（status=done / phase=Done）→ ended，关闭订阅流；
         // - 非终态（真人待接手）→ state，订阅端更新 phase（ai_speaking → awaiting_humans）。
         // 否则订阅者永远看不到本次跃迁，停留在陈旧状态。
         if !meeting_id_c.is_empty() {
-            if let Some((status, phase)) = agent.finish_meeting(&meeting_id_c, &consensus) {
+            if let Some((status, phase)) = agent.finish_meeting(&meeting_id_c, &agg.summary) {
                 // 【reviewer round-24 #2 performance·medium】**先广播实时事件 + 清理 presence，
                 // 再后台持久化**——与 handle_meeting_message（round-21 #1）的原则一致。persist 是
                 // spawn_blocking 全文件序列化 + fsync 且被 persist_lock 串行化，若 await 它再广播，
@@ -1173,20 +1183,44 @@ pub(crate) async fn handle_panel_discuss(
                 }).await;
             }
         }
-        // 最佳努力写入 Memoria（调用者自身 ns）
-        let stances_text = stances
-            .iter()
-            .map(|(id, s)| format!("【{}】{}", id, s))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let content = format!(
-            "[roundtable] topic={}\nconsensus={}\n---\n{}",
-            topic_c, consensus, stances_text
+        // 最佳努力写入 Memoria（调用者自身 ns）。
+        // P1-a：content 全部由程序拼接——首行/次行为程序聚合摘要（FTS 命中主入口），
+        // 随后每席一行立场卡（含规范立场/置信/理由），降级卡附原文；主席附注明确标注非权威。
+        let mut content = format!(
+            "[roundtable] topic={}\nconsensus={}\n",
+            topic_c, agg.summary
         );
+        if let Some(note) = &display_note {
+            content.push_str(&format!("主席附注（非权威结论，LLM 生成，仅供参考）：{}\n", note));
+        }
+        content.push_str("---\n");
+        for c in &stances {
+            if c.structured {
+                let reasons = if c.key_reasons.is_empty() {
+                    String::new()
+                } else {
+                    format!("；理由：{}", c.key_reasons.join("；"))
+                };
+                let conf = c.confidence.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+                content.push_str(&format!(
+                    "【{}·{}】立场：{}（置信 {}）{}\n",
+                    c.persona_id, c.display_name, c.stance, conf, reasons
+                ));
+            } else {
+                content.push_str(&format!(
+                    "【{}·{}】立场：未结构化（降级保留原文）\n{}\n",
+                    c.persona_id, c.display_name, c.raw
+                ));
+            }
+        }
         // Profile/dynamic 主源读 memories(category=decision)；勿再写 category=roundtable
+        let mut tags = vec!["decision".to_string(), "roundtable".to_string(), "roundtable:stance-card".to_string()];
+        if !meeting_id_c.is_empty() {
+            tags.push(format!("meeting:{}", meeting_id_c));
+        }
         let args = serde_json::json!({
             "content": content,
-            "tags": ["decision", "roundtable"],
+            "tags": tags,
             "category": "decision",
             "confidence": 80,
             "importance": 5,

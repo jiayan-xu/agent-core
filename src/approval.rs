@@ -51,6 +51,12 @@ pub struct PendingApproval {
     /// TASK-652：绑定会话；旧 JSON 回填缺省 `legacy`
     #[serde(default = "default_session_id")]
     pub session_id: String,
+    /// R2 网关链路：创建方附带的调用方授权域，批准后据此恢复执行
+    #[serde(default)]
+    pub allowed_ns: Option<Vec<String>>,
+    /// R2 网关链路：关联的网关执行记录 id，批准后回写终态
+    #[serde(default)]
+    pub execution_id: Option<String>,
 }
 
 fn default_session_id() -> String {
@@ -99,6 +105,11 @@ pub struct ApprovalManager {
 }
 
 impl ApprovalManager {
+    /// 分级审批：暴露权威存储（AutoApproved 记录 / 撤销链 / quota 计数）
+    pub fn sqlite_store(&self) -> Option<&std::sync::Arc<std::sync::Mutex<crate::approval_store::ApprovalStore>>> {
+        self.sqlite.as_ref()
+    }
+
     /// 内存模式（测试 / 无持久化需求）
     pub fn new() -> Self {
         Self::new_with_sqlite(None, None)
@@ -251,6 +262,8 @@ impl ApprovalManager {
                     description: rec.description.clone(),
                     approver_id: rec.approver_id.clone(),
                     requester_id: rec.requester_id.clone(),
+                    allowed_ns: None,
+                    execution_id: None,
                     status: ApprovalStatus::Pending,
                     created_at: rec.created_at,
                     operation_hash: rec.operation_hash.clone(),
@@ -330,6 +343,8 @@ impl ApprovalManager {
             approver_id,
             requester_id,
             "legacy",
+            None,
+            None,
         )
         .await
     }
@@ -343,6 +358,8 @@ impl ApprovalManager {
         approver_id: &str,
         requester_id: &str,
         session_id: &str,
+        allowed_ns: Option<Vec<String>>,
+        execution_id: Option<String>,
     ) -> String {
         // C1b 防重复建单：同 tool+requester 已有 pending → 复用既有 id，不重复造单。
         if crate::approval::is_pending_sync(self, tool_name, requester_id) {
@@ -381,6 +398,8 @@ impl ApprovalManager {
             created_at: now,
             operation_hash,
             session_id,
+            allowed_ns,
+            execution_id,
         };
         self.sqlite_upsert(&Self::pending_to_record(
             &pending,
@@ -943,6 +962,8 @@ mod tests {
             created_at: 1000.0,
             operation_hash: "op_hash_456".to_string(),
             session_id: "s1".to_string(),
+            allowed_ns: None,
+            execution_id: None,
         };
         let json = am.build_a2a_request(&approval, "agent/agent-001/dept/运营部");
         assert_eq!(json["type"], "approval_request");
@@ -1133,6 +1154,8 @@ mod tests {
                 "admin",
                 "agent-001",
                 "sess/p3",
+                None,
+                None,
             )
             .await;
         let hash = am.get_pending(&aid).await.unwrap().operation_hash;
@@ -1177,6 +1200,8 @@ mod tests {
                     "dashboard-admin",
                     "agent-001",
                     "sess/demo",
+                    None,
+                    None,
                 )
                 .await;
             let hash = am.get_pending(&aid).await.unwrap().operation_hash;
@@ -1211,6 +1236,8 @@ mod tests {
                 "admin",
                 "agent-001",
                 "sess/A",
+                None,
+                None,
             )
             .await;
         let hash_a = am.get_pending(&aid_a).await.unwrap().operation_hash;

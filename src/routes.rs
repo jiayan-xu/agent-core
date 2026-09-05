@@ -13,6 +13,7 @@ use tower_http::cors::CorsLayer;
 use crate::auth::auth_middleware;
 use crate::bootstrap::trace_middleware;
 use crate::handlers::admin::*;
+use crate::handlers::gateway::{handle_auto_write_undo, handle_auto_writes_list, handle_tool_execute, handle_tool_execute_get};
 use crate::handlers::approval::*;
 use crate::handlers::chat::*;
 use crate::handlers::collab::*;
@@ -37,6 +38,7 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/approval/history", get(handle_approval_history))
         .route("/api/approval/{id}/respond", post(handle_approval_respond))
         .route("/approval-console", get(handle_approval_console))
+        .route("/api/ops/briefing", get(handle_ops_briefing))
         .route("/updates/pfaix/latest.json", get(handle_updates_latest))
         .route("/updates/pfaix/{file}", get(handle_updates_static))
         // /v1 别名：PFAiX 的 getAgentCoreBaseUrl() 返回带 /v1 的 base，
@@ -67,6 +69,8 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
             post(handle_admin_harness_activate),
         )
         .route("/api/admin/consolidate", post(handle_admin_consolidate))
+        .route("/api/admin/consolidate_eval", post(handle_admin_consolidate_eval))
+        .route("/api/admin/prompt_evolve", post(handle_admin_prompt_evolve))
         .route("/api/admin/agent/repair", post(handle_agent_repair))
         .route("/api/agent/events", axum::routing::get(handle_agent_events))
         .route("/api/save-config", post(handle_save_config))
@@ -75,7 +79,12 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/collab/approval", post(handle_collab_approval))
         .route("/api/collab/delete", post(handle_collab_delete))
         .route("/api/collab/peers", get(handle_collab_peers))
+        .route("/api/collab/profile", get(handle_collab_profile))
         .route("/api/memory/feedback", post(handle_memory_feedback))
+        .route("/api/tool/execute", post(handle_tool_execute))
+        .route("/api/tool/execute/{id}", get(handle_tool_execute_get))
+        .route("/api/tool/auto-writes", get(handle_auto_writes_list))
+        .route("/api/tool/auto-writes/{id}/undo", post(handle_auto_write_undo))
         .route("/v1/chat/completions", post(handle_v1_chat))
         .route("/api/persona", post(handle_persona_create).get(handle_persona_list))
         .route("/api/persona/{id}", delete(handle_persona_delete).get(handle_persona_get))

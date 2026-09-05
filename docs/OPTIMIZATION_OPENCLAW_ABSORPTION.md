@@ -151,5 +151,5 @@
 - [x] 研究完成（v2026.7.1 源码深读 + 宣传对照）
 - [x] 方案修订（2026-07-18：checkpoint/沙箱现状 + Crestodian 笔误 + 划界）
 - [x] **Phase A 已落地（2026-07-18）**：A1 `boot_lifecycle.rs` + boundary `safe_mode` 闩锁（崩溃循环抑制危险/未分类/外发工具自动执行）；A2 approval `operation_hash` 三门（`compute_operation_hash` + `build_a2a_request` 带 hash + `record_response` 经 `get_pending` 回填，防 LLM 自批）；A3 `audit_events` SQLite 元数据表（`attach_db` 建表 + `record_event` INSERT `tool_call_id=sha256` + `recent_from_db` 读回 + `from_str` 反查）。`cargo check` 全绿，approval/audit 单测通过。
-- [ ] Phase B 待开工（按 §6 路线）
+- [x] **Phase B 已关闭（2026-08-14，用户决策）**：B1 safe_mode 运维出口 / B2 会话消息元数据落 Memoria / B3 技能包安全扫描卡口 —— 均不做，不再安排。safe_mode 解除维持现状（重启后健康启动自动解除）。决策已记 Memoria（decision，tags `phase-b-closed`）。
 - 探针目录 `openclaw-probe/` 为只读研究副本，可随时删除。

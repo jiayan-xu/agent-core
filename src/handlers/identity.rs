@@ -980,12 +980,32 @@ pub(crate) async fn build_agent(
         human_approval,              // L2: 人工审批通道（真人兜底）
         meta_evolution: config.meta_evolution.clone().unwrap_or_default(),
         safety: safety_cfg,
+        gateway_approval: config.gateway_approval.clone().unwrap_or_default(),
         features: config.features.clone(),
         lats: config.lats.clone(),
         multiagent: config.multiagent.clone(),
         ttc: config.ttc.clone(),
         intake_filter: config.intake_filter.clone().unwrap_or_default(),
         orchestration: config.orchestration.clone().unwrap_or_default(),
+        tool_overrides: config
+            .boundary
+            .as_ref()
+            .map(|b| {
+                let mut pairs = Vec::new();
+                for i in &b.tool_overrides {
+                    match agent_core::boundary::ToolClass::parse(&i.level) {
+                        Some(level) => pairs.push((i.tool.clone(), level)),
+                        None => tracing::error!(
+                            target = "boundary",
+                            tool = %i.tool,
+                            level = %i.level,
+                            "agent.toml [boundary.tool_overrides] 非法级别，跳过该条——operator 的收紧被丢弃，工具保持默认启发式级别（仅接受 read/write/dangerous/unknown）"
+                        ),
+                    }
+                }
+                pairs
+            })
+            .unwrap_or_default(),
     };
     // A1 (OpenClaw 吸收): 记录启动并判定是否进入 safe_mode（崩溃循环保护）。
     // 返回 (启动记录 id, 是否需抑制危险/未分类/外发工具自动执行)。

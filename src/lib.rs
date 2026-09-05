@@ -5,7 +5,9 @@ pub mod persistent_subagent; // P1-B 递归持久子 agent（句柄 + A2A 路由
 pub mod approval;
 pub mod clarify; // P2-3：澄清工具（Request clarification 对标）
 pub mod reply_polish; // PFAiX 回复净化：检测 JSON/代码块泄漏
-pub mod approval_store; // TASK-652：审批权威表（checkpoints.db 同库异表）
+pub mod approval_store;
+pub mod gateway; // R1 工具执行网关（ADR-016：无头执行 + 三态响应）
+pub mod gateway_approval; // 分级审批：LLM 自动判定区 + 硬人工区 + fail-safe（ADR-016 修订）
 pub mod resources;
 pub mod audit;
 pub mod boundary;
@@ -13,6 +15,8 @@ pub mod boot_lifecycle;
 pub mod checkpoint;
 pub mod checkpoint_recovery; // 战略罗盘「持久执行深化」：checkpoint 恢复核心（可纯内存 e2e 测试）
 pub mod composer;
+pub mod consolidate_eval; // P2-2：consolidate 固定评估集（固定题集 + 北极星指标，为 P3 进化铺路）
+pub mod prompt_evolver; // P3：prompt 离线进化循环（autoresearch 协议：变异→评估→保留/丢弃）
 pub mod degrade;
 pub mod harness;
 pub mod llm;

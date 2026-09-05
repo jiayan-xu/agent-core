@@ -6,6 +6,7 @@
 //! 纯搬移 + `pub(crate)` 可见性，零行为变更。
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +19,7 @@ use tokio::sync::Mutex;
 use tokio::time::interval;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing::Instrument;
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::EnvFilter;
 
 use agent_core::metrics::MetricsRegistry;
@@ -52,14 +54,81 @@ pub(crate) fn build_cors_layer(host: &str, port: u16, configured: &[String]) -> 
         .allow_headers(Any)
 }
 
+/// 解析日志文件路径：按日期命名，避免单文件无限增长。
+///
+/// 优先级：`AGENT_CORE_LOG_FILE`（可为文件或目录）> 当前工作目录 > exe 同目录。
+/// 三处都不可写时返回 None（退回纯 stdout，不因日志问题阻塞启动）。
+fn resolve_log_file_path() -> Option<PathBuf> {
+    let name = format!("agentcore_{}.log", Local::now().format("%Y-%m-%d"));
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("AGENT_CORE_LOG_FILE") {
+        let p = PathBuf::from(p);
+        candidates.push(if p.is_dir() { p.join(&name) } else { p });
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join(&name));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(&name));
+        }
+    }
+    for c in candidates {
+        let parent_ok = match c.parent() {
+            Some(p) => p.exists() || std::fs::create_dir_all(p).is_ok(),
+            None => false,
+        };
+        if parent_ok
+            && std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&c)
+                .is_ok()
+        {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// 初始化 tracing：同时写入日志文件与 stdout。
+///
+/// 日志落盘由代码保证，**不依赖启动时是否做了 shell 重定向**——此前仅写
+/// stdout，一旦重启忘了 `>> xxx.log 2>&1`，日志就整段丢失（2026-08-21 起
+/// 连续丢失 8 天运行日志即由此造成）。
 pub(crate) fn init_tracing() {
     let filter = EnvFilter::try_from_env("AGENT_CORE_LOG")
         .or_else(|_| EnvFilter::try_from_env("RUST_LOG"))
         .unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
+
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(true)
-        .try_init();
+        .with_target(true);
+
+    let log_path = resolve_log_file_path();
+    match log_path {
+        Some(path) => match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                eprintln!("[agent-core] log file: {}", path.display());
+                let _ = builder.with_writer(Arc::new(file).and(std::io::stdout)).try_init();
+            }
+            Err(e) => {
+                eprintln!(
+                    "[agent-core] open log file failed ({}): {e}, stdout only",
+                    path.display()
+                );
+                let _ = builder.try_init();
+            }
+        },
+        None => {
+            eprintln!("[agent-core] no writable log path, stdout only");
+            let _ = builder.try_init();
+        }
+    }
 }
 
 pub(crate) async fn trace_middleware(request: Request, next: Next) -> axum::response::Response {
@@ -188,6 +257,7 @@ pub(crate) fn spawn_server(
                 timer.tick().await;
                 let mut fail_count = 0u32;
                 let mut insight_cycle = 0u32;
+                let mut last_nvr_ymd = String::new();
                 loop {
                     timer.tick().await;
                     insight_cycle += 1;
@@ -226,6 +296,29 @@ pub(crate) fn spawn_server(
                                 }
                             }
                         }
+                        // 每日 23:30 后自动下载理文/金源/苏新当天 NVR 录像（每天一次）
+                        let nvr_now = chrono::Local::now();
+                        let nvr_ymd = nvr_now.format("%Y-%m-%d").to_string();
+                        let nvr_hour = nvr_now.hour();
+                        let nvr_minute = nvr_now.minute();
+                        if (nvr_hour == 23 && nvr_minute >= 30) && last_nvr_ymd != nvr_ymd {
+                            for company in ["理文", "金源", "苏新"] {
+                                let nvr_args = serde_json::json!({
+                                    "date": nvr_ymd,
+                                    "company": company,
+                                    "workers": 1
+                                });
+                                match agent.call_tool_routed("download_nvr_videos", "default", &nvr_args, &agent_ns, "").await {
+                                    Ok(reply) => {
+                                        tracing::info!("NVR定时下载 {}: {}", company, &reply.chars().take(120).collect::<String>());
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("NVR定时下载 {} 失败: {}", company, e);
+                                    }
+                                }
+                            }
+                            last_nvr_ymd = nvr_ymd;
+                        }
                         // 每 4 轮（约 2 小时）执行一次洞见发现
                         if insight_cycle % 4 == 0 {
                             let insight = agent.run_insights(&agent_ns).await;
@@ -241,25 +334,27 @@ pub(crate) fn spawn_server(
                         };
                         if (2..=4).contains(&hour) && !already {
                             let default_ns = format!("agent/{}", agent.config.identity.agent_id);
-            let ns_list = std::env::var("CONSOLIDATE_NAMESPACES")
-                .unwrap_or(default_ns.clone());
-                            let mut results = Vec::new();
-                            for ns in ns_list
+                            let ns_list = std::env::var("CONSOLIDATE_NAMESPACES")
+                                .unwrap_or(default_ns.clone());
+                            let ns_vec: Vec<String> = ns_list
                                 .split(',')
-                                .map(|s| s.trim())
+                                .map(|s| s.trim().to_string())
                                 .filter(|s| !s.is_empty())
-                            {
+                                .collect();
+                            let mut results = Vec::new();
+                            for ns in &ns_vec {
                                 let res = agent.consolidate(ns).await;
-                                tracing::info!("[consolidate] {}", res);
-                                results.push(serde_json::json!({"ns": ns, "result": res}));
+                                tracing::info!("[consolidate] {}", res.summary_line());
+                                results.push(serde_json::json!({"ns": ns, "result": res.detail, "patterns_added": res.patterns_added}));
                             }
                             // PR5 自驱：低峰 consolidate 维护周期后触发一轮元进化
                             // （受 meta_evolution.enabled + cooldown_hours 双重保护，非低峰/未开启则不动作）
                             let me_val = agent.run_meta_evolution(&default_ns).await;
                             tracing::info!(target: "consciousness", "meta_evolution(nightly): {}", me_val);
                             results.push(serde_json::json!({"ns": default_ns, "meta_evolution": me_val}));
-                            // 记忆库维护：衰减循环 + GFS 轮转备份（每日一次，与 consolidate 同周期）
-                            let maint = agent.memoria_maintenance().await;
+                            // 记忆库维护：衰减循环 + GFS 轮转备份（每日一次，与 consolidate 同周期；
+                            // decay 需逐 ns 显式传 namespace，见 agent.rs::memoria_maintenance）
+                            let maint = agent.memoria_maintenance(&ns_vec).await;
                             if maint.contains("failed") {
                                 tracing::warn!(target: "consciousness", "nightly maintenance reported failure: {}", maint);
                             }

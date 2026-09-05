@@ -295,13 +295,37 @@ impl Consciousness {
             let ns = &ns_list[idx];
             tracing::info!(target: "consciousness", ns = %ns, cursor = idx, "A4: 空闲 tick 推进 consolidation round-robin");
             // 内层预算超时（外层 TICK 已有 600s watchdog），避免单次 consolidate 卡住整轮
-            let res = tokio::time::timeout(Duration::from_secs(300), agent.consolidate(ns)).await;
+            // 420s 覆盖典型批次：主提炼 chat_batch 单次尝试（确定性 ≤300s，ocr PR#70
+            // 第二轮：无重试无 failover）+ memoria 拉取/写入往返。evolve 循环
+            // 默认跳过（CONSOLIDATE_SKIP_EVOLVE），开启且批次巨大时会被本层
+            // 截断——类型化 LlmError 优先于外层超时的不变量由 chat_batch 的
+            // 单次尝试语义保证（≤300s < 420s）
+            let res = tokio::time::timeout(Duration::from_secs(420), agent.consolidate(ns)).await;
             match res {
-                Ok(summary) => {
-                    let line = format!("consolidate[{}]: {}", ns, summary);
+                Ok(outcome) => {
+                    // P1-d：BackgroundEvent.summary 改为**结构化 JSON**（patterns_added 等字段
+                    // 可被事件消费方直接读取，LLM 人读文本沉入 detail）——不再用一句转述文本
+                    // 当事件载荷。
+                    let line = outcome.summary_line();
                     tracing::info!(target: "consciousness", "{}", line);
-                    results_json.push(serde_json::json!({"ns": ns, "result": summary}));
-                    out.push(BackgroundEvent::new("consolidate", line));
+                    results_json.push(serde_json::json!({
+                        "ns": outcome.ns, "result": outcome.detail,
+                        "status": outcome.status,
+                        "patterns_added": outcome.patterns_added,
+                        "observations": outcome.observations,
+                        "observations_visible": outcome.observations_visible,
+                    }));
+                    let structured = serde_json::json!({
+                        "kind": "consolidate", "ns": outcome.ns,
+                        "status": outcome.status,
+                        "patterns_added": outcome.patterns_added,
+                        "observations": outcome.observations,
+                        "observations_visible": outcome.observations_visible,
+                        "fetched": outcome.fetched,
+                        "cursor": outcome.cursor,
+                        "detail": outcome.detail,
+                    });
+                    out.push(BackgroundEvent::new("consolidate", structured.to_string()));
                 }
                 Err(_) => {
                     tracing::warn!(target: "consciousness_watchdog", ns = %ns, "A4: consolidate 超时(>300s)跳过");

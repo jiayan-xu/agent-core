@@ -84,6 +84,29 @@ pub(crate) struct Config {
     /// ADR-017：LLM 编排层 v2（落 [orchestration]，缺省全默认 OFF，flag-off 零行为变化）
     #[serde(default)]
     pub(crate) orchestration: Option<agent_core::orchestration::OrchestrationConfig>,
+    /// 工具分类手动收紧（落 [boundary.tool_overrides]，缺省空）。
+    /// 与 register_tool 同语义：learn_tools 刷新不覆盖；进程启动时自动重放，
+    /// 使 operator 的 pin 跨重启生效。
+    #[serde(default)]
+    pub(crate) boundary: Option<BoundaryConfig>,
+    /// 分级审批（落 [gateway_approval]，缺省 human_all=现状全人工）
+    #[serde(default)]
+    pub(crate) gateway_approval: Option<agent_core::gateway_approval::GatewayApprovalConfig>,
+}
+
+/// 工具分类手动收紧配置（[boundary]）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BoundaryConfig {
+    #[serde(default)]
+    pub(crate) tool_overrides: Vec<ToolOverrideItem>,
+}
+
+/// 单条手动收紧：tool 名（大小写不敏感，存储侧 canonical 小写）+ 权限级别
+/// （仅接受 read/write/dangerous/unknown，非法值启动时告警并跳过）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ToolOverrideItem {
+    pub(crate) tool: String,
+    pub(crate) level: String,
 }
 
 /// Phase 7：代码自我进化引擎配置
@@ -365,6 +388,11 @@ pub(crate) fn expand_config_llm_env(cfg: &mut Config) {
             expand_llm_config(llm);
         }
     }
+    if let Some(ga) = cfg.gateway_approval.as_mut() {
+        if let Some(j) = ga.judge.as_mut() {
+            expand_provider(j);
+        }
+    }
     if let Some(ce) = cfg.code_evolution.as_mut() {
         if let Some(k) = ce.evolve_key.as_mut() {
             *k = expand_env(k);
@@ -486,6 +514,8 @@ pub(crate) fn load_or_create_config() -> Config {
         ttc: Default::default(),
         intake_filter: None,
         orchestration: None,
+        boundary: None,
+        gateway_approval: None,
     };
     init_domain_and_org(&cfg);
     let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());

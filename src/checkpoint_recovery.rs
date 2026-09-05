@@ -12,7 +12,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::checkpoint::{CheckpointState, CheckpointStore};
-use crate::composer::{ExecutionPlan, StepPlan};
+use crate::composer::ExecutionPlan;
+#[cfg(test)]
+use crate::composer::StepPlan;
 use crate::metrics::MetricsRegistry;
 use crate::session::{PendingAction, SessionManager, SessionState};
 

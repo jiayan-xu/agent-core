@@ -1,5 +1,22 @@
 # 演进日志 / CHANGELOG
 
+## 2026-08-30
+
+### v0.10.1 · MCP 中文身份修复 + 审批台迭代收尾（fix 发版锚点）
+- **改动**：
+  - `plugins/agentcore-mcp/mcp_server.py` agent_headers()：含中文的
+    AGENTCORE_AGENT_ID 自动 percent-encode（服务端 auth.rs
+    percent_decode_agent_id 还原）——修复同事侧 codex 经 MCP 调 agent-core
+    全部 401（HTTP 头不允非 ASCII，原始中文头必败）。
+  - approval_console_new.html：审批台安全与健壮性修复——内联 onclick 改
+    data-* 事件委托（堵 JS-string 上下文 XSS）、运维简报全字段 esc 转义、
+    loadOps 补 r.ok/d.error 检查与 el 作用域修正、startAuto/loadOps 移出
+    try 早退路径、审批历史死代码修复（补 #history 容器）、死 CSS 清理。
+  - bootstrap.rs / approval.rs / routes.rs：审批台与引导页此前迭代的收尾。
+- **效果**：同事对话业务查询/写操作全链路（query_entrance/query_whitelist
+  免审批；manage_whitelist 走审批）实测打通；审批台审查意见清零。
+- **动机**：PFAiX 分发版同事对话 401 事故根因修复；审批台多轮审查意见收尾。
+
 ## 2026-08-13
 
 ### v0.10.0 · P2 收尾（usage 真值记账 + 会话→根 ns 沉淀任务，新能力发版锚点）

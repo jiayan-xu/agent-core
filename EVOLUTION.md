@@ -1,5 +1,25 @@
 # agent-core 演进日志
 
+## 2026-08-17 — 夜间维护 memory_decay 缺 namespace 修复（梦境链路收口）
+
+> **助手检索锚点**：`memory_decay` / `memoria_maintenance` / `夜间维护` / `-32002` → 先读本节，勿再全库考古。
+
+### 背景
+夜间低峰维护（bootstrap 02:00-04:59 块）每日调用 `memoria_maintenance()`，其中 `memory_decay` 以空参 `{}` 调用。memoria 的 NsPolicy 门控对 admin 维护身份（授权 `*`）缺参直接返回 `-32002 Namespace argument required`，导致 **decay 每晚必挂**（备份正常、衰减零执行），且伴随观察落点错配，梦境巩固（consolidate）长期空转。
+
+### 变更
+- **`src/agent.rs`**：`memoria_maintenance(&self)` → `memoria_maintenance(&self, ns_list: &[String])`，`memory_decay` 改为逐 ns 显式传 `{"namespace": ns}`（与 consolidate 同批 ns_list；空列表时跳过 decay，避免复现 -32002）。
+- **`src/bootstrap.rs`**：夜间块将 consolidate 同源的 `ns_vec`（`CONSOLIDATE_NAMESPACES` 解析结果）传给维护函数，decay 与巩固同范围。
+
+### 部署
+- `cargo build --release` 后重启 `agent-core.exe --service`（`:9753`）。
+
+### 验证
+- admin 身份直接调 `memory_decay {"namespace":"agent/xujiayan"}` → `{"status":"ok","processed":3855,"cold":0}`；`decay_log` 落库 3855 行（`warm→decayed`，`1.0→0.95`）。
+- 旧调用形态（空参）对照：`-32002 Namespace argument required`。
+
+---
+
 ## 2026-07-23 — PFAiX 对话栏文档归档到部门共享记忆
 
 > 助手锚点：`/api/documents/archive` / 对话栏上传 / `memoriaDeptArchive`

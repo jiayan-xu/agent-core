@@ -9,8 +9,9 @@
 //!
 //! 本模块只放纯逻辑与状态；热路径接线在 `agent.rs::llm_loop`。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -93,11 +94,20 @@ pub struct ToolSummaryConfig {
     #[serde(default)]
     pub enabled: bool,
     /// 单条工具结果超过该字符数才触发摘要。
+    /// `0` 的语义是「所有 tool 结果都触发摘要」（显式值，不做下限兜底）。
     #[serde(default = "default_summary_threshold_chars")]
     pub threshold_chars: usize,
     /// 从第几轮起对所有工具结果摘要（防长会话上下文膨胀）。
     #[serde(default = "default_summary_start_round")]
     pub start_round: usize,
+    /// 每轮最多摘要几条工具结果（防热路径串行 LLM 调用失控）。
+    /// `0` 的语义是「本轮不摘要」——调用点显式短路返回，不静默改成 1。
+    #[serde(default = "default_summary_max_per_round")]
+    pub max_per_round: usize,
+}
+
+fn default_summary_max_per_round() -> usize {
+    2
 }
 
 impl Default for ToolSummaryConfig {
@@ -106,6 +116,7 @@ impl Default for ToolSummaryConfig {
             enabled: false,
             threshold_chars: default_summary_threshold_chars(),
             start_round: default_summary_start_round(),
+            max_per_round: default_summary_max_per_round(),
         }
     }
 }
@@ -156,23 +167,32 @@ impl SessionPhaseStore {
     pub fn open(db_path: &str) -> Self {
         match rusqlite::Connection::open(db_path) {
             Ok(conn) => {
-                let created = conn
-                    .execute_batch(
-                        "CREATE TABLE IF NOT EXISTS orchestration_phase (
-                             session_id TEXT PRIMARY KEY,
-                             phase      TEXT NOT NULL,
-                             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-                         );",
-                    )
-                    .is_ok();
-                if created {
-                    Self {
+                // 与 harness/session 连接并发写同一文件：设 busy_timeout + WAL，
+                // 避免默认 0ms 超时下 promote 偶发 database is locked 静默丢持久化
+                // （ocr 修复）。失败必须留痕，不能静默吞错。
+                if let Err(e) = conn.busy_timeout(std::time::Duration::from_secs(2)) {
+                    tracing::warn!(target = "orchestration", db = %db_path, err = %e,
+                        "busy_timeout 设置失败");
+                }
+                if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
+                    tracing::warn!(target = "orchestration", db = %db_path, err = %e,
+                        "journal_mode=WAL 设置失败");
+                }
+                match conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS orchestration_phase (
+                         session_id TEXT PRIMARY KEY,
+                         phase      TEXT NOT NULL,
+                         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                     );",
+                ) {
+                    Ok(_) => Self {
                         conn: Some(Arc::new(Mutex::new(conn))),
+                    },
+                    Err(e) => {
+                        tracing::warn!(target = "orchestration", db = %db_path, err = %e,
+                            "orchestration_phase 表创建失败，phase 存储降级为内存模式");
+                        Self { conn: None }
                     }
-                } else {
-                    tracing::warn!(target = "orchestration", db = %db_path,
-                        "orchestration_phase 表创建失败，phase 存储降级为内存模式");
-                    Self { conn: None }
                 }
             }
             Err(e) => {
@@ -183,23 +203,36 @@ impl SessionPhaseStore {
         }
     }
 
-    /// 纯内存实例（单测 / 降级路径）。
+    /// 纯内存实例（单测 / 降级路径）。建表失败同样降级为无存储。
     pub fn new_in_memory() -> Self {
         match rusqlite::Connection::open_in_memory() {
-            Ok(conn) => {
-                let _ = conn.execute_batch(
-                    "CREATE TABLE orchestration_phase (
-                         session_id TEXT PRIMARY KEY,
-                         phase      TEXT NOT NULL,
-                         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-                     );",
-                );
-                Self {
+            Ok(conn) => match conn.execute_batch(
+                "CREATE TABLE orchestration_phase (
+                     session_id TEXT PRIMARY KEY,
+                     phase      TEXT NOT NULL,
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );",
+            ) {
+                Ok(_) => Self {
                     conn: Some(Arc::new(Mutex::new(conn))),
+                },
+                Err(e) => {
+                    tracing::warn!(target = "orchestration", err = %e,
+                        "内存 phase 表创建失败");
+                    Self { conn: None }
                 }
+            },
+            Err(e) => {
+                tracing::warn!(target = "orchestration", err = %e,
+                    "内存 SQLite 打开失败，phase 存储降级为无存储");
+                Self { conn: None }
             }
-            Err(_) => Self { conn: None },
         }
+    }
+
+    /// 完全禁用（所有编排开关 OFF 时使用：零文件副作用，不建表、不开库）。
+    pub fn disabled() -> Self {
+        Self { conn: None }
     }
 
     pub fn is_promoted(&self, session_id: &str) -> bool {
@@ -207,16 +240,25 @@ impl SessionPhaseStore {
             return false;
         };
         let Ok(guard) = conn.lock() else {
+            tracing::warn!(target = "orchestration", session = %session_id,
+                "phase 存储连接 Mutex 中毒，按未 promoted 处理");
             return false;
         };
-        guard
-            .query_row(
-                "SELECT phase FROM orchestration_phase WHERE session_id=?1",
-                rusqlite::params![session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map(|phase| phase == "promoted")
-            .unwrap_or(false)
+        // 每次请求最多走到这里一次（promoted_cache 命中后短路）；busy_timeout 上限 2s。
+        // QueryReturnedNoRows 是「未 promoted」的正常负结果，不告警；仅真实 DB 错误告警。
+        match rusqlite::OptionalExtension::optional(guard.query_row(
+            "SELECT phase FROM orchestration_phase WHERE session_id=?1",
+            rusqlite::params![session_id],
+            |row| row.get::<_, String>(0),
+        )) {
+            Ok(Some(phase)) => phase == "promoted",
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(target = "orchestration", session = %session_id, err = %e,
+                    "phase 查询失败，按未 promoted 处理（该会话可能重新 bootstrap）");
+                false
+            }
+        }
     }
 
     /// 标记 promoted（INSERT OR IGNORE：append-only 幂等）。失败只告警，不阻断主流程。
@@ -225,6 +267,8 @@ impl SessionPhaseStore {
             return false;
         };
         let Ok(guard) = conn.lock() else {
+            tracing::warn!(target = "orchestration", session = %session_id,
+                "phase 存储连接 Mutex 中毒，promote 落盘跳过");
             return false;
         };
         match guard.execute(
@@ -243,25 +287,74 @@ impl SessionPhaseStore {
 
 // ── 控制器 ──────────────────────────────────────────────────────────────
 
+/// 进程内 session 集合的 LRU 上限：防止长驻服务中缓存随会话数无限增长。
+/// 淘汰只丢缓存（真相在 SessionPhaseStore / 幂等重算），不影响正确性。
+const SESSION_SET_CACHE_MAX: usize = 4096;
+const NOT_PROMOTED_NEGATIVE_TTL: Duration = Duration::from_secs(30);
+
+/// 有界 LRU session 集合：`contains` 命中不刷新顺序（promote 是 append-only，
+/// 无热/冷再排序语义），只保证容量上界。
+#[derive(Default)]
+struct BoundedSessionSet {
+    order: VecDeque<String>,
+    set: HashSet<String>,
+}
+
+impl BoundedSessionSet {
+    fn contains(&self, session_id: &str) -> bool {
+        self.set.contains(session_id)
+    }
+
+    fn insert(&mut self, session_id: &str) {
+        if self.set.contains(session_id) {
+            return;
+        }
+        if self.order.len() >= SESSION_SET_CACHE_MAX {
+            if let Some(evicted) = self.order.pop_front() {
+                self.set.remove(&evicted);
+            }
+        }
+        let owned = session_id.to_string();
+        self.order.push_back(owned.clone());
+        self.set.insert(owned);
+    }
+}
+
 pub struct OrchestrationController {
     pub cfg: OrchestrationConfig,
     store: SessionPhaseStore,
-    /// 进程内缓存：promote 是 append-only，缓存命中即真。
-    promoted_cache: Mutex<HashSet<String>>,
+    /// 进程内缓存：promote 是 append-only，缓存命中即真；有界（见
+    /// `BoundedSessionSet`），淘汰只丢缓存、真相仍可回查 store。
+    promoted_cache: Mutex<BoundedSessionSet>,
+    /// bootstrap 首请求的 per-session 原子预留：同一 session 的并发 run
+    /// 只有一个能进入最小工具面，其余 run 直接走常规路径。
+    /// **必须无界**：这是「进行中」锁而非可重建缓存，误淘汰会重新打开
+    /// 并发 bootstrap 窗口；条目在 finish/cancel 时删除，常态不增长。
+    bootstrap_in_flight: Mutex<HashSet<String>>,
+    /// 未 promoted 负缓存（短 TTL）：避免 bootstrap 竞争失败 / 冷启动期对同一
+    /// session 的每次请求都同步回查 SQLite。
+    not_promoted_cache: Mutex<HashMap<String, Instant>>,
     /// guardrail hooks（ADR-017 P2）。默认注册旧补丁的等价内置 hooks。
     hooks: HookRegistry,
 }
 
 impl OrchestrationController {
     pub fn new(cfg: OrchestrationConfig) -> Self {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let store = SessionPhaseStore::open(&cwd.join("harness.db").to_string_lossy());
+        let store = if cfg.bootstrap.enabled {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            SessionPhaseStore::open(&cwd.join("harness.db").to_string_lossy())
+        } else {
+            // 全部开关 OFF：零文件副作用（不建表、不开库）
+            SessionPhaseStore::disabled()
+        };
         let hooks = HookRegistry::default();
         register_builtin_hooks(&hooks);
         OrchestrationController {
             cfg,
             store,
-            promoted_cache: Mutex::new(HashSet::new()),
+            promoted_cache: Mutex::new(BoundedSessionSet::default()),
+            bootstrap_in_flight: Mutex::new(HashSet::new()),
+            not_promoted_cache: Mutex::new(HashMap::new()),
             hooks,
         }
     }
@@ -273,7 +366,9 @@ impl OrchestrationController {
         OrchestrationController {
             cfg,
             store,
-            promoted_cache: Mutex::new(HashSet::new()),
+            promoted_cache: Mutex::new(BoundedSessionSet::default()),
+            bootstrap_in_flight: Mutex::new(HashSet::new()),
+            not_promoted_cache: Mutex::new(HashMap::new()),
             hooks,
         }
     }
@@ -288,65 +383,427 @@ impl OrchestrationController {
         self.hooks.run(point, ctx)
     }
 
+    /// 查询 session 是否已 promoted（缓存命中即真；miss 时同步查 SQLite）。
+    ///
+    /// ⚠️ 异步调用方注意：缓存未命中时这里是同步 rusqlite 查询（std Mutex +
+    /// busy_timeout 上限 2s）。bootstrap 开启时每个未命中 session 只在首请求
+    /// 走一次该冷路径；若 harness.db 高并发写竞争，后续可把 store 调用迁到
+    /// `tokio::task::spawn_blocking`。
     pub fn is_promoted(&self, session_id: &str) -> bool {
         {
             let Ok(cache) = self.promoted_cache.lock() else {
+                tracing::warn!(target = "orchestration", session = %session_id,
+                    "promoted_cache Mutex 中毒，按未 promoted 处理（会话可能重新 bootstrap）");
                 return false;
             };
             if cache.contains(session_id) {
                 return true;
             }
         }
+        // 短 TTL 负缓存：避免未 promoted session 在竞争失败/冷启动期重复同步查库
+        if let Ok(negative) = self.not_promoted_cache.lock() {
+            if let Some(at) = negative.get(session_id) {
+                if at.elapsed() < NOT_PROMOTED_NEGATIVE_TTL {
+                    return false;
+                }
+            }
+        }
         let promoted = self.store.is_promoted(session_id);
         if promoted {
             if let Ok(mut cache) = self.promoted_cache.lock() {
-                cache.insert(session_id.to_string());
+                cache.insert(session_id);
+            } else {
+                tracing::warn!(target = "orchestration", session = %session_id,
+                    "promoted_cache Mutex 中毒，命中结果未写入缓存");
+            }
+            if let Ok(mut negative) = self.not_promoted_cache.lock() {
+                negative.remove(session_id);
+            }
+        } else if let Ok(mut negative) = self.not_promoted_cache.lock() {
+            // 有界 + 惰性过期：查询路径已按 TTL 判活，插入只在容量打满时
+            // 才 retain 清理一次，miss 路径保持 O(1)、缩短持锁时间
+            //（ocr perf·low 修复：不再每次 miss 都全表扫描）。
+            if negative.len() >= SESSION_SET_CACHE_MAX {
+                negative.retain(|_, at| at.elapsed() < NOT_PROMOTED_NEGATIVE_TTL);
+            }
+            if negative.len() < SESSION_SET_CACHE_MAX {
+                negative.insert(session_id.to_string(), Instant::now());
+            } else {
+                tracing::warn!(target = "orchestration", session = %session_id,
+                    "未 promoted 负缓存容量已满，本次不回填负缓存");
             }
         }
         promoted
     }
 
-    pub fn promote(&self, session_id: &str) {
-        if let Ok(mut cache) = self.promoted_cache.lock() {
-            cache.insert(session_id.to_string());
+    /// 原子 compare-and-set：首次标记者返回 true，后续调用返回 false。
+    /// 与 `promote` 一样 append-only；用于消除同 session 并发 run 的
+    /// check-then-promote 窗口。
+    ///
+    /// ⚠️ 返回值语义：**仅表示本进程内存 CAS 是否赢**，不表示落盘持久化成功。
+    /// 落盘失败由 `store.promote` 内部告警并降级为「重启后该 session 重新 bootstrap」。
+    pub fn try_promote(&self, session_id: &str) -> bool {
+        let won = {
+            let Ok(mut cache) = self.promoted_cache.lock() else {
+                tracing::warn!(target = "orchestration", session = %session_id,
+                    "promoted_cache Mutex 中毒，promote 跳过（不阻塞主流程）");
+                return false;
+            };
+            if cache.contains(session_id) {
+                false
+            } else {
+                cache.insert(session_id);
+                true
+            }
+        };
+        if won {
+            self.store.promote(session_id);
+            if let Ok(mut negative) = self.not_promoted_cache.lock() {
+                negative.remove(session_id);
+            }
         }
-        self.store.promote(session_id);
+        won
     }
 
-    /// 构造 bootstrap 工具面：按意图相关性取前 `max_tools` 个，写/危险工具硬排除。
-    /// 无安全候选时返回空（LLM 先诚实作答；promote 后下一请求恢复全量目录）。
-    pub fn bootstrap_tools(&self, _raw_message: &str, full_tools: &[ToolDef]) -> Vec<ToolDef> {
-        let max = self.cfg.bootstrap.max_tools.max(1);
+    pub fn promote(&self, session_id: &str) {
+        self.try_promote(session_id);
+    }
+
+    /// 尝试预留本 session 的 bootstrap 首请求（per-session 原子闸）。
+    /// 仅当 session 未 promoted、也没有其他 run 正在 bootstrap 时成功。
+    /// 调用方必须在首个 LLM 响应后 `finish_bootstrap`（成功）或
+    /// `cancel_bootstrap`（失败/提前返回），防止预留泄漏。
+    ///
+    /// 锁策略：只把 in-flight 集合的查重+插入放在临界区，**不持锁查 SQLite**——
+    /// 否则单 session 的 promoted 落盘查询（busy_timeout 最多 2s）会阻塞全部
+    /// session 的 bootstrap 决策。先拿下预留，再到锁外复核 promoted；若复核为
+    /// 已 promoted（例如其他进程刚写入），释放预留并返回 false。
+    pub fn try_begin_bootstrap(&self, session_id: &str) -> bool {
+        {
+            let Ok(mut in_flight) = self.bootstrap_in_flight.lock() else {
+                tracing::warn!(target = "orchestration", session = %session_id,
+                    "bootstrap_in_flight Mutex 中毒，本次不进入 bootstrap");
+                return false;
+            };
+            if in_flight.contains(session_id) {
+                return false;
+            }
+            in_flight.insert(session_id.to_string());
+        }
+        // 锁外复核 promoted：预留已原子持有，同 session 并发 run 已拿不到第二张票。
+        if self.is_promoted(session_id) {
+            self.cancel_bootstrap(session_id);
+            return false;
+        }
+        true
+    }
+
+    /// bootstrap 首请求成功：先 promote（append-only），再释放 per-session 预留。
+    /// 顺序不能反——先释放会重新打开并发窗口，其他 run 可能看到未 promoted
+    /// 而再次进入 bootstrap。
+    pub fn finish_bootstrap(&self, session_id: &str) {
+        self.promote(session_id);
+        match self.bootstrap_in_flight.lock() {
+            Ok(mut in_flight) => {
+                in_flight.remove(session_id);
+            }
+            Err(_) => tracing::warn!(target = "orchestration", session = %session_id,
+                "bootstrap_in_flight Mutex 中毒，预留未释放（promote 已完成，后续 run 不会重复 bootstrap）"),
+        }
+    }
+
+    /// bootstrap 首请求失败/提前返回：只释放预留，不 promote。
+    pub fn cancel_bootstrap(&self, session_id: &str) {
+        match self.bootstrap_in_flight.lock() {
+            Ok(mut in_flight) => {
+                in_flight.remove(session_id);
+            }
+            Err(_) => tracing::warn!(target = "orchestration", session = %session_id,
+                "bootstrap_in_flight Mutex 中毒，预留未释放（本次失败不 promote）"),
+        }
+    }
+
+    /// 异步包装：把同步 SQLite 冷路径移出 tokio worker（spawn_blocking）。
+    pub async fn is_promoted_async(self: &Arc<Self>, session_id: String) -> bool {
+        let this = Arc::clone(self);
+        // 与 acquire_bootstrap_async 同模式：闭包取 clone，原值留作错误日志
+        //（join 失败时任务丢失，只有外部副本能记录 session——冷路径一次
+        // 小分配换取可诊断性，ocr maintainability·low 修复）。
+        let sid = session_id.clone();
+        match tokio::task::spawn_blocking(move || this.is_promoted(&sid)).await {
+            Ok(v) => v,
+            Err(e) => {
+                // join 失败（任务未执行/panic）与「未 promoted」不可混为一谈：
+                // 前者会导致已 promoted 会话被重复 bootstrap，必须可诊断
+                //（ocr other·low 修复：不暴露 panic payload）。
+                tracing::error!(target = "orchestration", session = %session_id,
+                    err = %e, "is_promoted_async spawn_blocking join 失败，按未 promoted 处理");
+                false
+            }
+        }
+    }
+
+    /// 原子取得 per-session bootstrap 预留，返回 RAII guard。
+    /// guard 在作用域结束（包括 async future 被取消/丢弃、panic unwind）时自动
+    /// 释放预留；调用方在首请求成功后调用 `BootstrapReservation::promote_async`
+    /// 落盘并释放。拿不到预留返回 None（同 session 已有 run 在 bootstrap）。
+    pub async fn acquire_bootstrap_async(
+        self: &Arc<Self>,
+        session_id: String,
+    ) -> Option<BootstrapReservation> {
+        let this = Arc::clone(self);
+        let sid = session_id.clone();
+        let won = match tokio::task::spawn_blocking(move || this.try_begin_bootstrap(&sid)).await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // join 失败：预留尝试被静默丢弃，会话回退全量工具面——
+                // 与「没抢到预留」不可混为一谈，必须可诊断（ocr other·low 修复）。
+                tracing::error!(target = "orchestration", session = %session_id,
+                    err = %e, "acquire_bootstrap_async spawn_blocking join 失败，按未取得预留处理");
+                false
+            }
+        };
+        won.then(|| BootstrapReservation {
+            controller: Arc::clone(self),
+            session_id,
+            active: true,
+        })
+    }
+
+    /// 原子取得 per-session bootstrap 预留，返回 RAII guard。
+    /// guard 在作用域结束（包括 async future 被取消/丢弃、panic unwind）时自动
+    /// 释放预留；调用方在首请求成功后调用 `BootstrapReservation::promote`
+    /// 落盘并释放。拿不到预留返回 None（同 session 已有 run 在 bootstrap）。
+    pub fn acquire_bootstrap(self: &Arc<Self>, session_id: &str) -> Option<BootstrapReservation> {
+        if !self.try_begin_bootstrap(session_id) {
+            return None;
+        }
+        Some(BootstrapReservation {
+            controller: Arc::clone(self),
+            session_id: session_id.to_string(),
+            active: true,
+        })
+    }
+
+    /// 构造 bootstrap 工具面：只保留「权威边界判定为只读」的工具（`is_safe` 谓词
+    /// 由调用方用 `boundary` 的 ToolClassifier 实现），再按意图相关性取前
+    /// `max_tools` 个。`max_tools=0` 表示「不给任何工具」（操作者显式意图，不静默改成 1）。
+    /// 无安全候选时返回空（LLM 先诚实作答；promote 后同请求即恢复全量目录）。
+    ///
+    /// ⚠️ 开关语义与模块头一致（flag-off 零行为变化）：`bootstrap.enabled=false`
+    /// 时**原样返回** `full_tools`——本函数只服务 bootstrap 面，而 bootstrap 面
+    /// 仅在 enabled 路径存在（agent.rs 也只在 bootstrap_active 时调用本函数）。
+    /// 安全过滤/相关性排序/截断只作用于 enabled 路径。调用方不得在开关关闭时
+    /// 用本函数做通用工具面过滤，否则会拿到未过滤的全量目录
+    ///（ocr maintainability·low 修复：pass-through 语义显式化，`pub(crate)` 限制
+    /// 外部误用面）。
+    pub(crate) fn bootstrap_tools(
+        &self,
+        raw_message: &str,
+        full_tools: &[ToolDef],
+        is_safe: &dyn Fn(&str) -> bool,
+    ) -> Vec<ToolDef> {
+        if !self.cfg.bootstrap.enabled {
+            tracing::debug!(target = "orchestration", tools = full_tools.len(),
+                "bootstrap_tools: 开关关闭，原样返回全量目录（pass-through，flag-off 零行为变化；本函数不是通用安全过滤器）");
+            return full_tools.to_vec();
+        }
+        let max = self.cfg.bootstrap.max_tools;
+        if max == 0 {
+            return Vec::new();
+        }
         let mut scored: Vec<(i32, usize, &ToolDef)> = full_tools
             .iter()
             .enumerate()
-            .map(|(idx, tool)| (bootstrap_tool_score(&tool.function.name), idx, tool))
+            .filter(|(_, tool)| bootstrap_tool_allowed(&tool.function.name, is_safe(&tool.function.name)))
+            .map(|(idx, tool)| {
+                (
+                    bootstrap_tool_score(&tool.function.name, raw_message),
+                    idx,
+                    tool,
+                )
+            })
             .collect();
         // 稳定排序：分值降序、原顺序保持
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         scored
             .into_iter()
-            .filter(|(score, _, _)| *score > BOOTSTRAP_DENY_SCORE)
             .take(max)
             .map(|(_, _, tool)| tool.clone())
             .collect()
     }
 }
 
-const BOOTSTRAP_DENY_SCORE: i32 = -1000;
+/// bootstrap per-session 预留的 RAII guard。
+/// 正常成功路径调用 `promote`；其余所有路径（early-return、async future 被取消、
+/// panic unwind）由 `Drop` 自动释放预留，杜绝 in-flight 泄漏。
+pub struct BootstrapReservation {
+    controller: Arc<OrchestrationController>,
+    session_id: String,
+    active: bool,
+}
 
-/// 工具名打分：意图相关查询工具优先；写/危险/治理类工具一律 DENY（永不过 bootstrap 面）。
-fn bootstrap_tool_score(name: &str) -> i32 {
-    let n = name.to_ascii_lowercase();
-    const DENY_SUBSTR: &[&str] = &[
-        "write", "delete", "remove", "sync", "commit", "archive", "register", "login",
-        "kill", "shutdown", "revoke", "batch_delete", "merge", "evolve", "repair",
-        "respond", "send", "approval", "reboot", "restart",
-    ];
-    if DENY_SUBSTR.iter().any(|d| n.contains(d)) {
-        return BOOTSTRAP_DENY_SCORE;
+impl BootstrapReservation {
+    /// 首请求成功：append-only promote + 释放 per-session 预留。
+    pub fn promote(mut self) {
+        if self.active {
+            self.controller.finish_bootstrap(&self.session_id);
+            self.active = false;
+        }
     }
-    let score = if n.contains("query") {
+
+    /// 异步首请求成功：promote 的 SQLite 写移出 tokio worker。
+    /// spawn_blocking join 失败（任务未执行 / panic）时同步回退释放预留，
+    /// 避免 `bootstrap_in_flight` 条目泄漏——Drop 兜底只看 `active`，而这里
+    /// `active=false` 会绕开 Drop，必须显式 cancel（ocr bug·low 修复）。
+    pub async fn promote_async(mut self) {
+        if self.active {
+            let controller = Arc::clone(&self.controller);
+            let session_id = self.session_id.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                controller.finish_bootstrap(&session_id);
+            })
+            .await;
+            if let Err(e) = joined {
+                tracing::error!(target = "orchestration", session = %self.session_id,
+                    err = %e, "promote_async spawn_blocking join 失败，同步回退释放预留");
+                self.controller.cancel_bootstrap(&self.session_id);
+            }
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for BootstrapReservation {
+    fn drop(&mut self) {
+        if self.active {
+            self.controller.cancel_bootstrap(&self.session_id);
+        }
+    }
+}
+
+/// 动作段拒绝集：把工具名按 `_` / `-` / camelCase 边界切成段后**全段扫描**，
+/// 任一段命中写/DDL 动词即拒绝。首段/尾段规则会漏掉 `query_batch_update_log`、
+/// `cross_agent_register_user` 这类中间段带写动词的工具；只按 `_` 切分还会漏掉
+/// `updateState`、`sendMessage`。`query_archive_log` 是唯一的已知误伤项，
+/// 已放入 `BOOTSTRAP_EXPLICIT_ALLOW`（且 allow 不再越过 safe 门）。
+/// 危险/写工具的第一道闸由 `boundary::is_read_only_tool` / ToolClassifier 承担；
+/// 本表兜底覆盖常见写动词段（update/insert/create/fill/manage/save/add/put/post/
+/// remember/dispatch 等）。
+fn bootstrap_action_segments_ok(name: &str) -> bool {
+    const DENY_ACTIONS: &[&str] = &[
+        "write", "delete", "remove", "sync", "commit", "archive", "register", "login",
+        "kill", "shutdown", "revoke", "merge", "evolve", "repair", "respond", "send",
+        "reboot", "restart", "manage", "fill", "batch", "update", "insert", "create",
+        "remember", "dispatch", "save", "add", "put", "post", "submit", "approve",
+        "reject", "set", "reset", "clear", "purge", "refresh", "modify", "edit",
+        "export", "import", "upload", "enable", "disable", "start", "stop", "run",
+        "trigger", "forward", "execute", "alter", "drop", "truncate", "push",
+        "publish", "install", "grant", "append", "move", "copy", "invoke",
+    ];
+    !action_segments(name)
+        .iter()
+        // 写动词粘数字尾（update2/create2024）先剥尾部数字再比；段内「数字 → 小写」
+        // 边界已由 action_segments 切分（get2update/stat2update 不再整段绕过）。
+        .map(|segment| segment.trim_end_matches(|c: char| c.is_ascii_digit()))
+        .any(|segment| DENY_ACTIONS.iter().any(|a| segment == *a))
+}
+
+/// 把工具名切成动作段：`_`、`-`、camelCase、「缩写/数字 + 大写」与「数字 + 小写」
+/// 边界都是分隔符。兼容 `updateState`、`getOSUpdate`、`OSSendMessage`、
+/// `get2Update`、`get2update` 这类命名，避免 write 动词粘在缩写/数字后面
+/// 绕过分段检查。
+fn action_segments(name: &str) -> Vec<String> {
+    let chars: Vec<char> = name.chars().collect();
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch == '_' || ch == '-' {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        let prev = i.checked_sub(1).and_then(|j| chars.get(j)).copied();
+        let next = chars.get(i + 1).copied();
+        let boundary = (ch.is_ascii_uppercase()
+            && !current.is_empty()
+            && (matches!(prev, Some(p) if p.is_ascii_lowercase() || p.is_ascii_digit())
+                || matches!(next, Some(n) if n.is_ascii_lowercase())))
+            || (ch.is_ascii_lowercase()
+                && !current.is_empty()
+                && matches!(prev, Some(p) if p.is_ascii_digit()));
+        if boundary {
+            segments.push(std::mem::take(&mut current));
+        }
+        current.push(ch.to_ascii_lowercase());
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// SELECT-only SQL 工具能力标签：仅 `execute_sql`（dashboard 侧实现强制
+/// SELECT-only，见 db_write.rs 注释与 `boundary::ToolClassifier` 的 read 分类）。
+/// bootstrap 面放行 SQL 执行工具必须同时满足「边界判 read + 本能力标签」：
+/// 未来若出现 `execute_sql_write` 之类别名或分类漂移，能力标签不匹配即拒绝
+///（ocr security·medium 修复：不依赖通用 Read 分类单独放行写能力工具）。
+fn is_select_only_sql_tool(name: &str) -> bool {
+    name.eq_ignore_ascii_case("execute_sql")
+}
+
+/// 显式允许名：只覆盖动作段兜底检查的**已知只读工具**（`query_archive_log` 的
+/// 中间段 `archive` 是名词，不是写动作）。
+/// 白名单不再越过 `safe` 门，也不越过 `bootstrap_explicit_deny`：边界分类为
+/// 写/危险的工具永远进不了 bootstrap 面。
+const BOOTSTRAP_EXPLICIT_ALLOW: &[&str] = &["fuzzy_match_plate", "query_archive_log"];
+
+fn bootstrap_tool_allowed(name: &str, safe: bool) -> bool {
+    // 权威边界判定优先：safe=false 一律拒绝，白名单只豁免动作段启发式，
+    // 不能把边界判为写/危险的工具重新放进 bootstrap（ADR-017 不变量）。
+    if !safe {
+        return false;
+    }
+    if bootstrap_explicit_deny(name) {
+        return false;
+    }
+    if BOOTSTRAP_EXPLICIT_ALLOW
+        .iter()
+        .any(|n| name.eq_ignore_ascii_case(n))
+    {
+        return true;
+    }
+    // SQL 执行类工具走独立能力标签（SELECT-only），不并入普通白名单
+    if is_select_only_sql_tool(name) {
+        return true;
+    }
+    bootstrap_action_segments_ok(name)
+}
+
+/// 显式拒绝名：`boundary::is_read_only_tool` 的前缀启发式存在已知宽放项
+/// （如 `cross_` 前缀），这些具名工具在 boundary 分类中具备写能力，
+/// bootstrap 面必须精确排除（ocr security·high 修复）。
+fn bootstrap_explicit_deny(name: &str) -> bool {
+    const DENY_NAMES: &[&str] = &[
+        "cross_agent_query",
+        "reasonix_dispatch",
+        "continue_task",
+        "memory_remember",
+        "memory_merge",
+        "register_agent",
+    ];
+    DENY_NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
+}
+
+/// 工具名打分：查询/读取类优先；`raw_message` 带数据查询语义时 query/sql 类加权。
+fn bootstrap_tool_score(name: &str, raw_message: &str) -> i32 {
+    let n = name.to_ascii_lowercase();
+    let query_intent = ["查询", "多少", "进厂", "车次", "数据", "记录", "统计", "白名单"]
+        .iter()
+        .any(|k| raw_message.contains(k));
+    let mut score = if n.contains("query") {
         10
     } else if n.contains("get") {
         9
@@ -361,7 +818,31 @@ fn bootstrap_tool_score(name: &str) -> i32 {
     } else {
         1
     };
+    if query_intent && (n.contains("query") || n.contains("sql") || n.contains("get")) {
+        score += 2;
+    }
     score
+}
+
+/// YES/NO 评审解析（ADR-017 Reflect 用）：严格只认**以 YES/NO 开头**的答复；
+/// `已达成NO`、`请继续执行YES`、自由文本等一律 None，由调用方按 fail-open 处理。
+pub fn parse_yes_no(text: &str) -> Option<bool> {
+    fn prefix_ok(t: &str, prefix: &str) -> bool {
+        t.starts_with(prefix)
+            && t[prefix.len()..]
+                .chars()
+                .next()
+                .map(|c| !c.is_ascii_alphanumeric())
+                .unwrap_or(true)
+    }
+    let t = text.trim().to_ascii_uppercase();
+    if prefix_ok(&t, "YES") {
+        Some(true)
+    } else if prefix_ok(&t, "NO") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 // ── P2/P3 基础设施（默认 OFF，接线由 agent 层分阶段完成）─────────────────
@@ -377,20 +858,56 @@ pub enum FailureClass {
     Fatal,
 }
 
-/// 从错误文本做保守分类。默认 Recoverable（宁可多走降级，不把 fatal 误判成重试）。
+/// 从错误文本做保守分类：**Fatal 判定优先于 Retryable**（错误文本可能同时含
+/// 「参数/超时」与「审批/红线/拒绝」等词，fatal 必须赢），默认 Recoverable
+/// （宁可多走降级，不把 fatal 误判成重试）。
+///
+/// ⚠️ 超时分类约束：`timeout` 归 Retryable 仅表示「可回灌修正后重试」的候选，
+/// 但超时是不确定状态（服务端可能已提交副作用）。调用方**不得**据此对写/非幂等
+/// 工具自动重试；当前 agent.rs 只把该分类用于结构化日志。
 pub fn classify_tool_failure(error: &str) -> FailureClass {
     let e = error.to_ascii_lowercase();
-    if e.contains("schema") || e.contains("参数") || e.contains("invalid") || e.contains("timeout") {
-        FailureClass::Retryable
-    } else if e.contains("红线")
+    if e.contains("红线")
         || e.contains("审批")
         || e.contains("配额")
         || e.contains("kill switch")
-        || e.contains("拒绝")
+        || e.contains("审批拒绝")
+        || e.contains("拒绝访问")
+        || e.contains("权限拒绝")
+        || e.contains("拒绝执行")
+        || e.contains("access denied")
+        || e.contains("permission denied")
         || e.contains("unauthorized")
         || e.contains("forbidden")
+        || e.contains("invalid token")
+        || e.contains("invalid credentials")
+        || e.contains("invalid session")
+        || e.contains("session expired")
+        || e.contains("token expired")
+        || e.contains("session timeout")
+        || e.contains("token timeout")
+        || e.contains("会话超时")
+        || e.contains("登录超时")
+        || e.contains("令牌超时")
+        || e.contains("token 超时")
+        || e.contains("令牌已过期")
+        || e.contains("会话已过期")
+        || e.contains("登录已过期")
+        || e.contains("凭证已过期")
+        || e.contains("已过期")
+        || e.contains("无权限")
+        || e.contains("无权")
+        || e.contains("权限不足")
+        || e.contains("未授权")
+        || e.contains("禁止")
     {
         FailureClass::Fatal
+    } else if e.contains("schema")
+        || e.contains("参数")
+        || e.contains("超时")
+        || e.contains("timeout")
+    {
+        FailureClass::Retryable
     } else {
         FailureClass::Recoverable
     }
@@ -443,6 +960,8 @@ pub struct HookContext<'a> {
     pub attachment: bool,
     /// 快速通道已注入数据（对齐旧补丁的 fast_path_data 判断）
     pub fast_path_data: bool,
+    /// 当前轮是否至少有一个数据查询类工具可用（bootstrap 最小面可能为空/无查询工具）
+    pub query_tool_available: bool,
     /// 当前轮次（0-based，对齐旧补丁的 _round）
     pub round: u32,
     /// 轮数上限语义与旧补丁一致：`self.config.max_tool_rounds`（非 Easy 局部 3 轮上限）
@@ -466,17 +985,30 @@ impl Default for HookRegistry {
 
 impl HookRegistry {
     pub fn register(&self, hook: std::sync::Arc<dyn OrchestrationHook>) {
-        if let Ok(mut hooks) = self.hooks.lock() {
-            hooks.push(hook);
+        match self.hooks.lock() {
+            Ok(mut hooks) => hooks.push(hook),
+            Err(_) => tracing::warn!(target = "orchestration.hooks",
+                point = ?hook.point(), priority = hook.priority(),
+                "hooks Mutex 中毒，guardrail hook 注册被丢弃（安全钩可能静默失效）"),
         }
     }
 
     /// 按 priority 升序执行同挂载点的 hooks，合并裁决：
     /// Abort 优先；否则首个 Retry；否则合并 Inject；否则 Continue。
+    ///
+    /// ⚠️ 多个 Abort 的语义：升序遍历时**第一个** Abort 立即短路返回（先执行、
+    /// 先 Abort 先赢）。若需要「更高 priority 的 Abort 覆盖更低 priority」，
+    /// 注册方应把安全裁决 hook 放到更小 priority（先执行），或在注册前自行协调；
+    /// 本注册表不做二次比较。
     pub fn run(&self, point: HookPoint, ctx: &HookContext) -> HookAction {
         let snapshot: Vec<std::sync::Arc<dyn OrchestrationHook>> = {
             let Ok(guard) = self.hooks.lock() else {
-                return HookAction::Continue;
+                tracing::error!(target = "orchestration.hooks", point = ?point,
+                    "hooks Mutex 中毒，guardrail hook 全部失效；fail-closed Abort");
+                return HookAction::Abort {
+                    reply: "⚠️ 内部安全钩子（guardrail）注册表不可用，本次操作已中止。请重启服务或人工介入。"
+                        .to_string(),
+                };
             };
             let mut v: Vec<_> = guard.iter().filter(|h| h.point() == point).cloned().collect();
             v.sort_by_key(|h| h.priority());
@@ -497,7 +1029,14 @@ impl HookRegistry {
             }
         }
         if let Some(r) = retry {
-            r
+            // Retry 时合并同挂载点其他 hook 的 Inject（ocr 修复：不能静默丢弃注入）
+            match r {
+                HookAction::Retry { mut messages } => {
+                    messages.extend(injected);
+                    HookAction::Retry { messages }
+                }
+                other => other,
+            }
         } else if injected.is_empty() {
             HookAction::Continue
         } else {
@@ -520,7 +1059,11 @@ impl OrchestrationHook for DataQueryForceToolHook {
         100
     }
     fn run(&self, ctx: &HookContext) -> HookAction {
-        if !ctx.data_query || ctx.attachment || ctx.fast_path_data {
+        if !ctx.data_query
+            || ctx.attachment
+            || ctx.fast_path_data
+            || !ctx.query_tool_available
+        {
             return HookAction::Continue;
         }
         HookAction::Inject {
@@ -598,7 +1141,9 @@ impl TurnBudget {
         TurnBudget {
             ns: ns.to_string(),
             quota,
-            max_rounds,
+            // 至少 1 轮：0 轮会让 llm_loop 完全跳过循环体，bootstrap 预留释放与
+            // 预算硬拒检查都执行不到（ocr bug·high）。
+            max_rounds: max_rounds.max(1),
         }
     }
 
@@ -635,6 +1180,16 @@ mod tests {
         }
     }
 
+    fn bootstrap_on_cfg() -> OrchestrationConfig {
+        OrchestrationConfig {
+            bootstrap: BootstrapConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn defaults_are_all_off() {
         let cfg = OrchestrationConfig::default();
@@ -644,11 +1199,12 @@ mod tests {
         assert!(!cfg.read_parallel.enabled);
         assert_eq!(cfg.bootstrap.max_tokens, 1024);
         assert_eq!(cfg.bootstrap.max_tools, 3);
+        assert_eq!(cfg.tool_summary.max_per_round, 2);
     }
 
     #[test]
     fn bootstrap_picks_query_tools_and_denies_writes() {
-        let cfg = OrchestrationConfig::default();
+        let cfg = bootstrap_on_cfg();
         let ctrl = OrchestrationController::new_with_store(cfg, SessionPhaseStore::new_in_memory());
         let full = vec![
             tool("query_entrance"),
@@ -657,21 +1213,198 @@ mod tests {
             tool("repo_ws_write"),
             tool("execute_sql"),
             tool("read_doc"),
+            tool("query_archive_log"),
         ];
-        let picked = ctrl.bootstrap_tools("查进厂记录", &full);
+        let picked = ctrl.bootstrap_tools("查进厂记录", &full, &|n| {
+            crate::boundary::is_read_only_tool(n)
+        });
         let names: Vec<&str> = picked.iter().map(|t| t.function.name.as_str()).collect();
         assert_eq!(picked.len(), 3);
         assert!(names.contains(&"query_entrance"));
         assert!(names.contains(&"get_vehicle"));
         assert!(!names.iter().any(|n| n.contains("write")));
+        // 开关关闭 = 真 pass-through（模块头 flag-off 零行为变化）：原样返回
+        // 全量目录；安全过滤只服务 bootstrap 面（enabled 路径），避免未来
+        // 调用点在开关关闭时被本函数静默裁剪工具目录（ocr maintainability·low 修复）。
+        let disabled = OrchestrationController::new_with_store(
+            OrchestrationConfig::default(),
+            SessionPhaseStore::new_in_memory(),
+        );
+        assert_eq!(disabled.bootstrap_tools("x", &full, &|_| true).len(), full.len());
+    }
+
+    #[test]
+    fn bootstrap_face_only_contains_read_tools() {
+        // 回归锁（ocr security·medium 修复）：bootstrap 面只允许边界判 read 的
+        // 工具（execute_sql 经 SELECT-only 能力标签放行）；未来 execute_sql
+        // 别名或分类漂移被学成 write 时，本测试直接拦截 flash 首轮拿写能力工具。
+        let c = crate::boundary::ToolClassifier::new();
+        let cfg = OrchestrationConfig {
+            bootstrap: BootstrapConfig {
+                enabled: true,
+                max_tools: 50,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ctrl = OrchestrationController::new_with_store(cfg, SessionPhaseStore::new_in_memory());
+        let full = vec![
+            tool("execute_sql"),
+            tool("fuzzy_match_plate"),
+            tool("query_archive_log"),
+            tool("query_plate"),
+            tool("cross_validate"),
+            tool("memory_recall"),
+            tool("delete_entrance_record"),
+            tool("repo_ws_diff"),
+            tool("memory_remember"),
+        ];
+        let picked = ctrl.bootstrap_tools("查一下数据", &full, &|n| {
+            c.classify_typed(n) == crate::boundary::ToolClass::Read
+        });
+        assert!(!picked.is_empty());
+        // execute_sql 必须经 SELECT-only 能力标签被选中：若 is_select_only_sql_tool
+        // 被移除/改坏，execute 动作段在 DENY_ACTIONS 中会把它挡在面外，
+        // 本断言直接失败（ocr test·medium 修复：锁定能力标签路径而非只查只读性）。
+        assert!(
+            picked.iter().any(|t| t.function.name == "execute_sql"),
+            "execute_sql 未进入 bootstrap 面（SELECT-only 能力标签失效？）"
+        );
+        for t in &picked {
+            assert_eq!(
+                c.classify_typed(&t.function.name),
+                crate::boundary::ToolClass::Read,
+                "bootstrap 面混入非 read 工具: {}",
+                t.function.name
+            );
+        }
     }
 
     #[test]
     fn bootstrap_empty_when_all_denied() {
-        let cfg = OrchestrationConfig::default();
+        let cfg = bootstrap_on_cfg();
         let ctrl = OrchestrationController::new_with_store(cfg, SessionPhaseStore::new_in_memory());
         let full = vec![tool("cw_write"), tool("repo_ws_write")];
-        assert!(ctrl.bootstrap_tools("x", &full).is_empty());
+        assert!(ctrl.bootstrap_tools("x", &full, &|_| true).is_empty());
+    }
+
+    #[test]
+    fn bootstrap_honors_zero_and_explicit_deny() {
+        // max_tools=0 是操作者显式意图：不给任何工具，不得静默改成 1
+        let cfg_zero = OrchestrationConfig {
+            bootstrap: BootstrapConfig {
+                enabled: true,
+                max_tools: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ctrl = OrchestrationController::new_with_store(cfg_zero, SessionPhaseStore::new_in_memory());
+        let full = vec![tool("query_entrance")];
+        assert!(ctrl.bootstrap_tools("x", &full, &|_| true).is_empty());
+
+        // is_read_only 前缀启发式的已知宽放项必须被显式名单排除
+        let cfg = bootstrap_on_cfg();
+        let ctrl = OrchestrationController::new_with_store(cfg, SessionPhaseStore::new_in_memory());
+        let full = vec![tool("cross_agent_query"), tool("query_entrance")];
+        let picked = ctrl.bootstrap_tools("x", &full, &|_| true);
+        let names: Vec<&str> = picked.iter().map(|t| t.function.name.as_str()).collect();
+        assert!(!names.contains(&"cross_agent_query"));
+        assert!(names.contains(&"query_entrance"));
+    }
+
+    #[test]
+    fn bootstrap_whitelist_does_not_override_safe_or_explicit_deny() {
+        let cfg = bootstrap_on_cfg();
+        let ctrl = OrchestrationController::new_with_store(cfg, SessionPhaseStore::new_in_memory());
+        let full = vec![tool("execute_sql"), tool("cross_agent_query")];
+        // safe=false 时白名单必须失效（权威边界判定优先）
+        assert!(ctrl.bootstrap_tools("x", &full, &|_| false).is_empty());
+        // safe=true 但显式拒绝名单命中时，白名单也不得放行
+        let picked =
+            ctrl.bootstrap_tools("x", &full, &|n| n == "execute_sql" || n == "cross_agent_query");
+        assert!(picked.iter().all(|t| t.function.name == "execute_sql"));
+    }
+
+    #[test]
+    fn bootstrap_action_deny_scans_all_segments() {
+        // 写动词位于中间段也必须被动作段兜底拦截
+        assert!(!bootstrap_action_segments_ok("cross_agent_register_user"));
+        assert!(!bootstrap_action_segments_ok("query_batch_update_log"));
+        // camelCase / 连字符命名也不能绕过动作段扫描
+        assert!(!bootstrap_action_segments_ok("updateState"));
+        assert!(!bootstrap_action_segments_ok("send-message"));
+        // 缩写/数字 + 大写边界也不能把写动词粘进同一段
+        assert!(!bootstrap_action_segments_ok("getOSUpdate"));
+        assert!(!bootstrap_action_segments_ok("OSSendMessage"));
+        assert!(!bootstrap_action_segments_ok("get2Update"));
+        // 写动词粘数字尾 / 数字后接小写动词也不能绕过（ocr security·low 修复）
+        assert!(!bootstrap_action_segments_ok("update2"));
+        assert!(!bootstrap_action_segments_ok("create2024"));
+        assert!(!bootstrap_action_segments_ok("get2update"));
+        assert!(!bootstrap_action_segments_ok("stat2update"));
+        // DDL/危险动词兜底（execute_sql 本身由白名单放行，见下）
+        assert!(!bootstrap_action_segments_ok("alter_table"));
+        assert!(!bootstrap_action_segments_ok("drop_table"));
+        assert!(!bootstrap_action_segments_ok("truncate_log"));
+        // 已知只读误伤项：名词 archive 在中间段，经显式允许放行
+        assert!(!bootstrap_action_segments_ok("query_archive_log"));
+        assert!(bootstrap_tool_allowed("query_archive_log", true));
+        assert!(!bootstrap_tool_allowed("execute_sql", false));
+    }
+
+    #[test]
+    fn bootstrap_reservation_is_atomic_and_releasable() {
+        let cfg = bootstrap_on_cfg();
+        let ctrl = OrchestrationController::new_with_store(cfg, SessionPhaseStore::new_in_memory());
+        assert!(ctrl.try_begin_bootstrap("s1"));
+        // 同 session 并发第二个 run 拿不到预留
+        assert!(!ctrl.try_begin_bootstrap("s1"));
+        // 不同 session 互不影响
+        assert!(ctrl.try_begin_bootstrap("s2"));
+        ctrl.cancel_bootstrap("s1");
+        assert!(ctrl.try_begin_bootstrap("s1"));
+        // 成功后 promote 并释放预留；已 promoted 的 session 不再能预留
+        ctrl.finish_bootstrap("s1");
+        assert!(ctrl.is_promoted("s1"));
+        assert!(!ctrl.try_begin_bootstrap("s1"));
+    }
+
+    #[test]
+    fn bootstrap_reservation_guard_autoreleases_on_drop() {
+        let cfg = bootstrap_on_cfg();
+        let ctrl = Arc::new(OrchestrationController::new_with_store(
+            cfg,
+            SessionPhaseStore::new_in_memory(),
+        ));
+        let guard = ctrl.acquire_bootstrap("s1").expect("预留应成功");
+        assert!(!ctrl.try_begin_bootstrap("s1"));
+        // 模拟 async future 取消 / panic unwind：drop guard 自动释放预留
+        drop(guard);
+        assert!(ctrl.try_begin_bootstrap("s1"));
+        // 上面 try_begin 是手动探测，它留下的预留要清掉，再走 RAII acquire
+        ctrl.cancel_bootstrap("s1");
+        let guard = ctrl.acquire_bootstrap("s1").expect("释放后应可重新预留");
+        guard.promote();
+        assert!(ctrl.is_promoted("s1"));
+        assert!(!ctrl.try_begin_bootstrap("s1"));
+    }
+
+    #[test]
+    fn promoted_cache_is_bounded() {
+        let cfg = bootstrap_on_cfg();
+        let ctrl = OrchestrationController::new_with_store(cfg, SessionPhaseStore::disabled());
+        for i in 0..(SESSION_SET_CACHE_MAX + 16) {
+            ctrl.promote(&format!("s{i}"));
+        }
+        // 直接观察缓存容器：容量不能超过上限（LRU 淘汰，DB 仍可回查）
+        {
+            let cache = ctrl.promoted_cache.lock().unwrap();
+            assert!(cache.order.len() <= SESSION_SET_CACHE_MAX);
+            assert!(cache.set.len() <= SESSION_SET_CACHE_MAX);
+        }
+        // 仍在缓存中的最近 session 命中不受影响
+        assert!(ctrl.is_promoted(&format!("s{}", SESSION_SET_CACHE_MAX + 15)));
     }
 
     #[test]
@@ -692,6 +1425,41 @@ mod tests {
         assert_eq!(classify_tool_failure("红线：治理层不可修改"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("配额超限"), FailureClass::Fatal);
         assert_eq!(classify_tool_failure("some mcp error"), FailureClass::Recoverable);
+        // Fatal 关键词优先于 Retryable 关键词（ocr 修复：混合错误文本不得误判为可重试）
+        assert_eq!(classify_tool_failure("参数错误：审批拒绝"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("invalid: forbidden"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("参数错误：无权限"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("权限不足"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("未授权"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("禁止操作"), FailureClass::Fatal);
+        // 网络层「连接被拒绝」是瞬时故障，不得被宽泛「拒绝」误判为 Fatal
+        assert_eq!(classify_tool_failure("连接被拒绝"), FailureClass::Recoverable);
+        assert_eq!(classify_tool_failure("connection denied"), FailureClass::Recoverable);
+        // 会话/token 过期是认证终态，即使文本含 timeout 也必须 Fatal
+        assert_eq!(classify_tool_failure("session timeout"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("token timeout"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("会话超时"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("登录超时"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("令牌已过期"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("登录已过期"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("执行超时"), FailureClass::Retryable);
+        // 认证/会话类 invalid 属于 Fatal，不因宽泛 invalid 误判为可重试
+        assert_eq!(classify_tool_failure("invalid token"), FailureClass::Fatal);
+        assert_eq!(classify_tool_failure("invalid session"), FailureClass::Fatal);
+    }
+
+    #[test]
+    fn yes_no_parser_is_strict_and_fail_open_on_ambiguity() {
+        assert_eq!(parse_yes_no("YES"), Some(true));
+        assert_eq!(parse_yes_no("yes, 目标达成。"), Some(true));
+        assert_eq!(parse_yes_no("NO"), Some(false));
+        assert_eq!(parse_yes_no("NO - 缺少数据"), Some(false));
+        // 歧义 → None（调用方 fail-open）
+        assert_eq!(parse_yes_no("NOT SURE"), None);
+        assert_eq!(parse_yes_no("The answer needs work"), None);
+        // 首 token 不是 YES/NO 的一律 None（含 CJK 前缀）
+        assert_eq!(parse_yes_no("已达成NO"), None);
+        assert_eq!(parse_yes_no("请继续执行YES"), None);
     }
 
     fn hook_ctx<'a>(
@@ -712,6 +1480,7 @@ mod tests {
             data_query,
             attachment,
             fast_path_data: fast_path,
+            query_tool_available: true,
             round,
             hard_max_rounds: hard_max,
             candidate_reply: reply,
