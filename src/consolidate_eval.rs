@@ -29,6 +29,11 @@ use crate::agent::{AgentCore, PatternReplyKind, CONSOLIDATE_MIN_OBS_CHARS_DEFAUL
 /// `list_past_hit_rates` 按版本过滤，P3 进化循环不会把跨版本数字当序列比较。
 pub const EVAL_SET_VERSION: u32 = 2;
 
+/// P3 进化循环消费：题集观察行（与 EVAL_SET 同源）
+pub fn eval_set_lines() -> Vec<String> {
+    EVAL_SET.iter().map(|c| c.obs.to_string()).collect()
+}
+
 /// v2 题集内容指纹（eval_set_content_fingerprint 锁定；改用例须同步递增版本与指纹）
 pub const EVAL_SET_V2_FINGERPRINT: u64 = 6055525382911605762;
 
@@ -181,7 +186,7 @@ pub struct EvalReport {
 
 /// 纯评分函数（ocr PR#68：评分与 LLM 调用解耦，回归测试不花真实调用）。
 /// `included` = pattern_extraction_prompt 返回的可见观察数（引用上界）。
-fn score_reply(
+pub(crate) fn score_reply(
     reply: &str,
     included: usize,
     ns: &str,

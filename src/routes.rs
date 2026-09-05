@@ -70,6 +70,7 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         )
         .route("/api/admin/consolidate", post(handle_admin_consolidate))
         .route("/api/admin/consolidate_eval", post(handle_admin_consolidate_eval))
+        .route("/api/admin/prompt_evolve", post(handle_admin_prompt_evolve))
         .route("/api/admin/agent/repair", post(handle_agent_repair))
         .route("/api/agent/events", axum::routing::get(handle_agent_events))
         .route("/api/save-config", post(handle_save_config))
