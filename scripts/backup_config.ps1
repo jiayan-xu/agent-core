@@ -1,6 +1,10 @@
 # backup_config.ps1
 # Binary backup of agent.toml with byte-level and TOML validation.
 #
+# Note: agent.toml is rewritten at runtime by save_config (src/config.rs),
+# so run this AFTER config edits, not before — otherwise the backup captures
+# a pre-edit state (ocr PR#75 medium).
+#
 # Safety rules:
 #   - Copies bytes verbatim (Copy-Item), never decodes/re-encodes text.
 #   - Verifies SHA256 source == backup.
@@ -64,11 +68,27 @@ if ($LASTEXITCODE -ne 0) {
 Write-Output ("backup ok: {0} ({1})" -f (Split-Path $Dest -Leaf), $pyOut)
 
 # 4) retention: keep newest N agent.toml.bak-* files
+# Sort by the creation timestamp embedded in the backup name, not mtime:
+# Copy-Item preserves the source's LastWriteTime, so after a restore every
+# subsequent backup inherits the restored file's old mtime and sorts as
+# "oldest" — retention would prune the newest backups first (ocr PR#75 high).
 $Backups = Get-ChildItem -LiteralPath $RepoRoot -Filter 'agent.toml.bak-*' -File |
-    Sort-Object LastWriteTimeUtc -Descending
+    Sort-Object Name -Descending
 if ($Backups.Count -gt $Keep) {
     $Backups | Select-Object -Skip $Keep | ForEach-Object {
         Remove-Item -LiteralPath $_.FullName -Force
         Write-Output ("pruned old backup: {0}" -f $_.Name)
     }
 }
+
+# 5) guard: secret-bearing backups must stay out of version control
+# agent.toml is gitignored because it can hold plaintext keys; the exact-name
+# pattern does NOT match agent.toml.bak-* (ocr PR#75 security high). Verify and
+# abort if the destination would be tracked.
+$check = git -C $RepoRoot check-ignore -q "agent.toml.bak-$Stamp" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Error ("agent.toml.bak-* is NOT gitignored — refusing to create a secret-bearing backup " +
+                 "that 'git add .' would stage. Add 'agent.toml.bak-*' to .gitignore first.")
+    exit 4
+}
+Write-Output "gitignore guard ok"
