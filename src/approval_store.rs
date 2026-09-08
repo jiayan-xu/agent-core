@@ -113,6 +113,24 @@ impl ApprovalStore {
                 }
             }
         }
+        // AutoApproved 记录过期自愈（ocr R8 建议）：36h 后标记 Consumed，
+        // 防止 ApprovalManager 重启时把已执行的自动批准误读为 Pending。
+        // ocr CI：与 mark_consumed 对齐——status 与 consumed_at 同条 UPDATE 落盘，
+        // 否则出现 status=Consumed/consumed_at=NULL 的审计三元组不一致
+        //（checkpoint_recovery 会把 consumed_at IS NULL 当孤儿信号）。
+        // 失败按上方迁移循环的约定传播：SQLITE_BUSY 等若被吞掉，陈旧 AutoApproved
+        // 行会静默留存（继续出现在 list_auto_approvals / 占用配额视图），正是本次
+        // 自愈要消除的状态。
+        let n = self
+            .conn
+            .execute(
+                "UPDATE approvals SET status = 'Consumed', consumed_at = CAST(strftime('%s','now') AS REAL) WHERE status = 'AutoApproved' AND created_at < (strftime('%s','now') - 129600)",
+                [],
+            )
+            .map_err(|e| format!("AutoApproved 过期自愈 UPDATE 失败: {}", e))?;
+        if n > 0 {
+            tracing::info!(count = n, "AutoApproved 记录过期自愈（36h）→ Consumed");
+        }
         Ok(())
     }
 

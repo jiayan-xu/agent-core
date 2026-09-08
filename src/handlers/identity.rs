@@ -105,19 +105,19 @@ pub(crate) fn sanitize_ns_segment(s: &str) -> String {
         .to_string()
 }
 
-/// 协作通讯录展示名：「{部门展示}部{姓名}」；部门/姓名缺失时回退到可用值。
+/// 协作展示名：纯姓名（2026-09-08 改）。
+///
+/// 历史：曾拼「{部门展示}部{姓名}」写入 display_name。但通讯录、私信、会议名单等
+/// 展示位均已有独立部门字段/列，前缀造成「工程部徐凯 + 工程部」重复，且同一人
+/// 新旧身份（徐佳琰 / 工程部徐佳琰）因展示名不同而去重失效。
+/// 部门信息仍完整保留在 namespace(dept/) 与 department_display 字段，不再进展示名。
 /// 仅用于 display_name，绝不进入 agent_id / namespace / HTTP 头。
-pub(crate) fn agent_display_name(dept_display: &str, name_display: &str, fallback: &str) -> String {
-    let dept = dept_display.trim();
+pub(crate) fn agent_display_name(_dept_display: &str, name_display: &str, fallback: &str) -> String {
     let name = name_display.trim();
-    let base = if name.is_empty() { fallback } else { name };
-    if dept.is_empty() {
-        return base.to_string();
-    }
-    if dept.ends_with('部') {
-        format!("{}{}", dept, base)
+    if name.is_empty() {
+        fallback.to_string()
     } else {
-        format!("{}部{}", dept, base)
+        name.to_string()
     }
 }
 
