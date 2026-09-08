@@ -288,11 +288,12 @@ _PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 _IDCARD_RE = re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)")
 
 
-def mask_text(text):
-    """出口脱敏：车牌/公司名/手机号/身份证号 → [车牌N]/[公司N]/[手机N]/[证件N]。
-    映射持久化到 AGENTCORE_MASK_FILE（office_proxy 反掩码展示给用户用）。"""
-    if not isinstance(text, str) or not text:
-        return text
+def _load_mask_context():
+    """读一次映射文件并派生计数器，供一次结果树遍历内复用（ocr 性能审查）。
+
+    返回 (mapping, counters, dirty, load_failed)；用完调 _flush_mask_context 统一落盘。
+    此前 mask_text 每次调用都重新 open+json.load+全表扫描，而 dispatch 层对每个字符串
+    叶子都调用一次 → 单次 tools/call 成本 O(叶子数 × 映射大小)。"""
     path = _mask_file()
     load_failed = [False]
     try:
@@ -307,28 +308,49 @@ def mask_text(text):
         sys.stderr.write("[mask] WARN: load failed ({}) {}: disabling write-back\n".format(e, path))
         mapping = {}
         load_failed[0] = True
-    dirty = [False]
-
-    def put(token, val):
-        if val not in mapping:
-            mapping[val] = token
-            dirty[0] = True
-        return mapping[val]
 
     # 令牌格式 2026-09-07 起为「车牌N」：LLM 会把 [车牌N] 的方括号规范化掉，
     # 导致入站反掩码 miss（白名单写入令牌事故根因）。计数跨新旧格式取最大号。
     def _max_idx(kind_cn):
         mx = 0
         for v in mapping.values():
-            for pref in ("[%s" % kind_cn, "「%s" % kind_cn):
+            for pref in ("[%s" % kind_cn, "\u300c%s" % kind_cn):
                 if v.startswith(pref):
                     try:
-                        mx = max(mx, int(v[len(pref):].rstrip("]」")))
+                        mx = max(mx, int(v[len(pref):].rstrip("]\u300d")))
                     except ValueError:
                         pass
         return mx
-    counters = {k: _max_idx(cn) for k, cn in _CN_KIND.items()}
 
+    counters = {k: _max_idx(cn) for k, cn in _CN_KIND.items()}
+    return mapping, counters, [False], load_failed
+
+
+def _flush_mask_context(mctx):
+    mapping, _counters, dirty, load_failed = mctx
+    if not (dirty[0] and not load_failed[0]):
+        return
+    path = _mask_file()
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        log("mask map save failed:", e)
+
+
+def mask_text(text, mctx=None):
+    """出口脱敏：车牌/公司名/手机号/身份证号 → [车牌N]/[公司N]/[手机N]/[证件N]。
+    映射持久化到 AGENTCORE_MASK_FILE（office_proxy 反掩码展示给用户用）。
+    mctx 传入时复用调用方已加载的映射/计数器（一次遍历一份），落盘也交给调用方；
+    不传则自建自落（兼容既有单点调用）。"""
+    if not isinstance(text, str) or not text:
+        return text
+    own = mctx is None
+    if own:
+        mctx = _load_mask_context()
+    mapping, counters, dirty, _load_failed = mctx
 
     # ocr 修复：先查 mapping 再分配（原 mk() 在 lambda 里无条件先求值，重复值浪费
     # 计数器导致 token 编号复用 → 掩码歧义）
@@ -337,7 +359,7 @@ def mask_text(text):
             val = m.group(0)
             if val not in mapping:
                 counters[kind] += 1
-                mapping[val] = "「%s%d」" % (_CN_KIND[kind], counters[kind])
+                mapping[val] = "\u300c%s%d\u300d" % (_CN_KIND[kind], counters[kind])
                 dirty[0] = True
             return mapping[val]
         return f
@@ -347,18 +369,15 @@ def mask_text(text):
     text = _PHONE_RE.sub(_sub("PH"), text)
     text = _IDCARD_RE.sub(_sub("ID"), text)
 
-    if dirty[0] and not load_failed[0]:
-        try:
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(mapping, f, ensure_ascii=False)
-            os.replace(tmp, path)
-        except Exception as e:
-            log("mask map save failed:", e)
+    if own:
+        _flush_mask_context(mctx)
     return text
 
 
 # 控制字段：值是 hex/id，被手机号正则误命中会破坏审批回显指纹（ocr 审查 high）
+# 已自查掩码的 handler（dispatch 不再整串重掩，见 dispatch 处注释）
+_MASK_HANDLED_TOOLS = {"agentcore_tool_execute", "agentcore_tool_execute_status"}
+
 _MASK_SKIP_KEYS = {
     "operation_hash", "approval_id", "execution_id", "trace_id", "idempotency_key",
     "tool_call_id", "session_id", "thread_id", "check_run_id",
@@ -419,19 +438,26 @@ def _unmask_arguments(args, pairs=None):
     return args
 
 
-def _mask_result_json(data):
+def _mask_result_json(data, mctx=None):
     """对工具返回的 JSON 做脱敏：整树递归，字符串叶子掩码（控制字段除外）。
-    dict key 也掩码（Excel/台账工具的 map 可能用车牌/公司名做 key）。"""
+    dict key 也掩码（Excel/台账工具的 map 可能用车牌/公司名做 key）。
+    整棵树共享一份映射/计数器，遍历结束统一落盘（ocr 性能审查：避免逐叶重读全表）。"""
+    if mctx is None:
+        mctx = _load_mask_context()
+        try:
+            return _mask_result_json(data, mctx)
+        finally:
+            _flush_mask_context(mctx)
     if isinstance(data, dict):
         return {
-            (mask_text(k) if isinstance(k, str) and k not in _MASK_SKIP_KEYS else k):
-            (v if k in _MASK_SKIP_KEYS else _mask_result_json(v))
+            (mask_text(k, mctx) if isinstance(k, str) and k not in _MASK_SKIP_KEYS else k):
+            (v if k in _MASK_SKIP_KEYS else _mask_result_json(v, mctx))
             for k, v in data.items()
         }
     if isinstance(data, list):
-        return [_mask_result_json(v) for v in data]
+        return [_mask_result_json(v, mctx) for v in data]
     if isinstance(data, str):
-        return mask_text(data)
+        return mask_text(data, mctx)
     return data
 
 
@@ -1168,7 +1194,12 @@ def handle_tools_call(req_id, params):
         # 此前仅 agentcore_tool_execute/_status 两处自查，_json_handler 家族
         # （sessions/metrics/documents 等）的结果裸出。mask_text 落盘映射后，
         # office_proxy 回复侧可反掩码还原给用户。
-        payload = _mask_result_json(payload)
+        # 例外（ocr CI high）：下列 handler 已在自身内做 dict 层 key-aware 掩码，
+        # 其 content[].text 是 json.dumps 的预序列化串——整串重掩是 key-blind 的，
+        # 64-hex operation_hash/execution_id 恰含 11 位连续数字时（约 1/200）会被
+        # 手机号正则改成「手机N」，破坏审批回显指纹（approval_respond 报哈希不匹配）。
+        if name not in _MASK_HANDLED_TOOLS:
+            payload = _mask_result_json(payload)
         return rpc_result(req_id, {
             "content": [{
                 "type": "text",
