@@ -113,6 +113,15 @@ impl ApprovalStore {
                 }
             }
         }
+        // AutoApproved 记录过期自愈（ocr R8 建议）：36h 后标记 Consumed，
+        // 防止 ApprovalManager 重启时把已执行的自动批准误读为 Pending
+        let n = self.conn.execute(
+            "UPDATE approvals SET status = 'Consumed'              WHERE status = 'AutoApproved' AND created_at < (strftime('%s','now') - 129600)",
+            [],
+        ).unwrap_or(0);
+        if n > 0 {
+            tracing::info!(count = n, "AutoApproved 记录过期自愈（36h）→ Consumed");
+        }
         Ok(())
     }
 
