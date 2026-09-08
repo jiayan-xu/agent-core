@@ -315,10 +315,19 @@ def mask_text(text):
             dirty[0] = True
         return mapping[val]
 
-    counters = {"CAR": len([v for v in mapping.values() if v.startswith("[车牌")]),
-                "ORG": len([v for v in mapping.values() if v.startswith("[公司")]),
-                "PH": len([v for v in mapping.values() if v.startswith("[手机")]),
-                "ID": len([v for v in mapping.values() if v.startswith("[证件")])}
+    # 令牌格式 2026-09-07 起为「车牌N」：LLM 会把 [车牌N] 的方括号规范化掉，
+    # 导致入站反掩码 miss（白名单写入令牌事故根因）。计数跨新旧格式取最大号。
+    def _max_idx(kind_cn):
+        mx = 0
+        for v in mapping.values():
+            for pref in ("[%s" % kind_cn, "「%s" % kind_cn):
+                if v.startswith(pref):
+                    try:
+                        mx = max(mx, int(v[len(pref):].rstrip("]」")))
+                    except ValueError:
+                        pass
+        return mx
+    counters = {k: _max_idx(cn) for k, cn in _CN_KIND.items()}
 
 
     # ocr 修复：先查 mapping 再分配（原 mk() 在 lambda 里无条件先求值，重复值浪费
@@ -328,7 +337,7 @@ def mask_text(text):
             val = m.group(0)
             if val not in mapping:
                 counters[kind] += 1
-                mapping[val] = "[%s%d]" % (_CN_KIND[kind], counters[kind])
+                mapping[val] = "「%s%d」" % (_CN_KIND[kind], counters[kind])
                 dirty[0] = True
             return mapping[val]
         return f
@@ -1136,6 +1145,12 @@ def handle_tools_call(req_id, params):
     arguments = params.get("arguments") or {}
     if not isinstance(arguments, dict):
         arguments = {}
+    # dispatch 层统一入站反掩码：所有工具参数先 [车牌N]→原文。
+    # 此前只有 agentcore_tool_execute 内部做，_json_handler 家族裸传——
+    # 2026-09-04 白名单写入 [车牌121] 即陈旧进程+无兜底的复合事故。幂等：
+    # 已还原的参数再过一遍无 token 可替换。
+    _refresh_mask_cache()
+    arguments = _unmask_arguments(arguments, _MASK_CACHE["sorted_pairs"])
     if admin_hidden() and name in ADMIN_HIDDEN_TOOLS:
         return rpc_result(req_id, {
             "content": [{"type": "text", "text": "tool %s is hidden on this mount (AGENTCORE_EXPOSE_ADMIN=0)" % name}],
@@ -1149,6 +1164,11 @@ def handle_tools_call(req_id, params):
         })
     try:
         payload = handler(arguments)
+        # dispatch 层统一出口掩码：结果整树掩码后再出给模型（敏感数据不出公网）。
+        # 此前仅 agentcore_tool_execute/_status 两处自查，_json_handler 家族
+        # （sessions/metrics/documents 等）的结果裸出。mask_text 落盘映射后，
+        # office_proxy 回复侧可反掩码还原给用户。
+        payload = _mask_result_json(payload)
         return rpc_result(req_id, {
             "content": [{
                 "type": "text",
