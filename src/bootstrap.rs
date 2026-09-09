@@ -296,13 +296,13 @@ pub(crate) fn spawn_server(
                                 }
                             }
                         }
-                        // 每日 23:30 后自动下载理文/金源/苏新当天 NVR 录像（每天一次）
+                        // 每日 23:30 后自动下载理文/金源/苏新/城西污水/苏水中法当天 NVR 录像（每天一次）
                         let nvr_now = chrono::Local::now();
                         let nvr_ymd = nvr_now.format("%Y-%m-%d").to_string();
                         let nvr_hour = nvr_now.hour();
                         let nvr_minute = nvr_now.minute();
                         if (nvr_hour == 23 && nvr_minute >= 30) && last_nvr_ymd != nvr_ymd {
-                            for company in ["理文", "金源", "苏新"] {
+                            for company in ["理文", "金源", "苏新", "城西污水", "苏水中法"] {
                                 let nvr_args = serde_json::json!({
                                     "date": nvr_ymd,
                                     "company": company,
