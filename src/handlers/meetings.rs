@@ -307,6 +307,13 @@ pub(crate) async fn handle_meeting_end(
     // 安全：结束会议的「请求者」强制绑定到已认证的 caller，忽略请求体中的 `requested_by` 伪造。
     // 否则任意认证用户可把 requested_by 设成 owner 以绕过 `end_meeting` 的 ownership 校验（越权结束会议）。
     let requested_by = caller.clone();
+    // 部门经理可结束本部门 scope 的会议（锁外判定：dept_cache 懒刷新含 MCP 往返，
+    // 不得在持 agent 全局锁时 await；scope 读取短锁快取）。私有无 scope 会议仍仅 owner/admin。
+    let scope_now = {
+        let g = st.agent.lock().await;
+        g.as_ref().and_then(|a| a.get_meeting(&id)).and_then(|m| m.scope)
+    };
+    let mgr_end = crate::auth::caller_manages_scope(&st, &caller, scope_now.as_deref()).await;
     // 在 agent 锁短作用域完成终态跃迁判定，随即释放全局锁，避免 presence 清理 / 实时广播
     // 在持全局锁期间 await 而拉长全局锁持有时长、并引入脆弱的锁顺序（reviewer round-10 F1）。
     // presence / 广播均在 agent 锁释放后进行，无 agent→presence 嵌套。
@@ -338,7 +345,8 @@ pub(crate) async fn handle_meeting_end(
                 None => String::new(),
             }
         };
-        match agent.end_meeting(&id, &consensus, &requested_by, admin) {
+        // end_meeting 的越权参数 = admin ∨ 本部门经理（mgr_end 已含 scope 匹配判定）
+        match agent.end_meeting(&id, &consensus, &requested_by, admin || mgr_end) {
             Ok(b) => (b, agent_arc, consensus),
             Err(e) => {
                 return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))

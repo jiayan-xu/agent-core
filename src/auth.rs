@@ -267,3 +267,151 @@ pub(crate) async fn auth_middleware(
         Err(resp) => resp,
     }
 }
+
+// ═══ 部门经理（负责人）解析（2026-09-13）═══
+//
+// 权威定义（与 memoria 推广方案 P1-1「负责人模板」一致）：
+//   注册表 entry 满足 permission=read_write 且 allowed_ns 含 org/<company>/dept/<slug>
+//   → 该 agent 是部门 <slug> 的经理。
+// agent-core 不自建名单（防双源漂移），定时（TTL 300s，懒刷新）从 memoria
+// agent_list 同步；memoria 侧改权限即生效，最长滞后 5 分钟。
+// 用途：会议邀请/结束放行（本部门 scope）、审批台部门内可见可批。
+
+use std::collections::HashSet;
+
+/// 部门注册表快照：成员归属 + 经理管辖（均从 agent_list 的 ns/permission 导出）。
+pub(crate) struct DeptCache {
+    /// agent_id → 所属部门 slug 集合（ns 中 org/<co>/dept/<slug> 段导出；
+    /// 含 proj 子路径如 dept/engineering/proj/gufei → 归 engineering）
+    pub(crate) members: std::collections::HashMap<String, HashSet<String>>,
+    /// agent_id → 管辖部门 slug 集合（permission=read_write 者）
+    pub(crate) managers: std::collections::HashMap<String, HashSet<String>>,
+    pub(crate) refreshed_at: std::time::Instant,
+}
+
+impl DeptCache {
+    fn from_agent_list(v: &serde_json::Value) -> Self {
+        let mut members = std::collections::HashMap::new();
+        let mut managers = std::collections::HashMap::new();
+        let is_manager = |perm: &str| perm == "read_write" || perm == "admin";
+        let arr = v.get("agents").and_then(|a| a.as_array());
+        for a in arr.into_iter().flatten() {
+            let id = a.get("agent_id").and_then(|x| x.as_str()).unwrap_or("");
+            if id.is_empty() {
+                continue;
+            }
+            let ns = a.get("namespace").and_then(|x| x.as_str()).unwrap_or("");
+            let perm = a.get("permission").and_then(|x| x.as_str()).unwrap_or("");
+            // ns 逗号分隔多段；扫 dept/<slug> 段（兼容旧式 dept/<co> 公司段：仅当
+            // 段前缀是 org/<company> 时才把 dept 后一段当部门 slug）
+            let mut depts = HashSet::new();
+            for seg in ns.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                let parts: Vec<&str> = seg.split('/').collect();
+                // 现代 ns：org/<company>/dept/<slug>；旧式公司段 dept/<company> 段首即 dept（i==0），
+                // 用 i>=1 区分——dept 前还有段说明挂在 org/agent 等前缀下
+                for i in 0..parts.len().saturating_sub(1) {
+                    if parts[i] == "dept" && i >= 1 && !parts[i + 1].is_empty() {
+                        depts.insert(parts[i + 1].to_string());
+                    }
+                }
+            }
+            if !depts.is_empty() {
+                members.insert(id.to_string(), depts.clone());
+                if is_manager(perm) {
+                    managers.insert(id.to_string(), depts);
+                }
+            }
+        }
+        Self { members, managers, refreshed_at: std::time::Instant::now() }
+    }
+}
+
+const DEPT_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// 懒刷新部门注册表快照（TTL 300s；刷新含 memoria MCP 往返，调用方须在 agent 全局锁外调用）。
+pub(crate) async fn dept_registry(st: &Arc<AppState>) -> Option<std::sync::Arc<DeptCache>> {
+    // 快路径：缓存新鲜直接用（clone Arc，不复制集合）
+    {
+        let g = st.dept_cache.lock().await;
+        if let Some(c) = g.as_ref() {
+            if c.refreshed_at.elapsed() < DEPT_CACHE_TTL {
+                return Some(c.clone());
+            }
+        }
+    }
+    // 过期：异步刷新（防并发击穿：占住锁期间其他请求等本次结果）
+    let mut g = st.dept_cache.lock().await;
+    if let Some(c) = g.as_ref() {
+        if c.refreshed_at.elapsed() < DEPT_CACHE_TTL {
+            return Some(c.clone());
+        }
+    }
+    let (server, cfg_admin) = {
+        let cfg = st.config.lock().await;
+        (cfg.server.clone(), cfg.memoria_admin_key.clone())
+    };
+    let client = memoria_proxy_client(&server, &cfg_admin);
+    match client.call_json("agent_list", &serde_json::json!({})).await {
+        Ok(v) => {
+            let cache = std::sync::Arc::new(DeptCache::from_agent_list(&v));
+            *g = Some(cache.clone());
+            tracing::debug!("部门注册表已刷新：成员 {} 人 / 经理 {} 人",
+                cache.members.len(), cache.managers.len());
+            Some(cache)
+        }
+        Err(e) => {
+            // 刷新失败：用过期快照兜底（权限收放最长滞后到 memoria 恢复），无快照则 None
+            tracing::warn!("部门注册表刷新失败（沿用旧快照）: {}", e);
+            g.as_ref().map(|c| c.clone())
+        }
+    }
+}
+
+/// caller 管辖的部门 slug 集合（无注册表/未注册 → 空集）
+pub(crate) async fn managed_depts(st: &Arc<AppState>, caller: &str) -> HashSet<String> {
+    match dept_registry(st).await {
+        Some(c) => c.managers.get(caller).cloned().unwrap_or_default(),
+        None => HashSet::new(),
+    }
+}
+
+/// agent 所属部门 slug 集合（用于判断审批项归属；未知身份 → 空集）
+pub(crate) async fn member_depts(st: &Arc<AppState>, agent_id: &str) -> HashSet<String> {
+    match dept_registry(st).await {
+        Some(c) => c.members.get(agent_id).cloned().unwrap_or_default(),
+        None => HashSet::new(),
+    }
+}
+
+/// caller 是否管辖会议 scope（scope 形如 "dept:<slug>"；非部门 scope 或无权 → false）
+pub(crate) async fn caller_manages_scope(
+    st: &Arc<AppState>,
+    caller: &str,
+    scope: Option<&str>,
+) -> bool {
+    let Some(sc) = scope else { return false };
+    let Some(slug) = sc.strip_prefix("dept:") else { return false };
+    managed_depts(st, caller).await.contains(slug)
+}
+
+#[cfg(test)]
+mod dept_cache_tests {
+    use super::*;
+
+    #[test]
+    fn parses_managers_and_members_from_agent_list() {
+        let v = serde_json::json!({ "agents": [
+            { "agent_id": "mgr_eng", "namespace": "agent/mgr_eng,org/cs-pufa-2nd-thermal/dept/engineering", "permission": "read_write" },
+            { "agent_id": "staff", "namespace": "agent/staff,org/cs-pufa-2nd-thermal/dept/engineering", "permission": "user" },
+            { "agent_id": "gufei_staff", "namespace": "agent/g,org/cs-pufa-2nd-thermal/dept/engineering/proj/gufei", "permission": "user" },
+            { "agent_id": "legacy_org", "namespace": "agent/l,dept/cs-pufa-2nd-thermal", "permission": "read_write" }
+        ]});
+        let c = DeptCache::from_agent_list(&v);
+        assert!(c.managers.contains_key("mgr_eng"), "read_write + dept ns → 经理");
+        assert!(!c.managers.contains_key("staff"), "user 权限不算经理");
+        let eng = c.members.get("gufei_staff").unwrap();
+        assert!(eng.contains("engineering"), "proj 子路径归到部门");
+        assert!(!c.managers.contains_key("legacy_org"), "旧式 dept/<company> 公司段不当部门");
+        assert!(c.members.get("legacy_org").is_none(), "公司段不产生部门归属");
+    }
+}

@@ -172,6 +172,7 @@ pub(crate) fn spawn_server(
                 config_path: path,
                 auth_cache: tokio::sync::Mutex::new(HashMap::new()),
                 ns_cache: tokio::sync::Mutex::new(HashMap::new()),
+                dept_cache: tokio::sync::Mutex::new(None),
                 collab_seen: tokio::sync::Mutex::new(HashMap::new()),
                 consolidate_last_ymd: tokio::sync::Mutex::new(String::new()),
                 consolidate_last: tokio::sync::Mutex::new(serde_json::json!({"status":"never"})),
