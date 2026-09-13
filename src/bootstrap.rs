@@ -412,6 +412,38 @@ pub(crate) fn spawn_server(
             let cors = build_cors_layer(&config.host, config.port, &config.cors_origins);
             let app = build_router(state.clone(), cors);
 
+            // ── 局域网 PFAiX 更新通道（2026-09-10）──
+            // 主 API 加固后只绑 127.0.0.1，但客户端回退列表敲的是局域网地址。
+            // 在局域网地址上单独挂「仅更新路径」的最小路由（其余 403），
+            // 默认与客户端内置回退列表一致，可用 PFAIX_LAN_UPDATE_BINDS 覆盖。
+            // 单地址绑定失败只告警不退出（DHCP 换址/网卡缺席不拖垮主服务）。
+            {
+                let lan_binds = std::env::var("PFAIX_LAN_UPDATE_BINDS").unwrap_or_else(|_| {
+                    "192.168.1.171:9753,192.168.6.79:9753,172.16.1.59:9753".to_string()
+                });
+                for b in lan_binds.split(',') {
+                    let b = b.trim().trim_end_matches('/').to_string();
+                    if b.is_empty() {
+                        continue;
+                    }
+                    tokio::spawn(async move {
+                        match tokio::net::TcpListener::bind(&b).await {
+                            Ok(l) => {
+                                println!("✓ PFAiX 局域网更新通道: http://{}/updates/pfaix/", &b);
+                                if let Err(e) =
+                                    axum::serve(l, crate::routes::build_updates_only_router()).await
+                                {
+                                    eprintln!("✗ 局域网更新通道 {} 异常终止: {}", b, e);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("! 局域网更新通道 {} 绑定失败(跳过): {}", b, e);
+                            }
+                        }
+                    });
+                }
+            }
+
             // 后台周期回收无接收者的会议 broadcast 通道（兜底清理并发退出竞态导致的 Sender 泄漏）
             spawn_meeting_channel_sweeper(state.clone());
             spawn_meeting_presence_sweeper(state.clone());
