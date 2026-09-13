@@ -20,6 +20,7 @@ use crate::handlers::collab::*;
 use crate::handlers::evolve::*;
 use crate::handlers::identity::*;
 use crate::handlers::meetings::*;
+use crate::handlers::meetings_group::{handle_meeting_ask, handle_meetings_create};
 use crate::handlers::system::*;
 use crate::state::AppState;
 
@@ -92,12 +93,13 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/session/persona", post(handle_session_persona_bind))
         .route("/api/documents/archive", post(handle_documents_archive))
         .route("/api/roundtable", post(handle_panel_discuss))
-        .route("/api/meetings", get(handle_meetings_list))
+        .route("/api/meetings", get(handle_meetings_list).post(handle_meetings_create))
         .route("/api/meetings/{id}", delete(handle_meeting_delete))
         .route("/api/meetings/{id}/stream", get(handle_meeting_stream))
         .route("/api/meetings/{id}/heartbeat", post(handle_meeting_heartbeat))
         .route("/api/meetings/{id}/message", post(handle_meeting_message))
         .route("/api/meetings/{id}/end", post(handle_meeting_end))
+        .route("/api/meetings/{id}/ask", post(handle_meeting_ask))
         .route("/api/evolve", post(handle_code_evolve))
         .route("/api/meta-evolution/run", post(handle_meta_evolution_run))
         .route("/api/meta-evolution/status", get(handle_meta_evolution_status))
@@ -108,4 +110,31 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .layer(cors)
         .layer(axum::middleware::from_fn(trace_middleware))
         .with_state(state)
+}
+
+/// 局域网 PFAiX 更新通道专用最小路由（2026-09-10）。
+///
+/// 背景：安全加固后主服务只绑 127.0.0.1，但 PFAiX 客户端（lan.rs / shell-dist）
+/// 内置回退列表敲的是局域网地址（192.168.1.171:9753 等）——同事检查更新全部失败。
+/// 本路由只暴露更新清单与安装包（本身即全员分发的产物，无敏感数据），
+/// 其余路径一律 403；管理 API 仍仅回环可达（见 main.rs 绑定校验）。
+/// 绑定地址清单由 bootstrap 从 PFAIX_LAN_UPDATE_BINDS 读取（默认与客户端回退列表一致）。
+pub(crate) fn build_updates_only_router() -> Router {
+    Router::new()
+        .route(
+            "/updates/pfaix/latest.json",
+            get(handle_updates_latest),
+        )
+        .route("/updates/pfaix/{file}", get(handle_updates_static))
+        .route(
+            "/v1/updates/pfaix/latest.json",
+            get(handle_updates_latest),
+        )
+        .route("/v1/updates/pfaix/{file}", get(handle_updates_static))
+        .fallback(|| async {
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                "updates-only endpoint",
+            )
+        })
 }

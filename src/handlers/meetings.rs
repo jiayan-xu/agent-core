@@ -225,6 +225,10 @@ pub(crate) async fn handle_meeting_message(
             serde_json::json!({ "message": msg, "status": status, "phase": phase }),
         ).await;
     }
+    // 群聊型改造（2026-09-12 方案 §3.3）：解析发言中的 @提及（@persona_id / @显示名），
+    // 命中则为每个被点名的分身 spawn 独立应答任务（LLM 全程不持锁、不阻塞本 HTTP 响应）；
+    // 未命中则什么都不做——AI 默认不抢话，仅在 @ 或「请 TA 表态」时开口。
+    crate::handlers::meetings_group::spawn_ask_for_mentions(&st, &id, &content, &caller, &caller_ns, admin).await;
     // 后台持久化（best-effort，不阻塞实时广播）：add_meeting_message 已不再内部落盘（round-14 #4），
     // 此处 spawn 后台任务落盘，避免同步全量写盘挡在广播/A2A 关键路径。save_meetings 内部仍持
     // 轻量 persist_lock 串行化，保进程崩溃不丢已确认发言。
@@ -291,21 +295,51 @@ pub(crate) async fn handle_meeting_end(
         Some(Json(v)) => v,
         None => serde_json::json!({}),
     };
+    // 群聊型改造（2026-09-12 方案 §3.4）结束语义拆分：
+    //   mode="consensus"（缺省，兼容旧客户端）→ 生成/回填共识；
+    //   mode="close" → 仅把 status=ended，不强制共识（显式 consensus 也忽略）。
+    // consensus 模式下显式文本缺省时，群聊型会议对**本场全部 AI 发言**做程序聚合
+    // （StanceCard::from_raw 从发言原文重建立场卡 → aggregate_stances，与圆桌同源）；
+    // 旧圆桌会议不受影响（其共识在收敛时已由 finish_meeting 回填，走 explicit 分支前
+    // 就已终态幂等返回）。
+    let mode = v.get("mode").and_then(|x| x.as_str()).unwrap_or("consensus");
+    let explicit_consensus = v.get("consensus").and_then(|x| x.as_str()).unwrap_or("").to_string();
     // 安全：结束会议的「请求者」强制绑定到已认证的 caller，忽略请求体中的 `requested_by` 伪造。
     // 否则任意认证用户可把 requested_by 设成 owner 以绕过 `end_meeting` 的 ownership 校验（越权结束会议）。
     let requested_by = caller.clone();
-    let consensus = v.get("consensus").and_then(|x| x.as_str()).unwrap_or("").to_string();
     // 在 agent 锁短作用域完成终态跃迁判定，随即释放全局锁，避免 presence 清理 / 实时广播
     // 在持全局锁期间 await 而拉长全局锁持有时长、并引入脆弱的锁顺序（reviewer round-10 F1）。
     // presence / 广播均在 agent 锁释放后进行，无 agent→presence 嵌套。
-    let (transitioned, agent_arc) = {
+    let (transitioned, agent_arc, consensus) = {
         let g = st.agent.lock().await;
         let Some(ref agent) = *g else {
             return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
         };
         let agent_arc = agent.clone();
+        let consensus = if mode == "close" {
+            String::new()
+        } else if !explicit_consensus.is_empty() {
+            explicit_consensus
+        } else {
+            match agent.get_meeting(&id) {
+                Some(m) => {
+                    let cards: Vec<StanceCard> = m
+                        .messages
+                        .iter()
+                        .filter(|x| x.kind == "ai")
+                        .map(|x| StanceCard::from_raw(x.from.clone(), x.from.clone(), x.content.clone()))
+                        .collect();
+                    if cards.is_empty() {
+                        String::new()
+                    } else {
+                        aggregate_stances(&cards).summary
+                    }
+                }
+                None => String::new(),
+            }
+        };
         match agent.end_meeting(&id, &consensus, &requested_by, admin) {
-            Ok(b) => (b, agent_arc),
+            Ok(b) => (b, agent_arc, consensus),
             Err(e) => {
                 return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))
                     .into_response()
@@ -335,6 +369,7 @@ pub(crate) async fn handle_meeting_end(
                     "phase": "done",
                     "terminal": true,
                     "consensus": consensus,
+                    "mode": mode,
                 }),
             ).await;
             // 后台持久化（best-effort，不阻塞实时广播与响应）：仅终态跃迁后才 spawn 落盘。
