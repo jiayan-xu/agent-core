@@ -70,17 +70,38 @@ pub(crate) async fn handle_meetings_create(
         Some(s) if !s.trim().is_empty() => s.to_string(),
         _ => return (StatusCode::BAD_REQUEST, "topic required").into_response(),
     };
-    // 与圆桌同默认：缺省私有（仅拥有者 / admin 可见），显式 visibility=public 才公开
-    let is_private = !(v
+    // 可见性三档：private（缺省）/ public / dept（部门内可见）。
+    // dept 档的 scope 从创建者 ns 自动推导（org/<co>/dept/<slug> 首个部门段），
+    // 前端无需感知 slug 字典；无部门归属的账号退回私有 + 提示。
+    let vis = v
         .get("visibility")
         .and_then(|x| x.as_str())
-        .map(|s| s == "public")
-        .unwrap_or(false));
-    let scope: Option<String> = v
+        .unwrap_or("private")
+        .to_string();
+    let mut is_private = vis != "public" && vis != "dept";
+    let mut scope: Option<String> = v
         .get("scope")
         .and_then(|x| x.as_str())
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty());
+    if vis == "dept" && scope.is_none() {
+        let slug = caller_ns
+            .iter()
+            .find_map(|ns| {
+                let parts: Vec<&str> = ns.split('/').collect();
+                (1..parts.len().saturating_sub(1))
+                    .find(|&i| parts[i] == "dept")
+                    .map(|i| parts[i + 1].to_string())
+            })
+            .filter(|s| !s.is_empty());
+        match slug {
+            Some(s) => scope = Some(format!("dept:{}", s)),
+            None => {
+                is_private = true;
+                tracing::warn!(caller = %caller, "dept 可见性请求但账号无部门归属，退回私有");
+            }
+        }
+    }
     // 发起者只能创建自己所属 scope 的会议（与 handle_panel_discuss 同一防越权判定）
     if let Some(ref sc) = scope {
         if !admin && !agent_core::agent::scope_matches_caller(sc, &caller_ns) {
@@ -492,7 +513,15 @@ pub(crate) async fn handle_meeting_invite(
         _ => return (StatusCode::BAD_REQUEST, "agent_id required").into_response(),
     };
 
-    // 锁内短临界区：owner/admin 校验 + 名单追加，随即释放全局锁
+    // 部门经理判定在 agent 锁**外**完成：dept_cache 懒刷新含 memoria MCP 往返（秒级），
+    // 绝不能在持全局 agent 锁期间 await（同 round-10 F1 锁纪律）。scope 读取用短锁快取。
+    let scope_now = {
+        let g = st.agent.lock().await;
+        g.as_ref().and_then(|a| a.get_meeting(&id)).and_then(|m| m.scope)
+    };
+    let mgr = crate::auth::caller_manages_scope(&st, &caller, scope_now.as_deref()).await;
+
+    // 锁内短临界区：owner/admin/经理校验 + 名单追加，随即释放全局锁
     let (agent_arc, added, topic) = {
         let g = st.agent.lock().await;
         let Some(ref agent) = *g else {
@@ -506,10 +535,10 @@ pub(crate) async fn handle_meeting_invite(
             )
                 .into_response()
         };
-        if m.owner_user_id != caller && !admin {
+        if m.owner_user_id != caller && !admin && !mgr {
             return (
                 StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "仅会议发起人可邀请"})),
+                Json(serde_json::json!({"error": "仅会议发起人或部门经理可邀请"})),
             )
                 .into_response()
         }

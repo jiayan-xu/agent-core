@@ -91,10 +91,35 @@ pub(crate) async fn handle_approval_pending(
     headers: axum::http::HeaderMap,
 ) -> Response {
     if !(approval_open_lan() || is_admin(&headers, &st).await) {
-        return (
-            axum::http::StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "需要 admin 权限"})),
-        )
+        // 部门经理：仅见本部门成员发起的待审项（memoria 注册表 read_write+dept ns 为权威）
+        let (caller, _) = match authenticate(&headers, &st).await {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
+        let managed = crate::auth::managed_depts(&st, &caller).await;
+        if managed.is_empty() {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "需要 admin 或部门经理权限"})),
+            )
+                .into_response();
+        }
+        // 部门注册表快照在 agent 锁外取好（刷新含 MCP 往返）；锁内只做纯过滤
+        let reg = crate::auth::dept_registry(&st).await;
+        let guard = st.agent.lock().await;
+        let Some(ref agent) = *guard else {
+            return Json(serde_json::json!({"error": "agent not ready"})).into_response();
+        };
+        let list = agent.approval_manager.list_pending().await;
+        let filtered: Vec<_> = list
+            .into_iter()
+            .filter(|it| {
+                reg.as_ref()
+                    .and_then(|r| r.members.get(&it.requester_id))
+                    .map_or(false, |d| d.iter().any(|x| managed.contains(x)))
+            })
+            .collect();
+        return Json(serde_json::json!({ "count": filtered.len(), "items": filtered, "scope": "dept" }))
             .into_response();
     }
     let guard = st.agent.lock().await;
@@ -134,12 +159,48 @@ pub(crate) async fn handle_approval_respond(
     Path(id): Path<String>,
     Json(body): Json<ApprovalRespondBody>,
 ) -> Response {
+    // 审批人身份：admin key / 内网开放 → "dashboard-admin"（不变）；
+    // 部门经理 → 其 agent_id（仅能批本部门成员的项，可见性与 pending 同规则）
+    let mut approver_id = "dashboard-admin".to_string();
     if !(approval_open_lan() || is_admin(&headers, &st).await) {
-        return (
-            axum::http::StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "需要 admin 权限"})),
-        )
-            .into_response();
+        let (caller, _) = match authenticate(&headers, &st).await {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
+        let managed = crate::auth::managed_depts(&st, &caller).await;
+        if managed.is_empty() {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "需要 admin 或部门经理权限"})),
+            )
+                .into_response();
+        }
+        let reg = crate::auth::dept_registry(&st).await;
+        // 短锁取该项请求人，锁外无 MCP；纯集合判定
+        let requester_dept_ok = {
+            let guard = st.agent.lock().await;
+            match guard.as_ref() {
+                Some(a) => {
+                    let p = a.approval_manager.get_pending(&id).await;
+                    match p {
+                        Some(p) => reg
+                            .as_ref()
+                            .and_then(|r| r.members.get(&p.requester_id))
+                            .map_or(false, |d| d.iter().any(|x| managed.contains(x))),
+                        None => false, // 不存在按 404 主流程报错；此处仅门禁
+                    }
+                }
+                None => false,
+            }
+        };
+        if !requester_dept_ok {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "该审批项不在你管辖的部门范围内"})),
+            )
+                .into_response();
+        }
+        approver_id = caller;
     }
     let guard = st.agent.lock().await;
     if let Some(ref agent) = *guard {
@@ -170,7 +231,7 @@ pub(crate) async fn handle_approval_respond(
             approval_id: id.clone(),
             approved,
             reason: body.reason.clone(),
-            approver_id: "dashboard-admin".to_string(),
+            approver_id: approver_id.clone(),
             operation_hash: expected_hash.clone(),
         };
         agent.approval_manager.record_response(resp).await;
