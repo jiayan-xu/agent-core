@@ -835,9 +835,24 @@ pub(crate) async fn handle_collab_approval(
 /// 协作通讯录（GET /api/collab/peers）
 ///
 /// 返回同组织已注册 Agent 列表（经 admin 中继调 Memoria `agent_list`）。
+#[derive(serde::Deserialize)]
+pub(crate) struct CollabPeersQuery {
+    /// humans=1：过滤系统/服务身份，仅返回真人注册（通讯录/邀请场景）
+    humans: Option<String>,
+}
+
+/// 系统/服务身份注册表（非真人）：通讯录 humans=1 查询时剔除。
+/// 新增服务身份时同步登记；真人同事不在此列。
+const SYSTEM_AGENT_IDS: &[&str] = &[
+    "admin", "default", "jarvis", "user", "office-agent", "workbuddy",
+    "dsh", "dsh-main", "dsh-slot", "dsh-memoria", "pfaix-office",
+    "dashboard", "monitor", "grok-bot", "agent/admin",
+];
+
 pub(crate) async fn handle_collab_peers(
     State(st): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<CollabPeersQuery>,
 ) -> axum::response::Response {
     let (_agent_id, _allowed_ns) = match authenticate(&headers, &st).await {
         Ok(a) => a,
@@ -861,6 +876,15 @@ pub(crate) async fn handle_collab_peers(
                 .filter(|a| {
                     let ns = a["namespace"].as_str().unwrap_or("");
                     peer_in_company(ns)
+                })
+                .filter(|a| {
+                    // humans=1：剔除系统/服务身份（通讯录与邀请只应出现"人"）
+                    if q.humans.as_deref() == Some("1")
+                        && SYSTEM_AGENT_IDS.contains(&a["agent_id"].as_str().unwrap_or(""))
+                    {
+                        return false;
+                    }
+                    true
                 })
                 .map(|a| {
                     serde_json::json!({
