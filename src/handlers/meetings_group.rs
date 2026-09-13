@@ -226,6 +226,26 @@ pub(crate) async fn ask_persona_flow(
     };
     let (_pid, card, provider) = agent_arc.persona_stance(&persona, &llm_topic, idx, &pool).await;
 
+    // 入库内容用**可读立场卡**（立场 + 摘要 + 理由 + 置信度），群聊时间线不再裸显
+    // 模型 JSON。尾部附 ```json 围栏保留 card.raw 原文：①任何客户端可折叠回溯；
+    // ②end 共识聚合的 StanceCard::from_raw 三级解析对围栏整串直解，立场分布不退化。
+    // 降级卡（模型没吐出合法 JSON）保持原文入库，与圆桌降级行为一致。
+    let content_text = if card.structured {
+        let mut t = format!("【{}】{}", card.stance, card.summary);
+        for r in &card.key_reasons {
+            t.push_str(&format!("\n· {r}"));
+        }
+        if let Some(c) = card.confidence {
+            t.push_str(&format!("\n（置信度 {c}/100）"));
+        }
+        t.push_str("\n```json\n");
+        t.push_str(card.raw.trim());
+        t.push_str("\n```");
+        t
+    } else {
+        card.raw.clone()
+    };
+
     // Step5 锁内短临界区写入会议（add_meeting_message 内部再校验
     // is_authorized + 终态守卫，竞态窗口内会议被删/已结束会在这里被挡下）。
     let msg = {
@@ -234,7 +254,7 @@ pub(crate) async fn ask_persona_flow(
             return Err((StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪".to_string()));
         };
         agent
-            .add_meeting_message(meeting_id, caller, &persona.persona_id, caller_ns, "ai", &card.raw, admin)
+            .add_meeting_message(meeting_id, caller, &persona.persona_id, caller_ns, "ai", &content_text, admin)
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?
     };
 
