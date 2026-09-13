@@ -296,25 +296,28 @@ pub(crate) fn spawn_server(
                                 }
                             }
                         }
-                        // 每日 23:30 后自动下载理文/金源/苏新/城西污水/苏水中法当天 NVR 录像（每天一次）
+                        // 每日 23:30 后自动下载当天 NVR 录像（每天一次）。
+                        // 2026-09-13 起改为单次无 company 调用：nvr_nightly_download.py
+                        // 白名单动态模式会自行分组——5 家白名单公司全摄像头，其他白名单
+                        // 车辆仅 cam_276（垃圾吊控制室）。此前逐家传 company 的调用使
+                        // 「其他白名单车辆」分支永远空转（e9f0909 两档改造漏改调度链，
+                        // 当天非五家的白名单车辆全部漏下）。锁在脚本层 (日期,企业) 双键
+                        // 互斥，与 Windows 计划任务 23:40 的无参调用互为备份不抢写。
                         let nvr_now = chrono::Local::now();
                         let nvr_ymd = nvr_now.format("%Y-%m-%d").to_string();
                         let nvr_hour = nvr_now.hour();
                         let nvr_minute = nvr_now.minute();
                         if (nvr_hour == 23 && nvr_minute >= 30) && last_nvr_ymd != nvr_ymd {
-                            for company in ["理文", "金源", "苏新", "城西污水", "苏水中法"] {
-                                let nvr_args = serde_json::json!({
-                                    "date": nvr_ymd,
-                                    "company": company,
-                                    "workers": 1
-                                });
-                                match agent.call_tool_routed("download_nvr_videos", "default", &nvr_args, &agent_ns, "").await {
-                                    Ok(reply) => {
-                                        tracing::info!("NVR定时下载 {}: {}", company, &reply.chars().take(120).collect::<String>());
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("NVR定时下载 {} 失败: {}", company, e);
-                                    }
+                            let nvr_args = serde_json::json!({
+                                "date": nvr_ymd,
+                                "workers": 1
+                            });
+                            match agent.call_tool_routed("download_nvr_videos", "default", &nvr_args, &agent_ns, "").await {
+                                Ok(reply) => {
+                                    tracing::info!("NVR定时下载(白名单全量): {}", &reply.chars().take(120).collect::<String>());
+                                }
+                                Err(e) => {
+                                    tracing::error!("NVR定时下载失败: {}", e);
                                 }
                             }
                             last_nvr_ymd = nvr_ymd;
