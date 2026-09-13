@@ -20,7 +20,7 @@ use crate::handlers::collab::*;
 use crate::handlers::evolve::*;
 use crate::handlers::identity::*;
 use crate::handlers::meetings::*;
-use crate::handlers::meetings_group::{handle_meeting_ask, handle_meetings_create};
+use crate::handlers::meetings_group::{handle_meeting_ask, handle_meeting_invite, handle_meetings_create};
 use crate::handlers::system::*;
 use crate::state::AppState;
 
@@ -100,6 +100,7 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/meetings/{id}/message", post(handle_meeting_message))
         .route("/api/meetings/{id}/end", post(handle_meeting_end))
         .route("/api/meetings/{id}/ask", post(handle_meeting_ask))
+        .route("/api/meetings/{id}/invite", post(handle_meeting_invite))
         .route("/api/evolve", post(handle_code_evolve))
         .route("/api/meta-evolution/run", post(handle_meta_evolution_run))
         .route("/api/meta-evolution/status", get(handle_meta_evolution_status))

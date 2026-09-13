@@ -461,3 +461,104 @@ mod tests {
         assert!(ask_cooldown_ok(m, "persona-other"), "其他分身不受影响");
     }
 }
+
+/// ═══ 群聊邀请（2026-09-13）：把同事拉进房间 ═══
+///
+/// POST /api/meetings/{id}/invite  body: { "agent_id": "xxx" }
+/// 仅 owner / admin 可邀请。成功后：participant_agents 去重追加 +
+/// A2A 邀请通知投递到对方收件箱（对方从其会议列表即可看到并进入发言）。
+pub(crate) async fn handle_meeting_invite(
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> axum::response::Response {
+    let (caller, caller_ns) = match authenticate(&headers, &st).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let admin = is_admin(&headers, &st).await;
+    match meeting_visible(&st, &id, &caller, &caller_ns, admin).await {
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "服务尚未就绪").into_response(),
+        Some(false) => return (StatusCode::FORBIDDEN, "无权访问该会议").into_response(),
+        Some(true) => {}
+    }
+    let v = match body {
+        Some(Json(v)) => v,
+        None => return (StatusCode::BAD_REQUEST, "missing body").into_response(),
+    };
+    let invitee = match v.get("agent_id").and_then(|x| x.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return (StatusCode::BAD_REQUEST, "agent_id required").into_response(),
+    };
+
+    // 锁内短临界区：owner/admin 校验 + 名单追加，随即释放全局锁
+    let (agent_arc, added, topic) = {
+        let g = st.agent.lock().await;
+        let Some(ref agent) = *g else {
+            return (StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
+        };
+        let arc = agent.clone();
+        let Some(m) = agent.get_meeting(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "会议不存在"})),
+            )
+                .into_response()
+        };
+        if m.owner_user_id != caller && !admin {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "仅会议发起人可邀请"})),
+            )
+                .into_response()
+        }
+        let added = match agent.add_meeting_participant(&id, &invitee) {
+            Ok(a) => a,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))
+                    .into_response()
+            }
+        };
+        (arc, added, m.topic)
+    };
+
+    // A2A 邀请通知（锁外；5s 超时与 message 投递同款，慢对端不阻塞响应）
+    let envelope = serde_json::json!({
+        "type": "meeting",
+        "subject": format!("「{}」：{} 邀请你参会", topic, caller),
+        "meeting": id,
+        "from": caller,
+        "content": format!(
+            "{} 邀请你进入会议「{}」（ID={}）。打开 PFAiX 会议列表即可进入发言。",
+            caller, topic, id
+        ),
+        "kind": "meeting-invite",
+    });
+    let delivered =
+        tokio::time::timeout(Duration::from_secs(5), agent_arc.collab_send_raw(&invitee, &envelope))
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+
+    // 后台落盘（best-effort）
+    let pa = agent_arc.clone();
+    let mid = id.clone();
+    tokio::spawn(async move {
+        persist_meetings_for(&pa, |e| {
+            tracing::error!(error = %e, meeting = %mid,
+                "handle_meeting_invite: 邀请已确认但落盘失败（可能进程崩溃丢失，请排查磁盘）");
+        })
+        .await;
+    });
+
+    let participants = agent_arc.get_meeting(&id).map(|m| m.participant_agents).unwrap_or_default();
+    Json(serde_json::json!({
+        "ok": true,
+        "invited": invitee,
+        "added": added,
+        "delivered": delivered,
+        "participants": participants,
+    }))
+    .into_response()
+}

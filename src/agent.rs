@@ -1325,6 +1325,16 @@ impl Meeting {
             || is_terminal_state(&self.status, self.phase)
     }
 
+    /// 群聊邀请（2026-09-13）：追加真人参会者到 participant_agents（去重）。
+    /// 返回是否实际新增（false=已在名单，幂等）。终态守卫与授权由调用方负责。
+    pub fn add_participant(&mut self, agent_id: &str) -> bool {
+        if self.participant_agents.iter().any(|a| a == agent_id) {
+            return false;
+        }
+        self.participant_agents.push(agent_id.to_string());
+        true
+    }
+
     /// 会议读写授权谓词（**单一权威来源**，reviewer round-17 #1 maintainability·medium）。
     ///
     /// 判定 caller 对 `self` 这份会议是否有读/写（发言）权限：owner / admin / 公开 /
@@ -2215,6 +2225,22 @@ impl AgentCore {
         // （spawn_blocking 迁移写盘到阻塞线程池），故「不阻塞 tokio worker」的保证来自调用方，
         // 而非本方法。本方法自身不落盘、也就谈不上阻塞任何线程。
         Ok(pushed)
+    }
+
+    /// 群聊型会议（2026-09-13）：向 running 会议追加真人参会者（邀请进群）。
+    /// 返回 Ok(true)=新增；Ok(false)=已在名单（幂等）；Err=会议不存在/已结束。
+    /// 授权（仅 owner / admin 可邀请）由调用方 handler 校验；本方法只管状态与去重。
+    /// 不内部落盘——落盘职责与 add_meeting_message 相同，上移给调用方锁外异步执行。
+    pub fn add_meeting_participant(&self, id: &str, agent_id: &str) -> Result<bool, String> {
+        let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+        let m = v.iter_mut().find(|m| m.id == id);
+        let Some(m) = m else {
+            return Err("无权访问该会议".to_string());
+        };
+        if m.is_terminal() {
+            return Err("会议已结束，不能邀请".to_string());
+        }
+        Ok(m.add_participant(agent_id))
     }
 
     /// Step2：结束会议并回填共识。requested_by 需为 owner / admin，否则拒绝。
@@ -16524,5 +16550,45 @@ mod stance_card_tests {
         assert_eq!(agg.structured, 0);
         assert!(agg.summary.contains("无结构化立场卡"));
         assert!(agg.summary.contains("2 份未结构化"));
+    }
+}
+
+
+#[cfg(test)]
+mod meeting_invite_tests {
+    use super::{Meeting, MeetingPhase};
+
+    fn meeting(status: &str, phase: Option<MeetingPhase>) -> Meeting {
+        Meeting {
+            id: "mtg_t".into(),
+            topic: "邀请测试".into(),
+            owner_user_id: "owner1".into(),
+            participant_personas: vec![],
+            is_private: true,
+            created_at: "2026-09-13T00:00:00Z".into(),
+            status: status.into(),
+            consensus: None,
+            scope: None,
+            participant_agents: vec![],
+            messages: vec![],
+            phase,
+            phase_raw: None,
+        }
+    }
+
+    #[test]
+    fn add_participant_dedups() {
+        let mut m = meeting("running", Some(MeetingPhase::Discussing));
+        assert!(m.add_participant("colleague_a"));
+        assert!(!m.add_participant("colleague_a"), "重复邀请应幂等");
+        assert!(m.add_participant("colleague_b"));
+        assert_eq!(m.participant_agents, vec!["colleague_a", "colleague_b"]);
+    }
+
+    #[test]
+    fn terminal_meeting_flag_drives_invite_guard() {
+        // 终态守卫在 AgentCore::add_meeting_participant 的 is_terminal()——验证终态/非终态判定
+        assert!(meeting("done", Some(MeetingPhase::Done)).is_terminal());
+        assert!(!meeting("running", Some(MeetingPhase::Discussing)).is_terminal());
     }
 }
