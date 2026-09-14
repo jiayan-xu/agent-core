@@ -430,12 +430,13 @@ pub(crate) fn spawn_server(
                     if b.is_empty() {
                         continue;
                     }
+                    let lan_state = state.clone();
                     tokio::spawn(async move {
                         match tokio::net::TcpListener::bind(&b).await {
                             Ok(l) => {
-                                println!("✓ PFAiX 局域网更新通道: http://{}/updates/pfaix/", &b);
+                                println!("✓ PFAiX 局域网更新通道(+NS注册): http://{}/updates/pfaix/", &b);
                                 if let Err(e) =
-                                    axum::serve(l, crate::routes::build_updates_only_router()).await
+                                    axum::serve(l, crate::routes::build_updates_only_router(lan_state)).await
                                 {
                                     eprintln!("✗ 局域网更新通道 {} 异常终止: {}", b, e);
                                 }

@@ -120,8 +120,12 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
 /// 本路由只暴露更新清单与安装包（本身即全员分发的产物，无敏感数据），
 /// 其余路径一律 403；管理 API 仍仅回环可达（见 main.rs 绑定校验）。
 /// 绑定地址清单由 bootstrap 从 PFAIX_LAN_UPDATE_BINDS 读取（默认与客户端回退列表一致）。
-pub(crate) fn build_updates_only_router() -> Router {
+pub(crate) fn build_updates_only_router(state: std::sync::Arc<crate::state::AppState>) -> Router {
     Router::new()
+        // NS 注册是同事入职唯一入口且本为公开端点：局域网分发场景必须可注册，
+        // 否则 WiFi/局域网同事永远建不了协作身份（2026-09-14 张三案：LAN 门禁挡注册）。
+        // 其余业务 API 仍仅本机 127.0.0.1 全量开放。
+        .route("/api/register", post(handle_register))
         .route(
             "/updates/pfaix/latest.json",
             get(handle_updates_latest),
@@ -138,4 +142,5 @@ pub(crate) fn build_updates_only_router() -> Router {
                 "updates-only endpoint",
             )
         })
+        .with_state(state)
 }
