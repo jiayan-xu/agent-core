@@ -41,3 +41,27 @@ public branch is `master` only.
 On 2026-07-08 the repo was scrubbed: admin key rotated, agent API key rotated, hardcoded
 `C:/Users/user/...` paths removed, internal review docs removed from the public tree. Historical
 commits may still contain inert (revoked) secret strings — do not reintroduce live ones.
+
+## Hard red lines: patterns NEVER to absorb from WeKnora (2026-10-04)
+Source: `docs/OPTIMIZATION_WEKNORA_ABSORPTION.md` §4 (evidence: file:line in WeKnora v0.8.2).
+If a future change reintroduces any of these, it is a security regression, not a style choice.
+
+1. **Never default sandbox exec to root.** WeKnora `DefaultSandboxExecUser = "root"` with no uid
+   drop / seccomp / read-only rootfs. Any exec-user config must default to an unprivileged user.
+2. **A name that sounds like a boundary must be a boundary.** WeKnora's `AllowSkillsRoot` was
+   documented as "not a filesystem boundary" while being the only thing standing in front of a
+   root shell. If it is not enforced in code, do not name it like it is.
+3. **No dead "non-root paths".** An `if opts.AsRoot { user = "root" }` branch that can never fire
+   (because root is already the default) misleads every reader and every auditor.
+4. **A deny-list is not a perimeter when it is the only defense** for a root shell. Escape the
+   trap by not having the root shell, not by extending the list.
+5. **Approval gates must cover every execution surface**, not just MCP tools. WeKnora's gate
+   covered MCP while `shell_exec` / file writes / skill installs ran unapproved.
+6. **Lexical allow-lists (`work_dir` "lexical only") are not path safety.** Resolve and canonicalize.
+7. **HTML-escaping memory blocks blocks markup injection, not semantic prompt injection.** A
+   well-formed sentence carrying hostile instructions passes intact; never present escaping as
+   an injection defense.
+8. **Skill packages need signature verification** (gpg/cosign). SHA256 only detects transport
+   corruption, not a malicious registry or a compromised publisher account.
+9. **Never silently persist degraded summaries as if they were full checkpoints** without a
+   user-visible marker — the loss becomes irreversible and invisible (context compaction).

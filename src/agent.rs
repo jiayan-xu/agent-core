@@ -384,6 +384,10 @@ pub struct AgentCore {
     /// 工具路由缓存（P1-3 修复：精确匹配而非 starts_with）
     /// tool_name → MCP 源索引
     tool_route_cache: tokio::sync::Mutex<HashMap<String, usize>>,
+    /// Phase B ①（WeKnora 吸收）：记忆检索 query 背景扩展的兴趣词缓存。
+    /// ns → (收割时刻, profile.static 兴趣词)；TTL 10 分钟，首个成功的
+    /// memory_context 响应自暖，后续消息的检索 query 据此 advisory 扩展。
+    bg_interests: tokio::sync::Mutex<HashMap<String, (std::time::Instant, Vec<String>)>>,
     /// 多租户命名空间注册表（P2-C）
     pub namespace_registry: std::sync::Mutex<NamespaceRegistry>,
     /// 审批管理器（P2-D）
@@ -1799,6 +1803,7 @@ impl AgentCore {
             snapshot_seq: std::sync::atomic::AtomicU64::new(1),
             audit_logger: AuditLogger::new(mcp_for_audit),
             tool_route_cache: tokio::sync::Mutex::new(HashMap::new()),
+            bg_interests: tokio::sync::Mutex::new(HashMap::new()),
             namespace_registry: std::sync::Mutex::new(NamespaceRegistry::new()),
             // L2 + TASK-652 P3：审批权威表挂 checkpoints.db；legacy approvals.json 只读回填
             approval_manager: {
@@ -9500,6 +9505,30 @@ impl AgentCore {
         intent: &crate::intent::Intent,
         fast_path_data: bool,
     ) -> ToolExecOutcome {
+        // Phase C 预检 0（WeKnora 吸收 §3.4）：并发显式 allowlist，默认 deny。
+        // 任一工具未被授予并发资格 → 整轮回退顺序路径（不做混排：
+        // 部分并行的顺序保证推理成本高于收益）。
+        //
+        // 2026-10-04 审查标注（方案 A）：CAN_RUN_CONCURRENTLY 为空时本预检恒真
+        // 回退，下方并行实现（boundary/schema 预检 + join_all 分块并发）处于
+        // **有意不可达**状态——它是待授予清单的预置资产（ADR-017），不是死代码
+        // 待清理。要恢复可达性：往 orchestration::CAN_RUN_CONCURRENTLY 逐个放行
+        // 已验证并发安全的只读工具。被拦回退计入
+        // read_parallel_allowlist_denied（区别于其他回退原因），监控上
+        // read_parallel_batches 恒 0 是策略结果而非健康信号。
+        if !tool_calls
+            .iter()
+            .all(|tc| crate::orchestration::can_run_concurrently(&tc.name))
+        {
+            self.metrics.inc_read_parallel_allowlist_denied();
+            return self
+                .execute_tool_calls_sequential(
+                    messages, tool_calls, executed_tools, tool_schemas,
+                    session_id, raw_message, user_id, allowed_ns, trace_id,
+                    round, intent, fast_path_data,
+                )
+                .await;
+        }
         // 预检 1：边界全绿（任一拒绝 → 回退顺序路径，保留既有拒绝/审批分支）。
         // 只读判定用权威 ToolClassifier（与 bootstrap is_safe 同一口径）：
         // 前缀启发式 `is_read_only_tool` 对 cross_* 等过宽，写能力工具可能被
@@ -10626,6 +10655,32 @@ impl AgentCore {
     /// 从 Memoria 拉取会话开场上下文。
     /// 优先 `memory_context`（profile + recall）；失败则降级 `memory_search_v2`。
     /// PFAiX 强制隔离：同时覆盖调用者私有 ns 与 allowed_ns 共享 ns。
+    /// Phase B ①：读会话兴趣词缓存（TTL 10 分钟；miss/过期返回空 → 不扩展）。
+    /// 2026-10-04 审查修复：miss 打 debug 日志——兴趣词静默失效（如 caller_ns
+    /// 首调失败）此前无任何痕迹，排查「扩展为何没生效」无从下手。
+    async fn cached_bg_interests(&self, ns: &str) -> Vec<String> {
+        const TTL_SECS: u64 = 600;
+        let map = self.bg_interests.lock().await;
+        match map.get(ns) {
+            Some((at, v)) if at.elapsed().as_secs() < TTL_SECS => v.clone(),
+            _ => {
+                tracing::debug!("[QUERY-BG] 兴趣词缓存 miss/过期（ns={ns}），本轮 query 不扩展");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Phase B ①：写入/刷新会话兴趣词缓存（来自 profile.static 收割）。
+    /// 2026-10-04 审查修复：① 写键固定 caller_ns——兴趣词是「本会话用户」的
+    /// 画像，原实现写循环变量 ns，caller_ns 首调失败而共享 ns 成功时词被写进
+    /// 永远读不到的键；② 写时顺带驱逐过期条目（此前只被动失效，长期驻留）。
+    async fn warm_bg_interests(&self, ns: &str, interests: Vec<String>) {
+        const TTL_SECS: u64 = 600;
+        let mut map = self.bg_interests.lock().await;
+        map.retain(|_, (at, _)| at.elapsed().as_secs() < TTL_SECS);
+        map.insert(ns.to_string(), (std::time::Instant::now(), interests));
+    }
+
     async fn search_memory(
         &self,
         query: &str,
@@ -10633,12 +10688,25 @@ impl AgentCore {
         allowed_ns: &[String],
     ) -> Result<(Option<Vec<serde_json::Value>>, Vec<serde_json::Value>), String> {
         let caller_ns = self.caller_ns(session_id);
-        let mut targets = vec![caller_ns];
+        let mut targets = vec![caller_ns.clone()];
         for ns in allowed_ns {
             if !targets.contains(ns) {
                 targets.push(ns.clone());
             }
         }
+
+        // Phase B ①（WeKnora 吸收）：用会话兴趣词背景扩展检索 query——
+        // advisory 只放宽不缩窄，最多追加 1 个扩写型兴趣词（见 memory_query_bg）。
+        // 首条消息缓存为空 → 原样透传（行为与接入前一致），首个成功的
+        // memory_context 响应自暖缓存后生效。AGENT_MEMORY_QUERY_BG=0 关闭。
+        let bg_query_owned: String;
+        let query: &str = if crate::memory_query_bg::bg_enabled() {
+            let interests = self.cached_bg_interests(&caller_ns).await;
+            bg_query_owned = crate::memory_query_bg::expand_query(query, &interests);
+            bg_query_owned.as_str()
+        } else {
+            query
+        };
 
         let mut merged: Vec<serde_json::Value> = Vec::new();
         let mut ledger_rows: Vec<serde_json::Value> = Vec::new();
@@ -10665,6 +10733,16 @@ impl AgentCore {
             if let Ok(val) = &ctx {
                 if val["status"].as_str() == Some("ok") {
                     used_context = true;
+                    // Phase B ① 自暖：收割 profile.static 为会话兴趣词（TTL 内复用）。
+                    // 2026-10-04 审查修复：写键固定 caller_ns（本会话用户画像），
+                    // 不随循环变量漂移到共享 ns 的键上。
+                    if let Some(static_arr) = val["profile"]["static"].as_array() {
+                        let harvested =
+                            crate::memory_query_bg::harvest_interests(static_arr);
+                        if !harvested.is_empty() {
+                            self.warm_bg_interests(&caller_ns, harvested).await;
+                        }
+                    }
                     if let Some(arr) = val["ledger"].as_array() {
                         for row in arr {
                             ledger_rows.push(row.clone());
@@ -11420,6 +11498,12 @@ impl AgentCore {
     /// 设计要点：不破坏现有前缀源路由；约定前缀名确定性放行（仅做前缀内拼写纠错），
     /// 非约定名（dashboard 业务技能）走"刷新→模糊匹配→清晰错误"三段式。
     async fn resolve_tool_name_middleware(&self, tool_name: &str) -> Result<String, String> {
+        // Phase C：退役工具最先拦截——绝不让退役名进入模糊纠错（query_sql 可能
+        // 被纠成某个编辑距离相近的活名，掩盖模型的真实意图），直接给精确替代。
+        if let Some(guidance) = Self::retired_tool_guidance(tool_name) {
+            tracing::warn!("[TOOL-RETIRED] 拦截退役工具名『{}』并返回替代指引", tool_name);
+            return Err(guidance.to_string());
+        }
         // 0. 本仓内置工具：不依赖 MCP 注册表
         if crate::local_fs::is_local_fs_tool(tool_name) {
             return Ok(tool_name.to_string());
@@ -12029,26 +12113,35 @@ impl AgentCore {
 
     /// 从所有 MCP 源获取工具列表（合并去重）
     /// P1-3 修复：同时更新 tool_route_cache 和 classifier
-    /// 无可用 MCP 工具时的兜底工具（query_plate / query_sql），供 fetch_tools 与 fetch_tools_filtered 共用（R9）
+    /// 无可用 MCP 工具时的兜底清单。Phase C（WeKnora 吸收 §3.4，2026-10-04）：
+    /// 原兜底的 query_plate / query_sql 是已退役旧名——system prompt 早已声明
+    /// 「旧名已不存在」，却仍在全部 MCP 源失联时把死工具喂给模型，让它反复
+    /// 调用反复撞墙。兜底改为**空清单**（失联时诚实无工具，好过提供幻影工具）；
+    /// 模型若仍点名旧名，由 RETIRED_TOOLS 给出精确替代指引。
     fn fallback_tools() -> Vec<ToolDef> {
-        vec![
-            ToolDef {
-                type_: "function".to_string(),
-                function: crate::llm::ToolDefFunction {
-                    name: "query_plate".to_string(),
-                    description: "查询车牌信息".to_string(),
-                    parameters: serde_json::json!({"type": "object", "properties": {"plate": {"type": "string"}}}),
-                },
-            },
-            ToolDef {
-                type_: "function".to_string(),
-                function: crate::llm::ToolDefFunction {
-                    name: "query_sql".to_string(),
-                    description: "执行 SQL 查询".to_string(),
-                    parameters: serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}}}),
-                },
-            },
-        ]
+        Vec::new()
+    }
+
+    /// Phase C（WeKnora 吸收 §3.4）：退役工具映射——保留退役名以解历史调用，
+    /// 返回给模型的不是「工具没了」而是**精确替代**（模型能自我纠正，而不是
+    /// 反复撞墙）。新增退役时：条目给出「替代工具 + 参数形态」，并同步清理
+    /// 工具清单/提示词里的旧名，防止再次出现 fallback_tools 式的幻影回归。
+    const RETIRED_TOOLS: &[(&str, &str)] = &[
+        (
+            "query_plate",
+            "query_plate 已退役。车牌精确匹配请改用 fuzzy_match_plate(plate=...)；自然语言查询请改用 nl_query(query=...)。",
+        ),
+        (
+            "query_sql",
+            "query_sql 已退役。SQL 查询请改用 execute_sql(sql=...)（受审批边界约束）；自然语言取数请改用 nl_query(query=...)。",
+        ),
+    ];
+
+    fn retired_tool_guidance(tool_name: &str) -> Option<&'static str> {
+        Self::RETIRED_TOOLS
+            .iter()
+            .find(|(n, _)| *n == tool_name)
+            .map(|(_, g)| *g)
     }
 
     // ── P1-5 降级收缩：工具列表健康探测 ──
@@ -16553,6 +16646,27 @@ mod stance_card_tests {
     }
 }
 
+
+#[cfg(test)]
+mod phasec_weknora_tests {
+    use super::AgentCore;
+
+    /// Phase C：退役名必须给出精确替代（模型可自我纠正），且不进模糊纠错。
+    #[test]
+    fn retired_tools_carry_precise_replacement() {
+        let g = AgentCore::retired_tool_guidance("query_sql").expect("query_sql 应在退役表");
+        assert!(g.contains("execute_sql"), "替代指引应含 execute_sql: {g}");
+        let g2 = AgentCore::retired_tool_guidance("query_plate").expect("query_plate 应在退役表");
+        assert!(g2.contains("fuzzy_match_plate"), "替代指引应含 fuzzy_match_plate: {g2}");
+        assert!(AgentCore::retired_tool_guidance("memory_recall").is_none(), "活工具不在退役表");
+    }
+
+    /// Phase C：兜底清单不再提供幻影工具（全部 MCP 源失联时诚实无工具）。
+    #[test]
+    fn fallback_tools_no_phantom_legacy() {
+        assert!(AgentCore::fallback_tools().is_empty(), "兜底清单应为空（退役名不得回流）");
+    }
+}
 
 #[cfg(test)]
 mod meeting_invite_tests {
