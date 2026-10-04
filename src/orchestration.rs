@@ -141,6 +141,20 @@ impl Default for ReadParallelConfig {
     }
 }
 
+/// Phase C（WeKnora 吸收 §3.4，2026-10-04）：并发执行显式 allowlist——**默认 deny**。
+/// WeKnora 的 CanRunConcurrently 模式：并发是逐个授予的特权，不是「看起来只读」
+/// 推断出的默认。与既有双保险（boundary 分类器 + schema 预检）叠加为第三道
+/// AND 门：即便 read_parallel.enabled=true，也仅清单内工具可进并行路径；
+/// 清单为空 = 全部顺序执行（与 enabled=false 行为等效，语义不同——
+/// 「没人被授予」而非「功能没开」）。放行前必须确认该工具并发安全
+/// （无共享可变状态、无顺序副作用）；**故意不在清单里**就别顺手加回。
+pub const CAN_RUN_CONCURRENTLY: &[&str] = &[];
+
+/// 工具是否被显式授予并发执行资格。
+pub fn can_run_concurrently(tool: &str) -> bool {
+    CAN_RUN_CONCURRENTLY.contains(&tool)
+}
+
 /// 编排层总配置（agent.toml `[orchestration]`，缺省全默认 = 全 OFF）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OrchestrationConfig {
@@ -1168,6 +1182,15 @@ impl TurnBudget {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Phase C（WeKnora 吸收）：并发资格默认 deny——空清单下任何工具（含
+    /// 只读工具）都不可并发，必须逐个显式授予。
+    #[test]
+    fn can_run_concurrently_defaults_to_deny() {
+        assert!(!can_run_concurrently("memory_recall"));
+        assert!(!can_run_concurrently("local_fs_read"));
+        assert!(!can_run_concurrently("anything"));
+    }
 
     fn tool(name: &str) -> ToolDef {
         ToolDef {

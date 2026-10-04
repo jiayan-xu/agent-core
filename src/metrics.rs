@@ -29,6 +29,10 @@ pub struct MetricsRegistry {
     hook_retries: AtomicU64,
     hook_aborts: AtomicU64,
     read_parallel_batches: AtomicU64,
+    // Phase C（WeKnora 吸收）审查补充：并行路径被显式 allowlist 拒绝的回退次数
+    // ——CAN_RUN_CONCURRENTLY 为空时 read_parallel_batches 恒 0 是"没并行"的
+    // 事实而非健康信号，该计数让「被 allowlist 拦下」与「其他原因回退」可区分。
+    read_parallel_allowlist_denied: AtomicU64,
     tool_summaries: AtomicU64,
     checkpoint_saves: AtomicU64,
     checkpoint_recoveries: AtomicU64,
@@ -87,6 +91,13 @@ impl MetricsRegistry {
     }
     pub fn inc_read_parallel(&self) {
         self.read_parallel_batches.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Phase C 审查补充：并行请求被 CAN_RUN_CONCURRENTLY allowlist 拒绝并回退
+    /// 顺序路径的计数（默认 deny 下 read_parallel_batches 恒 0 属预期，
+    /// 该计数 >0 说明有代码路径尝试并行但被策略拦下）。
+    pub fn inc_read_parallel_allowlist_denied(&self) {
+        self.read_parallel_allowlist_denied
+            .fetch_add(1, Ordering::Relaxed);
     }
     pub fn inc_tool_summary(&self) {
         self.tool_summaries.fetch_add(1, Ordering::Relaxed);
@@ -184,6 +195,9 @@ impl MetricsRegistry {
                 "hook_retries": self.hook_retries.load(Ordering::Relaxed),
                 "hook_aborts": self.hook_aborts.load(Ordering::Relaxed),
                 "read_parallel_batches": self.read_parallel_batches.load(Ordering::Relaxed),
+                "read_parallel_allowlist_denied": self
+                    .read_parallel_allowlist_denied
+                    .load(Ordering::Relaxed),
                 "tool_summaries": self.tool_summaries.load(Ordering::Relaxed),
                 "checkpoint_saves": self.checkpoint_saves.load(Ordering::Relaxed),
                 "checkpoint_recoveries": self.checkpoint_recoveries.load(Ordering::Relaxed),

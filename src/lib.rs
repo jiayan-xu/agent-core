@@ -33,6 +33,7 @@ pub mod scheduler;
 pub mod self_evolution;
 pub mod text_signals;
 pub mod memory_extract;
+pub mod memory_query_bg; // Phase B ①（WeKnora 吸收）：记忆检索 query 背景扩展（确定性、advisory）
 pub mod memory_evolve;
 pub mod meta_evolve;
 pub mod code_evolve;
