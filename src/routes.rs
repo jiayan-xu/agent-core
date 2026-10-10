@@ -46,7 +46,9 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         // lanManifestUrl 直接拼接导致请求 /v1/updates/...——旧版客户端无法改，
         // 服务端同时挂别名兼容（review/修复：检查更新 401 根因）
         .route("/v1/updates/pfaix/latest.json", get(handle_updates_latest))
-        .route("/v1/updates/pfaix/{file}", get(handle_updates_static));
+        .route("/v1/updates/pfaix/{file}", get(handle_updates_static))
+        // 活页通道：跑批侧镜像的数据页（wte/model/screen + hhv-data），壳端活页优先内嵌兜底
+        .route("/pages/{*file}", get(handle_pages_static));
 
     let protected = Router::new()
         .route("/api/chat", post(handle_chat))
@@ -117,7 +119,8 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
 ///
 /// 背景：安全加固后主服务只绑 127.0.0.1，但 PFAiX 客户端（lan.rs / shell-dist）
 /// 内置回退列表敲的是局域网地址（192.168.1.171:9753 等）——同事检查更新全部失败。
-/// 本路由只暴露更新清单与安装包（本身即全员分发的产物，无敏感数据），
+/// 本路由只暴露更新清单与安装包（本身即全员分发的产物，无敏感数据）+ 公开注册 +
+/// 活页 /pages（数据页镜像，与 dashboard:8000 同为 LAN 明文运行数据），
 /// 其余路径一律 403；管理 API 仍仅回环可达（见 main.rs 绑定校验）。
 /// 绑定地址清单由 bootstrap 从 PFAIX_LAN_UPDATE_BINDS 读取（默认与客户端回退列表一致）。
 pub(crate) fn build_updates_only_router(state: std::sync::Arc<crate::state::AppState>) -> Router {
@@ -136,6 +139,8 @@ pub(crate) fn build_updates_only_router(state: std::sync::Arc<crate::state::AppS
             get(handle_updates_latest),
         )
         .route("/v1/updates/pfaix/{file}", get(handle_updates_static))
+        // 活页通道（2026-10-10）：领导机/同事机经 LAN 拿跑批刷新的数据页
+        .route("/pages/{*file}", get(handle_pages_static))
         .fallback(|| async {
             (
                 axum::http::StatusCode::FORBIDDEN,

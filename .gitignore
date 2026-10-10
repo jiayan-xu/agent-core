@@ -75,3 +75,9 @@ meetings.json
 # 本机 Cursor 本地规则（含 ~/.dsh 路径与本地运维约定，不进公开仓库）
 .cursor/
 target-deploy/
+
+# mimosa 安全扫描产物（会话级，不入库）
+.mimosa/
+
+# PFAiX 活页发布目录（跑批镜像产物，由 hhv-model publish_pfaix_pages.py 生成，不入库）
+pages/

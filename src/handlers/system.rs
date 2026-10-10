@@ -101,6 +101,68 @@ pub(crate) async fn handle_updates_static(
     ([(axum::http::header::CONTENT_TYPE, ct)], data).into_response()
 }
 
+/// PFAiX 活页通道：静态目录根，默认在运行目录下 `pages/`，可用 PFAIX_PAGES_DIR 覆盖。
+/// 跑批侧（hhv-model scripts/publish_pfaix_pages.py）把数据页镜像进来；
+/// PFAiX 壳「活页优先、内嵌兜底」——数据刷新不再需要发版（2026-10-10 拍板）。
+pub(crate) fn pfaix_pages_dir() -> std::path::PathBuf {
+    std::env::var("PFAIX_PAGES_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join("pages")
+        })
+}
+
+/// 活页静态文件（支持 hhv-data 等子目录），路径穿越防御 + MIME + no-cache。
+/// 同时挂在主路由与局域网 updates-only 路由（领导机走 LAN 拿活页）。
+pub(crate) async fn handle_pages_static(
+    axum::extract::Path(file): axum::extract::Path<String>,
+) -> impl axum::response::IntoResponse {
+    let root = pfaix_pages_dir();
+    let candidate = root.join(file.replace('\\', "/"));
+    // 路径穿越防御：必须在 root 下
+    let (Ok(root_canon), Ok(cand_canon)) = (
+        std::fs::canonicalize(&root),
+        std::fs::canonicalize(&candidate),
+    ) else {
+        return (axum::http::StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    if !cand_canon.starts_with(&root_canon) || !cand_canon.is_file() {
+        return (axum::http::StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let data = match tokio::fs::read(&cand_canon).await {
+        Ok(d) => d,
+        Err(_) => return (axum::http::StatusCode::NOT_FOUND, "not found").into_response(),
+    };
+    let ct = match cand_canon
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "png" => "image/png",
+        "svg" => "image/svg+xml",
+        "jpg" | "jpeg" => "image/jpeg",
+        "txt" | "md" | "csv" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    };
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, ct),
+            // 数据页随跑批刷新，禁强缓存（壳端另带 ?t= 时间戳双保险）
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        data,
+    )
+        .into_response()
+}
+
 /// 公开健康检查（无鉴权）。供 PFAiX 状态条 / 诊断包探测。
 /// 附带 Memoria 公开 /health 的 embed 摘要 + 最近 Dream 巩固状态。
 pub(crate) async fn handle_health(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
