@@ -32,17 +32,29 @@ pub(crate) async fn handle_approval_console() -> Html<&'static str> {
     Html(APPROVAL_CONSOLE_HTML)
 }
 
-/// R2 运维简报代理：转发 dashboard :8000/healthz 给审批台前端展示
+/// R2 运维简报代理：dashboard /healthz + OPS 值班报告（oncall/latest.md，经 dashboard 静态口
+/// /hhv-data/oncall/ 读取，2026-10-10 从会议出口迁入）。值班报告拉取失败不阻断简报（oncall_md 置空）。
 pub(crate) async fn handle_ops_briefing() -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
     let client = reqwest::Client::new();
-    let resp = client
+    let healthz_fut = client
         .get("http://127.0.0.1:8000/healthz")
         .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await;
+        .send();
+    let oncall_fut = client
+        .get("http://127.0.0.1:8000/hhv-data/oncall/latest.md")
+        .timeout(std::time::Duration::from_secs(5))
+        .send();
+    let (resp, oncall) = tokio::join!(healthz_fut, oncall_fut);
     match resp {
         Ok(r) => {
-            let body: serde_json::Value = r.json().await.unwrap_or(serde_json::json!({"error": "parse fail"}));
+            let mut body: serde_json::Value = r.json().await.unwrap_or(serde_json::json!({"error": "parse fail"}));
+            let md = match oncall {
+                Ok(o) if o.status().is_success() => o.text().await.unwrap_or_default(),
+                _ => String::new(),
+            };
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("oncall_md".to_string(), serde_json::Value::String(md));
+            }
             Ok(Json(body))
         }
         Err(e) => Err((
@@ -420,6 +432,13 @@ async function loadOps() {
       '<b>DB：</b>' + dbInfo.ok + ' · ' + dbInfo.size_mb + ' MB · ' + dbInfo.vehicle_entrance_rows + ' 条入场记录<br>' +
       '<span style="color:#8892aa;font-size:11px">' + (d.checked_at || '') + '</span>' +
       '</div>';
+    const md = String(d.oncall_md || '').trim();
+    if (md) {
+      el.innerHTML += '<details style="margin-top:8px;border-top:1px dashed #d8e0ec;padding-top:6px">' +
+        '<summary style="cursor:pointer;font-weight:600;color:#1E88E5">🧭 OPS 值班报告（每 2h 自动巡逻）</summary>' +
+        '<pre style="white-space:pre-wrap;font:12px/1.7 Consolas,monospace;color:#1a2332;margin:8px 0 0">' + esc(md) + '</pre>' +
+        '</details>';
+    }
   } catch(e) {
     el.innerHTML = '<span class="err">运维简报加载失败: ' + esc(String(e)) + '</span>';
   }
