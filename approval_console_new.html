@@ -41,17 +41,12 @@
   .st-approved { color: #178a50; font-weight: bold; } .st-denied { color: #c5453b; font-weight: bold; }
   .st-consumed { color: #1E88E5; font-weight: bold; } .st-pending { color: #b37400; font-weight: bold; }
   .auto-note { font-size: 11px; color: #8d9eb0; }
+.pf-head{display:flex;align-items:center;gap:10px;padding:14px 24px;background:#fff;border-bottom:1px solid #e2e8f0;font-family:'Microsoft YaHei',sans-serif}.pf-logo{width:32px;height:32px;border-radius:8px;flex-shrink:0;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);display:inline-flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;color:#fff}.pf-head b{font-size:17px;color:#17213a}.pf-app{margin-left:auto;font-size:12px;color:#94a3b8;letter-spacing:1px}
+.pf-top{background:#fff;position:relative}.pf-top::after{content:"";position:absolute;bottom:0;left:0;right:0;height:3px;background:linear-gradient(90deg,#F58220 0%,#5DAF3B 50%,#1E88E5 100%)}.pf-top-bar{display:flex;align-items:center;height:80px;padding:0 24px;font-family:Microsoft YaHei,sans-serif}.pf-top-l{flex:1;display:flex;align-items:center;gap:20px;font-size:13px;color:#8d9eb0;align-self:flex-end;padding-bottom:8px}.pf-top-c{flex:1;display:flex;align-items:center;justify-content:center;gap:14px}.pf-top-t{font-size:42px;font-weight:800;color:#1a2332;margin:0;white-space:nowrap}.pf-top-r{flex:1;display:flex;align-items:center;justify-content:flex-end;gap:16px;font-size:13px;color:#5a6d82;align-self:flex-end;padding-bottom:8px}
 </style>
 </head>
 <body>
-<div class="header-line"></div>
-<header>
- <div class="header-top">
-  <div class="h-left">固废监管系统 · agent-core</div>
-  <div class="h-center"><span class="shield">🛡️</span><h1>人工审批台</h1></div>
-  <div class="h-right"><span class="auto-note">危险/红线工具二次确认 · 真人兜底</span></div>
- </div>
-</header>
+<div class="pf-top"><div class="pf-top-bar"><div class="pf-top-l">危险/红线工具二次确认 · 真人兜底</div><div class="pf-top-c"><span style="font-size:38px">🛡️</span><h1 class="pf-top-t">人工审批台</h1></div><div class="pf-top-r">智浦助手 PFAiX</div></div></div>
 <div class="wrap">
   <div class="keybar">
     <span class="auto-note">🔒 身份由办公网 IP 绑定 + 防火墙白名单保证（APPROVAL_OPEN_LAN=1）</span>

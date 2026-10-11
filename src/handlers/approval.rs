@@ -28,8 +28,15 @@ use crate::state::AppState;
 
 
 /// 人工审批台页面（内嵌静态 HTML，浏览器打开后配合 admin key 使用）
-pub(crate) async fn handle_approval_console() -> Html<&'static str> {
-    Html(APPROVAL_CONSOLE_HTML)
+pub(crate) async fn handle_approval_console() -> Html<String> {
+    // 2026-10-11: prefer the sibling html file so the console can be rebranded
+    // without recompiling; fall back to the embedded copy.
+    let p = std::env::var("AGENT_CORE_DIR").map(|d| std::path::PathBuf::from(d)
+        .join("approval_console_new.html")).unwrap_or_else(|_| std::path::PathBuf::from(r"C:\Users\user\agent-core\approval_console_new.html"));
+    match std::fs::read_to_string(p) {
+        Ok(s) if s.len() > 1024 => Html(s),
+        _ => Html(APPROVAL_CONSOLE_HTML.to_string()),
+    }
 }
 
 /// R2 运维简报代理：dashboard /healthz + OPS 值班报告（oncall/latest.md，经 dashboard 静态口
@@ -415,6 +422,37 @@ async function load() {
     startAuto();
   } catch (e) { list.innerHTML = '<div class="empty err">请求出错: ' + e + '</div>'; }
 }
+function renderOncall(md) {
+  const lines = md.replace(/\r/g, '').split(String.fromCharCode(10));
+  const banner = lines.find(l => l.startsWith('> '));
+  if (!banner) return '<pre style="white-space:pre-wrap;font:12px/1.7 Consolas,monospace;color:#1a2332;margin:0">' + esc(md) + '</pre>';
+  // 总结论横幅：按emoji定色（✅绿/⚠黄/🔴红）
+  const bTxt = banner.replace(/^>\s*\*\*?/, '').replace(/\*\*?$/, '').replace(/^总结论[:：]\s*/, '');
+  const bColor = bTxt.includes('🔴') ? '#c62828' : (bTxt.includes('⚠') ? '#b45309' : '#1e7a3c');
+  const bBg = bTxt.includes('🔴') ? '#fdecea' : (bTxt.includes('⚠') ? '#fdf3e2' : '#e9f5ee');
+  let html = '<div style="background:' + bBg + ';color:' + bColor + ';border-left:3px solid ' + bColor +
+    ';padding:8px 12px;border-radius:6px;font-weight:600;font-size:13.5px">' + esc(bTxt) + '</div>';
+  // 四问分块（## 标题 → 小节；- 条目 → 行）；<details> 技术明细整体收进二级折叠
+  let inTech = false, techBuf = [];
+  for (const l of lines) {
+    if (l.startsWith('<details>')) { inTech = true; continue; }
+    if (l.startsWith('</details>')) break;
+    if (inTech) { techBuf.push(l); continue; }
+    if (l.startsWith('## ')) {
+      html += '<div style="margin-top:10px;font-weight:600;font-size:13px;color:#1a2332">' + esc(l.slice(3)) + '</div>';
+    } else if (l.startsWith('- ')) {
+      html += '<div style="padding:2px 0 2px 14px;font-size:13px;color:#39445c;line-height:1.6">· ' + esc(l.slice(2)) + '</div>';
+    } else if (l.trim() && !l.startsWith('#') && !l.startsWith('>')) {
+      html += '<div style="font-size:13px;color:#39445c">' + esc(l) + '</div>';
+    }
+  }
+  const tech = techBuf.join(String.fromCharCode(10)).trim();
+  if (tech) {
+    html += '<details style="margin-top:10px"><summary style="cursor:pointer;font-size:12px;color:#8892aa">技术明细（工程师用）</summary>' +
+      '<pre style="white-space:pre-wrap;font:11.5px/1.6 Consolas,monospace;color:#5b6472;margin:6px 0 0">' + esc(tech) + '</pre></details>';
+  }
+  return html;
+}
 async function loadOps() {
   try {
     const r = await fetch("/api/ops/briefing");
@@ -436,7 +474,7 @@ async function loadOps() {
     if (md) {
       el.innerHTML += '<details style="margin-top:8px;border-top:1px dashed #d8e0ec;padding-top:6px">' +
         '<summary style="cursor:pointer;font-weight:600;color:#1E88E5">🧭 OPS 值班报告（每 2h 自动巡逻）</summary>' +
-        '<pre style="white-space:pre-wrap;font:12px/1.7 Consolas,monospace;color:#1a2332;margin:8px 0 0">' + esc(md) + '</pre>' +
+        '<div style="margin:8px 0 0">' + renderOncall(md) + '</div>' +
         '</details>';
     }
   } catch(e) {
