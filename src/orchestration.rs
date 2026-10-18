@@ -835,6 +835,10 @@ fn bootstrap_tool_score(name: &str, raw_message: &str) -> i32 {
     if query_intent && (n.contains("query") || n.contains("sql") || n.contains("get")) {
         score += 2;
     }
+    // 2026-10-18 平台化 P1：点名优先——消息里出现完整工具名时强制进 bootstrap 面。
+    if raw_message.to_ascii_lowercase().contains(&n) {
+        score += 1000;
+    }
     score
 }
 
