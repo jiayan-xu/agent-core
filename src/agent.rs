@@ -9703,6 +9703,10 @@ impl AgentCore {
                     text
                 }
             };
+            // P1 平台化审计：聊天工具调用统一落 AuditLogger（成功/失败都记，allowed=true 表示经授权后执行）
+            self.audit_logger
+                .log_tool_call(&self.config.identity.agent_id, &tc.name, &tc.arguments, true)
+                .await;
             {
                 let mut log = self.execution_log.lock().await;
                 log.push(ExecutionLog {
@@ -10216,6 +10220,11 @@ impl AgentCore {
                     text
                 }
             };
+
+            // P1 平台化审计：聊天工具调用统一落 AuditLogger（成功/失败都记，allowed=true 表示经授权后执行）
+            self.audit_logger
+                .log_tool_call(&self.config.identity.agent_id, &tc.name, &tc.arguments, true)
+                .await;
 
             // 记录执行日志（供蒸馏）
             {

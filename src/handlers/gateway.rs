@@ -360,6 +360,11 @@ pub(crate) async fn handle_tool_execute(
                 Some(result.clone()),
                 None,
             );
+            // P1 平台化审计：外部 MCP 客户端经网关的调用同样落 AuditLogger
+            agent
+                .audit_logger
+                .log_tool_call(&auth.agent_id, &body.tool, &body.arguments, true)
+                .await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -379,6 +384,11 @@ pub(crate) async fn handle_tool_execute(
                 None,
                 Some(e.clone()),
             );
+            // P1 平台化审计：失败调用同样留痕（allowed=true 表示经授权后执行）
+            agent
+                .audit_logger
+                .log_tool_call(&auth.agent_id, &body.tool, &body.arguments, true)
+                .await;
             (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(serde_json::json!({
