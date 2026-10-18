@@ -7920,6 +7920,13 @@ impl AgentCore {
         // 首轮 Easy 仍靠 has_write_intent 跳过 bootstrap（写工具进不了 bootstrap 面）；
         // 常驻覆盖 Hard / 写意图 / promote 之后。
         "download_nvr_videos",
+        // 2026-10-18 平台化 P1：hhv 远程测算能力（MCP 首条）常驻，
+        // 避免 Easy 首轮 12 工具面被既有诊断工具挤掉；默认 scope 只读，hhv_run 不下发。
+        "hhv_health",
+        "hhv_list_configs",
+        "hhv_list_jobs",
+        "hhv_job_status",
+        "hhv_get_result",
     ];
 
     fn prefetch_tokens(s: &str) -> Vec<String> {
@@ -8016,10 +8023,17 @@ impl AgentCore {
             return out;
         }
         let cap = cap.saturating_sub(always.len());
+        // 2026-10-18 平台化 P1：用户在消息里点名某个工具时，强制抬到候选集顶部，
+        // 避免新接入的平台能力（如 hhv_*）被 12 工具面裁掉。
+        let msg_lower = message.to_ascii_lowercase();
         let mut scored: Vec<(f64, ToolDef)> = rest
             .into_iter()
             .map(|t| {
-                let s = Self::score_tool_relevance(message, &t.function.name, &t.function.description);
+                let name_lower = t.function.name.to_ascii_lowercase();
+                let mut s = Self::score_tool_relevance(message, &t.function.name, &t.function.description);
+                if !name_lower.is_empty() && msg_lower.contains(&name_lower) {
+                    s += 1000.0;
+                }
                 (s, t)
             })
             .collect();
