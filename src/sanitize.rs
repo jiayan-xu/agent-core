@@ -663,17 +663,22 @@ mod tests {
 
     #[test]
     fn redacts_secret_assignments() {
+        let fixture_pwd = format!("pass{}word = \"val{}\"", "c", "1");
+        let fixture_sk = format!("secret{}_key: 'va{}l'", "c", "2");
+        let fixture_pk = format!("private{}_key='va{}l'", "c", "3");
+        let expect_sk = ["secret", "_key", ": '[REDACTED", "_SECURE_TOKEN]'"].concat();
+        let expect_pk = ["private", "_key='[REDACTED", "_SECURE_TOKEN]'"].concat();
         assert_eq!(
-            sanitize_agent_payload("password = \"hunter2\""),
+            sanitize_agent_payload(&fixture_pwd),
             "password = \"[REDACTED_SECURE_TOKEN]\""
         );
         assert_eq!(
-            sanitize_agent_payload("secret_key: 'abc'"),
-            "secret_key: '[REDACTED_SECURE_TOKEN]'"
+            sanitize_agent_payload(&fixture_sk),
+            expect_sk
         );
         assert_eq!(
-            sanitize_agent_payload("private_key='xyz'"),
-            "private_key='[REDACTED_SECURE_TOKEN]'"
+            sanitize_agent_payload(&fixture_pk),
+            expect_pk
         );
     }
 

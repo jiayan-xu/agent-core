@@ -12,4 +12,5 @@ pub mod gateway;
 pub mod identity;
 pub mod meetings;
 pub mod meetings_group;
+pub mod platform;
 pub mod system;

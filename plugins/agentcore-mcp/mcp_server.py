@@ -27,6 +27,7 @@
 """
 import json
 import os
+import pathlib
 import re
 import sys
 import urllib.error
@@ -145,16 +146,32 @@ def http_json(
     # POST/PUT body 必须带 Content-Type（public=True 时 headers 仅有 Accept，漏了会 415）
     if data is not None and "Content-Type" not in headers:
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    # curl 列表形参（Mimosa 基线，2026-10-19 统一整改）
+    import subprocess as _sp
+    import tempfile as _tf
+    cmd = ["curl", "-s", "-m", str(timeout_secs), "-X", method,
+           "-w", r"\n%{http_code}"]
+    for k, v in headers.items():
+        cmd += ["-H", f"{k}: {v}"]
+    tmp = None
+    if data is not None:
+        tmp = _tf.NamedTemporaryFile(suffix=".json", delete=False)
+        tmp.write(data)
+        tmp.close()
+        cmd += ["--data-binary", f"@{tmp.name}"]
+    cmd.append(url)
     try:
-        with urllib.request.urlopen(req, timeout=timeout_secs) as resp:
-            status = getattr(resp, "status", 200)
-            raw = resp.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        status = e.code
-        raw = e.read().decode("utf-8", "replace")
+        r = _sp.run(cmd, capture_output=True, timeout=timeout_secs + 5,
+                    creationflags=0x08000000)
+        lines = (r.stdout or b"").decode("utf-8", "replace").strip().rsplit("\n", 1)
+        status = int(lines[1]) if len(lines) == 2 and lines[1].isdigit() else 0
+        raw = lines[0] if lines else ""
     except Exception as e:  # noqa: BLE001
         raise ToolError("%s %s 请求失败: %s" % (method, path, e)) from e
+    finally:
+        if tmp:
+            import os as _os
+            _os.unlink(tmp.name)
 
     parsed = None
     if raw.strip():
@@ -232,20 +249,31 @@ def sse_events(
         # 长任务用「读超时」而非「总超时」：总超时会把长时间空闲的流按已超时杀掉。
         # 每行读取都复位计时，仅当读操作超过该秒数才判定超时（默认 300s，可用 env 调整）。
         read_timeout = int(os.environ.get("AGENTCORE_SSE_READ_TIMEOUT_SECS") or "300") or None
-        with urllib.request.urlopen(req, timeout=read_timeout) as resp:  # 长任务不设总超时
-            for raw in resp:
-                line = raw.decode("utf-8", "replace").rstrip("\r\n")
-                if line == "":
-                    flush()
-                elif line.startswith("event:"):
-                    event_name = line[len("event:"):].strip()
-                    event_seen = True
-                elif line.startswith("data:"):
-                    # RFC 8202 §3：data: 后仅一个空格是分隔符，多余空格属于 payload。
-                    # .lstrip(' ') 会误删所有前导空格，损坏缩进代码块/格式化 JSON 等有效数据。
-                    raw_data = line[len('data:'):]
-                    data_lines.append(raw_data[1:] if raw_data.startswith(' ') else raw_data)
-            flush()
+        # SSE 走 curl -N（no-buffer 流式，Mimosa 基线）
+        import subprocess as _sp
+        sse_cmd = ["curl", "-s", "-N", "-m", str(read_timeout or 3600)]
+        for k, v in (admin_headers() if admin else agent_headers()).items():
+            sse_cmd += ["-H", f"{k}: {v}"]
+        if data is not None:
+            sse_cmd += ["-H", "Content-Type: application/json"]
+        sse_cmd.append(url)
+        proc = _sp.Popen(sse_cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL,
+                         creationflags=0x08000000)
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            if line == "":
+                flush()
+            elif line.startswith("event:"):
+                event_name = line[len("event:"):].strip()
+                event_seen = True
+            elif line.startswith("data:"):
+                # RFC 8202 §3：data: 后仅一个空格是分隔符，多余空格属于 payload。
+                # .lstrip(' ') 会误删所有前导空格，损坏缩进代码块/格式化 JSON 等有效数据。
+                raw_data = line[len('data:'):]
+                data_lines.append(raw_data[1:] if raw_data.startswith(' ') else raw_data)
+        proc.stdout.close()
+        proc.wait()
+        flush()
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", "replace")
         raise ToolError("HTTP %s %s: %s" % (e.code, path, raw[:300])) from e
@@ -333,7 +361,7 @@ def _flush_mask_context(mctx):
     path = _mask_file()
     try:
         tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        with pathlib.Path(tmp).open("w", encoding="utf-8") as f:
             json.dump(mapping, f, ensure_ascii=False)
         os.replace(tmp, path)
     except Exception as e:
