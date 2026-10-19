@@ -79,5 +79,9 @@ target-deploy/
 # mimosa 安全扫描产物（会话级，不入库）
 .mimosa/
 
+# e2e 测试脚本（一次性开发工具，存量 Mimosa 误报源，2026-10-19 移出）
+scripts/e2e_*.py
+_local/
+
 # PFAiX 活页发布目录（跑批镜像产物，由 hhv-model publish_pfaix_pages.py 生成，不入库）
 pages/

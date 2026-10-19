@@ -21,6 +21,7 @@ use crate::handlers::evolve::*;
 use crate::handlers::identity::*;
 use crate::handlers::meetings::*;
 use crate::handlers::meetings_group::{handle_meeting_ask, handle_meeting_invite, handle_meetings_create};
+use crate::handlers::platform::*;
 use crate::handlers::system::*;
 use crate::state::AppState;
 
@@ -40,6 +41,11 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/approval/{id}/respond", post(handle_approval_respond))
         .route("/approval-console", get(handle_approval_console))
         .route("/api/ops/briefing", get(handle_ops_briefing))
+        // ── P3 平台治理（2026-10-19，从 dashboard 迁出 Phase 1 只读） ──
+        .route("/api/registry", get(handle_registry_list))
+        .route("/api/registry/{id}", get(handle_registry_entry))
+        .route("/api/platform/agent-card/{id}", get(handle_agent_card))
+        .route("/api/platform/sandbox-levels", get(handle_sandbox_levels))
         .route("/updates/pfaix/latest.json", get(handle_updates_latest))
         .route("/updates/pfaix/{file}", get(handle_updates_static))
         // /v1 别名：PFAiX 的 getAgentCoreBaseUrl() 返回带 /v1 的 base，
