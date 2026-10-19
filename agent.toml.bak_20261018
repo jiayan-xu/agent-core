@@ -1,0 +1,203 @@
+agent_id = "user"
+domain_mode = "solid_waste"
+org_company = "cs-pufa-2nd-thermal"
+api_key = ""
+server = "http://127.0.0.1:9003"
+port = 9753
+host = "0.0.0.0"
+cors_origins = []
+memoria_admin_key = ""
+personas = []
+
+[[mcp_source]]
+name = "dashboard"
+url = ""
+token = ""
+command = 'C:\Python314\python.exe'
+args = ['C:\Users\user\dashboard\dashboard_mcp_server.py']
+namespace = "org/cs-pufa-2nd-thermal/dept/engineering/proj/gufei"
+
+[[mcp_source]]
+name = "fsutil"
+url = ""
+token = ""
+command = 'C:\Python314\python.exe'
+args = ['C:\Users\user\office-tools\office_mcp_server.py']
+
+[[mcp_source]]
+name = "officecli"
+url = ""
+token = ""
+command = 'C:\Python314\python.exe'
+args = ['C:\Users\user\office-tools\officecli_mcp_bridge.py']
+
+[[mcp_source]]
+name = "skill-market"
+url = ""
+token = ""
+command = 'C:\Python314\python.exe'
+args = [
+    'C:\services\mcp-servers\skill-market-mcp\server.py',
+    "--agent-core",
+]
+
+[llm]
+base_url = "https://open.bigmodel.cn"
+model = "glm-5.3"
+api_key = "${ZHIP_API_KEY}"
+chat_path = "/api/paas/v4/chat/completions"
+max_tokens = 16384
+temperature = 0.0
+
+[[llm.fallbacks]]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-pro"
+api_key = "${AGENT_API_KEY}"
+chat_path = "/v1/chat/completions"
+
+[[llm.fallbacks]]
+base_url = "https://api.siliconflow.cn"
+model = "deepseek-ai/DeepSeek-V3"
+api_key = "${SILICONFLOW_API_KEY}"
+chat_path = "/v1/chat/completions"
+
+[llm.difficulty]
+classify = "heuristic"
+scorer = "heuristic"
+
+[meta_evolution]
+# LEGACY (D7/R1)：维护/进化决策已移交 dsh（经网关 agentcore_tool_execute 触发）。
+# 以下保留为被动触发（dsh 调用时才执行），不再主动调度。
+# R4 评审时决定是否删除。
+enabled = false
+window_days = 30
+min_samples = 20
+holdout_ratio = 0.2
+improve_threshold = 0.05
+max_rollback_rate = 0.15
+cooldown_hours = 24
+optimizer_model = "deepseek-v4-flash"
+
+[meta_evolution.budget]
+max_turns = 20
+max_tokens = 500000
+max_wall_clock_secs = 120
+max_continuations_per_window = 5
+continuation_window_secs = 3600
+gate_command = ""
+
+[safety]
+approval_mode = "human_in_loop"
+high_risk_tools = [
+    "delete_*",
+    "export_*",
+    "send_*",
+    "upload_*",
+    "webhook_*",
+]
+high_risk_change_types = [
+    "supersede",
+    "override",
+]
+
+[code_evolution]
+enabled = true
+target_path = "C:/Users/user/evo-sandbox/src/lib.rs"
+generations = 4
+circuit_failures = 3
+dry_run_default = true
+allow_commit = true
+evolve_key = "a1560c77ef40ce10e8326e078f142fbe"
+fn_name = "fib"
+
+[code_evolution.budget]
+max_turns = 8
+max_tokens = 200000
+max_wall_clock_secs = 300
+max_continuations_per_window = 0
+continuation_window_secs = 0
+gate_command = ""
+
+[features]
+skill_library = true
+lats = false        # R3 冻结（2026-08-23）
+multiagent = false  # R3 冻结
+ttc = false         # R3 冻结
+persona_auto_memory = true
+
+[lats]
+enabled = false
+max_depth = 3
+max_branches = 3
+daily_token_budget = 200000
+value_estimator = "heuristic"
+beam_width = 2
+
+[multiagent]
+enabled = false
+max_subagents = 4
+opt_in_token = "[compose]"
+task_whitelist = []
+subagent_timeout_secs = 120
+
+[ttc]
+enabled = false     # R3 冻结
+best_of_n = 3
+scorer = "majority"
+sample_temperature = 0.7
+token_budget = 8000
+verifier_enabled = true
+max_refine_rounds = 2
+verifier_threshold = 7.0
+
+[intake_filter]
+enabled = true
+test_ns_isolation = true
+a2a_receipt_drop = true
+dialog_substance = true
+min_substance_len = 12
+quarantine_ns = ""
+
+[orchestration.bootstrap]
+enabled = true
+max_tokens = 1024
+max_tools = 3
+
+[orchestration.plan_reflect]
+enabled = false
+max_reflect_rounds = 2
+
+[orchestration.tool_summary]
+enabled = false
+threshold_chars = 8192
+start_round = 4
+max_per_round = 2
+
+[orchestration.read_parallel]
+enabled = false
+max_concurrent = 4
+
+# ── 分级审批（2026-09-03，ADR-016 修订）──
+# mode: human_all=全部人工（现状，零行为变化）| llm_auto=可逆写操作经 LLM judge 自动批准
+# 硬人工名单（删除/大范围同步/关停/导出/身份变更，见 gateway_approval.rs）永远人工，不受 auto_tools 影响
+# judge 失败/超时/每日配额满 → fail-safe 转人工
+[gateway_approval]
+mode = "llm_auto"
+daily_quota = 50
+judge_timeout_ms = 8000
+auto_tools = [
+  "manage_whitelist",
+  "fill_excel_log",
+  "generate_month_log",
+  "manage_holiday",
+  "organize_folders",
+  "archive_operate",
+  "manage_samples",
+]
+
+# 审批 judge 专用：deepseek-v4-flash（快、判定质量好、同 DeepSeek key）
+[gateway_approval.judge]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key = "${AGENT_API_KEY}"
+chat_path = "/v1/chat/completions"
