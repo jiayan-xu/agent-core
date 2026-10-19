@@ -41,11 +41,16 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/approval/{id}/respond", post(handle_approval_respond))
         .route("/approval-console", get(handle_approval_console))
         .route("/api/ops/briefing", get(handle_ops_briefing))
-        // ── P3 平台治理（2026-10-19，从 dashboard 迁出 Phase 1 只读） ──
+        // ── P3 平台治理（2026-10-19，从 dashboard 迁出） ──
         .route("/api/registry", get(handle_registry_list))
         .route("/api/registry/{id}", get(handle_registry_entry))
         .route("/api/platform/agent-card/{id}", get(handle_agent_card))
+        .route("/api/platform/agent-card/{id}/mint", post(handle_mint_card))
         .route("/api/platform/sandbox-levels", get(handle_sandbox_levels))
+        .route("/api/platform/sandbox/{id}/{level}", post(handle_set_sandbox))
+        .route("/api/platform/approve/{id}", post(handle_approve))
+        .route("/api/platform/revoke/{id}", post(handle_revoke))
+        .route("/api/platform/audit", get(handle_audit_log))
         .route("/updates/pfaix/latest.json", get(handle_updates_latest))
         .route("/updates/pfaix/{file}", get(handle_updates_static))
         // /v1 别名：PFAiX 的 getAgentCoreBaseUrl() 返回带 /v1 的 base，
