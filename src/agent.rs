@@ -7920,6 +7920,9 @@ impl AgentCore {
         // 首轮 Easy 仍靠 has_write_intent 跳过 bootstrap（写工具进不了 bootstrap 面）；
         // 常驻覆盖 Hard / 写意图 / promote 之后。
         "download_nvr_videos",
+        // 2026-10-20 P3：NVR 控制（录制/云台/预置点）平台化后常驻，
+        // 避免 Easy 首轮工具面只留 download_nvr_videos/system_ops。
+        "nvr_control",
         // 2026-10-18 平台化 P1：hhv 远程测算能力（MCP 首条）常驻，
         // 避免 Easy 首轮 12 工具面被既有诊断工具挤掉；默认 scope 只读，hhv_run 不下发。
         "hhv_health",
