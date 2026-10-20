@@ -78,6 +78,7 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
             get(handle_admin_quota_get).put(handle_admin_quota_put),
         )
         .route("/api/admin/audit", get(handle_admin_audit))
+        .route("/api/admin/audit/event", post(handle_admin_audit_event))
         .route(
             "/api/admin/harness/activate",
             post(handle_admin_harness_activate),

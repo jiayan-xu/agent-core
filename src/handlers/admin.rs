@@ -511,6 +511,61 @@ pub(crate) async fn handle_admin_audit(
     }
 }
 
+/// P3：外部平台项目写操作审计入口（dashboard/NVR/data-pipeline 经 admin 凭证上报）。
+#[derive(Deserialize)]
+pub(crate) struct ExternalAuditEvent {
+    detail: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    trace_id: Option<String>,
+    #[serde(default)]
+    event_type: Option<String>,
+}
+
+pub(crate) async fn handle_admin_audit_event(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(body): axum::Json<ExternalAuditEvent>,
+) -> axum::response::Response {
+    if !is_admin(&headers, &st).await {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "需要 admin 权限"})),
+        )
+            .into_response();
+    }
+    let agent_id = headers
+        .get("x-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("external-project")
+        .to_string();
+    let event_type = body
+        .event_type
+        .as_deref()
+        .and_then(agent_core::audit::AuditEventType::from_str)
+        .unwrap_or(agent_core::audit::AuditEventType::ToolInvocation);
+    let event = agent_core::audit::AuditEvent {
+        ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        trace_id: body.trace_id.unwrap_or_else(agent_core::audit::new_trace_id),
+        agent_id,
+        session_id: body.session_id,
+        event_type,
+        detail: body.detail,
+    };
+    let guard = st.agent.lock().await;
+    if let Some(ref agent) = *guard {
+        agent.audit_logger.record_event(event).await;
+        Json(serde_json::json!({"status": "recorded"})).into_response()
+    } else {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "agent 尚未就绪"})),
+        )
+            .into_response()
+    }
+}
+
 /// P2-3：批准并激活待审批的 Harness 模板（含危险工具的蒸馏模板须经此人工 / admin 批准）
 #[derive(serde::Deserialize)]
 pub(crate) struct HarnessActivate {
