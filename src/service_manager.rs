@@ -62,6 +62,9 @@ fn default_stop_timeout() -> u64 {
 fn default_restart_policy() -> String {
     "on-failure".to_string()
 }
+fn default_true() -> bool {
+    true
+}
 
 /// 单个被管服务的配置（`[[services]]` 表）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +111,14 @@ pub struct ServiceConfig {
     /// 优雅停机接口（POST）。空串则直接 TerminateProcess。
     #[serde(default)]
     pub stop_path: String,
+    /// 端口仍被占用时，是否按端口找 PID 强杀（默认 true）。
+    ///
+    /// 必要性：迁移前启动的实例、跨代遗留实例都没有本模块的 `Child` 句柄，
+    /// 不按端口杀就永远停不掉 → `restart` 会退化成「假成功」。
+    /// agent-core 以 LocalSystem 运行，权限足以终止托盘/普通令牌杀不掉的外部实例。
+    /// 保守场景可置 false（此时 stop 只会等待端口自然释放）。
+    #[serde(default = "default_true")]
+    pub kill_by_port: bool,
     /// 本服务专属环境变量。
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -376,23 +387,80 @@ impl ServiceManager {
             }
         }
 
-        // 3) 端口兜底：跨代/外部启动的进程本模块没有句柄，只能等它自己退；
-        //    这里不做「按端口杀任意进程」——误杀代价太高（可能杀掉占同端口的别的东西）。
+        // 3) 端口兜底：本模块没有句柄的实例（跨代/外部/迁移前的老进程）只能等；
+        //    等不到就按端口找 PID 强杀。**这一步需要权限**——agent-core 以 LocalSystem
+        //    运行，能杀掉托盘/普通令牌杀不掉的外部实例（这正是迁移后 restart 假成功
+        //    的根因：老实例无句柄 → stop 杀不掉 → start 发现端口在听 → 报「已在运行」）。
+        //    这些端口都是专用服务端口，误杀风险可控；可用 kill_by_port=false 关闭。
         for _ in 0..(c.stop_timeout_sec * 2) {
             if !self.port_open(c.port) {
                 return Ok(format!("{} 已停止（终止 {killed} 个进程）", c.name));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+        if c.kill_by_port {
+            if let Some(pid) = Self::find_pid_by_port(c.port) {
+                let _ = Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                tracing::warn!(
+                    target: "agent.services",
+                    "服务 {} 无句柄，已按端口 {} 强杀 PID={}",
+                    c.name, c.port, pid
+                );
+                for _ in 0..10 {
+                    if !self.port_open(c.port) {
+                        return Ok(format!("{} 已停止（按端口强杀 PID={pid}）", c.name));
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            }
+        }
         Err(format!(
-            "{} 端口 {} 仍被占用（可能由外部进程监听，未强杀）",
-            c.name, c.port
+            "{} 端口 {} 仍被占用（kill_by_port={}，未能终止监听者）",
+            c.name, c.port, c.kill_by_port
         ))
     }
 
+    /// 解析 `netstat -ano` 找监听指定端口的 PID。
+    ///
+    /// 不用 `GetExtendedTcpTable`（要更多 FFI 与 unsafe），netstat 足够且可读性好。
+    fn find_pid_by_port(port: u16) -> Option<u32> {
+        let out = Command::new("netstat").args(["-ano"]).output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let needle = format!(":{port}");
+        for line in text.lines() {
+            if !line.contains("LISTENING") {
+                continue;
+            }
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 4 {
+                continue;
+            }
+            // 本地地址列形如 0.0.0.0:8080 / [::]:8080 / 127.0.0.1:9753
+            let local = cols[1];
+            if !local.ends_with(&needle) {
+                continue;
+            }
+            if let Ok(pid) = cols[cols.len() - 1].parse::<u32>() {
+                return Some(pid);
+            }
+        }
+        None
+    }
+
     /// 重启。
+    ///
+    /// 注意：**stop 失败必须直接返回错误**。早期版本写成 `let _ = self.stop(...)`
+    /// 忽略失败，导致「老实例无句柄、杀不掉 → 端口还在 → start 探测到就在跑 →
+    /// 返回『已在运行』」的**假成功**（2026-10-22 实测：调 ox restart 返回 ok=true
+    /// 但其实什么都没重启）。这种假成功比报错更糟，因为它会让人以为操作生效了。
     pub async fn restart(&self, key: &str) -> Result<String, String> {
-        let _ = self.stop(key).await;
+        if let Err(e) = self.stop(key).await {
+            return Err(format!("重启中止（停止阶段失败）: {e}"));
+        }
         self.start(key).await
     }
 
@@ -503,6 +571,7 @@ mod tests {
             stop_timeout_sec: 1,
             restart: "off".into(),
             stop_path: String::new(),
+            kill_by_port: true,
             env: HashMap::new(),
         }
     }
