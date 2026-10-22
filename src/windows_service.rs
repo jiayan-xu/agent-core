@@ -120,10 +120,32 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     STATUS_HANDLE.store(h as isize, Ordering::SeqCst);
     set_status(SERVICE_START_PENDING, 0, 30_000);
 
-    // ★ 关键：SCM 的 cwd 是 System32，必须切到 exe 目录才能找到 agent.toml
+    // ★★ 关键：定位 agent.toml，不能只按 exe 目录。
+    //
+    // 两个事实叠加会出大事：SCM 启动服务的 cwd 是 C:\Windows\System32；而本项目的
+    // exe 位于 `<repo>/target/release/`，agent.toml 却在 `<repo>/`（上一层）。
+    // 若只 set_current_dir(exe.parent())，`config_path()` 会去 target/release 找
+    // agent.toml，找不到就**凭空创建一份默认配置**——实测（2026-10-22）服务起来后
+    // `/api/services` 返回 enabled=false，生产配置里的 [[services]] / llm /
+    // mcp_source / personas **全部丢失**，却因为环境变量仍注入而看起来「健康」，
+    // 属于极难察觉的降级。
+    //
+    // 故：从 exe 目录向上最多 4 级，找到含 agent.toml 的目录就切过去。
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let _ = std::env::set_current_dir(dir);
+        let mut cur = exe.parent().map(|p| p.to_path_buf());
+        let mut hops = 0;
+        while let Some(dir) = cur {
+            if dir.join("agent.toml").exists() {
+                let _ = std::env::set_current_dir(&dir);
+                emit!("agent.toml 定位成功: {}", dir.display());
+                break;
+            }
+            hops += 1;
+            if hops >= 4 {
+                emit!("! 向上 {hops} 级仍未找到 agent.toml，将使用默认配置（功能会降级）");
+                break;
+            }
+            cur = dir.parent().map(|p| p.to_path_buf());
         }
     }
 
