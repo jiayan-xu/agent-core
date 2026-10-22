@@ -1,6 +1,6 @@
 [package]
 name = "agent_core"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 
 [features]
@@ -37,3 +37,8 @@ open = "5"
 wry = "0.49"
 tao = "0.31"
 image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+
+# Windows 服务支持（P2 阶段3）：用 SCM 托管 agent-core，不再依赖 GUI 托盘拉起。
+# 直接从本地 registry 缓存取（离线可用），未引入新 crates 之外的传递依赖。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Services"] }

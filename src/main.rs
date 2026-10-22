@@ -34,6 +34,7 @@ mod config;
 mod handlers;
 mod routes;
 mod state;
+mod windows_service; // P2 阶段3：SCM 托管（install/uninstall/dispatcher）
 
 use bootstrap::*;
 use config::*;
@@ -43,6 +44,34 @@ fn main() {
     // --service 与默认等价（兼容托盘与旧启动脚本）。
     init_tracing();
     let args: Vec<String> = std::env::args().collect();
+
+    // ── Windows 服务管理（P2 阶段3，需管理员）──
+    // 装成 SCM 服务后由系统负责开机自启与崩溃重启，不再依赖 GUI 托盘拉起——
+    // 这是「编排层自身不能是单点」的前提。
+    if args.iter().any(|a| a == "--install-service") {
+        match windows_service::install() {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("✗ 安装失败: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.iter().any(|a| a == "--uninstall-service") {
+        match windows_service::uninstall() {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("✗ 卸载失败: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    // 由 SCM 拉起时，dispatcher 阻塞到服务停止后返回 true → 本进程使命结束；
+    // 普通命令行下立即返回 false（错误 1063），继续走原有启动流程，行为不变。
+    if windows_service::try_run_as_service() {
+        return;
+    }
+
     let want_gui = args.iter().any(|a| a == "--gui" || a == "--desktop");
     let is_service = !want_gui; // 默认 / --service → 无窗
 

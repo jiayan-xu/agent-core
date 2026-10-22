@@ -479,7 +479,21 @@ pub(crate) fn spawn_server(
             spawn_meeting_channel_sweeper(state.clone());
             spawn_meeting_presence_sweeper(state.clone());
 
-            if let Err(e) = axum::serve(listener, app).await {
+            // 服务方式运行时，SCM 发 STOP 会置 stop_requested()；带上它做优雅关停，
+            // 让在途请求收尾再退出（否则 ServiceMain 返回时线程被硬切）。
+            // 命令行方式下 stop_requested() 恒为 false，行为与之前完全一致。
+            let shutdown = async {
+                loop {
+                    if crate::windows_service::stop_requested() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+            };
+            if let Err(e) = axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await
+            {
                 tracing::error!("HTTP 服务异常终止: {}", e);
             }
         });
