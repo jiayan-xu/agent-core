@@ -40,6 +40,18 @@ const DETACHED_PROCESS: u32 = 0x0000_0008;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// 脱离父进程所在的 Job Object。
+///
+/// **这是「agent-core 重启，被管服务继续跑」这条承诺的技术前提**。
+/// 实测教训（2026-10-22）：仅用 DETACHED_PROCESS 时，若 agent-core 自身处在某个
+/// Job 里（CodeBuddy/托盘/服务包装器创建的都可能），子进程会**默认继承同一个 Job**，
+/// 那么父进程被 kill 时 Job 关闭 → 被管服务被一起收走。
+/// 当天 emb(:8778) 就这样被带走了两次，进而拖慢 memoria /health 触发上层误判。
+///
+/// 注意：若 Job 未设 `JOB_OBJECT_LIMIT_BREAKAWAY_OK`，带此标志会 CreateProcess 失败
+/// （拒绝访问），故调用处必须能回退到不带该标志。
+#[cfg(windows)]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
 fn default_expect() -> u16 {
     200
@@ -208,11 +220,50 @@ impl ServiceManager {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         #[cfg(windows)]
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        {
+            // 先尝试脱离父 Job（保证 agent-core 重启不带走被管服务）；
+            // 若当前 Job 未允许 BREAKAWAY，CreateProcess 会失败，下面回退重试。
+            cmd.creation_flags(
+                DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+                    | CREATE_BREAKAWAY_FROM_JOB,
+            );
+        }
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("启动 {} 失败: {e}", c.name))?;
+        let child = match cmd.spawn() {
+            Ok(ch) => ch,
+            Err(first_err) => {
+                #[cfg(windows)]
+                {
+                    tracing::warn!(
+                        target: "agent.services",
+                        "启动 {} 时无法脱离父 Job（{}），回退为普通脱离模式——\
+                         若 agent-core 被强杀，该服务可能被一起收走",
+                        c.name, first_err
+                    );
+                    // 回退：重建命令（Command 不能复用），去掉 BREAKAWAY
+                    let mut c2 = Command::new(&c.exe);
+                    c2.args(&c.args);
+                    if !c.cwd.is_empty() {
+                        c2.current_dir(&c.cwd);
+                    }
+                    for (k, v) in &c.env {
+                        c2.env(k, v);
+                    }
+                    c2.stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null());
+                    c2.creation_flags(
+                        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                    );
+                    c2.spawn()
+                        .map_err(|e| format!("启动 {} 失败: {e}", c.name))?
+                }
+                #[cfg(not(windows))]
+                {
+                    return Err(format!("启动 {} 失败: {first_err}", c.name));
+                }
+            }
+        };
         let pid = child.id();
 
         {

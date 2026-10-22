@@ -170,9 +170,12 @@ pub(crate) async fn handle_health(State(st): State<Arc<AppState>>) -> Json<serde
         let cfg = st.config.lock().await;
         cfg.server.clone()
     };
+    // 超时 5s（原 2s）：memoria 的 /health 内含 embed 探活，embed 异常时它自身会
+    // 等约 2s 才返回，2s 的超时会把「memoria 慢」误判成「memoria 不可达」，
+    // 进而让整体 status=fail（2026-10-22 实测踩到）。
     let memoria_health = reqwest::Client::new()
         .get(format!("{}/health", memoria_url.trim_end_matches('/')))
-        .timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
         .send()
         .await
         .ok();
