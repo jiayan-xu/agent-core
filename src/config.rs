@@ -92,6 +92,10 @@ pub(crate) struct Config {
     /// 分级审批（落 [gateway_approval]，缺省 human_all=现状全人工）
     #[serde(default)]
     pub(crate) gateway_approval: Option<agent_core::gateway_approval::GatewayApprovalConfig>,
+    /// P2 服务编排（落 `[[services]]` 表）。缺省空表 = 不接管任何服务，零行为变化。
+    /// 该表放在 agent.toml 里（已 gitignore），可写本机绝对路径与端口。
+    #[serde(default)]
+    pub(crate) services: Vec<agent_core::service_manager::ServiceConfig>,
 }
 
 /// 工具分类手动收紧配置（[boundary]）。
@@ -406,6 +410,181 @@ pub(crate) fn expand_config_llm_env(cfg: &mut Config) {
 /// P1-4：运行时解析——克隆后展开全部 ${ENV} 占位符（顶层 + mcp_source + 三处 LlmConfig）+ 环境变量覆盖。
 /// 关键：只作用于克隆体，绝不修改存储态 config；从而 save_config 序列化的是带占位的原始配置，不泄漏明文密钥。
 /// 单一展开入口仍为 `expand_config_llm_env` + `expand_env`，未引入第二套展开逻辑。
+#[derive(Debug, Deserialize)]
+struct RegistryFile {
+    #[serde(default)]
+    entries: Vec<RegistryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryEntry {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    endpoints: Option<RegistryEndpoints>,
+    #[serde(default)]
+    lifecycle: Option<RegistryLifecycle>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryEndpoints {
+    #[serde(default)]
+    mcp: Option<RegistryMcpEndpoint>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryMcpEndpoint {
+    #[serde(default)]
+    transport: String,
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryLifecycle {
+    #[serde(default)]
+    status: Option<String>,
+}
+
+fn registry_status_active(status: &Option<String>) -> bool {
+    !matches!(
+        status.as_deref().unwrap_or("").trim().to_ascii_lowercase().as_str(),
+        "retired" | "disabled" | "archived" | "deleted"
+    )
+}
+
+/// MCP source 去重键：stdio 取首个脚本参数（如 dashboard_mcp_server.py），
+/// 无脚本时取 command；HTTP 取 url。仅做字符串归一用于去重，不用于文件访问。
+fn mcp_source_dedup_key(command: &str, args: &[String], url: &str) -> String {
+    fn norm(value: &str) -> String {
+        value
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_ascii_lowercase()
+            .split(['/', '\\'])
+            .collect::<Vec<_>>()
+            .join("\\")
+    }
+    let script = args.iter().find(|a| {
+        let l = a.to_ascii_lowercase();
+        l.ends_with(".py") || l.ends_with(".exe") || l.ends_with(".cmd") || l.ends_with(".bat")
+    });
+    if let Some(s) = script {
+        return format!("script:{}", norm(s));
+    }
+    if !command.trim().is_empty() {
+        return format!("command:{}", norm(command));
+    }
+    format!("url:{}", norm(url))
+}
+
+/// P3：把平台注册表 `type=mcp` 条目合并进运行时 MCP source 列表。
+/// 注册表条目按去重键/名称压过 agent.toml 的同名同源静态配置（agent.toml 保留
+/// 作为注册表缺失时的回退，不回写、不落盘）。返回合并条数供启动日志观测。
+fn merge_registry_mcp_sources_into(sources: &mut Vec<McpSourceConfig>, registry_text: &str) -> usize {
+    let registry: RegistryFile = match serde_json::from_str(registry_text) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(target: "agent.config", "PFAiX registry parse failed, keep agent.toml sources: {e}");
+            return 0;
+        }
+    };
+
+    let mut merged: Vec<McpSourceConfig> = Vec::new();
+    let mut seen_keys: std::collections::HashSet<String> = Default::default();
+    let mut seen_names: std::collections::HashSet<String> = Default::default();
+    for entry in registry.entries {
+        if entry.kind != "mcp" || !registry_status_active(&entry.lifecycle.and_then(|l| l.status)) {
+            continue;
+        }
+        let Some(mcp) = entry.endpoints.and_then(|e| e.mcp) else {
+            continue;
+        };
+        let transport = mcp.transport.trim().to_ascii_lowercase();
+        let src = match transport.as_str() {
+            "stdio" if !mcp.command.trim().is_empty() => McpSourceConfig {
+                name: entry.id.clone(),
+                url: String::new(),
+                token: mcp.token.clone(),
+                command: mcp.command.clone(),
+                args: mcp.args.clone(),
+                namespace: mcp.namespace.clone(),
+            },
+            "http" | "sse" if !mcp.url.trim().is_empty() => McpSourceConfig {
+                name: entry.id.clone(),
+                url: mcp.url.clone(),
+                token: mcp.token.clone(),
+                command: String::new(),
+                args: Vec::new(),
+                namespace: mcp.namespace.clone(),
+            },
+            _ => continue,
+        };
+        let key = mcp_source_dedup_key(&src.command, &src.args, &src.url);
+        if seen_keys.contains(&key) || seen_names.contains(&src.name) {
+            tracing::warn!(target: "agent.config", "PFAiX registry duplicate mcp entry skipped: {}", src.name);
+            continue;
+        }
+        seen_keys.insert(key);
+        seen_names.insert(src.name.clone());
+        merged.push(src);
+    }
+
+    let registry_keys: std::collections::HashSet<String> = merged
+        .iter()
+        .map(|s| mcp_source_dedup_key(&s.command, &s.args, &s.url))
+        .collect();
+    let registry_names: std::collections::HashSet<String> =
+        merged.iter().map(|s| s.name.to_ascii_lowercase()).collect();
+    sources.retain(|s| {
+        let key = mcp_source_dedup_key(&s.command, &s.args, &s.url);
+        !registry_keys.contains(&key) && !registry_names.contains(&s.name.to_ascii_lowercase())
+    });
+    let count = merged.len();
+    sources.extend(merged);
+    count
+}
+
+/// 注册表只读路径固定在用户 profile 下的 pfaix-platform 目录，且拒绝包含
+/// 上跳分量，避免把配置读取指到允许目录之外的文件。
+fn registry_file_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("USERPROFILE").ok()?;
+    if home.trim().is_empty() || home.contains("..") {
+        return None;
+    }
+    let base = std::path::Path::new(&home).join("pfaix-platform");
+    let path = base.join("apps.json");
+    let normalized = std::fs::canonicalize(&path).ok()?;
+    let normalized_base = std::fs::canonicalize(&base).ok()?;
+    if normalized.parent() != Some(normalized_base.as_path()) {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn merge_registry_mcp_sources(cfg: &mut Config) -> usize {
+    let Some(path) = registry_file_path() else {
+        tracing::warn!(target: "agent.config", "PFAiX registry path unavailable, keep agent.toml sources");
+        return 0;
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => merge_registry_mcp_sources_into(&mut cfg.mcp_source, &text),
+        Err(e) => {
+            tracing::warn!(target: "agent.config", "PFAiX registry unavailable ({}: {e}), keep agent.toml sources", path.display());
+            0
+        }
+    }
+}
+
 pub(crate) fn resolve_config_for_runtime(cfg: &Config) -> Config {
     let mut r = cfg.clone();
     // 顶层字段
@@ -420,6 +599,20 @@ pub(crate) fn resolve_config_for_runtime(cfg: &Config) -> Config {
         if let Some(ns) = src.namespace.as_mut() {
             *ns = expand_env(ns);
         }
+    }
+    // P3：项目 MCP source 以平台注册表为权威；agent.toml 仅保留内置/回退源。
+    // 测试二进制默认关闭（避免单测意外挂真实项目进程），可用 PFAIX_REGISTRY_MCP=1 显式开启。
+    let registry_enabled = !cfg!(test)
+        && std::env::var("PFAIX_REGISTRY_MCP")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+    let merged = if registry_enabled {
+        merge_registry_mcp_sources(&mut r)
+    } else {
+        0
+    };
+    if merged > 0 {
+        tracing::info!(target: "agent.config", "PFAiX registry merged {merged} mcp source(s) at runtime");
     }
     // 统一展开所有 LlmConfig（全局池 + 分身池 + code_evolution 池）——单一入口
     expand_config_llm_env(&mut r);
@@ -516,6 +709,7 @@ pub(crate) fn load_or_create_config() -> Config {
         orchestration: None,
         boundary: None,
         gateway_approval: None,
+        services: Vec::new(),
     };
     init_domain_and_org(&cfg);
     let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());
@@ -594,6 +788,62 @@ mod env_expand_tests {
             "pre/abc/mid/abc/post"
         );
         std::env::remove_var("HY3_EV_MIX");
+    }
+}
+
+#[cfg(test)]
+mod registry_mcp_tests {
+    use super::*;
+
+    fn static_src(name: &str, command: &str, args: &[&str]) -> McpSourceConfig {
+        McpSourceConfig {
+            name: name.to_string(),
+            url: String::new(),
+            token: String::new(),
+            command: command.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            namespace: None,
+        }
+    }
+
+    #[test]
+    fn registry_sources_override_duplicates_and_add_projects() {
+        let mut sources = vec![
+            static_src("dashboard", "C:/Python314/python.exe", &["C:\\Users\\user\\dashboard\\dashboard_mcp_server.py"]),
+            static_src("fsutil", "C:/Python314/python.exe", &["C:\\Users\\user\\office-tools\\office_mcp_server.py"]),
+        ];
+        let registry = r#"{
+          "entries": [
+            {"id":"solid-waste","type":"mcp","endpoints":{"mcp":{"transport":"stdio","command":"C:/Python314/python.exe","args":["C:/Users/user/dashboard/dashboard_mcp_server.py"],"namespace":"org/test"}}},
+            {"id":"data-pipeline","type":"mcp","endpoints":{"mcp":{"transport":"stdio","command":"C:/Python314/python.exe","args":["C:/Users/user/hhv-model/scripts/pipeline_mcp.py"]}}}
+          ]
+        }"#;
+        let merged = merge_registry_mcp_sources_into(&mut sources, registry);
+        assert_eq!(merged, 2);
+        let names: Vec<&str> = sources.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"dashboard"), "注册表 solid-waste 应压过 agent.toml 的同源 dashboard");
+        assert!(names.contains(&"fsutil"), "内置源不应被注册表误删");
+        assert!(names.contains(&"solid-waste"));
+        assert!(names.contains(&"data-pipeline"));
+        assert_eq!(
+            sources.iter().find(|s| s.name == "solid-waste").and_then(|s| s.namespace.as_deref()),
+            Some("org/test")
+        );
+    }
+
+    #[test]
+    fn registry_retired_and_non_mcp_entries_are_ignored() {
+        let mut sources = vec![static_src("fsutil", "C:/Python314/python.exe", &["office.py"])];
+        let registry = r#"{
+          "entries": [
+            {"id":"retired-project","type":"mcp","lifecycle":{"status":"retired"},"endpoints":{"mcp":{"transport":"stdio","command":"x.exe"}}},
+            {"id":"some-app","type":"app"}
+          ]
+        }"#;
+        let merged = merge_registry_mcp_sources_into(&mut sources, registry);
+        assert_eq!(merged, 0);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "fsutil");
     }
 }
 

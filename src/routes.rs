@@ -22,6 +22,7 @@ use crate::handlers::identity::*;
 use crate::handlers::meetings::*;
 use crate::handlers::meetings_group::{handle_meeting_ask, handle_meeting_invite, handle_meetings_create};
 use crate::handlers::platform::*;
+use crate::handlers::services::*;
 use crate::handlers::system::*;
 use crate::state::AppState;
 
@@ -59,7 +60,10 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/v1/updates/pfaix/latest.json", get(handle_updates_latest))
         .route("/v1/updates/pfaix/{file}", get(handle_updates_static))
         // 活页通道：跑批侧镜像的数据页（wte/model/screen + hhv-data），壳端活页优先内嵌兜底
-        .route("/pages/{*file}", get(handle_pages_static));
+        .route("/pages/{*file}", get(handle_pages_static))
+        // ── P2 服务编排（2026-10-22）：只读状态公开，托盘/看板无需凭据即可渲染 ──
+        // 只暴露 key/name/port/running/uptime；pid/错误详情走 /api/services/detail（受保护）。
+        .route("/api/services", get(handle_services_public));
 
     let protected = Router::new()
         .route("/api/chat", post(handle_chat))
@@ -73,11 +77,17 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/admin/degrade", get(handle_admin_degrade))
         .route("/api/admin/killswitch", post(handle_admin_killswitch))
         .route("/api/metrics", get(handle_metrics))
+        .route("/api/services/detail", get(handle_services_list))
+        .route("/api/services/tick", post(handle_services_tick))
+        .route("/api/services/{key}/start", post(handle_service_start))
+        .route("/api/services/{key}/stop", post(handle_service_stop))
+        .route("/api/services/{key}/restart", post(handle_service_restart))
         .route(
             "/api/admin/quota",
             get(handle_admin_quota_get).put(handle_admin_quota_put),
         )
         .route("/api/admin/audit", get(handle_admin_audit))
+        .route("/api/admin/audit/event", post(handle_admin_audit_event))
         .route(
             "/api/admin/harness/activate",
             post(handle_admin_harness_activate),

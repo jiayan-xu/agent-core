@@ -33,8 +33,14 @@ jobs:
             --source . \
             --config .gitleaks.toml \
             --no-banner \
-            --redact || {
+            --verbose \
+            --redact \
+            --report-path /tmp/gitleaks/report.json \
+            --report-format json || {
               echo "::error::gitleaks 检测到疑似密钥泄露，请检查（allowlist 见 .gitleaks.toml）"
+              echo "::group::findings (secrets redacted)"
+              cat /tmp/gitleaks/report.json || true
+              echo "::endgroup::"
               exit 1
             }
 

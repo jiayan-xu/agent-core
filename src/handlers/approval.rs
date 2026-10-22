@@ -39,8 +39,9 @@ pub(crate) async fn handle_approval_console() -> Html<String> {
     }
 }
 
-/// R2 运维简报代理：dashboard /healthz + OPS 值班报告（oncall/latest.md，经 dashboard 静态口
-/// /hhv-data/oncall/ 读取，2026-10-10 从会议出口迁入）。值班报告拉取失败不阻断简报（oncall_md 置空）。
+/// R2 运维简报代理：dashboard /healthz + OPS 值班报告（oncall/latest.md，经 agent-core
+/// 活页 /pages/hhv-data/oncall/ 读取，P4 后 dashboard 不再直挂模型输出）。值班报告拉取失败
+/// 不阻断简报（oncall_md 置空）。
 pub(crate) async fn handle_ops_briefing() -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
     let client = reqwest::Client::new();
     let healthz_fut = client
@@ -48,7 +49,7 @@ pub(crate) async fn handle_ops_briefing() -> Result<Json<serde_json::Value>, (ax
         .timeout(std::time::Duration::from_secs(5))
         .send();
     let oncall_fut = client
-        .get("http://127.0.0.1:8000/hhv-data/oncall/latest.md")
+        .get("http://127.0.0.1:9753/pages/hhv-data/oncall/latest.md")
         .timeout(std::time::Duration::from_secs(5))
         .send();
     let (resp, oncall) = tokio::join!(healthz_fut, oncall_fut);
