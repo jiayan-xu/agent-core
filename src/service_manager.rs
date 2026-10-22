@@ -81,8 +81,16 @@ pub struct ServiceConfig {
     /// 健康路径返回 404 时回退为「端口在听即正常」（nvr 旧构建场景）。
     #[serde(default)]
     pub fallback_port: bool,
-    /// 可执行文件绝对路径。
+    /// 可执行文件绝对路径（`task_name` 非空时可留空）。
+    #[serde(default)]
     pub exe: String,
+    /// 计划任务名（非空 = 该服务由 Windows 计划任务驱动，用 `schtasks` 启停）。
+    ///
+    /// 为什么需要两种类型：本机 `a2a`(A2A Bridge) 历史上是 `svc-a2a-bridge` 计划任务
+    /// 拉起的，没有可直接 spawn 的 exe 路径。硬塞进 process 模型会起不来。
+    /// 注意 `schtasks /end` 只结束任务、**不保证杀掉已运行进程**，故 stop 仍保留端口兜底。
+    #[serde(default)]
+    pub task_name: String,
     #[serde(default)]
     pub args: Vec<String>,
     /// 工作目录。
@@ -204,8 +212,38 @@ impl ServiceManager {
         if self.probe(c).await {
             return Ok(format!("{} 已在运行（端口 {}）", c.name, c.port));
         }
+
+        // ── 计划任务型：用 schtasks /run 拉起 ──
+        if !c.task_name.is_empty() {
+            let out = Command::new("schtasks")
+                .args(["/run", "/tn", &c.task_name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|e| format!("schtasks /run {} 失败: {e}", c.task_name))?;
+            if !out.success() {
+                return Err(format!(
+                    "schtasks /run {} 返回非零（任务不存在或无权限？）",
+                    c.task_name
+                ));
+            }
+            for _ in 0..40 {
+                if self.probe(c).await {
+                    return Ok(format!("{} 已启动（计划任务 {}）", c.name, c.task_name));
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            return Err(format!(
+                "{} 计划任务已触发，但 20s 内端口 {} 未就绪",
+                c.name, c.port
+            ));
+        }
+
         if !c.require_path.is_empty() && !Path::new(&c.require_path).exists() {
             return Err(format!("前置文件不存在: {}", c.require_path));
+        }
+        if c.exe.is_empty() {
+            return Err(format!("{} 未配置 exe 也未配置 task_name", c.name));
         }
 
         let mut cmd = Command::new(&c.exe);
@@ -293,6 +331,16 @@ impl ServiceManager {
     /// 停止一个服务：优先走优雅停机接口，再退化为终止进程，最后按端口兜底。
     pub async fn stop(&self, key: &str) -> Result<String, String> {
         let c = self.cfg(key).ok_or_else(|| format!("未知服务: {key}"))?;
+
+        // 0) 计划任务型：先结束任务。注意 schtasks /end 只结束任务实例，
+        //    不保证杀掉已运行的进程，故后面仍要等端口释放。
+        if !c.task_name.is_empty() {
+            let _ = Command::new("schtasks")
+                .args(["/end", "/tn", &c.task_name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
 
         // 1) 优雅停机（如 nvr_dl_service 的 /shutdown 需要先 DPSDK_Logout）
         if !c.stop_path.is_empty() {
@@ -448,6 +496,7 @@ mod tests {
             expect: 200,
             fallback_port: false,
             exe: "noop".into(),
+            task_name: String::new(),
             args: vec![],
             cwd: String::new(),
             require_path: String::new(),
