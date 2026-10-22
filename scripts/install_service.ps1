@@ -60,7 +60,16 @@ Write-Host "exe: $exe`n"
 
 # 1) 注册服务 + 崩溃重启策略（由 exe 内部调 SCM API 完成）
 & $exe --install-service
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# 不用 $LASTEXITCODE 判断：release 构建是 GUI 子系统（无控制台），旧版在 println!
+# 上会 panic 并返回非零码，导致这里误判失败而跳过后续注入（2026-10-22 踩到两次）。
+# 改为直接查服务是否已注册——这才是真正的成功判据，同时天然幂等。
+sc.exe query $svc > $null 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Host 'x 服务注册失败（需管理员权限）' -ForegroundColor Red
+    exit 1
+}
+Write-Host 'OK 服务已注册' -ForegroundColor Green
 
 # 2) 注入环境变量：SCM 启动的进程没有用户会话环境
 if (Test-Path $envFile) {

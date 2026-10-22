@@ -22,12 +22,25 @@
 //! 故 `service_main` 一进来就把 cwd 切到 exe 所在目录。
 
 use std::ffi::OsStr;
+use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{GetLastError, ERROR_SERVICE_DOES_NOT_EXIST};
 use windows_sys::Win32::System::Services::*;
+
+/// 在 GUI 子系统（release 构建的 `windows_subsystem = "windows"`，无控制台）下，
+/// `println!` 写 stdout 失败会 **panic**，导致 install 注册完服务后立刻异常退出、
+/// 脚本拿到非零退出码后提前中止（2026-10-22 实测踩到两次）。
+/// 这里统一用忽略错误的写入：有控制台就能看到，没有也不会 panic。
+macro_rules! emit {
+    ($($arg:tt)*) => {{
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+        let _ = std::io::stdout().flush();
+        tracing::info!($($arg)*);
+    }};
+}
 
 pub(crate) const SVC_NAME: &str = "agent-core";
 const SVC_DISPLAY: &str = "agent-core (PFAiX 编排引擎)";
@@ -255,16 +268,16 @@ pub(crate) fn install() -> Result<(), String> {
         CloseServiceHandle(scm);
     }
 
-    println!("✓ 服务已安装: {SVC_NAME}");
-    println!("  exe     : {exe_s}");
-    println!("  启动方式: 自动（开机自启）");
-    println!("  崩溃重启: 5s / 30s / 60s（计数 24h 重置）");
-    println!();
-    println!("下一步（均需管理员）:");
-    println!("  sc start {SVC_NAME}      # 启动");
-    println!("  sc query {SVC_NAME}      # 查看状态");
-    println!("  sc stop  {SVC_NAME}      # 停止");
-    println!("  {exe_s} --uninstall-service   # 卸载");
+    emit!("✓ 服务已安装: {SVC_NAME}");
+    emit!("  exe     : {exe_s}");
+    emit!("  启动方式: 自动（开机自启）");
+    emit!("  崩溃重启: 5s / 30s / 60s（计数 24h 重置）");
+    emit!("");
+    emit!("下一步（均需管理员）:");
+    emit!("  sc start {SVC_NAME}      # 启动");
+    emit!("  sc query {SVC_NAME}      # 查看状态");
+    emit!("  sc stop  {SVC_NAME}      # 停止");
+    emit!("  {exe_s} --uninstall-service   # 卸载");
     Ok(())
 }
 
@@ -300,6 +313,6 @@ pub(crate) fn uninstall() -> Result<(), String> {
             return Err(format!("DeleteService 失败: {err}"));
         }
     }
-    println!("✓ 服务已标记删除: {SVC_NAME}（正在运行则停止后彻底移除）");
+    emit!("✓ 服务已标记删除: {SVC_NAME}（正在运行则停止后彻底移除）");
     Ok(())
 }
