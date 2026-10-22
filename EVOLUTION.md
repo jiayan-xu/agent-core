@@ -1,5 +1,104 @@
 # agent-core 演进日志
 
+## 2026-10-22 — P2 服务治理重构：托盘退位，agent-core 编排 + SCM 托管（v0.12.0）
+
+> **助手检索锚点**：`service_manager` / `/api/services` / `[[services]]` / `managed_by` /
+> `SCM` / `windows_service` / `CREATE_BREAKAWAY_FROM_JOB` / `kill_by_port` /
+> 「托盘膨胀」/「服务编排」→ 先读本节，勿再全库考古。
+
+### 背景
+
+起点是一个很小的抱怨：「不想让托盘一直膨胀下去」。查下去发现根因不在托盘本身，而在
+**托盘被当成了服务注册表**——每加一个服务就要改脚本 `$SVCS` 表 + 加两项 switch + 加
+UI 项，而托盘是 GUI 进程、依赖登录桌面、崩溃即全体失管。连带暴露三个问题：
+
+1. `nvr_dl_service`(:8108) 根本不在任何管理者名下，10-15 起过一次就消失，队列静默积压 4 天；
+2. `nvr_event` 等服务的「重启」按钮长期失效；
+3. NVR 域组件被误收编成 dashboard 的子进程，导致 dashboard 重启连带杀掉持 DPSDK 会话的
+   8108 → 下次登录撞 ICC `LoginSecTime` 冷却（ret=27001000，实测 10 分 12 秒）。
+
+### 变更（分四阶段，均在一天内完成并逐段实测）
+
+**P0 — 8080 托管 8108（`nvr_player` 仓库）**
+8080 与 8108 同属 NVR 域但并列关系（8080 面向人：实时看/控；8108 面向机器：47x 离线归档），
+故做成「8080 托管 8108」而非合并进程：启动探 :8108 `/health`，有则**接管不重复起**；
+退出先 `POST /shutdown` 规范 Logout，端口不退才 terminate。托盘项数不增。
+
+**P1 — 托盘服务表外置**
+`$SVCS` + 两个 per-service switch → `services.json`（配置驱动）+ `-DryRun` 自检开关。
+加服务从「改三处代码」变成「加一段配置」。路径一律 `${...}` 占位符，不硬编码用户名。
+
+**P2-1 — `src/service_manager.rs`（核心）**
+`ServiceConfig`（`[[services]]` 表）+ `ServiceManager`（start/stop/restart/status/tick）。
+端点权限分层：`GET /api/services` 公开精简（托盘/看板须无凭据可读）；`/api/services/detail`
+与全部 POST 走 protected。
+
+**P2-3 — `src/windows_service.rs` + `scripts/install_service.ps1`（SCM 托管）**
+不引入 WinSW/NSSM，直接调 SCM API（`StartServiceCtrlDispatcherW` /
+`RegisterServiceCtrlHandlerExW` / `ChangeServiceConfig2W`），依赖 `windows-sys`。
+四种形态同一 exe：`--install-service` / `--uninstall-service` / SCM 拉起 / 普通命令行。
+崩溃重启策略 5s→30s→60s（24h 重置）；STOP 走 `with_graceful_shutdown` 让在途请求收尾。
+
+**P2-4 — 全量接管**
+`agent.toml` 6 个 `[[services]]`（ox/emb/mem/dash/nvr/a2a），加 agent-core 自身由 SCM 托管，
+本机 7 个服务全部纳管。托盘 `managed_by` 全部置 `agent-core`，转为纯显示 + 转调 API。
+
+### 关键设计判断（都是踩过才定下来的）
+
+- **与 `sandbox::Job Object` 语义相反，绝不能复用**：sandbox 是 kill-on-job-close（清 MCP
+  子进程防孤儿）；服务编排要的是「agent-core 重启，被管服务继续跑」。若复用，编排层一升级
+  就把生产服务全带走，比托盘更糟。
+- **`DETACHED_PROCESS` 不足以脱离 Job**：子进程默认继承父进程的 Job，父被 kill 时 Job 关闭
+  → 被管服务一起被收走（实测 emb 被带走两次）。必须加 `CREATE_BREAKAWAY_FROM_JOB`，
+  且该 Job 未允许 breakaway 时要能回退（否则 CreateProcess 拒绝访问）。
+- **进程存活 ≠ 服务可用**：以「端口监听 + 可选 HTTP 健康路径」为唯一判据（`fallback_port`
+  兼容旧版 `/health` 404）。进程句柄只用于优雅停机——假死时端口探测能发现，`try_wait` 不能。
+- **保活要防抖**：30s 周期、首轮延迟 60s（避免与托盘同时抢着拉起同一批服务）、
+  `on-failure` 要求连续失败 ≥2 次才动手。
+- **无句柄实例必须能按端口强杀**（`kill_by_port`）：迁移前启动的实例、跨代遗留实例都没有
+  `Child` 句柄，不按端口杀就永远停不掉，`restart` 会退化成「假成功」。
+
+### 部署
+
+`target/deploy_p2` 作为**专用蓝绿构建目录**：生产进程占用 `target/release/agent-core.exe`
+导致原地 `cargo build` 报「拒绝访问」，且停进程后托盘 60s 心跳会用旧 exe 抢回端口。
+改为「构建到独立目录 → 隔离端口验证 → 停进程 2 秒内替换 → 启动」，中断压到 10 秒。
+
+### 验证（全部实测，非推断）
+
+| 项 | 结果 |
+|---|---|
+| 崩溃重启 | `taskkill /F` 后事件日志 `ID=7031「将在 5000 毫秒内重新启动」`，新进程启动时间恰好 +5.0s |
+| **被管服务不受牵连** | agent-core 被强杀时 **6 个服务全部存活**（Breakaway 修复生效的实证）|
+| 编排恢复 | 重启后 `enabled=True` 6/6 在线，8 个端口全 UP |
+| 停止能力 | 调 `ox/restart` → 老实例按端口强杀、新 PID 接管（37s），旧版本此处是「假成功」|
+| 灰度保活 | 杀 emb → 53s 后由 agent-core 拉起，`PPID` 实证为 agent-core |
+
+### 过程中修掉的 5 个真实缺陷（都已写进代码注释）
+
+1. `println!` 在 GUI 子系统（`windows_subsystem="windows"`，release 构建）下写 stdout 失败会
+   **panic**——`--install-service` 在注册成功后立刻异常退出，脚本据非零码中止，后续
+   「注入 env」「启动服务」从未执行。→ 改 `let _ = writeln!` 的 `emit!` 宏。
+2. **服务模式 cwd 定位错**：只设 `exe.parent()` 会去 `target/release/` 找 `agent.toml`，
+   找不到就**凭空造一份默认配置** → 服务 RUNNING、`/health` 显示 ok，但 `[[services]]`/llm/
+   mcp_source/personas **全部丢失**（最难察觉的静默降级）。→ 向上最多 4 级查找。
+3. **SCM 不继承用户会话环境**：缺 `MEMORIA_ADMIN_KEY` → memoria 401、命名空间回退成
+   `agent/<id>`。→ 安装脚本把 env 注入服务注册表 `Environment`（MultiString）。
+4. **`restart` 假成功**：`let _ = stop()` 吞掉停止失败 → start 探测到端口在听 → 返回
+   `ok=true` 但零动作。假成功比报错更糟。→ stop 失败直接返回错误。
+5. **`/health` 探测 memoria 超时 2s 过紧**：memoria 的 `/health` 内含 embed 探活，
+   embed 异常时它自身要 ~2.05s 才返回 → 被误判「memoria 不可达」→ 整体 `status=fail`
+   并连带 ns 回退。→ 放宽到 5s。
+
+### 已知限制
+
+- `scheduledTask` 类型已实现（`schtasks /run|/end`）但本机无使用者——原以为是计划任务的
+  a2a 实为手工拉起的孤儿进程。`schtasks /end` 也只结束任务实例、不保证杀已运行进程。
+- 托盘 UI 仍用自己的端口探测，未改为直接渲染 `/api/services`（功能等价，数据源未统一）。
+- 开机自启（`Start=2`）配置正确，但需重启机器才能真验证。
+
+---
+
 ## 2026-08-17 — 夜间维护 memory_decay 缺 namespace 修复（梦境链路收口）
 
 > **助手检索锚点**：`memory_decay` / `memoria_maintenance` / `夜间维护` / `-32002` → 先读本节，勿再全库考古。
