@@ -13,6 +13,11 @@ paths = [
   '''.*/tests/.*''',
   '''.*/test_.*\.rs''',
   '''.*_test\.rs''',
+  # 2026-10-22：agent.toml 的 5 个备份（.bak_20261018 等，下划线格式漏出 *.bak/*.bak-* 的
+  # gitignore 覆盖）在 087ded4 被误提交，含 EVOLVE_KEY。文件已 git rm --cached，
+  # gitignore 已补 *.bak_*；但 gitleaks 全历史扫描仍会命中历史 commit，路径豁免避免 PR 永久阻塞。
+  # EVOLVE_KEY 建议轮换（见 EVOLUTION.md 2026-10-22 节）。
+  '''agent\.toml\.bak[^/]*''',
 ]
 regexes = [
   # 单元测试用的 deadbeef 占位 admin key

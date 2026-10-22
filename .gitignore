@@ -69,9 +69,13 @@ meetings.json
 
 # 备份/本地杂项（含密钥的 config/.env 备份，严禁进公开仓库；2026-08-18 补充）
 # 覆盖 .env.bak / agent.toml.bak 等普通备份名及带日期后缀变体（OCR 评审指正）
+# 2026-10-22 补：*.bak_*（下划线+日期格式漏网——agent.toml.bak2_20261018 等 5 个
+# 含 EVOLVE_KEY 的备份被误提交进公开仓库，见 EVOLUTION.md 2026-10-22 节）
 *.bak
 *.bak-*
+*.bak_*
 *.goodbak
+agent.toml.bak*
 # 本机 Cursor 本地规则（含 ~/.dsh 路径与本地运维约定，不进公开仓库）
 .cursor/
 target-deploy/
