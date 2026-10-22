@@ -92,6 +92,10 @@ pub(crate) struct Config {
     /// 分级审批（落 [gateway_approval]，缺省 human_all=现状全人工）
     #[serde(default)]
     pub(crate) gateway_approval: Option<agent_core::gateway_approval::GatewayApprovalConfig>,
+    /// P2 服务编排（落 `[[services]]` 表）。缺省空表 = 不接管任何服务，零行为变化。
+    /// 该表放在 agent.toml 里（已 gitignore），可写本机绝对路径与端口。
+    #[serde(default)]
+    pub(crate) services: Vec<agent_core::service_manager::ServiceConfig>,
 }
 
 /// 工具分类手动收紧配置（[boundary]）。
@@ -705,6 +709,7 @@ pub(crate) fn load_or_create_config() -> Config {
         orchestration: None,
         boundary: None,
         gateway_approval: None,
+        services: Vec::new(),
     };
     init_domain_and_org(&cfg);
     let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());

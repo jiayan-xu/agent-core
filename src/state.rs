@@ -63,6 +63,9 @@ pub(crate) struct AppState {
     /// Step3：会议在线表 meeting_id → (agent_id → 最近心跳 Instant)
     pub(crate) meeting_presence:
         tokio::sync::Mutex<HashMap<String, HashMap<String, std::time::Instant>>>,
+    /// P2 服务编排（2026-10-22）：接管本机常驻服务的启停与保活，托盘退化为纯面板。
+    /// 配置空表时 `is_empty()` 为真，保活循环不启动 → 零行为变化。
+    pub(crate) services: agent_core::service_manager::ServiceManager,
 }
 
 /// 白龙马 Phase B：多端唤醒 —— 后台活动事件（心跳自主产生的活动，供 PFAiX 拉取"唤醒"）

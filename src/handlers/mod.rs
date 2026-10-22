@@ -13,4 +13,5 @@ pub mod identity;
 pub mod meetings;
 pub mod meetings_group;
 pub mod platform;
+pub mod services; // P2：服务编排端点（启停/保活/状态）
 pub mod system;

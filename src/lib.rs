@@ -26,6 +26,7 @@ pub mod orchestration; // ADR-017：LLM 编排层 v2（flash 锚定引导 + Plan
 pub mod file_checkpoint;
 pub mod quota;
 pub mod sandbox;
+pub mod service_manager; // P2：本机常驻服务编排（启停+保活，语义与 sandbox Job 相反）
 pub mod intent; // 重构阶段1：统一意图分类（一次分类，下游守卫统一读取）
 pub mod session;
 pub mod runtime;

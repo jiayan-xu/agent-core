@@ -185,7 +185,33 @@ pub(crate) fn spawn_server(
                 metrics: metrics.clone(),
                 meeting_tx: tokio::sync::Mutex::new(HashMap::new()),
                 meeting_presence: tokio::sync::Mutex::new(HashMap::new()),
+                // P2：配置为空表时 ServiceManager 为惰性（is_empty），保活循环不启动
+                services: agent_core::service_manager::ServiceManager::new(
+                    config.services.clone(),
+                ),
             });
+
+            // P2 服务保活（2026-10-22）：配置空表则完全不启动循环 → 零行为变化。
+            // 首轮延迟 60s：避免 agent-core 与托盘同时抢着拉起同一批服务（双起抢端口）。
+            // 语义与 sandbox 的 Job Object 相反：这里**不**把服务挂进 kill-on-close Job，
+            // agent-core 重启/升级时被管服务必须继续跑。
+            if !state.services.is_empty() {
+                tracing::info!(
+                    target: "agent.services",
+                    "服务编排已启用：{} 项（保活周期 30s，首轮延迟 60s）",
+                    state.services.len()
+                );
+                let svc_state = state.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    loop {
+                        for a in svc_state.services.tick().await {
+                            tracing::info!(target: "agent.services", "{a}");
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    }
+                });
+            }
 
             // 先绑定端口，确保服务立即可用（即使 Memoria 慢/未就绪也不阻塞启动）
             let listener = match tokio::net::TcpListener::bind(&addr).await {
