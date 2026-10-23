@@ -70,6 +70,7 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/assistants/me", get(handle_assistant_me))
         .route("/api/assistants/heartbeat", post(handle_assistant_heartbeat))
         .route("/api/assistants/token/revoke", post(handle_assistant_token_revoke))
+        .route("/api/assistants/token/refresh", post(handle_assistant_token_refresh))
         .route("/api/agent/memory", post(handle_assistant_memory_write))
         .route("/api/agent/context", get(handle_assistant_context))
         .route("/api/a2a/tasks", post(handle_a2a_task_create))
@@ -95,11 +96,15 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/services/{key}/start", post(handle_service_start))
         .route("/api/services/{key}/stop", post(handle_service_stop))
         .route("/api/services/{key}/restart", post(handle_service_restart))
-        // ── Personal Assistant Platform Phase 0：用户侧 binding 管理 ──
+        // ── Personal Assistant Platform Phase 0/1：用户侧 binding 管理 ──
         .route("/api/assistants/bindings", post(handle_assistant_binding_create).get(handle_assistant_binding_list))
         .route("/api/assistants/bindings/{id}/revoke", post(handle_assistant_binding_revoke))
         .route("/api/assistants/bindings/{id}/tokens", post(handle_assistant_token_issue))
         .route("/api/assistants/events", get(handle_assistant_events))
+        // ── Phase 1：可见性 / 助手摘要目录 / 交接 brief ──
+        .route("/api/assistants/visibility", get(handle_assistant_visibility_get).put(handle_assistant_visibility_set))
+        .route("/api/assistants/directory", get(handle_assistant_directory))
+        .route("/api/assistants/handover-brief", post(handle_assistant_handover_brief))
         .route(
             "/api/admin/quota",
             get(handle_admin_quota_get).put(handle_admin_quota_put),

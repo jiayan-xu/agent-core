@@ -91,8 +91,8 @@ async fn audit_platform(
                 trace_id,
                 agent_id: user_id.to_string(),
                 session_id: binding_id.map(|s| s.to_string()),
-                event_type: AuditEventType::ToolInvocation,
-                detail: format!("event={event_type} | {detail}"),
+                event_type: AuditEventType::Custom(event_type.to_string()),
+                detail: detail.to_string(),
             })
             .await;
     }
@@ -118,8 +118,8 @@ async fn audit_agent_only(
                 trace_id: trace_id.to_string(),
                 agent_id: user_id.to_string(),
                 session_id: binding_id.map(|s| s.to_string()),
-                event_type: AuditEventType::ToolInvocation,
-                detail: format!("event={event_type} | {detail}"),
+                event_type: AuditEventType::Custom(event_type.to_string()),
+                detail: detail.to_string(),
             })
             .await;
     }
@@ -795,4 +795,310 @@ pub(crate) async fn handle_a2a_inbox(
             &message,
         ),
     }
+}
+
+// ── Phase 1：refresh token 轮换（公开路由，prt_ 即凭证） ──────────────────
+
+#[derive(Deserialize)]
+pub(crate) struct TokenRefreshRequest {
+    refresh_token: String,
+}
+
+pub(crate) async fn handle_assistant_token_refresh(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<TokenRefreshRequest>,
+) -> Response {
+    match st.assistant_platform.refresh_access(&req.refresh_token, 24) {
+        Ok((token, binding)) => {
+            audit_platform(
+                &st,
+                "assistant.token.refreshed",
+                &binding.user_id,
+                Some(&binding.binding_id),
+                &format!("token rotated, binding={}", binding.binding_id),
+            )
+            .await;
+            Json(serde_json::json!({"token": token})).into_response()
+        }
+        Err(message) => {
+            // 轮换失败也留痕（无效/重放 refresh token 是安全信号）
+            audit_platform(&st, "assistant.token.refresh_failed", "", None, &message).await;
+            err(
+                axum::http::StatusCode::UNAUTHORIZED,
+                "token_refresh_failed",
+                &message,
+            )
+        }
+    }
+}
+
+// ── Phase 1：可见性策略（受保护，本人） ────────────────────────────────────
+
+pub(crate) async fn handle_assistant_visibility_get(
+    State(st): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+) -> Response {
+    match st.assistant_platform.get_visibility(&ctx.agent_id) {
+        Ok(level) => Json(serde_json::json!({"level": level})).into_response(),
+        Err(message) => err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "visibility_read_failed",
+            &message,
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct VisibilitySetRequest {
+    level: String,
+}
+
+pub(crate) async fn handle_assistant_visibility_set(
+    State(st): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(req): Json<VisibilitySetRequest>,
+) -> Response {
+    match st.assistant_platform.set_visibility(&ctx.agent_id, &req.level) {
+        Ok(level) => {
+            audit_platform(
+                &st,
+                "assistant.visibility.changed",
+                &ctx.agent_id,
+                None,
+                &format!("level={level}"),
+            )
+            .await;
+            Json(serde_json::json!({"level": level})).into_response()
+        }
+        Err(message) => err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "visibility_set_failed",
+            &message,
+        ),
+    }
+}
+
+// ── Phase 1：通讯录助手摘要目录（受保护，按可见性过滤） ────────────────────
+//
+// 规则（方案 §6.3）：
+//   本人             → 自己全部 active binding
+//   level=off        → 他人不可见（本人仍可见）
+//   level=company    → 全员可见能力摘要
+//   level=dept（缺省）→ 仅同部门可见能力摘要
+// 部门关系经 dept_registry（memoria 注册表 ns 的 dept/<slug> 段，TTL 300s）；
+// 无部门信息的双方视为跨部门（默认不可见，宁缺勿漏）。
+
+pub(crate) async fn handle_assistant_directory(
+    State(st): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+) -> Response {
+    let requester = ctx.agent_id.clone();
+    let summaries = match st.assistant_platform.active_summaries() {
+        Ok(v) => v,
+        Err(message) => {
+            return err(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "directory_read_failed",
+                &message,
+            )
+        }
+    };
+    let visibility = st.assistant_platform.visibility_map().unwrap_or_default();
+    let requester_depts = crate::auth::member_depts(&st, &requester).await;
+
+    // 按 user 聚合
+    use std::collections::BTreeMap;
+    let mut by_user: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+    for (user_id, assistant_type, assistant_name, capabilities, last_seen) in summaries {
+        by_user.entry(user_id).or_default().push(serde_json::json!({
+            "assistant_type": assistant_type,
+            "assistant_name": assistant_name,
+            "capabilities": capabilities,
+            "last_seen_at": last_seen,
+        }));
+    }
+
+    let mut out = Vec::new();
+    for (user_id, assistants) in by_user {
+        let is_self = user_id == requester;
+        if !is_self {
+            let level = visibility.get(&user_id).map(|s| s.as_str()).unwrap_or("dept");
+            let visible = match level {
+                "off" => false,
+                "company" => true,
+                _ => {
+                    let owner_depts = crate::auth::member_depts(&st, &user_id).await;
+                    !owner_depts.is_disjoint(&requester_depts)
+                }
+            };
+            if !visible {
+                continue;
+            }
+        }
+        out.push(serde_json::json!({
+            "user_id": user_id,
+            "is_self": is_self,
+            "assistants": assistants,
+        }));
+    }
+    Json(serde_json::json!({
+        "requester": requester,
+        "requester_level": visibility
+            .get(&requester)
+            .cloned()
+            .unwrap_or_else(|| "dept".to_string()),
+        "users": out,
+    }))
+    .into_response()
+}
+
+// ── Phase 1：换助手交接 brief（受保护，本人） ──────────────────────────────
+//
+// 汇总 bindings 历史 + 近期平台事件 + 个人 NS 代表性记忆 → 生成结构化 brief，
+// 写回本人 NS（category=handover, tag=handover-brief），
+// 新助手经 /api/agent/context 检索 handover-brief 即可读到。
+
+pub(crate) async fn handle_assistant_handover_brief(
+    State(st): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+) -> Response {
+    let user_id = ctx.agent_id.clone();
+    let bindings = st
+        .assistant_platform
+        .list_bindings(&user_id)
+        .unwrap_or_default();
+    let events = st
+        .assistant_platform
+        .recent_events_for_user(&user_id, 40)
+        .unwrap_or_default();
+
+    let namespace = format!("agent/{user_id}");
+    let mut memories: Vec<serde_json::Value> = Vec::new();
+    {
+        let agent = {
+            let guard = st.agent.lock().await;
+            guard.as_ref().map(|a| a.clone())
+        };
+        if let Some(agent) = agent {
+            let args = serde_json::json!({
+                "namespace": namespace,
+                "query": "工作偏好 决策 结论 教训 项目",
+                "limit": 10,
+            });
+            if let Ok(result) = agent.mcp.call_json("memory_search_v2", &args).await {
+                if let Some(items) = result.get("results").and_then(|v| v.as_array()) {
+                    memories = items.clone();
+                }
+            }
+        }
+    }
+
+    // ── 组装 brief 文本 ──
+    let mut brief = String::new();
+    brief.push_str("# 助手交接 Brief\n\n");
+    brief.push_str(&format!(
+        "用户：{user_id}\n生成时间：{}\n\n",
+        Local::now().format("%Y-%m-%d %H:%M:%S")
+    ));
+
+    brief.push_str("## 助手绑定历史\n\n");
+    if bindings.is_empty() {
+        brief.push_str("（无绑定记录）\n");
+    }
+    for b in &bindings {
+        let caps = b.capabilities.join(" / ");
+        brief.push_str(&format!(
+            "- [{}] {}（{}）设备：{} · 能力：{} · 创建 {} · 最后活跃 {}\n",
+            b.status,
+            b.assistant_name,
+            b.assistant_type,
+            if b.device_id.is_empty() { "—" } else { &b.device_id },
+            if caps.is_empty() { "—" } else { &caps },
+            b.created_at,
+            b.last_seen_at.as_deref().unwrap_or("从未活跃"),
+        ));
+    }
+
+    brief.push_str("\n## 近期平台事件（最新 40 条）\n\n");
+    if events.is_empty() {
+        brief.push_str("（无事件）\n");
+    }
+    for e in events.iter().rev() {
+        let ts = e.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+        let et = e.get("event_type").and_then(|v| v.as_str()).unwrap_or("");
+        let d = e.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+        brief.push_str(&format!("- {ts} [{et}] {d}\n"));
+    }
+
+    brief.push_str("\n## 个人记忆要点（换助手延续的上下文）\n\n");
+    if memories.is_empty() {
+        brief.push_str("（个人 NS 暂无可检索记忆）\n");
+    }
+    for m in &memories {
+        let text = m
+            .get("content")
+            .or_else(|| m.get("text"))
+            .or_else(|| m.get("memory"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if text.is_empty() {
+            continue;
+        }
+        let snippet: String = text.chars().take(200).collect();
+        brief.push_str(&format!("- {snippet}\n"));
+    }
+
+    brief.push_str("\n## 新助手开工指引\n\n");
+    brief.push_str("1. 优先延续上方「个人记忆要点」中的偏好与结论；\n");
+    brief.push_str("2. 历史助手的能力范围见绑定历史，接手时以用户最新授权为准；\n");
+    brief.push_str("3. 本 brief 由 agent-core 生成并写入个人 NS，可随时请求用户重新生成。\n");
+
+    // ── 写回个人 NS ──
+    let mut stored = false;
+    {
+        let agent = {
+            let guard = st.agent.lock().await;
+            guard.as_ref().map(|a| a.clone())
+        };
+        if let Some(agent) = agent {
+            let args = serde_json::json!({
+                "namespace": namespace,
+                "content": brief,
+                "memory_type": "document",
+                "category": "handover",
+                "importance": 5,
+                "source": "agent-core",
+                "tags": ["handover-brief", "assistant:platform"],
+            });
+            match agent.mcp.call_json("memory_remember", &args).await {
+                Ok(_) => stored = true,
+                Err(message) => {
+                    return err(
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        "brief_store_failed",
+                        &format!("写入 memoria 失败：{message}"),
+                    )
+                }
+            }
+        }
+    }
+    audit_platform(
+        &st,
+        "assistant.handover_brief.created",
+        &user_id,
+        None,
+        &format!(
+            "bindings={} events={} memories={} stored={stored}",
+            bindings.len(),
+            events.len(),
+            memories.len()
+        ),
+    )
+    .await;
+    Json(serde_json::json!({
+        "stored": stored,
+        "namespace": namespace,
+        "brief": brief,
+    }))
+    .into_response()
 }

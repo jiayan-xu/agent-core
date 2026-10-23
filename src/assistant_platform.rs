@@ -295,6 +295,12 @@ impl AssistantPlatformStore {
             );
             CREATE INDEX IF NOT EXISTS idx_assistant_event_binding
                 ON assistant_events(binding_id, id);
+
+            CREATE TABLE IF NOT EXISTS assistant_visibility (
+                user_id    TEXT PRIMARY KEY,
+                level      TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             ",
         )
         .map_err(|e| format!("assistant db migration: {e}"))?;
@@ -610,6 +616,175 @@ impl AssistantPlatformStore {
             return Err("binding 不存在".to_string());
         }
         Ok(())
+    }
+
+    /// Phase 1：refresh token 轮换。prt_ 验证通过后签发全新 token 对并撤销旧行
+    /// （refresh 一次性使用，旧 access 随旧行一并失效）。
+    pub(crate) fn refresh_access(
+        &self,
+        refresh_token: &str,
+        hours: i64,
+    ) -> Result<(IssuedToken, AssistantBinding), String> {
+        let token = refresh_token.trim();
+        if !token.starts_with("prt_") {
+            return Err("token 类型错误（需 prt_ refresh token）".to_string());
+        }
+        let hash = sha256_hex(token);
+        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+        let row = conn
+            .query_row(
+                "SELECT t.token_id,t.scopes,t.expires_at,t.revoked_at,b.binding_id,b.status \
+                 FROM assistant_tokens t JOIN assistant_bindings b ON b.binding_id=t.binding_id \
+                 WHERE t.refresh_hash=?1",
+                params![hash],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("refresh lookup: {e}"))?
+            .ok_or("refresh token 无效".to_string())?;
+        let (old_token_id, scopes_s, expires_at, revoked_at, binding_id, status) = row;
+        if revoked_at.is_some() {
+            return Err("refresh token 已撤销（可能已轮换过）".to_string());
+        }
+        if status != "active" {
+            return Err(format!("binding 状态不可用: {status}"));
+        }
+        if expires_at <= now() {
+            return Err("refresh token 已过期".to_string());
+        }
+        let binding = self
+            .get_binding_inner(&conn, &binding_id)
+            .map_err(|e| format!("get binding: {e}"))?
+            .ok_or("binding 不存在".to_string())?;
+
+        // 新 token 对
+        let token_id = format!("tok_{}", random_hex(8));
+        let access_token = format!("pat_{token_id}_{}", random_hex(32));
+        let new_refresh = format!("prt_{token_id}_{}", random_hex(32));
+        let new_expires = expires(hours);
+        conn.execute(
+            "INSERT INTO assistant_tokens \
+             (token_id,binding_id,token_hash,refresh_hash,scopes,issued_at,expires_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                token_id,
+                binding_id,
+                sha256_hex(&access_token),
+                sha256_hex(&new_refresh),
+                scopes_s,
+                now(),
+                new_expires
+            ],
+        )
+        .map_err(|e| format!("issue token: {e}"))?;
+        // 旧行撤销（旧 access + 旧 refresh 同时失效）
+        conn.execute(
+            "UPDATE assistant_tokens SET revoked_at=?2 WHERE token_id=?1 AND revoked_at IS NULL",
+            params![old_token_id, now()],
+        )
+        .map_err(|e| format!("revoke old token: {e}"))?;
+        Ok((
+            IssuedToken {
+                token_id,
+                binding_id: binding.binding_id.clone(),
+                access_token,
+                refresh_token: new_refresh,
+                scopes: split_csv(&scopes_s),
+                expires_at: new_expires,
+            },
+            binding,
+        ))
+    }
+
+    /// Phase 1：通讯录助手摘要可见性。缺省 dept（仅同部门可见能力摘要）。
+    pub(crate) fn get_visibility(&self, user_id: &str) -> Result<String, String> {
+        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+        let level = conn
+            .query_row(
+                "SELECT level FROM assistant_visibility WHERE user_id=?1",
+                params![user_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("get visibility: {e}"))?;
+        Ok(level.unwrap_or_else(|| "dept".to_string()))
+    }
+
+    pub(crate) fn set_visibility(&self, user_id: &str, level: &str) -> Result<String, String> {
+        let level = level.trim();
+        if !matches!(level, "off" | "dept" | "company") {
+            return Err(format!("非法可见性级别: {level}（允许 off/dept/company）"));
+        }
+        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+        conn.execute(
+            "INSERT INTO assistant_visibility(user_id,level,updated_at) VALUES (?1,?2,?3) \
+             ON CONFLICT(user_id) DO UPDATE SET level=excluded.level, updated_at=excluded.updated_at",
+            params![user_id, level, now()],
+        )
+        .map_err(|e| format!("set visibility: {e}"))?;
+        Ok(level.to_string())
+    }
+
+    /// Phase 1：一次性取全部用户的可见性设置（目录端点避免逐用户查询）。
+    pub(crate) fn visibility_map(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+        let mut stmt = conn
+            .prepare("SELECT user_id,level FROM assistant_visibility")
+            .map_err(|e| format!("visibility map: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| format!("visibility map: {e}"))?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            if let Ok((k, v)) = row {
+                out.insert(k, v);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Phase 1：全量 active binding 摘要（通讯录目录用；可见性过滤在 handler 侧
+    /// 结合请求者部门做，存储层只给原始数据）。
+    pub(crate) fn active_summaries(
+        &self,
+    ) -> Result<Vec<(String, String, String, Vec<String>, Option<String>)>, String> {
+        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT user_id,assistant_type,assistant_name,capabilities,last_seen_at \
+                 FROM assistant_bindings WHERE status='active' ORDER BY user_id, assistant_type",
+            )
+            .map_err(|e| format!("list summaries: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                let caps_s: String = r.get(3)?;
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    serde_json::from_str::<Vec<String>>(&caps_s).unwrap_or_default(),
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .map_err(|e| format!("list summaries: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Ok(v) = row {
+                out.push(v);
+            }
+        }
+        Ok(out)
     }
 
     pub(crate) fn record_event(
@@ -1025,5 +1200,45 @@ mod tests {
         assert_eq!(b.user_id, "徐佳琰");
         assert!(b.scopes.contains(&"assistant:heartbeat".to_string()));
         assert!(b.scopes.contains(&"memory:write:self".to_string()));
+    }
+
+    #[test]
+    fn refresh_rotation_is_single_use() {
+        let s = store();
+        let b = s
+            .create_binding(NewBinding {
+                user_id: "r".into(),
+                assistant_type: "workbuddy".into(),
+                assistant_name: String::new(),
+                device_id: "dev".into(),
+                capabilities: vec![],
+                scopes: vec![],
+                public_key: String::new(),
+            })
+            .unwrap();
+        let (t1, _) = s.issue_token(&b.binding_id, 1).unwrap();
+        // 旧 access 有效
+        assert!(s.validate_token(&t1.access_token, "assistant:heartbeat").is_ok());
+        // 轮换：新对可用，旧 access + 旧 refresh 全部失效
+        let (t2, _) = s.refresh_access(&t1.refresh_token, 1).unwrap();
+        assert!(s.validate_token(&t2.access_token, "assistant:heartbeat").is_ok());
+        assert!(s.validate_token(&t1.access_token, "assistant:heartbeat").is_err());
+        // 旧 refresh 重放被拒（一次性）
+        assert!(s.refresh_access(&t1.refresh_token, 1).is_err());
+        // 新 refresh 可再轮换
+        assert!(s.refresh_access(&t2.refresh_token, 1).is_ok());
+        // 非 prt 前缀被拒
+        assert!(s.refresh_access(&t2.access_token, 1).is_err());
+    }
+
+    #[test]
+    fn visibility_default_dept_and_whitelist() {
+        let s = store();
+        assert_eq!(s.get_visibility("nobody").unwrap(), "dept");
+        assert_eq!(s.set_visibility("u1", "company").unwrap(), "company");
+        assert_eq!(s.get_visibility("u1").unwrap(), "company");
+        assert!(s.set_visibility("u1", "everyone").is_err());
+        let map = s.visibility_map().unwrap();
+        assert_eq!(map.get("u1").map(|s| s.as_str()), Some("company"));
     }
 }
