@@ -13,11 +13,12 @@ use tower_http::cors::CorsLayer;
 use crate::auth::auth_middleware;
 use crate::bootstrap::trace_middleware;
 use crate::handlers::admin::*;
-use crate::handlers::gateway::{handle_auto_write_undo, handle_auto_writes_list, handle_tool_execute, handle_tool_execute_get};
 use crate::handlers::approval::*;
+use crate::handlers::assistants::*;
 use crate::handlers::chat::*;
 use crate::handlers::collab::*;
 use crate::handlers::evolve::*;
+use crate::handlers::gateway::{handle_auto_write_undo, handle_auto_writes_list, handle_tool_execute, handle_tool_execute_get};
 use crate::handlers::identity::*;
 use crate::handlers::meetings::*;
 use crate::handlers::meetings_group::{handle_meeting_ask, handle_meeting_invite, handle_meetings_create};
@@ -63,7 +64,19 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/pages/{*file}", get(handle_pages_static))
         // ── P2 服务编排（2026-10-22）：只读状态公开，托盘/看板无需凭据即可渲染 ──
         // 只暴露 key/name/port/running/uptime；pid/错误详情走 /api/services/detail（受保护）。
-        .route("/api/services", get(handle_services_public));
+        .route("/api/services", get(handle_services_public))
+        // ── Personal Assistant Platform Phase 0（2026-10-23）──
+        // 本地助手持 opaque scoped token 调用；用户管理路由在 protected 侧。
+        .route("/api/assistants/me", get(handle_assistant_me))
+        .route("/api/assistants/heartbeat", post(handle_assistant_heartbeat))
+        .route("/api/assistants/token/revoke", post(handle_assistant_token_revoke))
+        .route("/api/agent/memory", post(handle_assistant_memory_write))
+        .route("/api/agent/context", get(handle_assistant_context))
+        .route("/api/a2a/tasks", post(handle_a2a_task_create))
+        .route("/api/a2a/tasks/{id}", get(handle_a2a_task_get))
+        .route("/api/a2a/tasks/{id}/status", post(handle_a2a_task_update))
+        .route("/api/a2a/messages", post(handle_a2a_message_create))
+        .route("/api/a2a/inbox", get(handle_a2a_inbox));
 
     let protected = Router::new()
         .route("/api/chat", post(handle_chat))
@@ -82,6 +95,11 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/services/{key}/start", post(handle_service_start))
         .route("/api/services/{key}/stop", post(handle_service_stop))
         .route("/api/services/{key}/restart", post(handle_service_restart))
+        // ── Personal Assistant Platform Phase 0：用户侧 binding 管理 ──
+        .route("/api/assistants/bindings", post(handle_assistant_binding_create).get(handle_assistant_binding_list))
+        .route("/api/assistants/bindings/{id}/revoke", post(handle_assistant_binding_revoke))
+        .route("/api/assistants/bindings/{id}/tokens", post(handle_assistant_token_issue))
+        .route("/api/assistants/events", get(handle_assistant_events))
         .route(
             "/api/admin/quota",
             get(handle_admin_quota_get).put(handle_admin_quota_put),

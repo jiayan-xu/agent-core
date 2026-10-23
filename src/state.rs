@@ -66,6 +66,9 @@ pub(crate) struct AppState {
     /// P2 服务编排（2026-10-22）：接管本机常驻服务的启停与保活，托盘退化为纯面板。
     /// 配置空表时 `is_empty()` 为真，保活循环不启动 → 零行为变化。
     pub(crate) services: agent_core::service_manager::ServiceManager,
+    /// Personal Assistant Platform（2026-10-23 Phase 0）：
+    /// BYO 本地智能体的 binding/token/A2A/事件持久化存储。
+    pub(crate) assistant_platform: crate::assistant_platform::AssistantPlatformStore,
 }
 
 /// 白龙马 Phase B：多端唤醒 —— 后台活动事件（心跳自主产生的活动，供 PFAiX 拉取"唤醒"）

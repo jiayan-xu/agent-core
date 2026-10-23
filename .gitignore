@@ -48,6 +48,8 @@ backups/
 updates/
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 __pycache__/
 *.pyc
 agent-core.exe

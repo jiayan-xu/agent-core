@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod approval;
+pub mod assistants;
 pub mod chat;
 pub mod collab;
 pub mod evolve;

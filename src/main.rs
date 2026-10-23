@@ -28,6 +28,7 @@ use wry::WebViewBuilder;
 
 use agent_core::metrics::MetricsRegistry;
 
+mod assistant_platform;
 mod auth;
 mod bootstrap;
 mod config;
