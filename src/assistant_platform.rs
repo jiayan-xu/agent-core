@@ -333,7 +333,9 @@ impl AssistantPlatformStore {
 
     pub(crate) fn create_binding(&self, req: NewBinding) -> Result<AssistantBinding, String> {
         let user_id = sanitize_user_id(&req.user_id);
-        let assistant_type = sanitize_id(&req.assistant_type).to_ascii_lowercase();
+        // 助手类型/能力允许 Unicode（用户常用中文如「数据分析」）：
+        // sanitize_id 是 ASCII-only，会把中文清成空串导致 400/能力静默丢失
+        let assistant_type = sanitize_user_id(&req.assistant_type).to_lowercase();
         let device_id = if req.device_id.trim().is_empty() {
             "default".to_string()
         } else {
@@ -351,7 +353,7 @@ impl AssistantPlatformStore {
         let capabilities = req
             .capabilities
             .iter()
-            .map(|x| sanitize_id(x).to_ascii_lowercase())
+            .map(|x| sanitize_user_id(x).to_lowercase())
             .filter(|x| !x.is_empty())
             .take(20)
             .collect::<Vec<_>>();
@@ -1240,5 +1242,27 @@ mod tests {
         assert!(s.set_visibility("u1", "everyone").is_err());
         let map = s.visibility_map().unwrap();
         assert_eq!(map.get("u1").map(|s| s.as_str()), Some("company"));
+    }
+
+    #[test]
+    fn chinese_type_and_capabilities_survive() {
+        let s = store();
+        let b = s
+            .create_binding(NewBinding {
+                user_id: "徐佳琰".into(),
+                assistant_type: "智浦助手".into(),
+                assistant_name: String::new(),
+                device_id: String::new(),
+                capabilities: vec!["数据分析".into(), "PPT".into(), "!!".into()],
+                scopes: vec![],
+                public_key: String::new(),
+            })
+            .unwrap();
+        assert_eq!(b.assistant_type, "智浦助手");
+        assert!(b.capabilities.contains(&"数据分析".to_string()));
+        assert!(b.capabilities.contains(&"ppt".to_string()));
+        assert!(!b.capabilities.iter().any(|c| c.is_empty()));
+        // 空名默认 = user_id-type（中文身份下可读）
+        assert_eq!(b.assistant_name, "徐佳琰-智浦助手");
     }
 }

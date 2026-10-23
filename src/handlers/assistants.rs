@@ -906,6 +906,31 @@ pub(crate) async fn handle_assistant_directory(
     let visibility = st.assistant_platform.visibility_map().unwrap_or_default();
     let requester_depts = crate::auth::member_depts(&st, &requester).await;
 
+    // agent_id → display_name：通讯录按显示名匹配。同一员工可能有两条身份
+    // （正式注册 + office_proxy 复合身份内嵌 _u_ 安装标签，后者被通讯录噪音
+    // 过滤排除），binding 挂复合身份而通讯录显示正式身份——display_name 合一。
+    let mut display_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    {
+        let (server, cfg_admin) = {
+            let cfg = st.config.lock().await;
+            (cfg.server.clone(), cfg.memoria_admin_key.clone())
+        };
+        let client = crate::config::memoria_proxy_client(&server, &cfg_admin);
+        if let Ok(v) = client.call_json("agent_list", &serde_json::json!({})).await {
+            if let Some(agents) = v.get("agents").and_then(|a| a.as_array()) {
+                for a in agents {
+                    let aid = a.get("agent_id").and_then(|x| x.as_str()).unwrap_or("");
+                    let dn = a.get("display_name").and_then(|x| x.as_str()).unwrap_or("");
+                    if !aid.is_empty() && !dn.is_empty() {
+                        display_names.entry(dn.to_string()).or_insert_with(|| aid.to_string());
+                        display_names.insert(aid.to_string(), dn.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     // 按 user 聚合
     use std::collections::BTreeMap;
     let mut by_user: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
@@ -937,6 +962,7 @@ pub(crate) async fn handle_assistant_directory(
         }
         out.push(serde_json::json!({
             "user_id": user_id,
+            "display_name": display_names.get(&user_id).cloned().unwrap_or_default(),
             "is_self": is_self,
             "assistants": assistants,
         }));
