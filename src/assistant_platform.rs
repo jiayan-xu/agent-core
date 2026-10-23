@@ -301,6 +301,22 @@ impl AssistantPlatformStore {
                 level      TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS meeting_members (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                meeting_id   TEXT NOT NULL,
+                binding_id   TEXT NOT NULL,
+                user_id      TEXT NOT NULL,
+                scopes       TEXT NOT NULL,
+                invited_by   TEXT NOT NULL,
+                granted_at   TEXT NOT NULL,
+                revoked_at   TEXT,
+                UNIQUE(meeting_id, binding_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_meeting_member_binding
+                ON meeting_members(binding_id, revoked_at);
+            CREATE INDEX IF NOT EXISTS idx_meeting_member_meeting
+                ON meeting_members(meeting_id, revoked_at);
             ",
         )
         .map_err(|e| format!("assistant db migration: {e}"))?;
@@ -789,6 +805,118 @@ impl AssistantPlatformStore {
         Ok(out)
     }
 
+    // ── Phase 2 P2-1：会议成员（assistant binding 入会 + 临时 scope） ──
+
+    /// 会议 scope 常量：授予入会助手的临时权限集（方案 §7.2）。
+    pub(crate) fn meeting_scopes() -> Vec<String> {
+        vec![
+            "meeting:read".to_string(),
+            "meeting:write".to_string(),
+            "a2a:send:meeting".to_string(),
+            "a2a:receive:meeting".to_string(),
+        ]
+    }
+
+    /// 邀请 binding 入会（幂等：已在会且未撤销 → 更新 scopes；已撤销 → 重新授予）。
+    /// 调用方须先完成：邀请人会议权限判定 + binding active 校验（handler 层）。
+    pub(crate) fn meeting_invite(
+        &self,
+        meeting_id: &str,
+        binding: &AssistantBinding,
+        invited_by: &str,
+    ) -> Result<(), String> {
+        let scopes = Self::meeting_scopes().join(",");
+        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+        conn.execute(
+            "INSERT INTO meeting_members(meeting_id,binding_id,user_id,scopes,invited_by,granted_at) \
+             VALUES (?1,?2,?3,?4,?5,?6) \
+             ON CONFLICT(meeting_id,binding_id) DO UPDATE SET \
+             scopes=excluded.scopes, invited_by=excluded.invited_by, \
+             granted_at=excluded.granted_at, revoked_at=NULL",
+            params![
+                meeting_id,
+                binding.binding_id,
+                binding.user_id,
+                scopes,
+                invited_by,
+                now()
+            ],
+        )
+        .map_err(|e| format!("meeting invite: {e}"))?;
+        Ok(())
+    }
+
+    /// 移除助手出会（撤销临时 scope；重复移除幂等）。
+    pub(crate) fn meeting_remove(&self, meeting_id: &str, binding_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+        let n = conn
+            .execute(
+                "UPDATE meeting_members SET revoked_at=?3 \
+                 WHERE meeting_id=?1 AND binding_id=?2 AND revoked_at IS NULL",
+                params![meeting_id, binding_id, now()],
+            )
+            .map_err(|e| format!("meeting remove: {e}"))?;
+        Ok(n > 0)
+    }
+
+    /// 会议结束：批量撤销该会全部成员（幂等，可重复调用）。
+    pub(crate) fn meeting_expire(&self, meeting_id: &str) -> Result<usize, String> {
+        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+        let n = conn
+            .execute(
+                "UPDATE meeting_members SET revoked_at=?2 \
+                 WHERE meeting_id=?1 AND revoked_at IS NULL",
+                params![meeting_id, now()],
+            )
+            .map_err(|e| format!("meeting expire: {e}"))?;
+        Ok(n)
+    }
+
+    /// 某 binding 是否为该会有效成员（未撤销）。
+    pub(crate) fn meeting_is_member(&self, meeting_id: &str, binding_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+        let found = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meeting_members \
+                 WHERE meeting_id=?1 AND binding_id=?2 AND revoked_at IS NULL",
+                params![meeting_id, binding_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| format!("meeting member check: {e}"))?;
+        Ok(found > 0)
+    }
+
+    /// 会议有效成员列表（binding_id + user_id + 邀请人 + 授予时间）。
+    pub(crate) fn meeting_members(
+        &self,
+        meeting_id: &str,
+    ) -> Result<Vec<(String, String, String, String)>, String> {
+        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT binding_id,user_id,invited_by,granted_at FROM meeting_members \
+                 WHERE meeting_id=?1 AND revoked_at IS NULL ORDER BY granted_at",
+            )
+            .map_err(|e| format!("meeting members: {e}"))?;
+        let rows = stmt
+            .query_map(params![meeting_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| format!("meeting members: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Ok(v) = row {
+                out.push(v);
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn record_event(
         &self,
         event_type: &str,
@@ -1264,5 +1392,45 @@ mod tests {
         assert!(!b.capabilities.iter().any(|c| c.is_empty()));
         // 空名默认 = user_id-type（中文身份下可读）
         assert_eq!(b.assistant_name, "徐佳琰-智浦助手");
+    }
+
+    #[test]
+    fn meeting_member_lifecycle() {
+        let s = store();
+        let mk = |u: &str| {
+            s.create_binding(NewBinding {
+                user_id: u.into(),
+                assistant_type: "wb".into(),
+                assistant_name: String::new(),
+                device_id: "d".into(),
+                capabilities: vec![],
+                scopes: vec![],
+                public_key: String::new(),
+            })
+            .unwrap()
+        };
+        let a = mk("a");
+        let b = mk("b");
+        // 邀请 a 入会；未邀请 b
+        s.meeting_invite("meet_x", &a, "host").unwrap();
+        assert!(s.meeting_is_member("meet_x", &a.binding_id).unwrap());
+        assert!(!s.meeting_is_member("meet_x", &b.binding_id).unwrap());
+        assert_eq!(s.meeting_members("meet_x").unwrap().len(), 1);
+        // 幂等重邀
+        s.meeting_invite("meet_x", &a, "host").unwrap();
+        assert_eq!(s.meeting_members("meet_x").unwrap().len(), 1);
+        // 移除后不可见；重复移除返回 false
+        assert!(s.meeting_remove("meet_x", &a.binding_id).unwrap());
+        assert!(!s.meeting_is_member("meet_x", &a.binding_id).unwrap());
+        assert!(!s.meeting_remove("meet_x", &a.binding_id).unwrap());
+        // 撤销后重邀 → 恢复成员（revoked_at 清空）
+        s.meeting_invite("meet_x", &a, "host").unwrap();
+        assert!(s.meeting_is_member("meet_x", &a.binding_id).unwrap());
+        // 会议结束批量失效（a + 新邀 b 一并撤销；幂等二次返回 0）
+        s.meeting_invite("meet_x", &b, "host").unwrap();
+        assert_eq!(s.meeting_expire("meet_x").unwrap(), 2);
+        assert_eq!(s.meeting_expire("meet_x").unwrap(), 0);
+        assert!(!s.meeting_is_member("meet_x", &a.binding_id).unwrap());
+        assert!(!s.meeting_is_member("meet_x", &b.binding_id).unwrap());
     }
 }

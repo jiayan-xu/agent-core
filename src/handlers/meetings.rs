@@ -368,6 +368,18 @@ pub(crate) async fn handle_meeting_end(
         true => {
             // 实际发生终态跃迁：清理在线态并广播 ended 事件（增量，不含完整消息历史）
             st.meeting_presence.lock().await.remove(&id);
+            // P2-1（2026-10-23）：会议结束 → 该会全部助手临时授权批量失效
+            // （meeting_members 批量 revoked；失败仅告警不回滚——会议终态已生效，
+            // 授权残留的风险窗口由 a2a_meeting_check 的「会议存活」判定兜底封死）
+            match st.assistant_platform.meeting_expire(&id) {
+                Ok(n) if n > 0 => {
+                    tracing::info!(meeting = %id, expired = n, "P2-1: 会议结束，助手临时授权已批量失效");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(meeting = %id, error = %e, "P2-1: 会议结束批量失效助手授权失败（a2a 侧仍有会议存活判定兜底）");
+                }
+            }
             broadcast_meeting_event(
                 &st,
                 &id,

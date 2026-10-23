@@ -605,6 +605,12 @@ pub(crate) async fn handle_a2a_task_create(
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    // P2-1（D10c）：带 meeting_id 的任务必须双方均为该会有效成员
+    if let Err(resp) =
+        a2a_meeting_check(&st, &auth.binding_id, &req.target_binding, req.meeting_id.as_deref()).await
+    {
+        return resp;
+    }
     let task = st.assistant_platform.create_task(
         &auth,
         &req.target_binding,
@@ -748,6 +754,12 @@ pub(crate) async fn handle_a2a_message_create(
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    // P2-1（D10c）：带 meeting_id 的消息必须双方均为该会有效成员
+    if let Err(resp) =
+        a2a_meeting_check(&st, &auth.binding_id, &req.target_binding, req.meeting_id.as_deref()).await
+    {
+        return resp;
+    }
     match st.assistant_platform.create_message(
         &auth,
         &req.target_binding,
@@ -1127,4 +1139,304 @@ pub(crate) async fn handle_assistant_handover_brief(
         "brief": brief,
     }))
     .into_response()
+}
+
+// ── Phase 2 P2-1：会议成员（助手 binding 入会 / 临时 scope） ───────────────
+//
+// D10a：仅会议 owner / 平台 admin 可邀请/移除助手（会议可见 ≠ 可管理）。
+// D10b：临时 scope 独立存 meeting_members（不进持久 token scopes），会 end 批量失效。
+// D10c：a2a task/message 带 meeting_id 时必须双方均为该会有效成员（见下方校验钩子）。
+
+/// 邀请助手入会：POST /api/meetings/{id}/assistants  {binding_id}
+/// 权限：badge 身份 = 会议 owner 或平台 admin；binding 必须 active。
+pub(crate) async fn handle_meeting_assistant_invite(
+    State(st): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(meeting_id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    let binding_id = req
+        .get("binding_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if binding_id.is_empty() {
+        return err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "binding_id_required",
+            "缺少 binding_id",
+        );
+    }
+    // 会议存在性 + owner 判定（agent 锁短作用域）
+    let owner_ok = {
+        let guard = st.agent.lock().await;
+        match guard.as_ref() {
+            None => {
+                return err(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "agent_not_ready",
+                    "服务尚未就绪",
+                )
+            }
+            Some(agent) => match agent.get_meeting(&meeting_id) {
+                None => {
+                    return err(
+                        axum::http::StatusCode::NOT_FOUND,
+                        "meeting_not_found",
+                        "会议不存在",
+                    )
+                }
+                // 已结束的会议不可再邀请（临时 scope 生命周期与会议一致）
+                Some(m) if m.status == "ended" || m.status == "done" => {
+                    return err(
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "meeting_ended",
+                        "会议已结束，临时授权已失效",
+                    )
+                }
+                Some(m) => m.owner_user_id == ctx.agent_id,
+            },
+        }
+    };
+    // D10a：owner 或平台 admin（admin 判定走 is_admin 需 headers，这里以 caller==owner
+    // 为准；平台 admin 场景可用 admin 头直调同端点——is_admin 在此不可用因未传 headers，
+    // 简化：owner-only。会议 scope 经理暂不开邀请权，Phase 2 试用后再议）
+    if !owner_ok {
+        return err(
+            axum::http::StatusCode::FORBIDDEN,
+            "not_meeting_owner",
+            "仅会议发起人可邀请助手",
+        );
+    }
+    let binding = match st.assistant_platform.get_binding(&binding_id) {
+        Ok(Some(b)) if b.status == "active" => b,
+        Ok(Some(b)) => {
+            return err(
+                axum::http::StatusCode::BAD_REQUEST,
+                "binding_not_active",
+                &format!("binding 状态不可用: {}", b.status),
+            )
+        }
+        Ok(None) => {
+            return err(
+                axum::http::StatusCode::NOT_FOUND,
+                "binding_not_found",
+                "binding 不存在",
+            )
+        }
+        Err(message) => {
+            return err(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "binding_read_failed",
+                &message,
+            )
+        }
+    };
+    if let Err(message) = st
+        .assistant_platform
+        .meeting_invite(&meeting_id, &binding, &ctx.agent_id)
+    {
+        return err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "meeting_invite_failed",
+            &message,
+        );
+    }
+    audit_platform(
+        &st,
+        "assistant.meeting.invited",
+        &ctx.agent_id,
+        Some(&binding.binding_id),
+        &format!("meeting={meeting_id} binding={} type={}", binding.binding_id, binding.assistant_type),
+    )
+    .await;
+    Json(serde_json::json!({
+        "meeting_id": meeting_id,
+        "binding_id": binding.binding_id,
+        "scopes": crate::assistant_platform::AssistantPlatformStore::meeting_scopes(),
+    }))
+    .into_response()
+}
+
+/// 移除助手出会：DELETE 语义经 POST /api/meetings/{id}/assistants/remove {binding_id}
+pub(crate) async fn handle_meeting_assistant_remove(
+    State(st): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(meeting_id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    let binding_id = req
+        .get("binding_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if binding_id.is_empty() {
+        return err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "binding_id_required",
+            "缺少 binding_id",
+        );
+    }
+    let owner_ok = {
+        let guard = st.agent.lock().await;
+        match guard.as_ref() {
+            None => {
+                return err(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "agent_not_ready",
+                    "服务尚未就绪",
+                )
+            }
+            Some(agent) => agent
+                .get_meeting(&meeting_id)
+                .map(|m| m.owner_user_id == ctx.agent_id)
+                .unwrap_or(false),
+        }
+    };
+    if !owner_ok {
+        return err(
+            axum::http::StatusCode::FORBIDDEN,
+            "not_meeting_owner",
+            "仅会议发起人可移除助手",
+        );
+    }
+    match st
+        .assistant_platform
+        .meeting_remove(&meeting_id, &binding_id)
+    {
+        Ok(true) => {
+            audit_platform(
+                &st,
+                "assistant.meeting.removed",
+                &ctx.agent_id,
+                Some(&binding_id),
+                &format!("meeting={meeting_id} binding={binding_id}"),
+            )
+            .await;
+            Json(serde_json::json!({"removed": true})).into_response()
+        }
+        Ok(false) => {
+            return err(
+                axum::http::StatusCode::NOT_FOUND,
+                "member_not_found",
+                "该助手不在此会议中",
+            )
+        }
+        Err(message) => err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "meeting_remove_failed",
+            &message,
+        ),
+    }
+}
+
+/// 会议助手成员列表：GET /api/meetings/{id}/assistants
+/// 权限：会议可见者（owner/admin/scope 成员/公开）——复用 meeting_visible 判定。
+#[derive(Deserialize)]
+pub(crate) struct MeetingMembersQuery {
+    #[serde(default)]
+    pub(crate) token: Option<String>,
+}
+
+pub(crate) async fn handle_meeting_assistants_list(
+    State(st): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(meeting_id): Path<String>,
+) -> Response {
+    // meeting_visible 返回 Option（None=agent 未就绪）；与会议模块同判：None→503
+    let visible = {
+        let guard = st.agent.lock().await;
+        match guard.as_ref() {
+            None => {
+                return err(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "agent_not_ready",
+                    "服务尚未就绪",
+                )
+            }
+            Some(agent) => {
+                agent.meeting_visible(&meeting_id, &ctx.agent_id, &ctx.allowed_ns, false)
+            }
+        }
+    };
+    if visible != Some(true) {
+        return err(
+            axum::http::StatusCode::FORBIDDEN,
+            "meeting_forbidden",
+            "无权访问该会议",
+        );
+    }
+    match st.assistant_platform.meeting_members(&meeting_id) {
+        Ok(members) => {
+            let list: Vec<serde_json::Value> = members
+                .into_iter()
+                .map(|(binding_id, user_id, invited_by, granted_at)| {
+                    serde_json::json!({
+                        "binding_id": binding_id,
+                        "user_id": user_id,
+                        "invited_by": invited_by,
+                        "granted_at": granted_at,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({"meeting_id": meeting_id, "members": list})).into_response()
+        }
+        Err(message) => err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "members_read_failed",
+            &message,
+        ),
+    }
+}
+
+/// P2-1 校验钩子（D10c）：a2a task/message 带 meeting_id 时校验发送方与目标
+/// 双方均为该会有效成员。无 meeting_id 维持 Phase 0 全局 a2a 语义。
+/// 返回 Err(响应) = 校验失败；Ok(()) = 放行。
+pub(crate) async fn a2a_meeting_check(
+    st: &Arc<AppState>,
+    from_binding: &str,
+    to_binding: &str,
+    meeting_id: Option<&str>,
+) -> Result<(), Response> {
+    let Some(meeting_id) = meeting_id else { return Ok(()) };
+    // 会议必须存在且未结束（结束的会不允许再发）
+    let meeting_alive = {
+        let guard = st.agent.lock().await;
+        match guard.as_ref() {
+            None => false,
+            Some(agent) => match agent.get_meeting(meeting_id) {
+                None => false,
+                Some(m) => m.status != "ended" && m.status != "done",
+            },
+        }
+    };
+    if !meeting_alive {
+        return Err(err(
+            axum::http::StatusCode::FORBIDDEN,
+            "meeting_not_active",
+            "会议不存在或已结束",
+        ));
+    }
+    for b in [from_binding, to_binding] {
+        match st.assistant_platform.meeting_is_member(meeting_id, b) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(err(
+                    axum::http::StatusCode::FORBIDDEN,
+                    "not_meeting_member",
+                    &format!("binding 未获该会议授权: {b}"),
+                ))
+            }
+            Err(message) => {
+                return Err(err(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "member_check_failed",
+                    &message,
+                ))
+            }
+        }
+    }
+    Ok(())
 }
