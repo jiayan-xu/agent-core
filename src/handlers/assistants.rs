@@ -1837,3 +1837,326 @@ pub(crate) async fn handle_a2a_inbox_stream(
         .keep_alive(KeepAlive::default())
         .into_response()
 }
+
+// ── Phase 3：artifact（方案 §8.3 / D8=本地受控目录+元数据+hash） ────────────
+//
+// POST /api/a2a/artifacts?task_id=&type=&title=  body=原始字节（a2a:send）
+//   会议域（带 meeting_id 的 task）自动校验发送方为任务方+会议成员；
+//   大小上限 50MB；返回 artifact 引用（消息里传引用不传本体）。
+// GET  /api/a2a/artifacts/{id}          元数据（from/to 双方可见）
+// GET  /api/a2a/artifacts/{id}/content  内容下载（读取时复核 sha256）
+// GET  /api/a2a/artifacts?task_id=      任务 artifact 列表（任务方可见）
+
+#[derive(Deserialize)]
+pub(crate) struct ArtifactUploadQuery {
+    #[serde(default)]
+    pub(crate) task_id: Option<String>,
+    #[serde(default)]
+    pub(crate) art_type: Option<String>,
+    #[serde(default)]
+    pub(crate) title: Option<String>,
+    #[serde(default)]
+    pub(crate) meeting_id: Option<String>,
+}
+
+pub(crate) async fn handle_artifact_upload(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ArtifactUploadQuery>,
+    body: axum::body::Bytes,
+) -> Response {
+    let auth = match assistant_auth(&st, &headers, "a2a:send").await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    // 关联 task 时：task 必须存在且发送方是任务一方；task 的对方即 artifact 接收方
+    let mut to_binding = String::new();
+    let mut meeting_id = q.meeting_id.clone();
+    let mut task_id = q.task_id.clone();
+    if let Some(tid) = task_id.clone() {
+        match st.assistant_platform.get_task(&tid) {
+            Ok(Some(task))
+                if task.from_binding == auth.binding_id
+                    || task.to_binding == auth.binding_id =>
+            {
+                to_binding = if task.from_binding == auth.binding_id {
+                    task.to_binding.clone()
+                } else {
+                    task.from_binding.clone()
+                };
+                meeting_id = meeting_id.or_else(|| task.meeting_id.clone());
+            }
+            Ok(Some(_)) => {
+                return err(
+                    axum::http::StatusCode::FORBIDDEN,
+                    "task_forbidden",
+                    "无权为该任务上传 artifact",
+                )
+            }
+            Ok(None) => {
+                return err(
+                    axum::http::StatusCode::NOT_FOUND,
+                    "task_not_found",
+                    "task 不存在",
+                )
+            }
+            Err(message) => {
+                return err(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "task_read_failed",
+                    &message,
+                )
+            }
+        }
+    } else if meeting_id.is_none() {
+        return err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "task_or_meeting_required",
+            "artifact 须关联 task_id 或 meeting_id",
+        );
+    }
+    // 会议域校验（D10c 同源逻辑）：带 meeting_id 时发送方须为会议成员
+    if let Some(mid) = meeting_id.as_deref() {
+        match st
+            .assistant_platform
+            .meeting_is_member(mid, &auth.binding_id)
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return err(
+                    axum::http::StatusCode::FORBIDDEN,
+                    "not_meeting_member",
+                    "binding 未获该会议授权",
+                )
+            }
+            Err(message) => {
+                return err(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "member_check_failed",
+                    &message,
+                )
+            }
+        }
+    }
+    // 无 task 时接收方须显式给出（query to_binding）
+    if to_binding.is_empty() {
+        return err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "target_required",
+            "关联 task 或显式提供接收方",
+        );
+    }
+    let art_type = q.art_type.clone().unwrap_or_else(|| "bin".to_string());
+    let title = q
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("artifact-{}", Local::now().format("%Y%m%d%H%M%S")));
+    match st.assistant_platform.save_artifact(
+        &auth.binding_id,
+        &to_binding,
+        meeting_id.as_deref(),
+        task_id.as_deref(),
+        &art_type,
+        &title,
+        &body,
+    ) {
+        Ok((artifact_id, sha, size)) => {
+            audit_platform(
+                &st,
+                "a2a.artifact.created",
+                &auth.user_id,
+                Some(&auth.binding_id),
+                &format!(
+                    "artifact={artifact_id} task={:?} meeting={:?} type={art_type} size={size} sha256={}",
+                    task_id.as_deref().unwrap_or("-"),
+                    meeting_id.as_deref().unwrap_or("-"),
+                    &sha[..16]
+                ),
+            )
+            .await;
+            // §8.3 引用形态返回：消息里只传这个，不传本体
+            (
+                axum::http::StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "artifact": {
+                        "artifact_id": artifact_id,
+                        "type": art_type,
+                        "title": title,
+                        "sha256": sha,
+                        "size": size,
+                        "uri": format!("artifact://{artifact_id}"),
+                    }
+                })),
+            )
+                .into_response()
+        }
+        Err(message) => err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "artifact_save_failed",
+            &message,
+        ),
+    }
+}
+
+fn artifact_access_allowed(
+    st: &Arc<AppState>,
+    artifact: &crate::assistant_platform::Artifact,
+    binding_id: &str,
+) -> bool {
+    artifact.from_binding == binding_id || artifact.to_binding == binding_id
+    // 生命周期随 task/binding 撤销即不可再访问新上传；已存 artifact 保留（审计不删）
+}
+
+pub(crate) async fn handle_artifact_get(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(artifact_id): Path<String>,
+) -> Response {
+    let auth = match assistant_auth(&st, &headers, "a2a:receive").await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    match st.assistant_platform.get_artifact(&artifact_id) {
+        Ok(Some(art)) if artifact_access_allowed(&st, &art, &auth.binding_id) => {
+            Json(serde_json::json!({"artifact": art})).into_response()
+        }
+        Ok(Some(_)) => err(
+            axum::http::StatusCode::FORBIDDEN,
+            "artifact_forbidden",
+            "无权读取该 artifact",
+        ),
+        Ok(None) => err(
+            axum::http::StatusCode::NOT_FOUND,
+            "artifact_not_found",
+            "artifact 不存在",
+        ),
+        Err(message) => err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "artifact_read_failed",
+            &message,
+        ),
+    }
+}
+
+pub(crate) async fn handle_artifact_content(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(artifact_id): Path<String>,
+) -> Response {
+    let auth = match assistant_auth(&st, &headers, "a2a:receive").await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let art = match st.assistant_platform.get_artifact(&artifact_id) {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            return err(
+                axum::http::StatusCode::NOT_FOUND,
+                "artifact_not_found",
+                "artifact 不存在",
+            )
+        }
+        Err(message) => {
+            return err(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_read_failed",
+                &message,
+            )
+        }
+    };
+    if !artifact_access_allowed(&st, &art, &auth.binding_id) {
+        return err(
+            axum::http::StatusCode::FORBIDDEN,
+            "artifact_forbidden",
+            "无权读取该 artifact",
+        );
+    }
+    match st.assistant_platform.read_artifact_content(&artifact_id) {
+        Ok(Some(data)) => {
+            audit_platform(
+                &st,
+                "a2a.artifact.downloaded",
+                &auth.user_id,
+                Some(&auth.binding_id),
+                &format!("artifact={artifact_id} bytes={}", data.len()),
+            )
+            .await;
+            (
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        Box::leak(format!("attachment; filename=\"{artifact_id}.{}\"",
+                            if art.art_type.is_empty() { "bin" } else { &art.art_type }).into_boxed_str()) as &str,
+                    ),
+                ],
+                data,
+            )
+                .into_response()
+        }
+        Ok(None) => err(
+            axum::http::StatusCode::NOT_FOUND,
+            "artifact_not_found",
+            "artifact 不存在",
+        ),
+        Err(message) => err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "artifact_content_failed",
+            &message,
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ArtifactListQuery {
+    #[serde(default)]
+    pub(crate) task_id: Option<String>,
+}
+
+pub(crate) async fn handle_artifact_list(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ArtifactListQuery>,
+) -> Response {
+    let auth = match assistant_auth(&st, &headers, "a2a:receive").await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let Some(task_id) = q.task_id else {
+        return err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "task_id_required",
+            "须按 task_id 查询",
+        );
+    };
+    // 权限：请求方须为任务一方
+    match st.assistant_platform.get_task(&task_id) {
+        Ok(Some(task))
+            if task.from_binding == auth.binding_id || task.to_binding == auth.binding_id =>
+        {
+            match st.assistant_platform.artifacts_for_task(&task_id) {
+                Ok(list) => Json(serde_json::json!({"artifacts": list})).into_response(),
+                Err(message) => err(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "artifacts_read_failed",
+                    &message,
+                ),
+            }
+        }
+        Ok(Some(_)) => err(
+            axum::http::StatusCode::FORBIDDEN,
+            "task_forbidden",
+            "无权读取该任务的 artifacts",
+        ),
+        Ok(None) => err(
+            axum::http::StatusCode::NOT_FOUND,
+            "task_not_found",
+            "task 不存在",
+        ),
+        Err(message) => err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "task_read_failed",
+            &message,
+        ),
+    }
+}

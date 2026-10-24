@@ -71,6 +71,23 @@ pub(crate) struct IssuedToken {
     pub(crate) expires_at: String,
 }
 
+/// P3（§8.3）：A2A artifact 元数据——大文件本体在本地受控目录，
+/// 消息/任务里只传 artifact 引用（id/type/title/sha256），不 base64。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Artifact {
+    pub(crate) artifact_id: String,
+    pub(crate) meeting_id: String,
+    pub(crate) task_id: String,
+    pub(crate) from_binding: String,
+    pub(crate) to_binding: String,
+    pub(crate) art_type: String,
+    pub(crate) title: String,
+    pub(crate) size_bytes: i64,
+    pub(crate) sha256: String,
+    pub(crate) trace_id: String,
+    pub(crate) created_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TokenAuth {
     pub(crate) token_id: String,
@@ -113,6 +130,8 @@ pub(crate) struct A2aMessage {
 
 pub(crate) struct AssistantPlatformStore {
     conn: Mutex<Connection>,
+    /// P3：artifact 落盘根目录（agent.toml 同目录下 artifacts/；None=测试模式不落盘）
+    artifacts_dir: Option<std::path::PathBuf>,
 }
 
 fn now() -> String {
@@ -134,6 +153,14 @@ fn random_hex(n: usize) -> String {
 fn sha256_hex(value: &str) -> String {
     let mut h = Sha256::new();
     h.update(value.as_bytes());
+    let out = h.finalize();
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// P3：字节内容 sha256（artifact 完整性）。
+fn sha256_hex_bytes(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
     let out = h.finalize();
     out.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -199,8 +226,20 @@ pub(crate) fn normalize_scopes(requested: &[String]) -> Vec<String> {
 impl AssistantPlatformStore {
     pub(crate) fn open(db_path: &Path) -> Result<Self, String> {
         let conn = Connection::open(db_path).map_err(|e| format!("open assistant db: {e}"))?;
+        // P3：artifact 目录跟随 db 同目录（agent.toml 旁 artifacts/）；:memory: 测试库不落盘
+        let artifacts_dir = if db_path.to_string_lossy().contains(":memory:") {
+            None
+        } else {
+            let d = db_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("artifacts");
+            std::fs::create_dir_all(&d).map_err(|e| format!("create artifacts dir: {e}"))?;
+            Some(d)
+        };
         Self::init(conn).map(|conn| Self {
             conn: Mutex::new(conn),
+            artifacts_dir,
         })
     }
 
@@ -317,6 +356,22 @@ impl AssistantPlatformStore {
                 ON meeting_members(binding_id, revoked_at);
             CREATE INDEX IF NOT EXISTS idx_meeting_member_meeting
                 ON meeting_members(meeting_id, revoked_at);
+
+            CREATE TABLE IF NOT EXISTS a2a_artifacts (
+                artifact_id  TEXT PRIMARY KEY,
+                meeting_id   TEXT,
+                task_id      TEXT,
+                from_binding TEXT NOT NULL,
+                to_binding   TEXT NOT NULL,
+                art_type     TEXT NOT NULL,
+                title        TEXT NOT NULL,
+                size_bytes   INTEGER NOT NULL,
+                sha256       TEXT NOT NULL,
+                trace_id     TEXT NOT NULL,
+                created_at   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_artifact_task ON a2a_artifacts(task_id);
+            CREATE INDEX IF NOT EXISTS idx_artifact_to ON a2a_artifacts(to_binding);
             ",
         )
         .map_err(|e| format!("assistant db migration: {e}"))?;
@@ -917,6 +972,145 @@ impl AssistantPlatformStore {
         Ok(out)
     }
 
+    // ── Phase 3：artifact 存储（方案 §8.3，D8 拍板=本地受控目录 + 元数据/hash） ──
+
+    /// P3 上限：单 artifact 50MB（大文件走 NAS 属 D8 后续演进，不进消息不进 memoria）。
+    pub(crate) const ARTIFACT_MAX_BYTES: usize = 50 * 1024 * 1024;
+
+    pub(crate) fn save_artifact(
+        &self,
+        from_binding: &str,
+        to_binding: &str,
+        meeting_id: Option<&str>,
+        task_id: Option<&str>,
+        art_type: &str,
+        title: &str,
+        data: &[u8],
+    ) -> Result<(String, String, usize), String> {
+        if data.is_empty() {
+            return Err("artifact 内容为空".to_string());
+        }
+        if data.len() > Self::ARTIFACT_MAX_BYTES {
+            return Err(format!("artifact 超限：{} bytes（上限 50MB）", data.len()));
+        }
+        let artifact_id = format!("art_{}", random_hex(12));
+        let sha = sha256_hex_bytes(data);
+        // 落盘（测试模式 artifacts_dir=None 跳过）
+        if let Some(dir) = &self.artifacts_dir {
+            let path = dir.join(&artifact_id);
+            std::fs::write(&path, data).map_err(|e| format!("write artifact: {e}"))?;
+        }
+        let trace_id = format!("apf_{}", random_hex(10));
+        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+        conn.execute(
+            "INSERT INTO a2a_artifacts \
+             (artifact_id,meeting_id,task_id,from_binding,to_binding,art_type,title,size_bytes,sha256,trace_id,created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![
+                artifact_id,
+                meeting_id,
+                task_id,
+                from_binding,
+                to_binding,
+                sanitize_id(art_type),
+                sanitize_text(title, 200),
+                data.len() as i64,
+                sha,
+                trace_id,
+                now()
+            ],
+        )
+        .map_err(|e| format!("save artifact: {e}"))?;
+        Ok((artifact_id, sha, data.len()))
+    }
+
+    pub(crate) fn get_artifact(&self, artifact_id: &str) -> Result<Option<Artifact>, String> {
+        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+        conn.query_row(
+            "SELECT artifact_id,ifnull(meeting_id,''),ifnull(task_id,''),from_binding,to_binding,\
+             art_type,title,size_bytes,sha256,trace_id,created_at \
+             FROM a2a_artifacts WHERE artifact_id=?1",
+            params![artifact_id],
+            |r| {
+                Ok(Artifact {
+                    artifact_id: r.get(0)?,
+                    meeting_id: r.get(1)?,
+                    task_id: r.get(2)?,
+                    from_binding: r.get(3)?,
+                    to_binding: r.get(4)?,
+                    art_type: r.get(5)?,
+                    title: r.get(6)?,
+                    size_bytes: r.get(7)?,
+                    sha256: r.get(8)?,
+                    trace_id: r.get(9)?,
+                    created_at: r.get(10)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| format!("get artifact: {e}"))
+    }
+
+    /// artifact 内容读取（落盘模式从磁盘读并复核 sha256；测试模式返回空）。
+    pub(crate) fn read_artifact_content(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let Some(art) = self.get_artifact(artifact_id)? else {
+            return Ok(None);
+        };
+        let Some(dir) = &self.artifacts_dir else {
+            return Ok(Some(Vec::new()));
+        };
+        let path = dir.join(artifact_id);
+        let data = std::fs::read(&path).map_err(|e| format!("read artifact: {e}"))?;
+        if sha256_hex_bytes(&data) != art.sha256 {
+            return Err(format!("artifact 完整性校验失败：{artifact_id}"));
+        }
+        Ok(Some(data))
+    }
+
+    /// 某任务的 artifact 列表（任务双方可见；handler 侧做权限判定）。
+    pub(crate) fn artifacts_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<Artifact>, String> {
+        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT artifact_id,ifnull(meeting_id,''),ifnull(task_id,''),from_binding,to_binding,\
+                 art_type,title,size_bytes,sha256,trace_id,created_at \
+                 FROM a2a_artifacts WHERE task_id=?1 ORDER BY created_at",
+            )
+            .map_err(|e| format!("list artifacts: {e}"))?;
+        let rows = stmt
+            .query_map(params![task_id], Self::artifact_from_row)
+            .map_err(|e| format!("list artifacts: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            if let Ok(v) = row {
+                out.push(v);
+            }
+        }
+        Ok(out)
+    }
+
+    fn artifact_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
+        Ok(Artifact {
+            artifact_id: r.get(0)?,
+            meeting_id: r.get(1)?,
+            task_id: r.get(2)?,
+            from_binding: r.get(3)?,
+            to_binding: r.get(4)?,
+            art_type: r.get(5)?,
+            title: r.get(6)?,
+            size_bytes: r.get(7)?,
+            sha256: r.get(8)?,
+            trace_id: r.get(9)?,
+            created_at: r.get(10)?,
+        })
+    }
+
     pub(crate) fn record_event(
         &self,
         event_type: &str,
@@ -1466,5 +1660,36 @@ mod tests {
         assert_eq!(s.meeting_expire("meet_x").unwrap(), 0);
         assert!(!s.meeting_is_member("meet_x", &a.binding_id).unwrap());
         assert!(!s.meeting_is_member("meet_x", &b.binding_id).unwrap());
+    }
+
+    #[test]
+    fn artifact_save_get_and_integrity() {
+        // :memory: 测试模式：artifacts_dir=None 不落盘，只验 DB 元数据链路
+        let s = store();
+        let (id, sha, size) = s
+            .save_artifact("b1", "b2", Some("m1"), Some("t1"), "pptx", "十月分析", b"hello artifact")
+            .unwrap();
+        assert!(id.starts_with("art_"));
+        assert_eq!(size, 14);
+        assert_eq!(sha.len(), 64);
+        let art = s.get_artifact(&id).unwrap().unwrap();
+        assert_eq!(art.from_binding, "b1");
+        assert_eq!(art.to_binding, "b2");
+        assert_eq!(art.task_id, "t1");
+        assert_eq!(art.art_type, "pptx");
+        assert_eq!(art.title, "十月分析");
+        assert_eq!(art.sha256, sha);
+        // 空/超限拒绝
+        assert!(s.save_artifact("b1", "b2", None, None, "bin", "x", b"").is_err());
+        let big = vec![0u8; AssistantPlatformStore::ARTIFACT_MAX_BYTES + 1];
+        assert!(s.save_artifact("b1", "b2", None, None, "bin", "x", &big).is_err());
+        // 列表
+        let list = s.artifacts_for_task("t1").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].artifact_id, id);
+        assert!(s.artifacts_for_task("t-none").unwrap().is_empty());
+        // 测试模式内容读取返回空 Some（落盘校验由部署冒烟覆盖）
+        assert!(s.read_artifact_content(&id).unwrap().is_some());
+        assert!(s.get_artifact("art_none").unwrap().is_none());
     }
 }

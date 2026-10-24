@@ -78,7 +78,19 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/a2a/tasks/{id}/status", post(handle_a2a_task_update))
         .route("/api/a2a/messages", post(handle_a2a_message_create))
         .route("/api/a2a/inbox", get(handle_a2a_inbox))
-        .route("/api/a2a/inbox/stream", get(handle_a2a_inbox_stream));
+        .route("/api/a2a/inbox/stream", get(handle_a2a_inbox_stream))
+        // ── Phase 3：artifact（引用传递，本体本地受控目录）──
+        // 上传单独放宽 body 限制到 50MB+1（axum 默认 2MB；store 侧再校验精确上限）
+        .nest(
+            "/api/a2a/artifacts",
+            Router::new()
+                .route("/", post(handle_artifact_upload).get(handle_artifact_list))
+                .route("/{id}", get(handle_artifact_get))
+                .route("/{id}/content", get(handle_artifact_content))
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::assistant_platform::AssistantPlatformStore::ARTIFACT_MAX_BYTES + 1024,
+                )),
+        );
 
     let protected = Router::new()
         .route("/api/chat", post(handle_chat))

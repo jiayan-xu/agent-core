@@ -48,12 +48,16 @@ def request(
     *,
     token: str | None = None,
     admin_key: str | None = None,
-    body: dict | None = None,
-) -> tuple[int, dict | list | str]:
+    body: dict | list | str | bytes | None = None,
+    raw_content_type: str | None = None,
+) -> tuple[int, dict | list | str | bytes]:
     url = validate_url(url)
     headers = {"Accept": "application/json"}
     data = None
-    if body is not None:
+    if isinstance(body, bytes):
+        data = body
+        headers["Content-Type"] = raw_content_type or "application/octet-stream"
+    elif body is not None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
     if token:
@@ -63,8 +67,12 @@ def request(
         headers["X-Agent-Key"] = admin_key
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8", "replace")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            payload = resp.read()
+            ctype = resp.headers.get("Content-Type", "")
+            if "octet-stream" in ctype:
+                return resp.status, payload  # bytes（artifact 下载）
+            raw = payload.decode("utf-8", "replace")
             parsed = json.loads(raw) if raw else {}
             return resp.status, parsed
     except urllib.error.HTTPError as exc:
@@ -241,6 +249,58 @@ def main() -> int:
             any(isinstance(m, dict) and m.get("kind") == "ai" and "completed" in str(m.get("content", "")) for m in msgs),
             "assistant task completion injected into meeting stream",
         )
+
+        # ── P3：artifact 全链路（上传→元数据→下载复核→列表） ──
+        import urllib.parse as _up
+        content = "P3 artifact 冒烟内容 十月固废分析报告".encode("utf-8")
+        q = _up.urlencode({"task_id": task_id, "type": "txt", "title": "十月分析.txt"})
+        status, payload = request(
+            "POST",
+            base + f"/api/a2a/artifacts?{q}",
+            token=dst["token"],
+            body=content,
+        )
+        expect(status == 201, f"artifact uploaded -> {status}")
+        art = payload.get("artifact", {})
+        art_id = art.get("artifact_id", "")
+        import hashlib as _hl
+        expect(
+            art.get("sha256") == _hl.sha256(content).hexdigest(),
+            "artifact sha256 matches content",
+        )
+        expect(art.get("uri") == f"artifact://{art_id}", "artifact reference uri returned")
+        # 元数据（src 为任务一方可读）
+        status, payload = request(
+            "GET",
+            base + f"/api/a2a/artifacts/{art_id}",
+            token=src["token"],
+        )
+        expect(status == 200 and payload.get("artifact", {}).get("task_id") == task_id, "artifact metadata readable by task peer")
+        # 内容下载 + hash 复核
+        status, data = request(
+            "GET",
+            base + f"/api/a2a/artifacts/{art_id}/content",
+            token=src["token"],
+        )
+        expect(status == 200 and isinstance(data, bytes) and data == content, "artifact content roundtrip intact")
+        # 任务 artifact 列表
+        status, payload = request(
+            "GET",
+            base + f"/api/a2a/artifacts?task_id={task_id}",
+            token=src["token"],
+        )
+        expect(
+            status == 200 and any(a.get("artifact_id") == art_id for a in payload.get("artifacts", [])),
+            "artifact listed for task",
+        )
+        # 未关联 task/meeting 的裸上传被拒（400）
+        status, _ = request(
+            "POST",
+            base + "/api/a2a/artifacts?type=bin&title=x",
+            token=src["token"],
+            body=b"orphan",
+        )
+        expect(status == 400, f"orphan artifact (no task/meeting) rejected -> {status}")
 
         # 带消息的 meeting 校验：未受邀第三方用例省略（需第三个 binding；用 src 发给 dst 合法路径已覆盖）
 
