@@ -204,6 +204,8 @@ pub(crate) fn spawn_server(
                     config.services.clone(),
                 ),
                 assistant_platform,
+                // P4：Resource Gateway 工具限流（内存计数）
+                assistant_tool_quota: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             });
 
             // P2 服务保活（2026-10-22）：配置空表则完全不启动循环 → 零行为变化。

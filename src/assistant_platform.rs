@@ -24,6 +24,8 @@ pub(crate) const ALLOWED_SCOPES: &[&str] = &[
     "memory:write:self",
     "a2a:send",
     "a2a:receive",
+    // P4（§9.3 Resource Gateway）：只读平台工具代理；写工具审批属 P4-2，暂无 scope
+    "tools:call:read",
 ];
 
 const DEFAULT_SCOPES: &[&str] = &[

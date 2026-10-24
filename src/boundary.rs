@@ -1217,7 +1217,17 @@ impl std::str::FromStr for ToolClass {
 /// 这里登记的名称是「classifier 没有前缀启发式、需要显式 bootstrap」的工具；
 /// 即便某个名称（如 read_text）同时被 is_read_only_tool 的 read_ 前缀覆盖，
 /// 也必须保留在此处，否则 classifier 一侧会漏分类。
-pub(crate) const EXPLICIT_READ_CROSS_TOOLS: &[&str] = &["cross_validate", "excel_group_sum", "read_text"];
+pub(crate) const EXPLICIT_READ_CROSS_TOOLS: &[&str] = &[
+    "cross_validate",
+    "excel_group_sum",
+    "read_text",
+    // P4（2026-10-24）：平台只读数据工具（数据管道/系统状态）——无 read 前缀但
+    // 语义确定只读；Resource Gateway 助手代理白名单与此同源
+    "pipeline_status",
+    "coverage_query",
+    "memory_health",
+    "system_status",
+];
 
 /// 工具分类器（P1-7 修复：配置驱动 + 自动学习）
 ///

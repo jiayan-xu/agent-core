@@ -73,6 +73,9 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/assistants/token/refresh", post(handle_assistant_token_refresh))
         .route("/api/agent/memory", post(handle_assistant_memory_write))
         .route("/api/agent/context", get(handle_assistant_context))
+        // ── Phase 4：Resource Gateway——MCP 工具代理（只读白名单+限流） ──
+        .route("/api/agent/tools/call", post(handle_agent_tools_call))
+        .route("/api/agent/tools", get(handle_agent_tools_list))
         .route("/api/a2a/tasks", post(handle_a2a_task_create))
         .route("/api/a2a/tasks/{id}", get(handle_a2a_task_get))
         .route("/api/a2a/tasks/{id}/status", post(handle_a2a_task_update))

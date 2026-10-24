@@ -2113,6 +2113,168 @@ pub(crate) struct ArtifactListQuery {
     pub(crate) task_id: Option<String>,
 }
 
+// ── Phase 4：MCP 工具代理（方案 §9.3 Resource Gateway） ────────────────────
+//
+// POST /api/agent/tools/call  {tool, arguments}（scope tools:call:read）
+// 六步链（§9.3）：scope 校验 → 工具分级 → （P4-2 审批位）→ MCP 调用 →
+// 审计 → 返回。第一版防线：
+//   ① 白名单：仅平台只读数据工具（数据管道状态/覆盖/新鲜度等）；
+//   ② is_read_only_tool 复核（boundary 权威分级，白名单与分级双保险）；
+//   写/未知工具一律 403+审计（危险工具审批管线属 P4-2）。
+// 限流：每 binding 每日 500 次（内存计数，重启清零——超额审计已有持久记录）。
+
+/// 助手可调的白名单工具（只读、平台数据类；逐个开放而非全量放行）。
+const ASSISTANT_TOOLS_READONLY: &[&str] = &[
+    // 数据管道（hhv-model pipeline MCP）
+    "pipeline_status",
+    "coverage_query",
+    // memoria 只读健康/统计（不涉个人内容检索——那是 memory:read:self 的边界）
+    "memory_health",
+    "system_status",
+];
+
+/// P4 限流：binding → (日期, 次数)。进程内计数（重启清零可接受：超额走审计追责）。
+async fn tool_quota_take(st: &Arc<AppState>, binding_id: &str) -> Result<(), usize> {
+    const DAILY_LIMIT: usize = 500;
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let mut map = st.assistant_tool_quota.lock().await;
+    let entry = map.entry(binding_id.to_string()).or_insert((today.clone(), 0usize));
+    if entry.0 != today {
+        *entry = (today.clone(), 0);
+    }
+    if entry.1 >= DAILY_LIMIT {
+        return Err(entry.1);
+    }
+    entry.1 += 1;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ToolCallRequest {
+    tool: String,
+    #[serde(default)]
+    arguments: serde_json::Value,
+}
+
+pub(crate) async fn handle_agent_tools_call(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<ToolCallRequest>,
+) -> Response {
+    let auth = match assistant_auth(&st, &headers, "tools:call:read").await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let tool = req.tool.trim().to_lowercase();
+    // 防线①：白名单
+    if !ASSISTANT_TOOLS_READONLY.contains(&tool.as_str()) {
+        audit_platform(
+            &st,
+            "agent.tool.denied",
+            &auth.user_id,
+            Some(&auth.binding_id),
+            &format!("tool={tool} reason=not_in_whitelist"),
+        )
+        .await;
+        return err(
+            axum::http::StatusCode::FORBIDDEN,
+            "tool_not_allowed",
+            &format!("工具不在助手白名单: {tool}"),
+        );
+    }
+    // 防线②：boundary 分级复核（白名单工具也必须是只读类）
+    if !agent_core::boundary::is_read_only_tool(&tool) {
+        audit_platform(
+            &st,
+            "agent.tool.denied",
+            &auth.user_id,
+            Some(&auth.binding_id),
+            &format!("tool={tool} reason=not_read_only_class"),
+        )
+        .await;
+        return err(
+            axum::http::StatusCode::FORBIDDEN,
+            "tool_not_allowed",
+            &format!("工具未通过只读分级: {tool}"),
+        );
+    }
+    // 限流（P4 任务 3）
+    if let Err(used) = tool_quota_take(&st, &auth.binding_id).await {
+        audit_platform(
+            &st,
+            "agent.tool.rate_limited",
+            &auth.user_id,
+            Some(&auth.binding_id),
+            &format!("tool={tool} used={used}"),
+        )
+        .await;
+        return err(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "quota_exceeded",
+            "每日工具调用配额已用尽",
+        );
+    }
+    let agent = {
+        let guard = st.agent.lock().await;
+        guard.as_ref().map(|a| a.clone())
+    };
+    let Some(agent) = agent else {
+        return err(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "agent_not_ready",
+            "服务尚未就绪",
+        );
+    };
+    let args_obj = if req.arguments.is_null() {
+        serde_json::json!({})
+    } else {
+        req.arguments.clone()
+    };
+    match agent.mcp.call_json(&tool, &args_obj).await {
+        Ok(result) => {
+            audit_platform(
+                &st,
+                "agent.tool.called",
+                &auth.user_id,
+                Some(&auth.binding_id),
+                &format!("tool={tool}"),
+            )
+            .await;
+            Json(serde_json::json!({"tool": tool, "result": result})).into_response()
+        }
+        Err(message) => {
+            audit_platform(
+                &st,
+                "agent.tool.failed",
+                &auth.user_id,
+                Some(&auth.binding_id),
+                &format!("tool={tool} error={message}"),
+            )
+            .await;
+            err(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "tool_call_failed",
+                &message,
+            )
+        }
+    }
+}
+
+/// 助手可用工具清单（发现端点，配 tools/call 用）。
+pub(crate) async fn handle_agent_tools_list(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = assistant_auth(&st, &headers, "tools:call:read").await {
+        return resp;
+    }
+    Json(serde_json::json!({
+        "tools": ASSISTANT_TOOLS_READONLY,
+        "daily_quota": 500,
+    }))
+    .into_response()
+}
+
 pub(crate) async fn handle_artifact_list(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,

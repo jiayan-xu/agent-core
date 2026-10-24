@@ -105,7 +105,10 @@ def main() -> int:
         expect(status == 200 and health.get("status") in (None, "ok"), "agent-core health 200")
 
         # ── 双助手（admin 名下，全 scope） ──
-        def mk_binding(kind: str) -> dict:
+        def mk_binding(kind: str, tools_scope: bool = False) -> dict:
+            scopes = ["assistant:heartbeat", "memory:read:self", "memory:write:self", "a2a:send", "a2a:receive"]
+            if tools_scope:
+                scopes.append("tools:call:read")  # P4：仅 src 带，dst 用于验证无 scope 拒
             status, payload = request(
                 "POST",
                 base + "/api/assistants/bindings",
@@ -115,14 +118,14 @@ def main() -> int:
                     "assistant_name": f"P2.1 {kind} {suffix}",
                     "device_id": f"p21-{kind}-{suffix}",
                     "capabilities": ["p21.smoke"],
-                    "scopes": ["assistant:heartbeat", "memory:read:self", "memory:write:self", "a2a:send", "a2a:receive"],
+                    "scopes": scopes,
                     "public_key": "",
                 },
             )
             expect(status == 201, f"create {kind} binding -> {status}")
             return {"binding": payload["binding"], "token": payload["token"]["access_token"]}
 
-        src = mk_binding("src")
+        src = mk_binding("src", tools_scope=True)
         dst = mk_binding("dst")
 
         # ── 建会（admin 身份 owner） ──
@@ -303,6 +306,49 @@ def main() -> int:
         expect(status == 400, f"orphan artifact (no task/meeting) rejected -> {status}")
 
         # 带消息的 meeting 校验：未受邀第三方用例省略（需第三个 binding；用 src 发给 dst 合法路径已覆盖）
+
+        # ── P4：Resource Gateway 工具代理 ──
+        # ① 清单（有 scope 的 src 可读）
+        status, payload = request("GET", base + "/api/agent/tools", token=src["token"])
+        expect(status == 200 and "pipeline_status" in payload.get("tools", []), "tools list readable with scope")
+        # ② 白名单+只读工具放行（数据管道状态）
+        status, payload = request(
+            "POST",
+            base + "/api/agent/tools/call",
+            token=src["token"],
+            body={"tool": "pipeline_status", "arguments": {}},
+        )
+        expect(status == 200, f"whitelisted read-only tool call -> {status}")
+        expect("result" in payload, "tool result returned")
+        # ③ 白名单外工具拒绝（写工具 + 未知工具）
+        status, _ = request(
+            "POST",
+            base + "/api/agent/tools/call",
+            token=src["token"],
+            body={"tool": "officecli_write", "arguments": {}},
+        )
+        expect(status == 403, f"non-whitelisted tool rejected -> {status}")
+        status, _ = request(
+            "POST",
+            base + "/api/agent/tools/call",
+            token=src["token"],
+            body={"tool": "totally_unknown_tool", "arguments": {}},
+        )
+        expect(status == 403, f"unknown tool rejected -> {status}")
+        # ④ 无 scope 的 dst 被拒（401，scope 缺失）
+        status, _ = request(
+            "POST",
+            base + "/api/agent/tools/call",
+            token=dst["token"],
+            body={"tool": "pipeline_status", "arguments": {}},
+        )
+        expect(status == 401, f"tool call without tools:call:read scope -> {status}")
+        # ⑤ 拒绝事件已入审计（audit_events 直查最近 agent.tool.denied）
+        import sqlite3 as _sq
+        _db = _sq.connect("file:audit_events.db?mode=ro", uri=True)
+        _n = _db.execute("select count(*) from audit_events where event_type='agent.tool.denied' and ts >= date('now','localtime')").fetchone()[0]
+        _db.close()
+        expect(_n >= 2, f"denied tool calls audited (count={_n})")
 
         # ── 会议结束 → 批量失效 + 结构化纪要 ──
         consensus_text = "会议结论\n决议：\n1. 报表采用台账口径\n2. 异常车次由工程部复核\n待办：\n1. 下月模板增加吨发对比\n2. 完成数据校验"
