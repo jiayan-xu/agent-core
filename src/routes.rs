@@ -76,6 +76,8 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         // ── Phase 4：Resource Gateway——MCP 工具代理（只读白名单+限流） ──
         .route("/api/agent/tools/call", post(handle_agent_tools_call))
         .route("/api/agent/tools", get(handle_agent_tools_list))
+        // P4-2：写工具审批轮询/执行（approved 后单次执行）
+        .route("/api/agent/tools/approvals/{id}", get(handle_agent_tool_approval_poll))
         .route("/api/a2a/tasks", post(handle_a2a_task_create))
         .route("/api/a2a/tasks/{id}", get(handle_a2a_task_get))
         .route("/api/a2a/tasks/{id}/status", post(handle_a2a_task_update))

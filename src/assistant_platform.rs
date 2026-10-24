@@ -26,6 +26,8 @@ pub(crate) const ALLOWED_SCOPES: &[&str] = &[
     "a2a:receive",
     // P4（§9.3 Resource Gateway）：只读平台工具代理；写工具审批属 P4-2，暂无 scope
     "tools:call:read",
+    // P4-2（2026-10-24）：写工具经审批管线（approver=助手主人，审批台响应）
+    "tools:call:write",
 ];
 
 const DEFAULT_SCOPES: &[&str] = &[

@@ -350,6 +350,80 @@ def main() -> int:
         _db.close()
         expect(_n >= 2, f"denied tool calls audited (count={_n})")
 
+        # ── P4-2：写工具审批全链路 ──
+        # ① 无 write scope 的助手调写工具 → 401
+        status, _ = request(
+            "POST",
+            base + "/api/agent/tools/call",
+            token=dst["token"],
+            body={"tool": "officecli_create", "arguments": {}},
+        )
+        expect(status == 401, f"write tool without tools:call:write scope -> {status}")
+
+        # ② 建 write binding（admin 名下，tools:call:write）
+        status, payload = request(
+            "POST",
+            base + "/api/assistants/bindings",
+            admin_key=admin_key,
+            body={
+                "assistant_type": "p42-writer",
+                "assistant_name": f"P4.2 writer {suffix}",
+                "device_id": f"p42-w-{suffix}",
+                "capabilities": [],
+                "scopes": ["assistant:heartbeat", "tools:call:write"],
+                "public_key": "",
+            },
+        )
+        expect(status == 201, f"create writer binding -> {status}")
+        writer = {"binding": payload["binding"], "token": payload["token"]["access_token"]}
+
+        # ③ 写工具调用 → 202 审批单
+        status, payload = request(
+            "POST",
+            base + "/api/agent/tools/call",
+            token=writer["token"],
+            body={"tool": "officecli_create", "arguments": {"kind": "docx", "title": f"P4 冒烟 {suffix}"}},
+        )
+        expect(status == 202, f"write tool call -> {status} (approval pending)")
+        approval_id = payload.get("approval_id", "")
+        op_hash = payload.get("operation_hash", "")
+        expect(bool(approval_id) and bool(op_hash), "approval_id + operation_hash returned")
+        # 轮询：pending
+        status, payload = request(
+            "GET",
+            base + f"/api/agent/tools/approvals/{approval_id}",
+            token=writer["token"],
+        )
+        expect(status == 202 and payload.get("status") == "pending", "poll shows pending")
+
+        # ④ admin 经现有审批台链路批准
+        status, payload = request(
+            "POST",
+            base + f"/api/approval/{approval_id}/respond",
+            admin_key=admin_key,
+            body={"approved": True, "reason": "p4 smoke", "operation_hash": op_hash},
+        )
+        expect(status == 200, f"admin approves via approval console -> {status}")
+
+        # ⑤ 轮询：approved → 执行并返回结果
+        status, payload = request(
+            "GET",
+            base + f"/api/agent/tools/approvals/{approval_id}",
+            token=writer["token"],
+        )
+        expect(status == 200 and payload.get("status") == "executed", f"poll after approve -> {status} {str(payload.get('status'))[:30]}")
+        expect("result" in payload, "executed tool result returned")
+
+        # ⑥ 防重放：同单再执行 → 409
+        status, _ = request(
+            "GET",
+            base + f"/api/agent/tools/approvals/{approval_id}",
+            token=writer["token"],
+        )
+        expect(status == 409, f"replay same approval -> {status}")
+
+        request("POST", base + f"/api/assistants/bindings/{writer['binding']['binding_id']}/revoke", admin_key=admin_key)
+
         # ── 会议结束 → 批量失效 + 结构化纪要 ──
         consensus_text = "会议结论\n决议：\n1. 报表采用台账口径\n2. 异常车次由工程部复核\n待办：\n1. 下月模板增加吨发对比\n2. 完成数据校验"
         status, _ = request(

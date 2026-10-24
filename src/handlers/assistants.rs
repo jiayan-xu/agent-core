@@ -2133,6 +2133,12 @@ const ASSISTANT_TOOLS_READONLY: &[&str] = &[
     "system_status",
 ];
 
+/// P4-2：写工具白名单（经审批管线执行，approver=助手主人；逐个开放）。
+const ASSISTANT_TOOLS_WRITABLE: &[&str] = &[
+    // officecli 文档创建（PPT/文档生成场景）
+    "officecli_create",
+];
+
 /// P4 限流：binding → (日期, 次数)。进程内计数（重启清零可接受：超额走审计追责）。
 async fn tool_quota_take(st: &Arc<AppState>, binding_id: &str) -> Result<(), usize> {
     const DAILY_LIMIT: usize = 500;
@@ -2161,6 +2167,11 @@ pub(crate) async fn handle_agent_tools_call(
     headers: HeaderMap,
     Json(req): Json<ToolCallRequest>,
 ) -> Response {
+    // P4-2 路由：按工具白名单决定读/写路径（写路径校验 tools:call:write）
+    let tool_pre = req.tool.trim().to_lowercase();
+    if ASSISTANT_TOOLS_WRITABLE.contains(&tool_pre.as_str()) {
+        return handle_agent_tools_call_write(st, headers, req).await;
+    }
     let auth = match assistant_auth(&st, &headers, "tools:call:read").await {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -2270,9 +2281,256 @@ pub(crate) async fn handle_agent_tools_list(
     }
     Json(serde_json::json!({
         "tools": ASSISTANT_TOOLS_READONLY,
+        "writable_tools": ASSISTANT_TOOLS_WRITABLE,
         "daily_quota": 500,
     }))
     .into_response()
+}
+
+// ── P4-2：写工具审批流（方案 §9.3 步骤 3「必要时审批」） ──────────────────
+//
+// POST /api/agent/tools/call（写白名单工具 + tools:call:write scope）：
+//   不直接执行——建审批单（approver=助手主人 user_id，requester=binding_id，
+//   operation_hash 防偷换），202 返回 approval_id/operation_hash；
+//   主人经审批台（现有 /api/approval/* 链路）批准或拒绝。
+// GET /api/agent/tools/approvals/{id}：助手轮询——
+//   pending → 202；denied → 403；approved → 校验防重放后执行工具并返回结果。
+// 防重放：执行成功即写 assistant_events（agent.tool.executed approval_id=…），
+//   后续同 approval_id 的执行请求查到该事件即 409 拒绝。
+
+pub(crate) async fn handle_agent_tools_call_write(
+    st: Arc<AppState>,
+    headers: HeaderMap,
+    req: ToolCallRequest,
+) -> Response {
+    let auth = match assistant_auth(&st, &headers, "tools:call:write").await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let tool = req.tool.trim().to_lowercase();
+    if !ASSISTANT_TOOLS_WRITABLE.contains(&tool.as_str()) {
+        audit_platform(
+            &st,
+            "agent.tool.denied",
+            &auth.user_id,
+            Some(&auth.binding_id),
+            &format!("tool={tool} reason=not_in_write_whitelist"),
+        )
+        .await;
+        return err(
+            axum::http::StatusCode::FORBIDDEN,
+            "tool_not_allowed",
+            &format!("工具不在助手写白名单: {tool}"),
+        );
+    }
+    if agent_core::boundary::is_read_only_tool(&tool) {
+        // 写白名单与分级矛盾——防御性拒绝（白名单配置错误时兜底）
+        audit_platform(
+            &st,
+            "agent.tool.denied",
+            &auth.user_id,
+            Some(&auth.binding_id),
+            &format!("tool={tool} reason=write_tool_classified_read"),
+        )
+        .await;
+        return err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "whitelist_conflict",
+            "写白名单与工具分级冲突（配置错误）",
+        );
+    }
+    // 限流同读路径
+    if let Err(used) = tool_quota_take(&st, &auth.binding_id).await {
+        audit_platform(
+            &st,
+            "agent.tool.rate_limited",
+            &auth.user_id,
+            Some(&auth.binding_id),
+            &format!("tool={tool} used={used}"),
+        )
+        .await;
+        return err(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "quota_exceeded",
+            "每日工具调用配额已用尽",
+        );
+    }
+    let agent = {
+        let guard = st.agent.lock().await;
+        guard.as_ref().map(|a| a.clone())
+    };
+    let Some(agent) = agent else {
+        return err(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "agent_not_ready",
+            "服务尚未就绪",
+        );
+    };
+    let args_obj = if req.arguments.is_null() {
+        serde_json::json!({})
+    } else {
+        req.arguments.clone()
+    };
+    let desc = format!(
+        "助手 {}（{}）请求写工具 {}",
+        auth.assistant_type, auth.user_id, tool
+    );
+    // 审批单：approver=主人（admin 审批台/dashboard-admin 可响应）；session=binding
+    let approval_id = agent
+        .approval_manager
+        .create_request_for_session(
+            &tool,
+            &args_obj,
+            &desc,
+            &auth.user_id,
+            &auth.binding_id,
+            &auth.binding_id,
+            None,
+            None,
+        )
+        .await;
+    // 回传 operation_hash 供审批台回显（防偷换），助手侧不需要
+    let op_hash = agent
+        .approval_manager
+        .get_pending(&approval_id)
+        .await
+        .map(|p| p.operation_hash)
+        .unwrap_or_default();
+    audit_platform(
+        &st,
+        "agent.tool.approval_requested",
+        &auth.user_id,
+        Some(&auth.binding_id),
+        &format!("tool={tool} approval={approval_id}"),
+    )
+    .await;
+    (
+        axum::http::StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "approval_pending",
+            "approval_id": approval_id,
+            "operation_hash": op_hash,
+            "poll": format!("/api/agent/tools/approvals/{approval_id}"),
+        })),
+    )
+        .into_response()
+}
+
+pub(crate) async fn handle_agent_tool_approval_poll(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(approval_id): Path<String>,
+) -> Response {
+    let auth = match assistant_auth(&st, &headers, "tools:call:write").await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let agent = {
+        let guard = st.agent.lock().await;
+        guard.as_ref().map(|a| a.clone())
+    };
+    let Some(agent) = agent else {
+        return err(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "agent_not_ready",
+            "服务尚未就绪",
+        );
+    };
+    // 单属校验：审批单 requester 必须是本 binding
+    let pending = agent.approval_manager.get_pending(&approval_id).await;
+    let Some(p) = pending else {
+        return err(
+            axum::http::StatusCode::NOT_FOUND,
+            "approval_not_found",
+            "审批单不存在或已终结",
+        );
+    };
+    if p.requester_id != auth.binding_id {
+        return err(
+            axum::http::StatusCode::FORBIDDEN,
+            "approval_forbidden",
+            "无权访问该审批单",
+        );
+    }
+    match agent.approval_manager.is_approved(&approval_id).await {
+        None => (
+            axum::http::StatusCode::ACCEPTED,
+            Json(serde_json::json!({"status": "pending"})),
+        )
+            .into_response(),
+        Some(false) => {
+            audit_platform(
+                &st,
+                "agent.tool.approval_denied",
+                &auth.user_id,
+                Some(&auth.binding_id),
+                &format!("approval={approval_id} tool={}", p.tool_name),
+            )
+            .await;
+            err(
+                axum::http::StatusCode::FORBIDDEN,
+                "approval_denied",
+                "审批已拒绝",
+            )
+        }
+        Some(true) => {
+            // 防重放：同 approval_id 已执行过 → 409
+            let executed_marker = format!("approval_id={approval_id}");
+            let already = st
+                .assistant_platform
+                .recent_events_for_user(&auth.user_id, 100)
+                .unwrap_or_default()
+                .into_iter()
+                .any(|e| {
+                    e.get("event_type").and_then(|v| v.as_str()) == Some("agent.tool.executed")
+                        && str::contains(
+                            &e.get("detail").and_then(|v| v.as_str()).unwrap_or(""),
+                            &executed_marker,
+                        )
+                });
+            if already {
+                return err(
+                    axum::http::StatusCode::CONFLICT,
+                    "already_executed",
+                    "该审批已执行过（单次有效）",
+                );
+            }
+            // 执行工具
+            match agent.mcp.call_json(&p.tool_name, &p.arguments).await {
+                Ok(result) => {
+                    audit_platform(
+                        &st,
+                        "agent.tool.executed",
+                        &auth.user_id,
+                        Some(&auth.binding_id),
+                        &format!("tool={} approval_id={approval_id}", p.tool_name),
+                    )
+                    .await;
+                    Json(serde_json::json!({
+                        "status": "executed",
+                        "tool": p.tool_name,
+                        "result": result,
+                    }))
+                    .into_response()
+                }
+                Err(message) => {
+                    audit_platform(
+                        &st,
+                        "agent.tool.failed",
+                        &auth.user_id,
+                        Some(&auth.binding_id),
+                        &format!("tool={} approval_id={approval_id} error={message}", p.tool_name),
+                    )
+                    .await;
+                    err(
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        "tool_call_failed",
+                        &message,
+                    )
+                }
+            }
+        }
+    }
 }
 
 pub(crate) async fn handle_artifact_list(
