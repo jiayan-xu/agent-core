@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PFAiX Personal Assistant Platform Phase 2.1 (meeting membership) smoke test.
+"""PFAiX Personal Assistant Platform Phase 2 smoke test (membership + brief + meeting-stream actions).
 
 Only accesses the loopback agent-core service. Covers:
 - meeting creation (badge identity) + assistant invite by owner
@@ -198,6 +198,50 @@ def main() -> int:
         )
         expect(status == 201, "task without meeting_id still allowed (Phase 0 semantics)")
 
+        # ── P2-2：会前 brief ──
+        status, payload = request(
+            "POST",
+            base + f"/api/meetings/{meeting_id}/brief",
+            admin_key=admin_key,
+        )
+        expect(status == 200, f"meeting brief created -> {status}")
+        expect("会前 Brief" in str(payload.get("brief", "")), "brief text assembled")
+        expect(payload.get("meeting_id") == meeting_id, "brief tied to meeting")
+        expect("项目共享上下文" in str(payload.get("brief", "")), "brief has project context section")
+        expect("参会人偏好摘要" in str(payload.get("brief", "")), "brief has prefs section")
+
+        # ── P2-2：助手动作入会议消息流 ──
+        # 上面同会任务创建应已注入系统行；经会议列表读 messages 验证（列表含 messages 字段）。
+        def meeting_messages() -> list:
+            status_, payload_ = request("GET", base + "/api/meetings", admin_key=admin_key)
+            if not isinstance(payload_, dict):
+                return []
+            for m in payload_.get("meetings") or []:
+                if isinstance(m, dict) and m.get("id") == meeting_id:
+                    return m.get("messages") or []
+            return []
+
+        msgs = meeting_messages()
+        expect(
+            any(isinstance(m, dict) and m.get("kind") == "ai" and "发起任务" in str(m.get("content", "")) for m in msgs),
+            "assistant task action injected into meeting stream",
+        )
+
+        # 任务终态同样入流：dst 完成任务 → completed 行
+        task_id = task.get("task_id", "")
+        status, payload = request(
+            "POST",
+            base + f"/api/a2a/tasks/{task_id}/status",
+            token=dst["token"],
+            body={"status": "completed", "result": "p2 smoke done"},
+        )
+        expect(status == 200, "task completed by dst")
+        msgs = meeting_messages()
+        expect(
+            any(isinstance(m, dict) and m.get("kind") == "ai" and "completed" in str(m.get("content", "")) for m in msgs),
+            "assistant task completion injected into meeting stream",
+        )
+
         # 带消息的 meeting 校验：未受邀第三方用例省略（需第三个 binding；用 src 发给 dst 合法路径已覆盖）
 
         # ── 会议结束 → 批量失效 ──
@@ -241,7 +285,7 @@ def main() -> int:
                 admin_key=admin_key,
             )
 
-        print("\nPHASE2_1_SMOKE_PASS")
+        print("\nPHASE2_SMOKE_PASS")
         return 0
     finally:
         for item in (src, dst):
@@ -261,5 +305,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:
-        print(f"PHASE2_1_SMOKE_FAIL: {exc}", file=sys.stderr)
+        print(f"PHASE2_SMOKE_FAIL: {exc}", file=sys.stderr)
         raise

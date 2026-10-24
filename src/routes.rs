@@ -150,6 +150,7 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         // ── Personal Assistant Platform Phase 2：会议助手成员（临时 scope） ──
         .route("/api/meetings/{id}/assistants", post(handle_meeting_assistant_invite).get(handle_meeting_assistants_list))
         .route("/api/meetings/{id}/assistants/remove", post(handle_meeting_assistant_remove))
+        .route("/api/meetings/{id}/brief", post(handle_meeting_brief))
         .route("/api/evolve", post(handle_code_evolve))
         .route("/api/meta-evolution/run", post(handle_meta_evolution_run))
         .route("/api/meta-evolution/status", get(handle_meta_evolution_status))

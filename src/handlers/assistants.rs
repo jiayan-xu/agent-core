@@ -641,6 +641,50 @@ pub(crate) async fn handle_a2a_task_create(
                 &task.trace_id,
             )
             .await;
+            // P2-2：会议域任务的动作摘要注入会议消息流（kind=ai 系统行，不推进 phase）。
+            // 注入失败不回滚任务（任务已持久化）——仅告警；广播与落盘复用会议模块模式。
+            if let Some(meeting_id) = req.meeting_id.clone() {
+                let summary = format!(
+                    "🤖 [{}] 发起任务（{}）：{}",
+                    auth.assistant_type, task.task_type, task.subject
+                );
+                let injected = {
+                    let guard = st.agent.lock().await;
+                    match guard.as_ref() {
+                        Some(agent) => {
+                            let agent_arc = agent.clone();
+                            agent_arc
+                                .add_meeting_system_line(
+                                    &meeting_id,
+                                    &format!("assistant:{}", auth.assistant_type),
+                                    &summary,
+                                )
+                                .map(|msg| (agent_arc, msg))
+                        }
+                        None => Err("agent 未就绪".to_string()),
+                    }
+                };
+                match injected {
+                    Ok((agent_arc, msg)) => {
+                        crate::handlers::meetings::broadcast_meeting_event(
+                            &st,
+                            &meeting_id,
+                            agent_core::agent::EventKind::Message,
+                            serde_json::json!({ "message": msg }),
+                        )
+                        .await;
+                        tokio::spawn(async move {
+                            crate::handlers::meetings::persist_meetings_for(&agent_arc, |e| {
+                                tracing::error!(error = %e, meeting = %meeting_id, "P2-2: 助手动作行落盘失败");
+                            })
+                            .await;
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(meeting = %meeting_id, error = %e, "P2-2: 助手任务摘要注入会议流失败（任务本身不受影响）");
+                    }
+                }
+            }
             (
                 axum::http::StatusCode::CREATED,
                 Json(serde_json::json!({"task": task})),
@@ -720,6 +764,52 @@ pub(crate) async fn handle_a2a_task_update(
                 &format!("task={} status={}", task.task_id, task.status),
             )
             .await;
+            // P2-2：会议域任务的终态（completed/failed/canceled）摘要注入会议流
+            if matches!(task.status.as_str(), "completed" | "failed" | "canceled") {
+                if let Some(meeting_id) = task.meeting_id.clone() {
+                    let summary = format!(
+                        "🤖 [{}] 任务 {} → {}{}",
+                        auth.assistant_type,
+                        task.task_id,
+                        task.status,
+                        task.result
+                            .as_deref()
+                            .map(|r| format!("：{}", r.chars().take(120).collect::<String>()))
+                            .unwrap_or_default()
+                    );
+                    let injected = {
+                        let guard = st.agent.lock().await;
+                        match guard.as_ref() {
+                            Some(agent) => {
+                                let agent_arc = agent.clone();
+                                agent_arc
+                                    .add_meeting_system_line(
+                                        &meeting_id,
+                                        &format!("assistant:{}", auth.assistant_type),
+                                        &summary,
+                                    )
+                                    .map(|msg| (agent_arc, msg))
+                            }
+                            None => Err("agent 未就绪".to_string()),
+                        }
+                    };
+                    if let Ok((agent_arc, msg)) = injected {
+                        crate::handlers::meetings::broadcast_meeting_event(
+                            &st,
+                            &meeting_id,
+                            agent_core::agent::EventKind::Message,
+                            serde_json::json!({ "message": msg }),
+                        )
+                        .await;
+                        tokio::spawn(async move {
+                            crate::handlers::meetings::persist_meetings_for(&agent_arc, |e| {
+                                tracing::error!(error = %e, meeting = %meeting_id, "P2-2: 助手终态行落盘失败");
+                            })
+                            .await;
+                        });
+                    }
+                }
+            }
             Json(serde_json::json!({"task": task})).into_response()
         }
         Err(message) => err(
@@ -1439,4 +1529,211 @@ pub(crate) async fn a2a_meeting_check(
         }
     }
     Ok(())
+}
+
+// ── Phase 2 P2-2：会前 brief（方案 §7.3） ──────────────────────────────────
+//
+// 参会人 + 主题 + 授权 → 会议简报：项目 NS 共享上下文 + 参会人偏好摘要，
+// 写入组织 NS（tag=meeting-brief:<id>），入会助手经 Memory Proxy 的 context
+// 语义可检索（简报在 org NS，Phase 0 context 只读个人 NS——故同时给 owner
+// 个人 NS 落一份摘要副本，简报正文以 org 为准）。
+// 边界（§7.3）：不暴露个人隐私记忆（偏好检索只取 preference 类），不暴露
+// 未授权项目数据（项目上下文仅检索 org ns 已有内容）。
+
+pub(crate) async fn handle_meeting_brief(
+    State(st): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(meeting_id): Path<String>,
+) -> Response {
+    // 权限：会议可见者可生成（owner/admin/scope 成员/公开——与成员列表同判定）
+    let (visible, meeting_info) = {
+        let guard = st.agent.lock().await;
+        match guard.as_ref() {
+            None => {
+                return err(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "agent_not_ready",
+                    "服务尚未就绪",
+                )
+            }
+            Some(agent) => {
+                let v = agent.meeting_visible(&meeting_id, &ctx.agent_id, &ctx.allowed_ns, false);
+                let info = agent.get_meeting(&meeting_id).map(|m| {
+                    (m.topic.clone(), m.owner_user_id.clone())
+                });
+                (v, info)
+            }
+        }
+    };
+    if visible != Some(true) {
+        return err(
+            axum::http::StatusCode::FORBIDDEN,
+            "meeting_forbidden",
+            "无权访问该会议",
+        );
+    }
+    let Some((topic, owner)) = meeting_info else {
+        return err(
+            axum::http::StatusCode::NOT_FOUND,
+            "meeting_not_found",
+            "会议不存在",
+        );
+    };
+
+    // 入会助手（含其主人 user_id 去重）
+    let members = st
+        .assistant_platform
+        .meeting_members(&meeting_id)
+        .unwrap_or_default();
+    let mut member_users: Vec<String> = members
+        .iter()
+        .map(|(_, user, _, _)| user.clone())
+        .collect();
+    member_users.push(owner.clone());
+    member_users.sort();
+    member_users.dedup();
+
+    let agent = {
+        let guard = st.agent.lock().await;
+        guard.as_ref().map(|a| a.clone())
+    };
+    let Some(agent) = agent else {
+        return err(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "agent_not_ready",
+            "服务尚未就绪",
+        );
+    };
+
+    // 项目共享上下文：固废项目 org ns（Phase 2 单项目试点；多项目授权待 Phase 4）
+    let org_ns = "org/cs-pufa-2nd-thermal/proj/gufei";
+    let mut project_ctx: Vec<String> = Vec::new();
+    if let Ok(v) = agent
+        .mcp
+        .call_json(
+            "memory_search_v2",
+            &serde_json::json!({"namespace": org_ns, "query": &topic, "limit": 8}),
+        )
+        .await
+    {
+        if let Some(items) = v.get("results").and_then(|r| r.as_array()) {
+            for it in items {
+                let t = it
+                    .get("content")
+                    .or_else(|| it.get("text"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                if !t.is_empty() {
+                    project_ctx.push(t.chars().take(160).collect());
+                }
+            }
+        }
+    }
+
+    // 参会人偏好摘要：每人个人 NS，只取 preference/偏好类（§7.3 边界）
+    let mut prefs: Vec<String> = Vec::new();
+    for u in &member_users {
+        if let Ok(v) = agent
+            .mcp
+            .call_json(
+                "memory_search_v2",
+                &serde_json::json!({
+                    "namespace": format!("agent/{u}"),
+                    "query": "工作偏好 呈现方式 关注点",
+                    "limit": 3,
+                }),
+            )
+            .await
+        {
+            if let Some(items) = v.get("results").and_then(|r| r.as_array()) {
+                for it in items {
+                    let t = it
+                        .get("content")
+                        .or_else(|| it.get("text"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    if !t.is_empty() {
+                        prefs.push(format!("- {u}：{}", t.chars().take(120).collect::<String>()));
+                    }
+                }
+            }
+        }
+    }
+
+    // 组装 brief
+    let mut brief = String::new();
+    brief.push_str("# 会前 Brief\n\n");
+    brief.push_str(&format!(
+        "会议：{topic}\n会议 ID：{meeting_id}\n生成时间：{}\n参会助手主人：{}\n\n",
+        Local::now().format("%Y-%m-%d %H:%M:%S"),
+        member_users.join("、")
+    ));
+    brief.push_str("## 项目共享上下文\n\n");
+    if project_ctx.is_empty() {
+        brief.push_str("（项目 NS 暂无相关上下文）\n");
+    } else {
+        for c in &project_ctx {
+            brief.push_str(&format!("- {c}\n"));
+        }
+    }
+    brief.push_str("\n## 参会人偏好摘要\n\n");
+    if prefs.is_empty() {
+        brief.push_str("（暂无偏好记录）\n");
+    } else {
+        for p in &prefs {
+            brief.push_str(&format!("{p}\n"));
+        }
+    }
+    brief.push_str("\n## 边界\n- 本 brief 仅含项目共享上下文与偏好级摘要，不含个人隐私记忆；\n- 未授权项目数据不在范围内。\n");
+
+    // 写入 org NS（权威）+ owner 个人 NS（摘要副本，入会助手 context 可检索）
+    let mut stored_org = false;
+    let org_args = serde_json::json!({
+        "namespace": org_ns,
+        "content": &brief,
+        "memory_type": "document",
+        "category": "meeting-brief",
+        "importance": 4,
+        "source": "agent-core",
+        "tags": [format!("meeting-brief:{meeting_id}"), "assistant:platform"],
+    });
+    if agent.mcp.call_json("memory_remember", &org_args).await.is_ok() {
+        stored_org = true;
+    }
+    let owner_copy = format!("# 会前 Brief（副本，正文以项目 NS 为准）\n\n{}", brief);
+    let owner_args = serde_json::json!({
+        "namespace": format!("agent/{owner}"),
+        "content": owner_copy,
+        "memory_type": "document",
+        "category": "meeting-brief",
+        "importance": 3,
+        "source": "agent-core",
+        "tags": [format!("meeting-brief:{meeting_id}")],
+    });
+    let mut stored_owner = false;
+    if agent.mcp.call_json("memory_remember", &owner_args).await.is_ok() {
+        stored_owner = true;
+    }
+
+    audit_platform(
+        &st,
+        "assistant.meeting_brief.created",
+        &ctx.agent_id,
+        None,
+        &format!(
+            "meeting={meeting_id} members={} project_ctx={} prefs={} org_stored={stored_org}",
+            member_users.len(),
+            project_ctx.len(),
+            prefs.len()
+        ),
+    )
+    .await;
+    Json(serde_json::json!({
+        "meeting_id": meeting_id,
+        "org_namespace": org_ns,
+        "stored": stored_org,
+        "owner_copy_stored": stored_owner,
+        "brief": brief,
+    }))
+    .into_response()
 }
