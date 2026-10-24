@@ -1225,6 +1225,40 @@ impl AssistantPlatformStore {
             .map_err(|e| format!("list inbox: {e}"))?;
         Ok(rows.filter_map(|x| x.ok()).collect())
     }
+
+    /// P2-3：inbox 增量查询——取 to_binding 的自 since_id（行 id，不含）之后的
+    /// 新消息（按 id 升序，封顶 100），供 SSE/长轮询推送用。
+    pub(crate) fn inbox_since(
+        &self,
+        binding_id: &str,
+        since_id: i64,
+    ) -> Result<Vec<(i64, serde_json::Value)>, String> {
+        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id,message_id,ifnull(meeting_id,''),from_binding,ifnull(task_id,''),\
+                 message_type,body,created_at \
+                 FROM a2a_messages WHERE to_binding=?1 AND id>?2 ORDER BY id ASC LIMIT 100",
+            )
+            .map_err(|e| format!("inbox since: {e}"))?;
+        let rows = stmt
+            .query_map(params![binding_id, since_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    serde_json::json!({
+                        "message_id": r.get::<_, String>(1)?,
+                        "meeting_id": r.get::<_, String>(2)?,
+                        "from_binding": r.get::<_, String>(3)?,
+                        "task_id": r.get::<_, String>(4)?,
+                        "message_type": r.get::<_, String>(5)?,
+                        "body": r.get::<_, String>(6)?,
+                        "created_at": r.get::<_, String>(7)?,
+                    }),
+                ))
+            })
+            .map_err(|e| format!("inbox since: {e}"))?;
+        Ok(rows.filter_map(|x| x.ok()).collect())
+    }
 }
 
 #[cfg(test)]

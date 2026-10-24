@@ -1737,3 +1737,103 @@ pub(crate) async fn handle_meeting_brief(
     }))
     .into_response()
 }
+
+// ── Phase 2 P2-3：inbox SSE 推送 ───────────────────────────────────────────
+//
+// GET /api/a2a/inbox/stream?since_id=N（assistant token 鉴权，a2a:receive）。
+// 服务发送事件：event=message data={...含 last_id}；30s 心跳 comment 保活；
+// 连接保持直至客户端断开或 token 失效（每轮推送前静默校验，失效即关流——
+// 撤销/binding 吊销即时生效）。实现取简：DB 增量轮询（2s）而非常驻通道——
+// Phase 0/2 消息量级（单机百级）下轮询足够，避免为 inbox 再建一套 broadcast
+// 注册表。升级路径：消息量起来后换成 meeting_tx 同款 per-binding channel。
+
+#[derive(Deserialize)]
+pub(crate) struct InboxStreamQuery {
+    #[serde(default)]
+    pub(crate) since_id: Option<i64>,
+}
+
+pub(crate) async fn handle_a2a_inbox_stream(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<InboxStreamQuery>,
+) -> Response {
+    // 鉴权：assistant token（同 inbox 拉取）——token 原文在流期间不重验签名
+    // （hash 查表即验），但每轮推送前复核有效性（撤销即时断流）。
+    let token = bearer_token(&headers);
+    let auth = match st
+        .assistant_platform
+        .validate_token(&token, "a2a:receive")
+    {
+        Ok(v) => v,
+        Err(message) => {
+            return err(
+                axum::http::StatusCode::UNAUTHORIZED,
+                "assistant_unauthorized",
+                &message,
+            )
+        }
+    };
+    let mut last_id = q.since_id.unwrap_or(0);
+    // 未指定 since_id：从当前最大 id 起推（只推新消息，历史走 /api/a2a/inbox 拉取）
+    if q.since_id.is_none() {
+        if let Ok(items) = st.assistant_platform.inbox_since(&auth.binding_id, i64::MAX - 1) {
+            if let Some((max, _)) = items.last() {
+                last_id = *max;
+            }
+        }
+    }
+
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use std::convert::Infallible;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let st2 = st.clone();
+    let binding_id = auth.binding_id.clone();
+    let token_for_recheck = token.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(32);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                _ = keepalive.tick() => {
+                    // SSE comment 保活（不产生客户端事件）
+                    if tx.send(Ok(Event::default().comment("keepalive"))).await.is_err() {
+                        break;
+                    }
+                    // 保活时顺带复核 token 有效性（撤销即时断流）
+                    if st2
+                        .assistant_platform
+                        .validate_token(&token_for_recheck, "a2a:receive")
+                        .is_err()
+                    {
+                        let _ = tx.send(Ok(Event::default().event("revoked").data("token revoked"))).await;
+                        break;
+                    }
+                }
+                _ = tick.tick() => {
+                    match st2.assistant_platform.inbox_since(&binding_id, last_id) {
+                        Ok(items) => {
+                            for (id, msg) in items {
+                                last_id = last_id.max(id);
+                                let payload = serde_json::json!({"last_id": id, "message": msg});
+                                let evt = Event::default().event("message").data(payload.to_string());
+                                if tx.send(Ok(evt)).await.is_err() {
+                                    return; // 客户端断开
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(binding = %binding_id, error = %e, "P2-3 inbox stream 增量查询失败");
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Sse::new(ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}

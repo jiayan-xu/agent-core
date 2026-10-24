@@ -77,7 +77,8 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/a2a/tasks/{id}", get(handle_a2a_task_get))
         .route("/api/a2a/tasks/{id}/status", post(handle_a2a_task_update))
         .route("/api/a2a/messages", post(handle_a2a_message_create))
-        .route("/api/a2a/inbox", get(handle_a2a_inbox));
+        .route("/api/a2a/inbox", get(handle_a2a_inbox))
+        .route("/api/a2a/inbox/stream", get(handle_a2a_inbox_stream));
 
     let protected = Router::new()
         .route("/api/chat", post(handle_chat))

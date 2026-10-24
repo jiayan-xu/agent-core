@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PFAiX Personal Assistant Platform Phase 2 smoke test (membership + brief + meeting-stream actions).
+"""PFAiX Personal Assistant Platform Phase 2 full smoke (membership + brief + stream actions + minutes + SSE).
 
 Only accesses the loopback agent-core service. Covers:
 - meeting creation (badge identity) + assistant invite by owner
@@ -244,14 +244,64 @@ def main() -> int:
 
         # 带消息的 meeting 校验：未受邀第三方用例省略（需第三个 binding；用 src 发给 dst 合法路径已覆盖）
 
-        # ── 会议结束 → 批量失效 ──
+        # ── 会议结束 → 批量失效 + 结构化纪要 ──
+        consensus_text = "会议结论\n决议：\n1. 报表采用台账口径\n2. 异常车次由工程部复核\n待办：\n1. 下月模板增加吨发对比\n2. 完成数据校验"
         status, _ = request(
             "POST",
             base + f"/api/meetings/{meeting_id}/end",
             admin_key=admin_key,
-            body={"mode": "close"},
+            body={"mode": "consensus", "consensus": consensus_text},
         )
-        expect(status == 200, f"meeting ended -> {status}")
+        expect(status == 200, f"meeting ended with structured consensus -> {status}")
+        # P2-3 纪要沉淀为后台 best-effort（org NS 写入）；org 内容属 memoria 侧，
+        # 冒烟此处做弱验证：无 500 即过，org NS 落库由后续人工经 memoria 复核。
+        import time as _t; _t.sleep(2)
+
+        # P2-3：inbox SSE 推送——dst 助手订阅流，src 发一条消息（非会议域，全局语义），
+        # 断言 15s 内收到 event=message。
+        import threading
+        import http.client
+        sse_events = []
+        def sse_listen():
+            try:
+                # http.client 直连回环 127.0.0.1:9753（目标主机硬编码字面量，
+                # 非 DNS 解析，无 rebinding/内网面；base 本身已过 validate_url 白名单）
+                conn = http.client.HTTPConnection("127.0.0.1", 9753, timeout=20)
+                conn.request("GET", "/api/a2a/inbox/stream",
+                             headers={"Authorization": "Bearer " + dst["token"]})
+                resp = conn.getresponse()
+                buf = b""
+                sep = chr(10) * 2
+                while len(sse_events) < 1:
+                    chunk = resp.read1(4096) if hasattr(resp, "read1") else resp.read(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    text = buf.decode("utf-8", "replace")
+                    while sep in text:
+                        frame, text = text.split(sep, 1)
+                        if frame.startswith("event: message"):
+                            sse_events.append(frame)
+                            return
+                    buf = text.encode("utf-8", "replace")
+                conn.close()
+            except Exception as e:
+                sse_events.append(f"SSE_ERROR: {e}")
+        th = threading.Thread(target=sse_listen, daemon=True)
+        th.start()
+        _t.sleep(1)  # 订阅建立
+        status, _ = request(
+            "POST",
+            base + "/api/a2a/messages",
+            token=src["token"],
+            body={"target_binding": dst["binding"]["binding_id"], "body": "sse push test"},
+        )
+        expect(status == 201, "message sent for SSE push")
+        th.join(timeout=16)
+        expect(
+            bool(sse_events) and not str(sse_events[0]).startswith("SSE_ERROR"),
+            f"inbox SSE push received ({sse_events[0][:60] if sse_events else 'none'})",
+        )
         # 会后：带 meeting_id 的任务被拒（成员已失效 + 会议已结束）
         status, _ = request(
             "POST",

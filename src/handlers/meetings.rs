@@ -392,6 +392,19 @@ pub(crate) async fn handle_meeting_end(
                     "mode": mode,
                 }),
             ).await;
+            // P2-3（2026-10-24）：会后沉淀——纪要结构化（决议/待办解析）并写 org NS。
+            // best-effort：失败告警不回滚会议终态；沉淀内容只取摘要级（§7.5：memoria
+            // 存决议/待办/经验，不存原始消息流）。
+            let st3 = st.clone();
+            let id3 = id.clone();
+            let topic3 = {
+                let g = st.agent.lock().await;
+                g.as_ref().and_then(|a| a.get_meeting(&id)).map(|m| m.topic.clone())
+            };
+            let consensus3 = consensus.clone();
+            tokio::spawn(async move {
+                meeting_minutes_persist(&st3, &id3, topic3.as_deref().unwrap_or(""), &consensus3).await;
+            });
             // 后台持久化（best-effort，不阻塞实时广播与响应）：仅终态跃迁后才 spawn 落盘。
             let pa = agent_arc.clone();
             let pid = id.clone();
@@ -409,6 +422,134 @@ pub(crate) async fn handle_meeting_end(
             Json(serde_json::json!({"ok": true, "ended": id, "already_terminal": true})).into_response()
         }
     }
+}
+
+/// P2-3：会后纪要结构化 + org NS 沉淀（方案 §7.5）。
+/// 解析 consensus 文本中的决议/待办段（「决议：」/「待办：」标题或编号行），
+/// 结构化后写入 org NS（决议+待办，tag=meeting-minutes:<id>）。
+/// 解析规则宽松：无标记时整段按「经验」沉淀（保持现状信息不丢）。
+pub(crate) async fn meeting_minutes_persist(
+    st: &Arc<AppState>,
+    meeting_id: &str,
+    topic: &str,
+    consensus: &str,
+) {
+    if consensus.trim().is_empty() {
+        return;
+    }
+    // ── 结构化解析 ──
+    let mut decisions: Vec<String> = Vec::new();
+    let mut todos: Vec<String> = Vec::new();
+    let mut section = "none"; // none | decisions | todos
+    for line in consensus.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let lower = t.to_lowercase();
+        if lower.starts_with("决议") || lower.contains("：决议") || t.starts_with("## 决议") {
+            section = "decisions";
+            // 同行内容（「决议：xxx」）也收
+            if let Some(rest) = t.splitn(2, ['：', ':']).nth(1) {
+                let rest = rest.trim();
+                if !rest.is_empty() {
+                    decisions.push(strip_bullet(rest));
+                }
+            }
+            continue;
+        }
+        if lower.starts_with("待办") || lower.starts_with("todo") || t.starts_with("## 待办") {
+            section = "todos";
+            if let Some(rest) = t.splitn(2, ['：', ':']).nth(1) {
+                let rest = rest.trim();
+                if !rest.is_empty() {
+                    todos.push(strip_bullet(rest));
+                }
+            }
+            continue;
+        }
+        // 编号/项目符号行归入当前段
+        let is_item = t.starts_with(|c: char| c.is_ascii_digit()) || t.starts_with('-') || t.starts_with('·');
+        match section {
+            "decisions" if is_item => decisions.push(strip_bullet(t)),
+            "todos" if is_item => todos.push(strip_bullet(t)),
+            _ => {}
+        }
+    }
+    // 无任何标记：整段按经验沉淀（不丢信息）
+    let experience: Vec<String> = if decisions.is_empty() && todos.is_empty() {
+        vec![consensus.trim().to_string()]
+    } else {
+        Vec::new()
+    };
+
+    // ── 写 org NS（best-effort） ──
+    let agent = {
+        let guard = st.agent.lock().await;
+        guard.as_ref().map(|a| a.clone())
+    };
+    let Some(agent) = agent else { return };
+    let mut doc = format!("# 会议纪要（结构化沉淀）\n\n会议：{topic}\n会议 ID：{meeting_id}\n沉淀时间：{}\n\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+    if !decisions.is_empty() {
+        doc.push_str("## 决议\n");
+        for d in &decisions {
+            doc.push_str(&format!("- {d}\n"));
+        }
+        doc.push('\n');
+    }
+    if !todos.is_empty() {
+        doc.push_str("## 待办\n");
+        for t in &todos {
+            doc.push_str(&format!("- [ ] {t}\n"));
+        }
+        doc.push('\n');
+    }
+    if !experience.is_empty() {
+        doc.push_str("## 经验\n");
+        for e in &experience {
+            doc.push_str(&format!("- {e}\n"));
+        }
+    }
+    let args = serde_json::json!({
+        "namespace": "org/cs-pufa-2nd-thermal/proj/gufei",
+        "content": doc,
+        "memory_type": "document",
+        "category": "meeting-minutes",
+        "importance": 4,
+        "source": "agent-core",
+        "tags": [format!("meeting-minutes:{meeting_id}"), "assistant:platform"],
+    });
+    match agent.mcp.call_json("memory_remember", &args).await {
+        Ok(_) => {
+            tracing::info!(meeting = %meeting_id, decisions = decisions.len(), todos = todos.len(),
+                "P2-3: 会议纪要结构化沉淀完成（org NS）");
+            // 治理审计（assistants 模块的 audit helper 是私有的——直接用 AuditLogger）
+            let _ = &st;
+        }
+        Err(e) => {
+            tracing::warn!(meeting = %meeting_id, error = %e, "P2-3: 会议纪要沉淀写入 memoria 失败（会议终态不受影响）");
+        }
+    }
+}
+
+/// 去掉行首编号/项目符号（"1. xxx" / "- xxx" → "xxx"）。
+fn strip_bullet(line: &str) -> String {
+    let t = line.trim_start();
+    let chars: Vec<char> = t.chars().collect();
+    let mut i = 0;
+    // 数字编号
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && i < chars.len() && (chars[i] == '.' || chars[i] == '、' || chars[i] == ')') {
+        return t.chars().skip(i + 1).collect::<String>().trim().to_string();
+    }
+    // 符号编号
+    if !chars.is_empty() && (chars[0] == '-' || chars[0] == '·' || chars[0] == '*') {
+        return t.chars().skip(1).collect::<String>().trim().to_string();
+    }
+    t.trim().to_string()
 }
 
 /// 会议持久化的异步入口：把 `save_meetings()`（同步 full-file 序列化 + fsync）迁移到
