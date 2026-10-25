@@ -22,7 +22,7 @@ use crate::mcp_client::McpClient;
 use serde::Serialize;
 
 /// 统一审计事件类型
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditEventType {
     /// 鉴权失败（x-agent-key / x-user-tag 不匹配、未注册）
@@ -49,10 +49,14 @@ pub enum AuditEventType {
     AutoApproval,
     /// 分级审批：自动批准写操作的撤销已执行
     UndoExecuted,
+    /// 平台事件（assistant/a2a/外部上报等）：真实事件名直接落 event_type 列，
+    /// 使 `/api/admin/audit?event=a2a.task.created` 按名过滤可命中。
+    /// 因携带 String，枚举不再 Copy——按值传递或克隆即可。
+    Custom(String),
 }
 
 impl AuditEventType {
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             AuditEventType::AuthFail => "auth_fail",
             AuditEventType::BoundaryDeny => "boundary_deny",
@@ -66,12 +70,15 @@ impl AuditEventType {
             AuditEventType::IdentityChange => "identity_change",
             AuditEventType::AutoApproval => "auto_approval",
             AuditEventType::UndoExecuted => "undo_executed",
+            AuditEventType::Custom(name) => name,
         }
     }
 
     /// 由 `as_str` 的持久化字符串还原枚举（耐久库读回用）。
+    /// 未知名称还原为 `Custom(name)` 而非丢弃——外部上报/新事件名在枚举缺失时
+    /// 保持原名，读写往返无损。
     pub fn from_str(s: &str) -> Option<Self> {
-        match s {
+        let known = match s {
             "auth_fail" => Some(AuditEventType::AuthFail),
             "boundary_deny" => Some(AuditEventType::BoundaryDeny),
             "approval_created" => Some(AuditEventType::ApprovalCreated),
@@ -85,7 +92,12 @@ impl AuditEventType {
             "auto_approval" => Some(AuditEventType::AutoApproval),
             "undo_executed" => Some(AuditEventType::UndoExecuted),
             _ => None,
-        }
+        };
+        known.or_else(|| {
+            let name = s.trim();
+            (!name.is_empty() && name.len() <= 64)
+                .then(|| AuditEventType::Custom(name.to_string()))
+        })
     }
 }
 

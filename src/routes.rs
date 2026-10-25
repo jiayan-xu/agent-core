@@ -6,18 +6,19 @@
 use std::sync::Arc;
 
 use axum::middleware::from_fn_with_state;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
 use crate::auth::auth_middleware;
 use crate::bootstrap::trace_middleware;
 use crate::handlers::admin::*;
-use crate::handlers::gateway::{handle_auto_write_undo, handle_auto_writes_list, handle_tool_execute, handle_tool_execute_get};
 use crate::handlers::approval::*;
+use crate::handlers::assistants::*;
 use crate::handlers::chat::*;
 use crate::handlers::collab::*;
 use crate::handlers::evolve::*;
+use crate::handlers::gateway::{handle_auto_write_undo, handle_auto_writes_list, handle_tool_execute, handle_tool_execute_get};
 use crate::handlers::identity::*;
 use crate::handlers::meetings::*;
 use crate::handlers::meetings_group::{handle_meeting_ask, handle_meeting_invite, handle_meetings_create};
@@ -63,7 +64,38 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/pages/{*file}", get(handle_pages_static))
         // ── P2 服务编排（2026-10-22）：只读状态公开，托盘/看板无需凭据即可渲染 ──
         // 只暴露 key/name/port/running/uptime；pid/错误详情走 /api/services/detail（受保护）。
-        .route("/api/services", get(handle_services_public));
+        .route("/api/services", get(handle_services_public))
+        // ── Personal Assistant Platform Phase 0（2026-10-23）──
+        // 本地助手持 opaque scoped token 调用；用户管理路由在 protected 侧。
+        .route("/api/assistants/me", get(handle_assistant_me))
+        .route("/api/assistants/heartbeat", post(handle_assistant_heartbeat))
+        .route("/api/assistants/token/revoke", post(handle_assistant_token_revoke))
+        .route("/api/assistants/token/refresh", post(handle_assistant_token_refresh))
+        .route("/api/agent/memory", post(handle_assistant_memory_write))
+        .route("/api/agent/context", get(handle_assistant_context))
+        // ── Phase 4：Resource Gateway——MCP 工具代理（只读白名单+限流） ──
+        .route("/api/agent/tools/call", post(handle_agent_tools_call))
+        .route("/api/agent/tools", get(handle_agent_tools_list))
+        // P4-2：写工具审批轮询/执行（approved 后单次执行）
+        .route("/api/agent/tools/approvals/{id}", get(handle_agent_tool_approval_poll))
+        .route("/api/a2a/tasks", post(handle_a2a_task_create))
+        .route("/api/a2a/tasks/{id}", get(handle_a2a_task_get))
+        .route("/api/a2a/tasks/{id}/status", post(handle_a2a_task_update))
+        .route("/api/a2a/messages", post(handle_a2a_message_create))
+        .route("/api/a2a/inbox", get(handle_a2a_inbox))
+        .route("/api/a2a/inbox/stream", get(handle_a2a_inbox_stream))
+        // ── Phase 3：artifact（引用传递，本体本地受控目录）──
+        // 上传单独放宽 body 限制到 50MB+1（axum 默认 2MB；store 侧再校验精确上限）
+        .nest(
+            "/api/a2a/artifacts",
+            Router::new()
+                .route("/", post(handle_artifact_upload).get(handle_artifact_list))
+                .route("/{id}", get(handle_artifact_get))
+                .route("/{id}/content", get(handle_artifact_content))
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::assistant_platform::AssistantPlatformStore::ARTIFACT_MAX_BYTES + 1024,
+                )),
+        );
 
     let protected = Router::new()
         .route("/api/chat", post(handle_chat))
@@ -82,6 +114,16 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/services/{key}/start", post(handle_service_start))
         .route("/api/services/{key}/stop", post(handle_service_stop))
         .route("/api/services/{key}/restart", post(handle_service_restart))
+        // ── Personal Assistant Platform Phase 0/1：用户侧 binding 管理 ──
+        .route("/api/assistants/bindings", post(handle_assistant_binding_create).get(handle_assistant_binding_list))
+        .route("/api/assistants/bindings/{id}/revoke", post(handle_assistant_binding_revoke))
+        .route("/api/assistants/bindings/{id}/tokens", post(handle_assistant_token_issue))
+        .route("/api/assistants/bindings/{id}/scopes", put(handle_assistant_binding_scopes))
+        .route("/api/assistants/events", get(handle_assistant_events))
+        // ── Phase 1：可见性 / 助手摘要目录 / 交接 brief ──
+        .route("/api/assistants/visibility", get(handle_assistant_visibility_get).put(handle_assistant_visibility_set))
+        .route("/api/assistants/directory", get(handle_assistant_directory))
+        .route("/api/assistants/handover-brief", post(handle_assistant_handover_brief))
         .route(
             "/api/admin/quota",
             get(handle_admin_quota_get).put(handle_admin_quota_put),
@@ -124,6 +166,10 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/meetings/{id}/end", post(handle_meeting_end))
         .route("/api/meetings/{id}/ask", post(handle_meeting_ask))
         .route("/api/meetings/{id}/invite", post(handle_meeting_invite))
+        // ── Personal Assistant Platform Phase 2：会议助手成员（临时 scope） ──
+        .route("/api/meetings/{id}/assistants", post(handle_meeting_assistant_invite).get(handle_meeting_assistants_list))
+        .route("/api/meetings/{id}/assistants/remove", post(handle_meeting_assistant_remove))
+        .route("/api/meetings/{id}/brief", post(handle_meeting_brief))
         .route("/api/evolve", post(handle_code_evolve))
         .route("/api/meta-evolution/run", post(handle_meta_evolution_run))
         .route("/api/meta-evolution/status", get(handle_meta_evolution_status))

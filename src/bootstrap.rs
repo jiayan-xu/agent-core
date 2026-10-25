@@ -165,6 +165,20 @@ pub(crate) fn spawn_server(
         // 白龙马 Phase C: 启动扫描一次本机资源只读元数据（ssh/git），供条件式门控注入
         let local_resources: SharedResourceSnapshot =
             Arc::new(std::sync::Mutex::new(agent_core::resources::scan_local_resources()));
+        // Personal Assistant Platform Phase 0：控制面持久化跟随 agent.toml 同目录。
+        let assistant_db_path = std::path::Path::new(&path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("assistant_platform.db");
+        let assistant_platform =
+            crate::assistant_platform::AssistantPlatformStore::open(&assistant_db_path)
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "✗ Assistant Platform DB 初始化失败（{}）：{e}",
+                        assistant_db_path.display()
+                    );
+                    std::process::exit(1);
+                });
         rt.block_on(async move {
             let state = Arc::new(AppState {
                 config: Mutex::new(config.clone()),
@@ -189,6 +203,9 @@ pub(crate) fn spawn_server(
                 services: agent_core::service_manager::ServiceManager::new(
                     config.services.clone(),
                 ),
+                assistant_platform,
+                // P4：Resource Gateway 工具限流（内存计数）
+                assistant_tool_quota: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             });
 
             // P2 服务保活（2026-10-22）：配置空表则完全不启动循环 → 零行为变化。

@@ -556,19 +556,37 @@ fn merge_registry_mcp_sources_into(sources: &mut Vec<McpSourceConfig>, registry_
 
 /// 注册表只读路径固定在用户 profile 下的 pfaix-platform 目录，且拒绝包含
 /// 上跳分量，避免把配置读取指到允许目录之外的文件。
+/// SCM LocalSystem 部署下 USERPROFILE 指向 systemprofile（用户目录不可达，
+/// 2026-10-25 实证：注册表 MCP 加载一直静默失败）——PFAIX_REGISTRY 显式
+/// 覆盖优先（agent-core.env 注入，该文件 ACL 仅 user/SYSTEM/Admins）。
 fn registry_file_path() -> Option<std::path::PathBuf> {
+    let resolve = |path: std::path::PathBuf| -> Option<std::path::PathBuf> {
+        let normalized = std::fs::canonicalize(&path).ok()?;
+        let parent = normalized.parent()?.to_path_buf();
+        let normalized_base = std::fs::canonicalize(&parent).ok()?;
+        if normalized.parent() != Some(normalized_base.as_path()) {
+            return None;
+        }
+        Some(normalized)
+    };
+    if let Ok(v) = std::env::var("PFAIX_REGISTRY") {
+        let v = v.trim();
+        if !v.is_empty() && !v.contains("..") {
+            // 覆盖值可为 apps.json 文件或其父目录
+            let p = std::path::PathBuf::from(v);
+            let file = if p.extension().map(|e| e == "json").unwrap_or(false) {
+                p
+            } else {
+                p.join("apps.json")
+            };
+            return resolve(file);
+        }
+    }
     let home = std::env::var("USERPROFILE").ok()?;
     if home.trim().is_empty() || home.contains("..") {
         return None;
     }
-    let base = std::path::Path::new(&home).join("pfaix-platform");
-    let path = base.join("apps.json");
-    let normalized = std::fs::canonicalize(&path).ok()?;
-    let normalized_base = std::fs::canonicalize(&base).ok()?;
-    if normalized.parent() != Some(normalized_base.as_path()) {
-        return None;
-    }
-    Some(normalized)
+    resolve(std::path::Path::new(&home).join("pfaix-platform").join("apps.json"))
 }
 
 fn merge_registry_mcp_sources(cfg: &mut Config) -> usize {

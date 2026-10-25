@@ -2248,6 +2248,34 @@ impl AgentCore {
         Ok(m.add_participant(agent_id))
     }
 
+    /// P2-2（2026-10-24）：助手动作系统行注入——a2a task/message 创建后把摘要记入
+    /// 会议消息流（kind=ai，from=助手标识）。授权不走 caller（系统行为）：调用方
+    /// （assistants.rs）已先经 a2a_meeting_check 校验双方 meeting 成员资格，本方法
+    /// 只做终态守卫 + 追加。不推进 phase（kind=ai 不触发 Discussing）。不内部落盘，
+    /// 落盘职责与 add_meeting_message 相同（调用方锁外异步）。
+    pub fn add_meeting_system_line(
+        &self,
+        id: &str,
+        from: &str,
+        content: &str,
+    ) -> Result<MeetingMessage, String> {
+        let mut v = self.meetings.lock().unwrap_or_else(|p| p.into_inner());
+        let m = v.iter_mut().find(|m| m.id == id);
+        let Some(m) = m else {
+            return Err("无权访问该会议".to_string());
+        };
+        if m.is_terminal() {
+            return Err("会议已结束".to_string());
+        }
+        let msg = MeetingMessage {
+            from: from.to_string(),
+            kind: MSG_KIND_AI.to_string(),
+            content: content.to_string(),
+            at: chrono::Utc::now().to_rfc3339(),
+        };
+        m.apply_message(msg)
+    }
+
     /// Step2：结束会议并回填共识。requested_by 需为 owner / admin，否则拒绝。
     pub fn end_meeting(
         &self,

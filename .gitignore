@@ -46,8 +46,12 @@ tests/test_*.py
 data/
 backups/
 updates/
+# P3：助手 artifact 本体（本地受控目录，元数据在 assistant_platform.db）
+artifacts/
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 __pycache__/
 *.pyc
 agent-core.exe
