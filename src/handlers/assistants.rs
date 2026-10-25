@@ -2202,10 +2202,9 @@ const ASSISTANT_TOOLS_READONLY: &[&str] = &[
 ];
 
 /// P4-2：写工具白名单（经审批管线执行，approver=助手主人；逐个开放）。
-const ASSISTANT_TOOLS_WRITABLE: &[&str] = &[
-    // officecli 文档创建（PPT/文档生成场景）
-    "officecli_create",
-];
+/// officecli_create 因 LocalSystem 下 .NET 运行时缺陷（System.Private.Xml
+/// 缺失）暂不可用，换 dashboard 的 create_docx（python-docx，无 .NET 依赖）。
+const ASSISTANT_TOOLS_WRITABLE: &[&str] = &["create_docx"];
 
 /// P4 限流：binding → (日期, 次数)。进程内计数（重启清零可接受：超额走审计追责）。
 async fn tool_quota_take(st: &Arc<AppState>, binding_id: &str) -> Result<(), usize> {
@@ -2442,6 +2441,35 @@ pub(crate) async fn handle_agent_tools_call_write(
         serde_json::json!({})
     } else {
         req.arguments.clone()
+    };
+    // P4-2 网关输入硬化（§9.3 网关职责）：create_docx 的 title 直接拼输出
+    // 文件名（可路径穿越）、output 可指定任意落盘路径——助手侧禁 output、
+    // title 收敛到安全字符集。审批参数冻结的是硬化后的值，执行侧天然一致。
+    let args_obj = if tool == "create_docx" {
+        let sanitize_spec = |spec: &mut serde_json::Map<String, serde_json::Value>| {
+            spec.remove("output");
+            if let Some(t) = spec.get("title").and_then(|v| v.as_str()) {
+                let safe: String = t
+                    .chars()
+                    .filter(|c| {
+                        c.is_alphanumeric()
+                            || matches!(c, '_' | '-' | '(' | ')' | '（' | '）' | '.' | ' ')
+                    })
+                    .take(80)
+                    .collect();
+                spec.insert("title".to_string(), serde_json::Value::String(safe));
+            }
+        };
+        let mut a = args_obj;
+        if let Some(spec) = a.get_mut("spec").and_then(|v| v.as_object_mut()) {
+            sanitize_spec(spec);
+        } else {
+            // execute() 兼容扁平 kwargs（spec = kwargs.get("spec", kwargs)）
+            sanitize_spec(a.as_object_mut().unwrap_or(&mut Default::default()));
+        }
+        a
+    } else {
+        args_obj
     };
     let desc = format!(
         "助手 {}（{}）请求写工具 {}",

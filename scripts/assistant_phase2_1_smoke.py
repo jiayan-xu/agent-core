@@ -361,7 +361,7 @@ def main() -> int:
             "POST",
             base + "/api/agent/tools/call",
             token=dst["token"],
-            body={"tool": "officecli_create", "arguments": {}},
+            body={"tool": "create_docx", "arguments": {}},
         )
         expect(status == 401, f"write tool without tools:call:write scope -> {status}")
 
@@ -387,7 +387,11 @@ def main() -> int:
             "POST",
             base + "/api/agent/tools/call",
             token=writer["token"],
-            body={"tool": "officecli_create", "arguments": {"kind": "docx", "title": f"P4 冒烟 {suffix}"}},
+            body={"tool": "create_docx", "arguments": {"spec": {
+                "title": f"P4 冒烟 {suffix}",
+                "output": "C:\Windows\evil.docx",
+                "sections": [{"heading": "结论", "paragraphs": ["冒烟测试文档"]}],
+            }}},
         )
         expect(status == 202, f"write tool call -> {status} (approval pending)")
         approval_id = payload.get("approval_id", "")
@@ -421,6 +425,9 @@ def main() -> int:
         _xr = payload.get("result", {})
         _xr = json.loads(_xr) if isinstance(_xr, str) else _xr
         expect(not (isinstance(_xr, dict) and "error" in _xr), f"executed tool routed correctly: {str(_xr)[:60]}")
+        # 网关硬化验证：output 被剥离 → 落盘在 dashboard/reports 而非尝试 C:\Windows
+        _path = str(_xr.get("path", "")) if isinstance(_xr, dict) else ""
+        expect("reports" in _path.lower() and "windows" not in _path.lower(), f"docx saved under reports (output param stripped): {_path[:70]}")
 
         # ⑥ 防重放：同单再执行 → 409
         status, _ = request(
