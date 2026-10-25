@@ -955,6 +955,74 @@ pub(crate) struct VisibilitySetRequest {
     level: String,
 }
 
+/// PUT /api/assistants/bindings/{id}/scopes（受保护，binding 属主本人）——
+/// 升级/收紧 binding scopes（白名单内；含 tools:call:read/write 等 P4 scope）。
+pub(crate) async fn handle_assistant_binding_scopes(
+    State(st): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(binding_id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> Response {
+    let Some(scopes): Option<Vec<String>> = req
+        .get("scopes")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+    else {
+        return err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "scopes_required",
+            "缺少 scopes 数组",
+        );
+    };
+    // 属主校验：binding.user_id 必须 == caller
+    match st.assistant_platform.get_binding(&binding_id) {
+        Ok(Some(b)) if b.user_id == ctx.agent_id => {}
+        Ok(Some(_)) => {
+            return err(
+                axum::http::StatusCode::FORBIDDEN,
+                "not_owner",
+                "仅 binding 属主可修改 scopes",
+            )
+        }
+        Ok(None) => {
+            return err(
+                axum::http::StatusCode::NOT_FOUND,
+                "binding_not_found",
+                "binding 不存在",
+            )
+        }
+        Err(message) => {
+            return err(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "binding_read_failed",
+                &message,
+            )
+        }
+    }
+    match st
+        .assistant_platform
+        .update_binding_scopes(&binding_id, &scopes)
+    {
+        Ok(binding) => {
+            audit_platform(
+                &st,
+                "assistant.binding.scopes_changed",
+                &ctx.agent_id,
+                Some(&binding_id),
+                &format!("scopes={}", binding.scopes.join(",")),
+            )
+            .await;
+            Json(serde_json::json!({"binding": binding})).into_response()
+        }
+        Err(message) => err(
+            axum::http::StatusCode::BAD_REQUEST,
+            "scopes_update_failed",
+            &message,
+        ),
+    }
+}
+
+
 pub(crate) async fn handle_assistant_visibility_set(
     State(st): State<Arc<AppState>>,
     Extension(ctx): Extension<AuthContext>,
@@ -2241,7 +2309,11 @@ pub(crate) async fn handle_agent_tools_call(
     } else {
         req.arguments.clone()
     };
-    match agent.mcp.call_json(&tool, &args_obj).await {
+    // 多源路由（按 tools/list 定位工具所在 source）——不能直打 agent.mcp：
+    // 那是 memoria 专用客户端，平台工具（pipeline 等）会被送进 memoria 报
+    // "Unknown tool"（2026-10-25 演示实测发现的 P4-1 路由 bug）
+    let client = agent.find_mcp_for_tool_async(&tool).await;
+    match client.call_json(&tool, &args_obj).await {
         Ok(result) => {
             audit_platform(
                 &st,
@@ -2495,8 +2567,9 @@ pub(crate) async fn handle_agent_tool_approval_poll(
                     "该审批已执行过（单次有效）",
                 );
             }
-            // 执行工具
-            match agent.mcp.call_json(&p.tool_name, &p.arguments).await {
+            // 执行工具（多源路由，同 tools/call 读路径——见该处注释）
+            let client = agent.find_mcp_for_tool_async(&p.tool_name).await;
+            match client.call_json(&p.tool_name, &p.arguments).await {
                 Ok(result) => {
                     audit_platform(
                         &st,

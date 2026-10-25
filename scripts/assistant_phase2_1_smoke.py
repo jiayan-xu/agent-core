@@ -320,6 +320,11 @@ def main() -> int:
         )
         expect(status == 200, f"whitelisted read-only tool call -> {status}")
         expect("result" in payload, "tool result returned")
+        # 路由验证：result 不得是 {"error": "Unknown tool"} 伪装（P4-1 曾直打 memoria
+        # 导致所有平台工具都返回 Unknown tool，200 但内容是错——2026-10-25 演示实测发现）
+        _r = payload.get("result", {})
+        _r = json.loads(_r) if isinstance(_r, str) else _r
+        expect(not (isinstance(_r, dict) and "error" in _r), f"tool routed to real source (not Unknown tool): {str(_r)[:60]}")
         # ③ 白名单外工具拒绝（写工具 + 未知工具）
         status, _ = request(
             "POST",
@@ -413,6 +418,9 @@ def main() -> int:
         )
         expect(status == 200 and payload.get("status") == "executed", f"poll after approve -> {status} {str(payload.get('status'))[:30]}")
         expect("result" in payload, "executed tool result returned")
+        _xr = payload.get("result", {})
+        _xr = json.loads(_xr) if isinstance(_xr, str) else _xr
+        expect(not (isinstance(_xr, dict) and "error" in _xr), f"executed tool routed correctly: {str(_xr)[:60]}")
 
         # ⑥ 防重放：同单再执行 → 409
         status, _ = request(

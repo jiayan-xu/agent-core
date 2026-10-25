@@ -486,6 +486,30 @@ impl AssistantPlatformStore {
             .map_err(|e| format!("get binding: {e}"))
     }
 
+    /// 更新 active binding 的 scopes（白名单内；create 是纯 INSERT，唯一索引
+    /// 连 revoked 行都占——升级 scope 只能走本方法，不能撤销重绑）。
+    pub(crate) fn update_binding_scopes(
+        &self,
+        binding_id: &str,
+        scopes: &[String],
+    ) -> Result<AssistantBinding, String> {
+        let normalized = normalize_scopes(scopes);
+        let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
+        let n = conn
+            .execute(
+                "UPDATE assistant_bindings SET scopes=?2, updated_at=?3 \
+                 WHERE binding_id=?1 AND status='active'",
+                params![binding_id, normalized.join(","), now()],
+            )
+            .map_err(|e| format!("update scopes: {e}"))?;
+        if n == 0 {
+            return Err("binding 不存在或非 active".to_string());
+        }
+        self.get_binding_inner(&conn, binding_id)
+            .map_err(|e| format!("reread binding: {e}"))?
+            .ok_or_else(|| "binding 更新后读取失败".to_string())
+    }
+
     pub(crate) fn list_bindings(&self, user_id: &str) -> Result<Vec<AssistantBinding>, String> {
         let conn = self.conn.lock().map_err(|e| format!("db lock: {e}"))?;
         let mut stmt = conn

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::middleware::from_fn_with_state;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
@@ -118,6 +118,7 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/assistants/bindings", post(handle_assistant_binding_create).get(handle_assistant_binding_list))
         .route("/api/assistants/bindings/{id}/revoke", post(handle_assistant_binding_revoke))
         .route("/api/assistants/bindings/{id}/tokens", post(handle_assistant_token_issue))
+        .route("/api/assistants/bindings/{id}/scopes", put(handle_assistant_binding_scopes))
         .route("/api/assistants/events", get(handle_assistant_events))
         // ── Phase 1：可见性 / 助手摘要目录 / 交接 brief ──
         .route("/api/assistants/visibility", get(handle_assistant_visibility_get).put(handle_assistant_visibility_set))
