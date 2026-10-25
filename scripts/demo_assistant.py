@@ -138,7 +138,19 @@ def write_memory(base: str, token: str) -> None:
 def read_context(base: str, token: str) -> None:
     q = input("  检索什么？> ").strip() or "工作偏好"
     st, d = request("GET", base + "/api/agent/context?q=" + urllib.parse.quote(q) + "&limit=5", token=token)
-    print(f"  状态 {st} | 命中 {len(d.get('result', {}).get('results', []) if isinstance(d.get('result'), dict) else [])} 条（换新助手也能读到——记忆跟着人）")
+    r = d.get("result", d)
+    if isinstance(r, str):
+        try:
+            r = json.loads(r)
+        except Exception:
+            r = {}
+    items = r.get("results", []) if isinstance(r, dict) else []
+    print(f"  状态 {st} | 命中 {len(items)} 条（换新助手也能读到——记忆跟着人）")
+    for i, it in enumerate(items, 1):
+        text = it.get("content") or it.get("text") or it.get("memory") or "" if isinstance(it, dict) else ""
+        if not text:
+            text = it if isinstance(it, str) else json.dumps(it, ensure_ascii=False)
+        print(f"   {i}. " + str(text)[:100].replace("\n", " "))
 
 
 def call_tool(base: str, token: str) -> None:
