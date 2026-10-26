@@ -42,11 +42,11 @@
   .st-consumed { color: #1E88E5; font-weight: bold; } .st-pending { color: #b37400; font-weight: bold; }
   .auto-note { font-size: 11px; color: #8d9eb0; }
 .pf-head{display:flex;align-items:center;gap:10px;padding:14px 24px;background:#fff;border-bottom:1px solid #e2e8f0;font-family:'Microsoft YaHei',sans-serif}.pf-logo{width:32px;height:32px;border-radius:8px;flex-shrink:0;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);display:inline-flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;color:#fff}.pf-head b{font-size:17px;color:#17213a}.pf-app{margin-left:auto;font-size:12px;color:#94a3b8;letter-spacing:1px}
-.pf-top{background:#fff;position:relative}.pf-top::after{content:"";position:absolute;bottom:0;left:0;right:0;height:3px;background:linear-gradient(90deg,#F58220 0%,#5DAF3B 50%,#1E88E5 100%)}.pf-top-bar{display:flex;align-items:center;height:80px;padding:0 24px;font-family:Microsoft YaHei,sans-serif}.pf-top-l{flex:1;display:flex;align-items:center;gap:20px;font-size:13px;color:#8d9eb0;align-self:flex-end;padding-bottom:8px}.pf-top-c{flex:1;display:flex;align-items:center;justify-content:center;gap:14px}.pf-top-t{font-size:42px;font-weight:800;color:#1a2332;margin:0;white-space:nowrap}.pf-top-r{flex:1;display:flex;align-items:center;justify-content:flex-end;gap:16px;font-size:13px;color:#5a6d82;align-self:flex-end;padding-bottom:8px}
+.pf-top{background:#fff;position:sticky;top:0;z-index:100}.pf-top::after{content:"";position:absolute;bottom:0;left:0;right:0;height:3px;background:linear-gradient(90deg,#F58220 0%,#5DAF3B 50%,#1E88E5 100%)}.pf-top-bar{display:flex;align-items:center;height:60px;padding:0 20px;gap:14px;font-family:Microsoft YaHei,sans-serif}.pf-top-c{display:flex;align-items:center;gap:10px;min-width:200px}.pf-top-logo{height:34px;width:auto}.pf-top-txt{display:flex;flex-direction:column}.pf-top-t{font-size:16px;font-weight:700;color:#1a2332;margin:0;white-space:nowrap;line-height:1.25}.pf-top-s{font-size:11px;color:#8d9eb0;margin-top:1px;white-space:nowrap;letter-spacing:.3px}.pf-top-l{flex:1}.pf-top-r{display:flex;align-items:flex-end;gap:12px;padding-bottom:7px}.pf-top-user{display:flex;align-items:center;gap:7px}.pf-top-un{font-size:13px;font-weight:600;color:#334155}.pf-top-clock{font-size:12.5px;color:#5a6d82;font-variant-numeric:tabular-nums}
 </style>
 </head>
 <body>
-<div class="pf-top"><div class="pf-top-bar"><div class="pf-top-l">危险/红线工具二次确认 · 真人兜底</div><div class="pf-top-c"><span style="font-size:38px">🛡️</span><h1 class="pf-top-t">人工审批台</h1></div><div class="pf-top-r">智浦助手 PFAiX</div></div></div>
+<div class="pf-top"><div class="pf-top-bar"><div class="pf-top-c"><img class="pf-top-logo" src="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Ctext x=%2712%27 y=%2718%27 font-size=%2718%27 text-anchor=%27middle%27%3E%F0%9F%9B%A1%EF%B8%8F%3C/text%3E%3C/svg%3E" alt=""><div class="pf-top-txt"><h1 class="pf-top-t">人工审批台</h1><div class="pf-top-s">危险/红线工具二次确认 · 真人兜底</div></div></div><div class="pf-top-l"></div><div class="pf-top-r"><div class="pf-top-user"><span class="pf-top-un" id="pfUser">…</span></div><span class="pf-top-clock" id="pfClock"></span></div></div></div>
 <div class="wrap">
   <div class="keybar">
     <span class="auto-note">🔒 身份由办公网 IP 绑定 + 防火墙白名单保证（APPROVAL_OPEN_LAN=1）</span>
@@ -190,5 +190,26 @@ function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function
 window.addEventListener("DOMContentLoaded", () => { load(); });
 
 </script>
-</body>
+
+<script>
+(function(){
+  function pfTick(){
+    var ck=document.getElementById('pfClock');
+    if(!ck) return;
+    var w=['星期日','星期一','星期二','星期三','星期四','星期五','星期六'];
+    var d=new Date(), p2=function(x){return ('0'+x).slice(-2)};
+    ck.textContent = d.getFullYear()+'年'+(d.getMonth()+1)+'月'+d.getDate()+'日 '+w[d.getDay()]+' '+p2(d.getHours())+':'+p2(d.getMinutes())+':'+p2(d.getSeconds());
+  }
+  pfTick(); setInterval(pfTick,1000);
+  // 审批人姓名：SSO 注入的 fetch 劫持会自动带 Bearer，可安全调用 directory 拿显示名
+  try{
+    fetch('/agent/directory').then(function(r){return r.ok?r.json():null}).then(function(d){
+      if(!d||!d.users) return;
+      var me=d.users.find(function(u){return u.online})||d.users[0];
+      var el=document.getElementById('pfUser');
+      if(me&&el) el.textContent=me.display_name||'审批人';
+    }).catch(function(){});
+  }catch(e){}
+})();
+</script></body>
 </html>
