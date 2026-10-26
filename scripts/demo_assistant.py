@@ -5,6 +5,9 @@
 让观众亲眼看到 绑定→记忆→协作→工具→审批 的完整形态。
 
 用法：
+  # 同事智能体自助接入第一步（拿门牌自取契约，无需令牌）：
+  python scripts/demo_assistant.py --discover http://100.67.56.106:9753
+
   # 演示准备（演示者一次性，创建演示绑定并把令牌存本地）：
   python scripts/demo_assistant.py --setup 演示助手A
   python scripts/demo_assistant.py --setup 演示助手B
@@ -82,6 +85,33 @@ def request(
             return exc.code, json.loads(raw)
         except Exception:
             return exc.code, {"error": raw[:200]}
+
+
+def discover(base: str) -> int:
+    """自助接入第一步：拿门牌拉平台契约（无需令牌）。"""
+    st, d = request("GET", base + "/.well-known/assistant-platform")
+    if st != 200:
+        print(f"✗ 发现失败（{st}）: {d}")
+        return 1
+    print(f"✓ {d.get('platform')} · spec v{d.get('spec_version')}")
+    print(f"  issuer: {d.get('issuer')}")
+    print("  接入三步:")
+    for s in d.get("quickstart", []):
+        print(f"   {s}")
+    print("  scopes:")
+    for s in d.get("scopes", []):
+        print(f"   - {s.get('scope')}: {s.get('description')}")
+    eps = d.get("endpoints", [])
+    print(f"  端点 {len(eps)} 个:")
+    for e in eps:
+        scope = e.get("scope", "")
+        print(f"   {e.get('method', 'GET'):<6} {e.get('path', '')}  [{scope}]")
+    r = d.get("authentication", {}).get("refresh", {})
+    print(f"  令牌轮换: POST {r.get('endpoint')}（{r.get('auth')}；轮换式）")
+    ns = d.get("identity", {})
+    print(f"  记忆归属: {ns.get('memory_namespace', '')}（{ns.get('namespace_rule', '')[:40]}…）")
+    print("  → 下一步：绑定助手拿令牌 → 按上面端点接入（演示：--setup / 演示手册）")
+    return 0
 
 
 def setup(base: str, name: str) -> int:
@@ -242,8 +272,16 @@ def main() -> int:
     parser.add_argument("--token-file", default="")
     parser.add_argument("--setup", default="", help="创建演示绑定（传助手名）")
     parser.add_argument("--peer-binding", default="", help="A2A 对方 binding_id（可选）")
+    parser.add_argument("--discover", action="store_true",
+                        help="拿门牌自取平台 API 契约（无需令牌——同事智能体接入第一步）")
     args = parser.parse_args()
     base = args.base_url.rstrip("/")
+    if args.discover:
+        # 发现的是公开契约（不带令牌），允许任意 http 门牌（内网/tailnet）
+        parsed = urllib.parse.urlsplit(base)
+        if parsed.scheme != "http" or not parsed.hostname:
+            raise SystemExit("discover 门牌只支持 http://<host:port>")
+        return discover(base)
     validate_url(base + "/health")
     if args.setup:
         return setup(base, args.setup)

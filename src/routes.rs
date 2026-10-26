@@ -67,6 +67,8 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/services", get(handle_services_public))
         // ── Personal Assistant Platform Phase 0（2026-10-23）──
         // 本地助手持 opaque scoped token 调用；用户管理路由在 protected 侧。
+        // ── Phase 1.5（2026-10-26）：发现端点——同事智能体拿门牌即可自取 API 契约 ──
+        .route("/.well-known/assistant-platform", get(crate::handlers::discovery::handle_assistant_discovery))
         .route("/api/assistants/me", get(handle_assistant_me))
         .route("/api/assistants/heartbeat", post(handle_assistant_heartbeat))
         .route("/api/assistants/token/revoke", post(handle_assistant_token_revoke))

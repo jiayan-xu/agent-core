@@ -8,6 +8,7 @@ pub mod approval;
 pub mod assistants;
 pub mod chat;
 pub mod collab;
+pub mod discovery; // /.well-known 平台发现端点（智能体自助接入）
 pub mod evolve;
 pub mod gateway;
 pub mod identity;
