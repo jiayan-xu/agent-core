@@ -500,14 +500,15 @@ pub(crate) async fn handle_approval_dingtalk_notify(
     }
 }
 
-/// GET /api/approval/dingtalk-oa-url：公司钉钉 OA 入口地址（审批台「钉钉 OA」按钮用）。
-/// 可配置 DINGTALK_OA_URL（进程环境或 svc-secrets env 文件，如公司专属 OA 门户）；
-/// 缺省网页版钉钉 https://im.dingtalk.com/（普通账号扫码登录，非官网下载页/管理后台）。
+/// GET /api/approval/dingtalk-oa-url：钉钉客户端入口目标（审批台「钉钉客户端」按钮用）。
+/// 可配置 DINGTALK_OA_URL（进程环境或 svc-secrets env 文件）：dingtalk:// 深链原样返回；
+/// https 页面由前端包成客户端内嵌页（page/link&pc_slide=true）打开；
+/// 缺省空串 → 前端 dingtalk:// 裸拉起本地客户端（网页门户 oa/www/im.dingtalk.com 均不可用作普通账号入口）。
 pub(crate) async fn handle_approval_dingtalk_oa_url() -> Response {
     let url = {
         let u = dingtalk_env("DINGTALK_OA_URL");
         if u.is_empty() {
-            "https://im.dingtalk.com/".to_string()
+            String::new()
         } else {
             u
         }

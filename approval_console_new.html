@@ -57,7 +57,7 @@
     <span class="auto-note">🔒 身份由办公网 IP 绑定 + 防火墙白名单保证（APPROVAL_OPEN_LAN=1）</span>
     <button class="btn-refresh" onclick="load()">刷新待审</button>
     <button class="btn-history" onclick="loadHistory()">审批历史</button>
-    <button class="btn-ding-oa" onclick="openDingOA()">钉钉 OA ↗</button>
+    <button class="btn-ding-oa" onclick="openDingOA()">钉钉客户端 ↗</button>
   </div>
   <!-- 运维简报 -->
   <div class="card" style="margin-bottom:16px; border-left:3px solid #1E88E5;">
@@ -175,17 +175,27 @@ document.getElementById("list").addEventListener("click", (ev) => {
   const reasonEl = card ? card.querySelector(".reason") : null;
   respond(b.dataset.id, b.dataset.hash, b.dataset.ok === "1", reasonEl ? reasonEl.value : "");
 });
-// 钉钉 OA 入口：从服务端取配置的 OA 地址（未配置则默认钉钉官方 OA 门）
-var _dingOAUrl = null;
+// 钉钉入口：dingtalk:// 协议直接拉起本地客户端（本机 HKCR\DingTalk → DingtalkScheme.exe）。
+// 服务端 DINGTALK_OA_URL 可配：dingtalk:// 深链原样用；https 页面包成客户端内嵌页(page/link)打开；未配置裸拉起客户端。
+function dingtalkLaunchUrl(t) {
+  if (t && t.indexOf("dingtalk://") === 0) return t;
+  if (t && /^https?:/i.test(t)) return "dingtalk://dingtalkclient/page/link?url=" + encodeURIComponent(t) + "&pc_slide=true";
+  return "dingtalk://";
+}
+var _dingTarget = null;  // null=未拉取，""=未配置
 async function openDingOA() {
   try {
-    if (!_dingOAUrl) {
+    if (_dingTarget === null) {
       const r = await fetch("/api/approval/dingtalk-oa-url");
       const j = await r.json().catch(() => ({}));
-      _dingOAUrl = (r.ok && j.url && j.url.indexOf("oa.dingtalk.com") < 0) ? j.url : "https://im.dingtalk.com/";
+      let u = (r.ok && typeof j.url === "string") ? j.url.trim() : "";
+      // 旧服务端缺省的网页门户地址一律忽略（会落到下载页/管理后台）
+      if (u && ["oa.dingtalk.com", "www.dingtalk.com", "im.dingtalk.com"].some(b => u.indexOf(b) >= 0)) u = "";
+      _dingTarget = u;
     }
-    window.location.href = _dingOAUrl;  // 当前页跳转（无弹窗拦截问题）
-  } catch (e) { window.open("https://im.dingtalk.com/", "_blank"); }
+    window.location.href = dingtalkLaunchUrl(_dingTarget);  // 协议跳转，浏览器确认后拉起客户端
+    toast("正在拉起钉钉客户端…若无反应请确认客户端已启动");
+  } catch (e) { window.location.href = dingtalkLaunchUrl(""); }
 }
 // 钉钉推送（门铃：只提醒，审批动作仍在审批台完成）
 async function dingNotify(id, btn) {  if (btn.disabled) return;
