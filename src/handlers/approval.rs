@@ -327,6 +327,179 @@ pub(crate) async fn handle_approval_respond(
     }
 }
 
+// ── 钉钉入口（2026-10-26）：审批台内置「推钉钉」按钮的后端 ──────────────────
+//
+// POST /api/approval/{id}/dingtalk-notify
+// 把指定待审单推送到钉钉群自定义机器人（markdown 消息：审批摘要 + 指纹 +
+// 审批台入口提示）。审批动作仍只在平台审批台内完成（钉钉=门铃，非审批通道）——
+// 符合条例 4（无新审批旁路）与 D6（批准只在 PFAiX）。
+// 凭据：DINGTALK_WEBHOOK_URL / DINGTALK_WEBHOOK_SECRET——进程环境优先，
+// 缺失时回退读固定常量路径的密钥文件（与 platform.rs load_platform_key 同模式）。
+
+/// 固定路径常量（部署机固定；文件 ACL 仅 user/SYSTEM/Admins，条例 10）。
+const DINGTALK_KEY_FILE: &str = r"C:\Users\user\.svc-secrets\agent-core.env";
+
+fn dingtalk_env(key: &str) -> String {
+    if let Ok(v) = std::env::var(key) {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if let Ok(content) = std::fs::read_to_string(DINGTALK_KEY_FILE) {
+        let prefix = format!("{key}=");
+        for line in content.lines() {
+            if let Some(v) = line.strip_prefix(&prefix) {
+                let v = v.trim().trim_matches('"').to_string();
+                if !v.is_empty() {
+                    return v;
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// URL-safe base64（无填充）——钉钉 webhook 加签要求。
+fn b64url_nopad(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        out.push(T[(b[0] >> 2) as usize] as char);
+        out.push(T[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(T[(((b[1] & 0x0f) << 2) | (b[2] >> 6)) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(T[(b[2] & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
+pub(crate) async fn handle_approval_dingtalk_notify(
+    State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    // 鉴权与 pending/respond 同门：APPROVAL_OPEN_LAN（网络位置即身份）
+    // （无 headers 参数——该端点只读审批信息+出站通知，不产生审批决策）
+    if !approval_open_lan() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "此入口未开放（需 APPROVAL_OPEN_LAN）"})),
+        )
+            .into_response();
+    }
+    let url = dingtalk_env("DINGTALK_WEBHOOK_URL");
+    let secret = dingtalk_env("DINGTALK_WEBHOOK_SECRET");
+    if url.is_empty() || secret.is_empty() {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({
+                "error": "dingtalk_not_configured",
+                "message": "未配置钉钉机器人：在 ~/.svc-secrets/agent-core.env 加 DINGTALK_WEBHOOK_URL 与 DINGTALK_WEBHOOK_SECRET（群机器人 webhook 地址与加签密钥）"
+            })),
+        )
+            .into_response();
+    }
+    // 出站目标锁定钉钉开放平台域名（防 SSRF 显式边界：仅 https://oapi.dingtalk.com）
+    if !url.starts_with("https://oapi.dingtalk.com/") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "webhook 域名必须是 https://oapi.dingtalk.com/…"})),
+        )
+            .into_response();
+    }
+
+    // 取审批单信息
+    let agent = {
+        let guard = st.agent.lock().await;
+        guard.as_ref().map(|a| a.clone())
+    };
+    let Some(agent) = agent else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "服务尚未就绪").into_response();
+    };
+    let Some(p) = agent.approval_manager.get_pending(&id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "审批项不存在或已处理"})),
+        )
+            .into_response();
+    };
+
+    // 组装 markdown 消息（含审批台入口提示；不携带可直接执行的审批链接——
+    // 决策动作仍需进审批台完成身份与指纹校验）
+    let created = chrono::DateTime::from_timestamp(p.created_at as i64, 0)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default();
+    let md = format!(
+        "### 🛡️ PFAiX 审批提醒\n\n**{}** 需人工确认\n\n- 审批号：`{}`\n- 请求方：{}\n- 请求人：{}\n- 创建：{}\n- 操作指纹：`{}`\n\n> 请打开 PFAiX 审批台处理（批准/拒绝在平台内完成）",
+        p.tool_name, p.approval_id, p.requester_id, p.approver_id, created, p.operation_hash
+    );
+
+    // 钉钉加签：sign = base64url(hmac_sha256("{ts}\n{secret}", secret))
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    use hmac::Mac;
+    let mut mac = <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes())
+        .expect("hmac key");
+    mac.update(format!("{ts}\n{secret}").as_bytes());
+    let sign = b64url_nopad(&mac.finalize().into_bytes());
+    let hook = format!("{url}&timestamp={ts}&sign={sign}");
+
+    let body = serde_json::json!({
+        "msgtype": "markdown",
+        "markdown": { "title": "PFAiX 审批提醒", "text": md },
+    });
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&hook)
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&body)
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            // 审计（治理侧；审批未变状态）
+            agent
+                .audit_logger
+                .record_event(agent_core::audit::AuditEvent {
+                    ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                    trace_id: agent_core::audit::new_trace_id(),
+                    agent_id: "dashboard-admin".into(),
+                    session_id: Some(id.clone()),
+                    event_type: agent_core::audit::AuditEventType::Custom(
+                        "dingtalk.notified".into(),
+                    ),
+                    detail: format!("approval={} tool={}", p.approval_id, p.tool_name),
+                })
+                .await;
+            Json(serde_json::json!({"ok": true, "notified": id})).into_response()
+        }
+        Ok(r) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("钉钉返回 {}", r.status())})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("推送失败: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 /// 人工审批台内嵌 HTML（fetch 直连本 agent-core 的 /api/approval/* 端点）
 pub(crate) const APPROVAL_CONSOLE_HTML: &str = r##"<!DOCTYPE html>
 <html lang="zh-CN">

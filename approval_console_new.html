@@ -24,7 +24,10 @@
   .btn-refresh { background: #1E88E5; color: #fff; font-weight: 600; }
   .btn-refresh:hover { background: #1976D2; }
   .btn-history { background: #fff; color: #6b5bd6; border: 1px solid #b9aee0; }
-  .btn-history:hover { background: #f1eefb; }
+  .btn-history:hover { background: #f1efef; }
+  .btn-ding { background: #fff; color: #1677ff; border: 1px solid #a8ccf7; font-weight: 500; }
+  .btn-ding:hover { background: #eef5ff; }
+  .btn-ding:disabled { opacity: .55; cursor: default; }
   .btn-approve { background: #178a50; color: #fff; font-weight: 600; }
   .btn-approve:hover { background: #10693c; }
   .btn-reject { background: #c5453b; color: #fff; }
@@ -85,7 +88,8 @@ async function load() {
           '<pre>' + esc(args) + '</pre>' +
           '<div class="actions"><input class="reason" placeholder="审批意见（可选）">' +
           '<button class="btn-approve" data-id="' + esc(it.approval_id) + '" data-hash="' + esc(it.operation_hash) + '" data-ok="1">✓ 批准</button>' +
-          '<button class="btn-reject" data-id="' + esc(it.approval_id) + '" data-hash="' + esc(it.operation_hash) + '" data-ok="">✕ 拒绝</button></div>';
+          '<button class="btn-reject" data-id="' + esc(it.approval_id) + '" data-hash="' + esc(it.operation_hash) + '" data-ok="">✕ 拒绝</button>' +
+          '<button class="btn-ding" data-id="' + esc(it.approval_id) + '">🔔 推钉钉</button></div>';
         list.appendChild(div);
       }
     }
@@ -167,6 +171,23 @@ document.getElementById("list").addEventListener("click", (ev) => {
   const card = b.closest(".card");
   const reasonEl = card ? card.querySelector(".reason") : null;
   respond(b.dataset.id, b.dataset.hash, b.dataset.ok === "1", reasonEl ? reasonEl.value : "");
+});
+// 钉钉推送（门铃：只提醒，审批动作仍在审批台完成）
+async function dingNotify(id, btn) {
+  if (btn.disabled) return;
+  btn.disabled = true; var old = btn.textContent; btn.textContent = "推送中…";
+  try {
+    const r = await fetch("/api/approval/" + encodeURIComponent(id) + "/dingtalk-notify", { method: "POST" });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok) { toast("已推送到钉钉 ✓"); btn.textContent = "已推送 ✓"; }
+    else if (r.status === 412) { toast("未配置钉钉机器人（缺 webhook）"); btn.textContent = old; }
+    else { toast("推送失败: " + (j.message || j.error || r.status)); btn.textContent = old; }
+  } catch (e) { toast("推送出错: " + e); btn.textContent = old; }
+  setTimeout(function(){ btn.disabled = false; btn.textContent = old; }, 2500);
+}
+document.getElementById("list").addEventListener("click", (ev) => {
+  const b = ev.target.closest("button.btn-ding");
+  if (b) dingNotify(b.dataset.id, b);
 });
 function startAuto(){ if(!AUTO){ AUTO = setInterval(load, 30000); } }
 function stopAuto(){ if(AUTO){ clearInterval(AUTO); AUTO = null; } }
