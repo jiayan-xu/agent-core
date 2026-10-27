@@ -502,12 +502,12 @@ pub(crate) async fn handle_approval_dingtalk_notify(
 
 /// GET /api/approval/dingtalk-oa-url：公司钉钉 OA 入口地址（审批台「钉钉 OA」按钮用）。
 /// 可配置 DINGTALK_OA_URL（进程环境或 svc-secrets env 文件，如公司专属 OA 门户）；
-/// 缺省钉钉官方 OA 门 https://oa.dingtalk.com/（登录后自动进公司工作台）。
+/// 缺省钉钉官方门户 https://www.dingtalk.com/（普通账号扫码登录，非管理后台 oa.dingtalk.com）。
 pub(crate) async fn handle_approval_dingtalk_oa_url() -> Response {
     let url = {
         let u = dingtalk_env("DINGTALK_OA_URL");
         if u.is_empty() {
-            "https://oa.dingtalk.com/".to_string()
+            "https://www.dingtalk.com/".to_string()
         } else {
             u
         }

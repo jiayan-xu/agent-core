@@ -28,6 +28,8 @@
   .btn-ding { background: #fff; color: #1677ff; border: 1px solid #a8ccf7; font-weight: 500; }
   .btn-ding:hover { background: #eef5ff; }
   .btn-ding:disabled { opacity: .55; cursor: default; }
+  .btn-ding-oa { background: #1677ff; color: #fff; font-weight: 600; }
+  .btn-ding-oa:hover { background: #0e5fd8; }
   .btn-approve { background: #178a50; color: #fff; font-weight: 600; }
   .btn-approve:hover { background: #10693c; }
   .btn-reject { background: #c5453b; color: #fff; }
@@ -55,6 +57,7 @@
     <span class="auto-note">🔒 身份由办公网 IP 绑定 + 防火墙白名单保证（APPROVAL_OPEN_LAN=1）</span>
     <button class="btn-refresh" onclick="load()">刷新待审</button>
     <button class="btn-history" onclick="loadHistory()">审批历史</button>
+    <button class="btn-ding-oa" onclick="openDingOA()">钉钉 OA ↗</button>
   </div>
   <!-- 运维简报 -->
   <div class="card" style="margin-bottom:16px; border-left:3px solid #1E88E5;">
@@ -172,9 +175,20 @@ document.getElementById("list").addEventListener("click", (ev) => {
   const reasonEl = card ? card.querySelector(".reason") : null;
   respond(b.dataset.id, b.dataset.hash, b.dataset.ok === "1", reasonEl ? reasonEl.value : "");
 });
+// 钉钉 OA 入口：从服务端取配置的 OA 地址（未配置则默认钉钉官方 OA 门）
+var _dingOAUrl = null;
+async function openDingOA() {
+  try {
+    if (!_dingOAUrl) {
+      const r = await fetch("/api/approval/dingtalk-oa-url");
+      const j = await r.json().catch(() => ({}));
+      _dingOAUrl = (r.ok && j.url && j.url.indexOf("oa.dingtalk.com") < 0) ? j.url : "https://www.dingtalk.com/";
+    }
+    window.location.href = _dingOAUrl;  // 当前页跳转（无弹窗拦截问题）
+  } catch (e) { window.open("https://www.dingtalk.com/", "_blank"); }
+}
 // 钉钉推送（门铃：只提醒，审批动作仍在审批台完成）
-async function dingNotify(id, btn) {
-  if (btn.disabled) return;
+async function dingNotify(id, btn) {  if (btn.disabled) return;
   btn.disabled = true; var old = btn.textContent; btn.textContent = "推送中…";
   try {
     const r = await fetch("/api/approval/" + encodeURIComponent(id) + "/dingtalk-notify", { method: "POST" });
