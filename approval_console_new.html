@@ -195,7 +195,27 @@ var _dingTarget = "";  // 预取结果；""=未配置/未就绪 → 裸拉起
     }).catch(() => {});
 })();
 function openDingOA() {
-  window.location.href = dingtalkLaunchUrl(_dingTarget);  // 同步发起：点击手势内，浏览器询问后拉起客户端
+  const url = dingtalkLaunchUrl(_dingTarget);
+  // PFAiX 内嵌帧（跨源）：WebView 禁止帧内直接发起外部协议跳转（"已阻止此内容"）。
+  // 壳已授予 remote http://* + opener:allow-open-url → 优先经 Tauri opener 由系统拉起；
+  // 注入未达帧时退化为 postMessage 壳桥（壳侧只放行 dingtalk://）；浏览器直开走同步手势跳转。
+  try {
+    const T = window.__TAURI__;
+    if (T && T.opener && T.opener.openUrl) {
+      T.opener.openUrl(url).catch(() => {});
+      toast("正在拉起钉钉客户端…无反应请确认客户端已启动");
+      return;
+    }
+    if (T && T.core && T.core.invoke) {
+      T.core.invoke("plugin:opener|open_url", { url: url }).catch(() => {});
+      toast("正在拉起钉钉客户端…无反应请确认客户端已启动");
+      return;
+    }
+  } catch (e) {}
+  if (window.parent && window.parent !== window) {
+    try { window.parent.postMessage({ pfaixOpen: url }, "*"); toast("已请求 PFAiX 拉起钉钉客户端…"); return; } catch (e) {}
+  }
+  window.location.href = url;  // 浏览器直开：点击手势内同步发起
   toast("正在拉起钉钉客户端…浏览器若询问请点「允许」；无反应请确认客户端已启动");
 }
 // 钉钉推送（门铃：只提醒，审批动作仍在审批台完成）
