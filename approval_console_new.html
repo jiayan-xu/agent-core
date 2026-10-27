@@ -182,10 +182,10 @@ async function openDingOA() {
     if (!_dingOAUrl) {
       const r = await fetch("/api/approval/dingtalk-oa-url");
       const j = await r.json().catch(() => ({}));
-      _dingOAUrl = (r.ok && j.url && j.url.indexOf("oa.dingtalk.com") < 0) ? j.url : "https://www.dingtalk.com/";
+      _dingOAUrl = (r.ok && j.url && j.url.indexOf("oa.dingtalk.com") < 0) ? j.url : "https://im.dingtalk.com/";
     }
     window.location.href = _dingOAUrl;  // 当前页跳转（无弹窗拦截问题）
-  } catch (e) { window.open("https://www.dingtalk.com/", "_blank"); }
+  } catch (e) { window.open("https://im.dingtalk.com/", "_blank"); }
 }
 // 钉钉推送（门铃：只提醒，审批动作仍在审批台完成）
 async function dingNotify(id, btn) {  if (btn.disabled) return;
