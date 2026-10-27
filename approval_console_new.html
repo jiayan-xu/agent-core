@@ -177,25 +177,26 @@ document.getElementById("list").addEventListener("click", (ev) => {
 });
 // 钉钉入口：dingtalk:// 协议直接拉起本地客户端（本机 HKCR\DingTalk → DingtalkScheme.exe）。
 // 服务端 DINGTALK_OA_URL 可配：dingtalk:// 深链原样用；https 页面包成客户端内嵌页(page/link)打开；未配置裸拉起客户端。
+// 关键约束：外部协议跳转必须在用户点击手势内同步发起——await fetch 之后再生效会被 Chromium
+// 判为非用户操作，直接拦成"已阻止此内容"(about:blank#blocked)。故配置在页面加载时预取。
 function dingtalkLaunchUrl(t) {
   if (t && t.indexOf("dingtalk://") === 0) return t;
   if (t && /^https?:/i.test(t)) return "dingtalk://dingtalkclient/page/link?url=" + encodeURIComponent(t) + "&pc_slide=true";
   return "dingtalk://";
 }
-var _dingTarget = null;  // null=未拉取，""=未配置
-async function openDingOA() {
-  try {
-    if (_dingTarget === null) {
-      const r = await fetch("/api/approval/dingtalk-oa-url");
-      const j = await r.json().catch(() => ({}));
-      let u = (r.ok && typeof j.url === "string") ? j.url.trim() : "";
+var _dingTarget = "";  // 预取结果；""=未配置/未就绪 → 裸拉起
+(function prefetchDingTarget() {
+  fetch("/api/approval/dingtalk-oa-url").then(r => r.ok ? r.json() : {})
+    .then(j => {
+      let u = (j && typeof j.url === "string") ? j.url.trim() : "";
       // 旧服务端缺省的网页门户地址一律忽略（会落到下载页/管理后台）
       if (u && ["oa.dingtalk.com", "www.dingtalk.com", "im.dingtalk.com"].some(b => u.indexOf(b) >= 0)) u = "";
       _dingTarget = u;
-    }
-    window.location.href = dingtalkLaunchUrl(_dingTarget);  // 协议跳转，浏览器确认后拉起客户端
-    toast("正在拉起钉钉客户端…若无反应请确认客户端已启动");
-  } catch (e) { window.location.href = dingtalkLaunchUrl(""); }
+    }).catch(() => {});
+})();
+function openDingOA() {
+  window.location.href = dingtalkLaunchUrl(_dingTarget);  // 同步发起：点击手势内，浏览器询问后拉起客户端
+  toast("正在拉起钉钉客户端…浏览器若询问请点「允许」；无反应请确认客户端已启动");
 }
 // 钉钉推送（门铃：只提醒，审批动作仍在审批台完成）
 async function dingNotify(id, btn) {  if (btn.disabled) return;
