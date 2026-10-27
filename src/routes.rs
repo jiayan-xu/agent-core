@@ -42,6 +42,7 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/approval/history", get(handle_approval_history))
         .route("/api/approval/{id}/respond", post(handle_approval_respond))
         .route("/api/approval/{id}/dingtalk-notify", post(handle_approval_dingtalk_notify))
+        .route("/api/approval/dingtalk-oa-url", get(handle_approval_dingtalk_oa_url))
         .route("/approval-console", get(handle_approval_console))
         .route("/api/ops/briefing", get(handle_ops_briefing))
         // ── P3 平台治理（2026-10-19，从 dashboard 迁出） ──
