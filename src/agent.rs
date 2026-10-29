@@ -8019,6 +8019,26 @@ impl AgentCore {
         download && video
     }
 
+    /// 跨会话问法检测（2026-10-29）：用户问「刚刚/之前和 zcode/workbuddy 等聊过的事」时
+    /// 必须走常规路径（memoria 接力注入 + 常驻三工具只在常规路径注入），并据此豁免
+    /// bootstrap 锚定。误报（普通消息含「刚刚」）无害——只是工具面更大、提示更全。
+    fn mentions_cross_session(q: &str) -> bool {
+        const CROSS_KEYS: &[&str] = &[
+            "zcode", "workbuddy", "work buddy", "记忆库",
+            "别的会话", "上个会话", "之前会话", "另一个会话", "其他会话",
+            "交接", "上次聊", "刚聊", "之前聊", "刚刚说", "刚才说",
+            "你记得吗", "你知道吗", "你还记得",
+        ];
+        let lower = q.to_ascii_lowercase();
+        CROSS_KEYS.iter().any(|k| {
+            if k.is_ascii() {
+                lower.contains(k)
+            } else {
+                q.contains(k)
+            }
+        })
+    }
+
     /// 当前工具面是否至少含一个数据查询类工具（HookContext.query_tool_available）。
     /// 口径与旧内联判断一致；OnPreAct / OnFinalAnswer / OnToolResult 三处共享，
     /// 避免 hook 上下文拿到硬编码 false 的错误快照（ocr bug·low 修复）。
@@ -8129,11 +8149,14 @@ impl AgentCore {
         let full_tools = self.select_exposed_tools(raw_message, allowed_ns, expose_cap).await;
         // ADR-017 P1：flash 锚定引导。仅 bootstrap 开启 + easy 路由 + 非写意图 + 未 promoted 触发；
         // flag-off / 其他条件不满足时 `bootstrap_active=false`，以下所有分支与原路径逐字等价。
+        // 2026-10-29 追加豁免：跨会话问法（「我和 zcode/workbuddy 刚聊的…」）必须走常规路径——
+        // bootstrap 中性提示会剥离 memoria 接力注入与常驻三工具，实测此类问题全部答非所问。
         // per-session 原子预留：同 session 并发 run 只有一个能拿最小工具面，
         // 其余 run 直接走常规路径（拿不到预留不算错误，也不取消其他 run 的预留）。
         let bootstrap_eligible = self.orchestration.cfg.bootstrap.enabled
             && is_easy_query
             && !Self::has_write_intent(raw_message)
+            && !Self::mentions_cross_session(raw_message)
             && !self
                 .orchestration
                 .is_promoted_async(session_id.to_string())
@@ -8215,7 +8238,7 @@ impl AgentCore {
             if let Some(sys) = ctx.messages.first_mut() {
                 if sys.role == "system" {
                     sys.content = Some(
-                        "You are a helpful assistant. 请优先调用给定的工具获取真实数据后再回答；没有可用的工具时再直接简洁回答。"
+                        "You are a helpful assistant. 请优先调用给定的工具获取真实数据后再回答；没有可用的工具时再直接简洁回答。若用户询问其他会话/其他智能体（如 zcode、workbuddy）聊过的事，调用 memory_search 或 memory_context 查询 memoria 记忆库后再回答。"
                             .to_string(),
                     );
                 }
