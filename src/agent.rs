@@ -7933,6 +7933,12 @@ impl AgentCore {
         "edit_code",
         "verify_code",
         "organize_folders",
+        // 2026-10-29 跨会话记忆接力三件（memoria 交接协议 v1 配套）：接力最小面常驻，
+        // 避免被相关性裁剪（实测 156 工具只暴露 17，memory_* 落选 → 智能体答「会话隔离」）。
+        // 只常驻这三个，其余 memoria 工具仍走相关性选择，控制工具面膨胀。
+        "memory_search",
+        "memory_context",
+        "memory_observe",
         // 2026-08-05：查询首选 nl_query（自然语言问数，自动汇总统计），
         // query_entrance 是逐车明细，放常驻会诱导 LLM 选它做聚合 → 数据错。
         "nl_query",
@@ -13041,6 +13047,18 @@ impl AgentCore {
         // 双轨：受控改库扳手 + 本机白名单仓库编辑
         prompt.push_str(crate::db_write::system_hint());
         prompt.push_str(crate::repo_ws::system_hint());
+        // 跨会话记忆接力（memoria 交接协议 v1，2026-10-29）：经网关的智能体都有 memoria
+        // 工具（namespace 由网关自动注入），但没有任何机制告诉它们「要去查」——实测 WB/ZCode
+        // 场景下智能体答「会话相互隔离」。此处平台级注入行为指令，改一处全端生效
+        // （文本与 memoria SERVER_INSTRUCTIONS 保持同义，memoria 侧为正本）。
+        prompt.push_str(
+            "\n## 跨会话记忆接力（memoria）\n\
+             - 你可访问 memoria 跨客户端持久记忆库（ZCode/WorkBuddy 等其他智能体共享；namespace 已由系统自动注入，无需手动指定）。\n\
+             - 用户提到「刚刚 / 之前 / 上一轮 / 我和 zcode / 我和 workbuddy / 别的会话」聊过的事时，第一动作是查记忆：开放问题用 `memory_search`，要最新任务状态/交接锚点用 `memory_context`；严禁回答「不知道 / 会话相互隔离」。\n\
+             - 命中后按最新记录（created_at 最新）作答；内容含「[下一步]」就顺着它接续工作。\n\
+             - 本轮产生新决定/新进展/新卡点时，轮末用 `memory_observe` 写一条三段式交接：[定了什么] … [卡在哪] … [下一步] …（source 写你的 agent 标识），让下一个会话能接上。\n\
+             - memoria 不可达时（工具报错/超时）如实说明，不要阻塞主线、不要编造记忆内容。\n",
+        );
 
         if !knowledge.is_empty() {
             prompt.push_str("## 记忆档案\n");
