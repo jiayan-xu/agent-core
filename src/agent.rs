@@ -12455,12 +12455,35 @@ impl AgentCore {
             .find(|s| !s.is_empty() && *s != "*")
             .unwrap_or(identity_ns);
         if ns.is_empty() || ns == "*" {
+            // 2026-10-29：全权限身份（allowed_ns=["*"]，如 admin）无具体 ns 可注入 →
+            // memoria 侧落默认 ns → 跨会话检索永远落空（实测）。兜底到主记忆区命名空间。
+            let fallback = Self::memoria_main_ns();
+            if fallback.is_empty() {
+                return;
+            }
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert(
+                    "namespace".to_string(),
+                    serde_json::json!(fallback),
+                );
+                tracing::debug!(tool = %tool_name, namespace = %fallback,
+                    "inject namespace for memoria tool (main-ns fallback)");
+            }
             return;
         }
         if let Some(obj) = args.as_object_mut() {
             obj.insert("namespace".to_string(), serde_json::json!(ns));
             tracing::debug!(tool = %tool_name, namespace = %ns, "inject namespace for memoria tool");
         }
+    }
+
+    /// 主记忆区命名空间兜底（memoria 交接协议 v1 配套）：全权限身份无具体 ns 时
+    /// 注入此值，保证跨会话检索落在主记忆区。可用 MEMORIA_MAIN_NS 环境变量覆盖。
+    fn memoria_main_ns() -> String {
+        std::env::var("MEMORIA_MAIN_NS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "agent/xujiayan".to_string())
     }
 
     /// 是否应自动注入 namespace（Memoria 记忆/实体/编排类；dashboard 业务技能不注入）。
