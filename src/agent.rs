@@ -12449,26 +12449,17 @@ impl AgentCore {
         if !Self::tool_accepts_namespace(tool_name) {
             return;
         }
-        let ns = allowed_ns
+        // 2026-10-29：全权限身份（allowed_ns=["*"]，如 admin）无具体 ns 可注入——
+        // 注意 identity_ns（=agent_id，如 "admin"）不是有效记忆 ns，不能作 fallback
+        // （实测注入 "admin" 后跨会话检索永远落空）。一律兜底主记忆区。
+        let ns = match allowed_ns
             .iter()
-            .map(|s| s.as_str())
             .find(|s| !s.is_empty() && *s != "*")
-            .unwrap_or(identity_ns);
+        {
+            Some(s) => s.as_str().to_string(),
+            None => Self::memoria_main_ns(),
+        };
         if ns.is_empty() || ns == "*" {
-            // 2026-10-29：全权限身份（allowed_ns=["*"]，如 admin）无具体 ns 可注入 →
-            // memoria 侧落默认 ns → 跨会话检索永远落空（实测）。兜底到主记忆区命名空间。
-            let fallback = Self::memoria_main_ns();
-            if fallback.is_empty() {
-                return;
-            }
-            if let Some(obj) = args.as_object_mut() {
-                obj.insert(
-                    "namespace".to_string(),
-                    serde_json::json!(fallback),
-                );
-                tracing::debug!(tool = %tool_name, namespace = %fallback,
-                    "inject namespace for memoria tool (main-ns fallback)");
-            }
             return;
         }
         if let Some(obj) = args.as_object_mut() {
