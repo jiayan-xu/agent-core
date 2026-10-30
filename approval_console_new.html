@@ -204,13 +204,36 @@ function openDingOA() {
     if (T && T.core && T.core.invoke) {
       T.core.invoke("plugin:opener|open_url", { url: url }).then(
         () => toast("已交由系统拉起钉钉客户端 ✓"),
-        (e) => { toast("opener失败: " + String((e && e.message) || e).slice(0, 90)); _dingFallback(url); }
+        (e) => { const m = String((e && e.message) || e); toast("opener失败: " + m.slice(0, 200), 10000); _dingErrShow(m); _dingFallback(url); }
       );
       return;
     }
   } catch (e) {}
   _dingFallback(url);
 }
+function _dingErrShow(m) {
+  let el = document.getElementById("ding-diag");
+  if (!el) { el = document.createElement("div"); el.id = "ding-diag";
+    el.style.cssText = "margin:10px 0;padding:8px 12px;border:1px solid #e5b8b4;background:#fdf0ef;border-radius:6px;font:12px/1.6 monospace;word-break:break-all;";
+    const kb = document.querySelector(".keybar"); kb && kb.parentNode.insertBefore(el, kb.nextSibling); }
+  el.textContent = "dingdiag " + new Date().toLocaleTimeString() + " :: " + m;
+}
+// 临时自诊断（每次加载自动测一次 opener；成功会拉起钉钉客户端，属预期行为）
+window.addEventListener("load", function () {
+  if (sessionStorage.getItem("dingdiag-done")) return;  // 每会话只测一次，免得反复拉起钉钉
+  sessionStorage.setItem("dingdiag-done", "1");
+  setTimeout(function () {
+    const T = window.__TAURI__;
+    const p = (T && T.core && T.core.invoke)
+      ? T.core.invoke("plugin:opener|open_url", { url: "dingtalk://" })
+      : Promise.reject("no-tauri-in-frame（__TAURI__ 未注入此帧）");
+    p.then(() => { _dingErrShow("OK ✓ opener 已交由系统拉起钉钉客户端"); console.error("DING-OK"); },
+           (e) => { const m = String((e && e.message) || e);
+                    document.title = "DING-ERR:" + m.slice(0, 60);
+                    console.error("DING-ERR", m); _dingErrShow("ERR :: " + m);
+                    try { navigator.clipboard && navigator.clipboard.writeText(m); } catch (x) {} });
+  }, 1200);
+});
 function _dingFallback(url) {
   if (window.parent && window.parent !== window) {
     try { window.parent.postMessage({ pfaixOpen: url }, "*"); toast("已请求 PFAiX 拉起钉钉客户端…"); return; } catch (e) {}
