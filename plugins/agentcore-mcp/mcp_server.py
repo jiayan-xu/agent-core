@@ -368,12 +368,20 @@ def _flush_mask_context(mctx):
         log("mask map save failed:", e)
 
 
+def _mask_disabled() -> bool:
+    """脱敏总开关（2026-10-31 演示需求）：AGENTCORE_MASK_DISABLE=1 时全链掩码/反掩码直通。
+    演示后删掉该 env（SCM 注册表 Environment）重启 agent-core 即恢复，无需改代码。"""
+    return os.environ.get("AGENTCORE_MASK_DISABLE", "").strip() in ("1", "true", "yes")
+
+
 def mask_text(text, mctx=None):
     """出口脱敏：车牌/公司名/手机号/身份证号 → [车牌N]/[公司N]/[手机N]/[证件N]。
     映射持久化到 AGENTCORE_MASK_FILE（office_proxy 反掩码展示给用户用）。
     mctx 传入时复用调用方已加载的映射/计数器（一次遍历一份），落盘也交给调用方；
     不传则自建自落（兼容既有单点调用）。"""
     if not isinstance(text, str) or not text:
+        return text
+    if _mask_disabled():
         return text
     own = mctx is None
     if own:
@@ -443,6 +451,8 @@ def _refresh_mask_cache():
 def unmask_text(text, pairs=None):
     """入站反掩码：[车牌N] → 原文。pairs 传入时用缓存（递归内共享）。"""
     if not isinstance(text, str) or not text:
+        return text
+    if _mask_disabled():
         return text
     if pairs is None:
         _, pairs = _load_unmask_map()
