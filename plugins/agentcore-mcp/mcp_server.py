@@ -369,9 +369,18 @@ def _flush_mask_context(mctx):
 
 
 def _mask_disabled() -> bool:
-    """脱敏总开关（2026-10-31 演示需求）：AGENTCORE_MASK_DISABLE=1 时全链掩码/反掩码直通。
-    演示后删掉该 env（SCM 注册表 Environment）重启 agent-core 即恢复，无需改代码。"""
-    return os.environ.get("AGENTCORE_MASK_DISABLE", "").strip() in ("1", "true", "yes")
+    """脱敏总开关（2026-10-31 演示需求）：
+    ① AGENTCORE_MASK_DISABLE=1 env（agent-core/office_proxy 直继承链有效）
+    ② 标记文件 ~/.agent-core-mask-off（codex spawn MCP 时 env 可能丢失——文件不丢）
+    演示后删 env+删标记文件重启即恢复。"""
+    if os.environ.get("AGENTCORE_MASK_DISABLE", "").strip() in ("1", "true", "yes"):
+        return True
+    try:
+        flag = os.path.join(os.path.expanduser("~"), ".agent-core-mask-off")
+        # SCM/提权上下文 expanduser 可能指向 systemprofile → 同时探测绝对路径
+        return os.path.isfile(flag) or os.path.isfile(r"C:\Users\user\.agent-core-mask-off")
+    except Exception:
+        return False
 
 
 def mask_text(text, mctx=None):
