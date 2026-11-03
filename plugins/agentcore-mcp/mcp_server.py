@@ -185,7 +185,10 @@ def http_json(
             detail = str(parsed.get("error") or parsed.get("message") or "")
         elif parsed is None and raw.strip():
             detail = raw.strip()[:500]
-        raise ToolError("HTTP %s %s %s %s" % (status, method, path, detail).strip())
+        # 2026-11-03 修复：原写法 (tuple).strip() —— 属性访问优先级高于 %，
+        # 任何 HTTP>=400 都先炸 AttributeError:'tuple' object has no attribute 'strip'，
+        # 把网关的真实错误信息（如"未找到工具"、参数校验提示）全部吞成天书。
+        raise ToolError(("HTTP %s %s %s %s" % (status, method, path, detail)).strip())
     return {"status": status, "json": parsed, "raw": raw}
 
 
