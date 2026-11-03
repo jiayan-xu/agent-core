@@ -313,6 +313,47 @@ pub struct StdioMcpClient {
     next_id: AtomicU64,
 }
 
+impl Drop for StdioMcpClient {
+    fn drop(&mut self) {
+        // save-config 换代 / client 重建时的即时回收。子进程同时受
+        // sandbox kill-on-close Job 兜底（agent-core 退出必死），这里只是
+        // 提前回收，避免换代后旧进程一直陪跑到进程退出。
+        //
+        // 凭 last_pid 裸杀有 pid 复用误杀风险（子进程退出且句柄关闭后，pid
+        // 可能已被系统分配给无关进程）。故只在能拿到 child 锁时动手：持有
+        // 锁即持有 Child 句柄，pid 不可能被复用；已退出则跳过；拿不到锁说明
+        // communicate 进行中，交由其自身路径与 Job 兜底。
+        // 注意：本函数的 kill_pid/c.wait() 是阻塞调用，若恰在 async worker 上析构
+        // 会短暂占用 worker；且「Job 兜底」仅 Windows 有效（sandbox 的 win_job 在
+        // 非 Windows 返回 false）——非 Windows 上 try_lock 失败（communicate 进行中）
+        // 的子进程可能泄漏到 agent-core 退出之后。当前仅 Windows 部署。
+        if let Ok(mut guard) = self.child.try_lock() {
+            let pid = guard.pid;
+            let running = guard
+                .inner
+                .as_mut()
+                .map(|c| !matches!(c.try_wait(), Ok(Some(_)))) // 存活或状态未知都尝试回收
+                .unwrap_or(false);
+            if running {
+                // 换代析构常发生在 tokio worker 上（如 handle_save_config 替换旧
+                // agent）：taskkill spawn+output 与 wait 都是阻塞调用。先放锁、把
+                // Child 所有权移交后台线程回收，避免占住执行器 worker（三审；与
+                // service_manager 的 spawn_blocking 模式一致）。
+                let inner = guard.inner.take();
+                drop(guard);
+                std::thread::spawn(move || {
+                    kill_pid(pid);
+                    if let Some(mut c) = inner {
+                        let _ = c.wait();
+                    }
+                });
+                return;
+            }
+            guard.inner = None;
+        }
+    }
+}
+
 /// 子进程状态
 struct ChildProcess {
     /// 用 Option 便于在通信时临时取出所有权（移入阻塞线程）后再归还
@@ -375,26 +416,60 @@ fn do_communicate(
 /// 外部无法调用 `Child::kill()`，只能凭 pid 远程终止。Windows 用 `taskkill /T /F`
 /// 杀整棵树，类 Unix 用 `kill -9`。
 #[cfg(windows)]
-fn kill_pid(pid: u32) {
-    let _ = std::process::Command::new("taskkill")
+pub(crate) fn kill_pid(pid: u32) {
+    match std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .output();
+        .output()
+    {
+        Ok(out) if !out.status.success() => tracing::warn!(
+            target: "agent.services",
+            "taskkill /T /F pid={} 返回非零（可能已自行退出或无权限）: {}",
+            pid,
+            String::from_utf8_lossy(&out.stderr).chars().take(120).collect::<String>()
+        ),
+        Err(e) => tracing::warn!(target: "agent.services", "taskkill pid={} 启动失败: {e}", pid),
+        _ => {}
+    }
 }
 
 #[cfg(not(windows))]
-fn kill_pid(pid: u32) {
-    let _ = std::process::Command::new("kill")
+/// 跨平台按 pid 强杀进程。
+///
+/// 注意：整树杀仅 Windows（taskkill /T /F）；类 Unix 只杀单个 pid，
+/// 如需整树需以独立进程组启动子进程并 `kill -9 -pgid`。
+pub(crate) fn kill_pid(pid: u32) {
+    match std::process::Command::new("kill")
         .args(["-9", &pid.to_string()])
-        .output();
+        .output()
+    {
+        Ok(out) if !out.status.success() => tracing::warn!(
+            target: "agent.services",
+            "kill -9 pid={} 返回非零（可能已自行退出）",
+            pid
+        ),
+        Err(e) => tracing::warn!(target: "agent.services", "kill pid={} 启动失败: {e}", pid),
+        _ => {}
+    }
 }
 
 impl StdioMcpClient {
     pub fn new(command: &str, args: &[String]) -> Self {
-        let child = spawn_process(command, args);
-        let pid = child.id();
+        // 构造期 spawn 失败不再 panic（三审）：inner 置空、pid=0 哨兵，
+        // 由 communicate 的 None→respawn 路径在调用时重试并以 Err 恢复
+        let child = match spawn_process(command, args) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(
+                    target: "agent.services",
+                    "MCP stdio 子进程首次启动失败（{command}）: {e}，将在调用时重试"
+                );
+                None
+            }
+        };
+        let pid = child.as_ref().map(|c| c.id()).unwrap_or(0);
         StdioMcpClient {
             child: tokio::sync::Mutex::new(ChildProcess {
-                inner: Some(child),
+                inner: child,
                 pid,
                 ready: false,
             }),
@@ -420,10 +495,18 @@ impl StdioMcpClient {
             None => true,
         };
         if exited {
-            let c = spawn_process(&self.command, &self.args);
-            guard.pid = c.id();
-            guard.inner = Some(c);
-            guard.ready = false;
+            match spawn_process(&self.command, &self.args) {
+                Ok(c) => {
+                    guard.pid = c.id();
+                    guard.inner = Some(c);
+                    guard.ready = false;
+                }
+                Err(e) => {
+                    // spawn 失败以 Err 传播而非 panic（三审）：inner 保持 None，
+                    // 下次调用重试
+                    return Err(format!("MCP 子进程重启失败: {e}"));
+                }
+            }
         }
 
         // 取出子进程所有权移入阻塞线程（避免同步 I/O 卡死 async runtime）
@@ -436,21 +519,61 @@ impl StdioMcpClient {
         let pid = guard.pid;
 
         let handle = tokio::task::spawn_blocking(move || {
-            let (res, new_ready) = do_communicate(&mut child, ready, &req_str);
-            (res, child, new_ready)
+            // panic 也把 Child 送回来：句柄存续期间 pid 不会被复用，补杀走
+            // 「判活 + kill_pid + wait 回收」的句柄路径（2026-11-03 二审 HIGH 修：
+            // 裸 kill_pid 在 unwind 掉句柄后可能误杀被复用 pid 的无关进程树）。
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                do_communicate(&mut child, ready, &req_str)
+            }));
+            (result, child)
         });
 
         match tokio::time::timeout(Duration::from_secs(30), handle).await {
-            Ok(Ok((res, child_back, new_ready))) => {
+            Ok(Ok((Ok((res, new_ready)), mut child_back))) => {
                 guard.pid = child_back.id();
                 guard.inner = Some(child_back);
                 guard.ready = new_ready;
                 let line = res?;
                 serde_json::from_str(line.trim()).map_err(|e| format!("parse JSON: {}", e))
             }
+            Ok(Ok((Err(panic), mut child_back))) => {
+                // panic payload 落日志留根因（三审）
+                let cause = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                tracing::error!(target: "agent.services", "MCP 通信线程 panic: {cause}");
+                // 句柄仍在手上，pid 未被复用，可安全判活+杀+回收
+                // （存活或状态未知都动手，与 Drop/start 的回收口径一致——三审）
+                if !matches!(child_back.try_wait(), Ok(Some(_))) {
+                    kill_pid(child_back.id());
+                    let _ = child_back.wait();
+                }
+                let c = match spawn_process(&cmd, &args) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        guard.inner = None;
+                        return Err(format!("MCP 通信线程 panic，且子进程重启失败: {e}"));
+                    }
+                };
+                guard.pid = c.id();
+                guard.inner = Some(c);
+                guard.ready = false;
+                Err(format!("MCP 通信线程 panic（已重启子进程）: {cause}"))
+            }
             Ok(Err(join_err)) => {
-                // 阻塞线程内部 I/O 失败
-                let c = spawn_process(&cmd, &args);
+                // 真正的 JoinError（任务被取消等）：句柄确实丢失，凭 pid 补杀兜底。
+                // 此时 pid 理论上可能已被复用（风险窗口极小），agent-core 退出时
+                // 仍有 kill-on-close Job 兜底。
+                kill_pid(guard.pid);
+                let c = match spawn_process(&cmd, &args) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        guard.inner = None;
+                        return Err(format!("MCP 通信线程错误，且子进程重启失败: {e}"));
+                    }
+                };
                 guard.pid = c.id();
                 guard.inner = Some(c);
                 guard.ready = false;
@@ -460,7 +583,13 @@ impl StdioMcpClient {
                 // 超时：凭 pid 远程 kill 卡住的子进程（关闭其 stdout 管道，使阻塞的
                 // read 返回），随后重启，解除死锁。旧进程由 taskkill/kill 回收，无泄漏。
                 kill_pid(pid);
-                let c = spawn_process(&cmd, &args);
+                let c = match spawn_process(&cmd, &args) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        guard.inner = None;
+                        return Err(format!("MCP 子进程重启失败（超时后）: {e}"));
+                    }
+                };
                 guard.pid = c.id();
                 guard.inner = Some(c);
                 guard.ready = false;
@@ -517,7 +646,7 @@ impl StdioMcpClient {
     }
 }
 
-fn spawn_process(command: &str, args: &[String]) -> Child {
+fn spawn_process(command: &str, args: &[String]) -> std::io::Result<Child> {
     let mut cmd = Command::new(command);
     cmd.args(args)
         .stdin(Stdio::piped())
@@ -543,14 +672,14 @@ fn spawn_process(command: &str, args: &[String]) -> Child {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let child = cmd
-        .spawn()
-        .expect("failed to spawn MCP server process");
+    // spawn 失败以 Err 传播（三审）：原 expect 会把 panic 泄回调用方，且
+    // guard.inner 停留 None + pid 过期，client 永久损坏。失败可恢复（重试）。
+    let child = cmd.spawn()?;
 
     // 后置约束：纳入 Job Object（kill-on-close），斩断孤儿/逃逸子进程
     crate::sandbox::confine_child_process(&child);
 
-    child
+    Ok(child)
 }
 
 // ── 统一 McpClient 枚举 ──

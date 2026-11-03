@@ -224,6 +224,69 @@ impl ServiceManager {
             return Ok(format!("{} 已在运行（端口 {}）", c.name, c.port));
         }
 
+        // 修复泄漏（2026-11-03）：probe 失败但旧子进程可能还活着（卡死但占 CPU、
+        // 不再监听端口）。此前走到下面直接覆盖 slot.child，把活句柄丢成孤儿——
+        // 保活每轮重启就漏一个 pythonw，数天累积数十个。这里先树杀旧进程并
+        // 回收句柄，再拉新。
+        //
+        // 宽限期：刚拉起还没来得及绑端口的服务是「慢启动」不是「卡死」，直接树杀
+        // 会造成杀/起死循环（2026-11-03 二审意见）。超过 120s 仍探测失败才动手。
+        {
+            let (old, fresh) = {
+                let mut rt = self.rt.lock().await;
+                match rt.get_mut(key) {
+                    Some(s) => {
+                        // 宽限期只在「有活句柄且未超时」时生效：保护慢启动进程；
+                        // spawn 失败残留的孤儿 started_at（child=None）不受保护，
+                        // 否则无进程可管却拒绝重启（2026-11-03 三审）
+                        let fresh = s.child.is_some()
+                            && s.started_at
+                                .map(|t| t.elapsed() < Duration::from_secs(120))
+                                .unwrap_or(false);
+                        // 宽限期内不下手：句柄留在 slot，慢启动进程不失去管理
+                        // （三审 HIGH 修：此前 take 后早退把句柄丢成孤儿）
+                        if fresh {
+                            (None, true)
+                        } else {
+                            (s.child.take(), false)
+                        }
+                    }
+                    None => (None, false),
+                }
+            };
+            if fresh {
+                return Ok(format!("{} 启动宽限期内（<120s），暂不重启", c.name));
+            }
+            if let Some(mut old) = old {
+                // try_wait 出错视为存活未知：仍尝试树杀（对已退出 pid 是无害空操作）
+                let alive_or_unknown = !matches!(old.try_wait(), Ok(Some(_)));
+                if alive_or_unknown {
+                    let pid = old.id();
+                    tracing::warn!(
+                        target: "agent.services",
+                        "服务 {} 探测失败但旧进程(pid={})存活或状态未知，树杀后重启",
+                        c.name, pid
+                    );
+                    let task = tokio::task::spawn_blocking(move || {
+                        crate::mcp_client::kill_pid(pid);
+                        let _ = old.wait();
+                    });
+                    // kill_pid 失败（无权限/进程顽固）时 old.wait() 可能永不返回：
+                    // 必须给 start() 出口，否则 tick 全量保活循环被卡死（三审）
+                    if tokio::time::timeout(Duration::from_secs(10), task)
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            target: "agent.services",
+                            "服务 {} 树杀后句柄回收超时（进程可能未被终止）",
+                            c.name
+                        );
+                    }
+                }
+            }
+        }
+
         // ── 计划任务型：用 schtasks /run 拉起 ──
         if !c.task_name.is_empty() {
             let out = Command::new("schtasks")
@@ -278,7 +341,7 @@ impl ServiceManager {
             );
         }
 
-        let child = match cmd.spawn() {
+        let mut child = match cmd.spawn() {
             Ok(ch) => ch,
             Err(first_err) => {
                 #[cfg(windows)]
@@ -314,13 +377,36 @@ impl ServiceManager {
             }
         };
         let pid = child.id();
+        // 多余实例（duplicate 分支）的树杀 pid：须在锁块前捕获——锁块会以
+        // Option::take 方式处置 child，之后不可再直用（三审借用修正）
+        let dup_pid = pid;
+        let mut child_opt = Some(child);
 
-        {
+        let surplus = {
             let mut rt = self.rt.lock().await;
             let slot = rt.entry(key.to_string()).or_default();
-            slot.child = Some(child);
-            slot.started_at = Some(Instant::now());
-            slot.last_error.clear();
+            if slot.child.is_some() {
+                // 并发 start 已登记活句柄（HTTP/tick/restart 三入口并发）：
+                // 终止本次多余实例而不是覆盖，避免造出孤儿
+                // （2026-11-03 二审：check-then-act 竞态补丁）
+                child_opt.take()
+            } else {
+                slot.child = child_opt.take();
+                slot.started_at = Some(Instant::now());
+                slot.last_error.clear();
+                None
+            }
+        };
+        if let Some(mut dup) = surplus {
+            // 锁下只做判定，阻塞的杀+回收放锁外（三审：wait 持全局锁会卡全部
+            // start/stop/status）。树杀 kill_pid：多余实例同样带 worker 子进程，
+            // 只杀本体会留孤儿；句柄在手 pid 不会被复用。
+            let task = tokio::task::spawn_blocking(move || {
+                crate::mcp_client::kill_pid(dup_pid);
+                let _ = dup.wait();
+            });
+            let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+            return Ok(format!("{} 已由并发启动拉起（本次多余实例已终止）", c.name));
         }
 
         // 等端口就绪（最多 20s）：就绪才算启动成功，避免「假成功」后保活狂重试
@@ -359,31 +445,48 @@ impl ServiceManager {
             let _ = self.http.post(&url).send().await;
         }
 
-        // 2) 终止本模块拉起的进程
+        // 2) 终止本模块拉起的进程：先取出句柄并释放 rt 锁——阻塞的 taskkill/wait
+        //    不能持有全局服务表锁（会卡住并发的 start/stop/status，2026-11-03 审查意见；
+        //    与 start() 的「取句柄-放锁-再杀」模式保持一致）
         let mut killed = 0usize;
-        {
+        let victim = {
             let mut rt = self.rt.lock().await;
-            if let Some(slot) = rt.get_mut(key) {
-                if let Some(mut ch) = slot.child.take() {
-                    // 先给它优雅退出的机会
-                    let deadline = Instant::now() + Duration::from_secs(c.stop_timeout_sec);
-                    loop {
-                        match ch.try_wait() {
-                            Ok(Some(_)) => break,
-                            Ok(None) => {
-                                if Instant::now() >= deadline {
-                                    let _ = ch.kill();
-                                    let _ = ch.wait();
-                                    killed += 1;
-                                    break;
-                                }
-                                tokio::time::sleep(Duration::from_millis(300)).await;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }
+            rt.get_mut(key).and_then(|slot| {
                 slot.started_at = None;
+                slot.child.take()
+            })
+        };
+        if let Some(mut ch) = victim {
+            // 先给它优雅退出的机会（锁外执行阻塞操作）
+            let deadline = Instant::now() + Duration::from_secs(c.stop_timeout_sec);
+            loop {
+                match ch.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if Instant::now() >= deadline {
+                            // 树杀（taskkill /T /F）：pythonw 服务（dashboard/ox
+                            // 等）常带 worker 子进程，只 kill 本体会把 worker
+                            // 留成孤儿（2026-11-03 事故来源之一）。阻塞操作
+                            // 放 spawn_blocking，避免占住执行器 worker。
+                            let vpid = ch.id();
+                            let task = tokio::task::spawn_blocking(move || {
+                                crate::mcp_client::kill_pid(vpid);
+                                let _ = ch.wait();
+                            });
+                            if let Err(je) = task.await {
+                                tracing::warn!(
+                                    target: "agent.services",
+                                    "服务 {} 树杀阻塞任务未完成: {je}",
+                                    c.name
+                                );
+                            }
+                            killed += 1;
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    Err(_) => break,
+                }
             }
         }
 
@@ -399,12 +502,47 @@ impl ServiceManager {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         if c.kill_by_port {
+            // 并发 start 已登记新句柄 = 端口监听者是新拉起的实例，不能按端口强杀
+            // （2026-11-03 三审：stop-vs-start check-then-act 窗口，netstat 复核
+            // 只能发现监听者变化、发现不了合法新实例）
+            let new_child_registered = {
+                let rt = self.rt.lock().await;
+                rt.get(key).map(|s| s.child.is_some()).unwrap_or(false)
+            };
+            if new_child_registered {
+                return Err(format!(
+                    "{} 检测到并发 start 已拉起新实例，跳过按端口强杀",
+                    c.name
+                ));
+            }
             if let Some(pid) = Self::find_pid_by_port(c.port) {
-                let _ = Command::new("taskkill")
-                    .args(["/F", "/PID", &pid.to_string()])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+                // netstat 快照可能过期（监听者刚退出/pid 被复用）：/T 树杀的误伤
+                // 半径大，动手前复核一次监听者没变（2026-11-03 二审意见）。
+                // 三种结局分开处理（三审）：监听者退出=stop 已生效，不该误报。
+                match Self::find_pid_by_port(c.port) {
+                    None if !self.port_open(c.port) => {
+                        return Ok(format!("{} 已停止（监听者已退出）", c.name));
+                    }
+                    None => {
+                        return Err(format!(
+                            "{} 端口 {} 监听者复核失败（netstat 异常？），本轮不强杀",
+                            c.name, c.port
+                        ));
+                    }
+                    Some(cur) if cur != pid => {
+                        return Err(format!(
+                            "{} 端口 {} 的监听者已变化（原 pid={pid}），本轮不强杀",
+                            c.name, c.port
+                        ));
+                    }
+                    _ => {}
+                }
+                // 复用 kill_pid（taskkill /T /F 树杀）：监听者可能带 worker 子进程，
+                // 不带 /T 会把子进程留成孤儿。阻塞操作放 spawn_blocking（三审）。
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::mcp_client::kill_pid(pid);
+                })
+                .await;
                 tracing::warn!(
                     target: "agent.services",
                     "服务 {} 无句柄，已按端口 {} 强杀 PID={}",
