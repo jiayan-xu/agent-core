@@ -2850,7 +2850,43 @@ impl AgentCore {
     ///   - 登录模式：agent_id=user_id → `agent/{user_id}/user/{user_id}`，记忆跨设备连续；
     ///   - legacy 模式：agent_id=user_tag=install_id → `agent/{install_id}/user/{install_id}`，与原行为一致。
     /// 旧格式或解析失败时回退到 agent 自身 ns，保持向后兼容。
+    /// session_id 布局（handlers/chat.rs）：jan/{agent_id}/{user_tag}/{conversation_id}。
+    /// 单点解析（OCR round5 low6）：返回 user_tag 段；非 jan 前缀/段数不足/空段返回 None。
+    /// 迭代器实现避免 collect 分配（请求热路径）。persona 自动绑定共用本函数。
+    fn session_user_tag(session_id: &str) -> Option<&str> {
+        let mut it = session_id.split('/');
+        if it.next()? != "jan" {
+            return None;
+        }
+        let agent_id = it.next()?;
+        if agent_id.is_empty() {
+            return None;
+        }
+        let user_tag = it.next()?;
+        if user_tag.is_empty() {
+            return None;
+        }
+        match it.next() {
+            Some(conv) if !conv.is_empty() => Some(user_tag),
+            _ => None,
+        }
+    }
+
+    /// NS 解析（OCR round5 medium2 前置条件说明）：
+    /// - persona 绑定会话（chat_inner 开头自动绑定）→ persona.memory_namespace；
+    /// - 未绑定会话 → legacy `agent/{agent_id}/user/{agent_id}`。
+    /// ⚠️ 本函数不做绑定——必须先经 chat_inner 入口；旁路入口（如 meetings SSE）
+    /// 的 persona 会话会走 legacy NS（数据分裂，见 pai Phase 3 执行记录 §7.3 finding 2）。
     pub fn caller_ns(&self, session_id: &str) -> String {
+        // persona 绑定会话：记忆归 persona.memory_namespace（如 pai → agent/xujiayan），
+        // 使 pai 对话的沉淀/召回与所属员工主记忆区对齐（10-22 命名空间规范）。
+        let bound_pid = self.persona_for_session(session_id);
+        if bound_pid != "default" {
+            let mns = self.get_persona(&bound_pid).memory_namespace.clone();
+            if !mns.is_empty() {
+                return mns;
+            }
+        }
         let parts: Vec<&str> = session_id.split('/').collect();
         if parts.len() >= 4 && parts[0] == "jan" {
             let agent_id = parts[1];
@@ -2914,6 +2950,28 @@ impl AgentCore {
         external_history: Option<Vec<(String, String)>>,
         stream_sender: Option<&tokio::sync::mpsc::UnboundedSender<crate::llm::SseEvent>>,
     ) -> String {
+        // persona 自动绑定（Phase 3/4）：user_tag 段（session_user_tag 单点解析）
+        // 与已注册 persona_id 一致时绑定——此后沉淀 NS、记忆召回、工具白名单均按
+        // persona 生效；未匹配会话行为逐字不变。
+        if let Some(pid) = Self::session_user_tag(session_id) {
+            if pid != "default" && self.persona_for_session(session_id) != pid {
+                // 锁作用域（OCR round5 low1）：contains 结果先落 bool 放掉
+                // MutexGuard，避免 personas→session_personas 嵌套锁顺序隐患。
+                let registered = self
+                    .personas
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains_key(pid);
+                // 安全（OCR round4 high）：user_tag 是客户端可控头（仅字符集清洗），
+                // 绑定前必须校验已认证身份（user_id = auth.rs 验证过的 ctx.agent_id）
+                // 是该 persona 的属主——否则任何调用者可借 header 绑定他人 persona、
+                // 经 caller_ns 读写其记忆 NS（跨员工越权）。非属主静默跳过绑定。
+                let persona = self.get_persona(pid);
+                if registered && persona.owner_user_id == *user_id {
+                    self.bind_session_persona(session_id, pid);
+                }
+            }
+        }
         // 确认词判定自 v16 起改为结构化（strong_confirm/review_prefix/explicit_approve_after_review
         // 组合），不再用 confirm_words 宽匹配（其 contains 匹配「执行/确定/去查」等命令动词会误判
         // → 0a 误执行 pending 写）。
@@ -6448,9 +6506,15 @@ impl AgentCore {
         // SAD 风格：并行获取上下文（记忆）和可用能力（工具列表）
         // 2026-08-05 提速：单步路径用动态工具选择（select_exposed_tools 按查询相关性
         // 暴露 top-30，而非全量 125）——Easy 查询 prompt 大幅缩小。
+        let persona_id = self.persona_for_session(session_id);
         let (mem_result, tools) = tokio::join!(
             self.search_memory(message, session_id, allowed_ns),
-            self.select_exposed_tools(message, allowed_ns, Self::EXPOSE_TOOL_CAP),
+            self.select_exposed_tools(
+                message,
+                allowed_ns,
+                Self::EXPOSE_TOOL_CAP,
+                &persona_id,
+            ),
         );
 
         let mut knowledge = Vec::new();
@@ -7964,6 +8028,16 @@ impl AgentCore {
         "hhv_list_jobs",
         "hhv_job_status",
         "hhv_get_result",
+        // pai 个人智能体只读工具（Phase 2）：常驻进工具面。
+        // Easy cap 被 20 个固废常驻工具占满时 rest 名额会归零，新接入的
+        // 能力若非常驻会被全裁掉（LLM 因此回复「工具不存在」）。
+        // 这 6 个工具全部只读（发信/写/删未挂载，见 pai_tools_mcp.py 契约）。
+        "pai_calendar_agenda",
+        "pai_class_digest",
+        "pai_qq_mail_list",
+        "pai_qq_mail_read",
+        "pai_ding_mail_recent",
+        "pai_oa_pending",
     ];
 
     fn prefetch_tokens(s: &str) -> Vec<String> {
@@ -8056,18 +8130,43 @@ impl AgentCore {
     /// 白龙马 ACI 的 selectTools 等价物：按当前消息(task_context)从全量工具中选 top-K 暴露给 LLM。
     /// 其余工具本轮不进 schema，仅不参与 LLM 提示（execute_tool_calls 对子集外工具跳过 schema
     /// 校验、直接走 call_tool_routed 全量路由——不会 Tool Not Found；见 5648 附近）。
-    async fn select_exposed_tools(&self, message: &str, allowed_ns: &[String], cap: usize) -> Vec<ToolDef> {
+    async fn select_exposed_tools(
+        &self,
+        message: &str,
+        allowed_ns: &[String],
+        cap: usize,
+        persona_id: &str,
+    ) -> Vec<ToolDef> {
         let all = self.fetch_tools_filtered(allowed_ns).await;
+        // persona 门控·源头剔除（OCR round7 high）：pai_* 只读工具仅对 pai persona
+        // 会话存在——在池子源头剔除，覆盖 always/rest/打分/全量所有分支的泄露路径
+        //（round7 指出仅从 always 桶挪到 rest 池会被「全量暴露分支」和「+1000 点名」
+        // 重新带出）。无关会话不付 token 成本、不会被误选，也不占 always 名额。
+        let is_pai_session = persona_id == "pai";
+        let all: Vec<ToolDef> = if is_pai_session {
+            all
+        } else {
+            all.into_iter()
+                .filter(|t| !t.function.name.starts_with("pai_"))
+                .collect()
+        };
         let total = all.len();
+        let always_exposed = |n: &str| {
+            if n.starts_with("pai_") {
+                is_pai_session
+            } else {
+                Self::ALWAYS_EXPOSE_TOOLS.contains(&n)
+            }
+        };
         // 抽离始终暴露的工具（诊断/运维类），剩余走相关性打分
         let always: Vec<ToolDef> = all
             .iter()
-            .filter(|t| Self::ALWAYS_EXPOSE_TOOLS.contains(&t.function.name.as_str()))
+            .filter(|t| always_exposed(t.function.name.as_str()))
             .cloned()
             .collect();
         let rest: Vec<ToolDef> = all
             .into_iter()
-            .filter(|t| !Self::ALWAYS_EXPOSE_TOOLS.contains(&t.function.name.as_str()))
+            .filter(|t| !always_exposed(t.function.name.as_str()))
             .collect();
         if rest.is_empty() {
             tracing::info!(exposed_tools = always.len(), total = total, "prefetch: 仅有常驻工具，直接返回");
@@ -8146,17 +8245,30 @@ impl AgentCore {
         } else {
             Self::EXPOSE_TOOL_CAP
         };
-        let full_tools = self.select_exposed_tools(raw_message, allowed_ns, expose_cap).await;
+        let full_tools = self
+            .select_exposed_tools(
+                raw_message,
+                allowed_ns,
+                expose_cap,
+                &self.persona_for_session(session_id),
+            )
+            .await;
         // ADR-017 P1：flash 锚定引导。仅 bootstrap 开启 + easy 路由 + 非写意图 + 未 promoted 触发；
         // flag-off / 其他条件不满足时 `bootstrap_active=false`，以下所有分支与原路径逐字等价。
         // 2026-10-29 追加豁免：跨会话问法（「我和 zcode/workbuddy 刚聊的…」）必须走常规路径——
         // bootstrap 中性提示会剥离 memoria 接力注入与常驻三工具，实测此类问题全部答非所问。
         // per-session 原子预留：同 session 并发 run 只有一个能拿最小工具面，
         // 其余 run 直接走常规路径（拿不到预留不算错误，也不取消其他 run 的预留）。
+        // persona 绑定会话（x-user-tag=persona_id，chat_inner 开头已自动绑定）：
+        // 跳过 bootstrap 最小工具面裁剪，保证 persona 只读工具进入常规工具面并
+        // 注入 system prompt；未绑定会话行为逐字不变。（OCR round5 finding 4：
+        // 与自动绑定同一规则派生，消除两处分歧。）
+        let persona_session = self.persona_for_session(session_id) != "default";
         let bootstrap_eligible = self.orchestration.cfg.bootstrap.enabled
             && is_easy_query
             && !Self::has_write_intent(raw_message)
             && !Self::mentions_cross_session(raw_message)
+            && !persona_session
             && !self
                 .orchestration
                 .is_promoted_async(session_id.to_string())
@@ -8893,7 +9005,16 @@ impl AgentCore {
         if pid == "default" {
             return; // 仅分身会话
         }
-        let ns = format!("agent/{}", pid);
+        // persona 配置了 memory_namespace（如 pai → agent/xujiayan）时优先使用，
+        // 使任务记忆与该 persona 的对话沉淀同 NS（10-22 命名空间规范）。
+        let ns = {
+            let mns = self.get_persona(&pid).memory_namespace.clone();
+            if mns.is_empty() {
+                format!("agent/{}", pid)
+            } else {
+                mns
+            }
+        };
         // 摄入过滤 Filter1：测试/实验分身命名空间不写任务记忆（避免 lme_*/pm_*/agent/rt* 污染）
         if self
             .config
@@ -16813,5 +16934,38 @@ mod meeting_invite_tests {
         // 终态守卫在 AgentCore::add_meeting_participant 的 is_terminal()——验证终态/非终态判定
         assert!(meeting("done", Some(MeetingPhase::Done)).is_terminal());
         assert!(!meeting("running", Some(MeetingPhase::Discussing)).is_terminal());
+    }
+}
+
+#[cfg(test)]
+mod pai_tool_face_tests {
+    use super::*;
+
+    /// OCR round2 finding 2：PAI_READ_TOOLS 与 ALWAYS_EXPOSE_TOOLS 必须同步；
+    /// 漂移方向均 fail-closed（少→unknown 黄线需确认，多→工具面被裁），
+    /// 本测试让漂移在 CI 即刻可见，而非等到运行时「工具不存在」。
+    #[test]
+    fn pai_read_tools_are_always_exposed() {
+        for t in crate::boundary::PAI_READ_TOOLS {
+            assert!(
+                AgentCore::ALWAYS_EXPOSE_TOOLS.contains(t),
+                "pai tool `{t}` 在 boundary::PAI_READ_TOOLS 但不在 AgentCore::ALWAYS_EXPOSE_TOOLS"
+            );
+        }
+    }
+
+    /// OCR round5 finding 5：反向漂移锁——ALWAYS_EXPOSE_TOOLS 里的 pai_* 工具
+    /// 必须全部登记在 boundary::PAI_READ_TOOLS（分类 read），否则每次调用
+    /// 都落入 unknown 黄线确认闸（正是要防的运行时故障）。
+    #[test]
+    fn pai_always_exposed_are_registered_read() {
+        for t in AgentCore::ALWAYS_EXPOSE_TOOLS {
+            if t.starts_with("pai_") {
+                assert!(
+                    crate::boundary::PAI_READ_TOOLS.contains(t),
+                    "pai tool `{t}` 在 AgentCore::ALWAYS_EXPOSE_TOOLS 但不在 boundary::PAI_READ_TOOLS"
+                );
+            }
+        }
     }
 }

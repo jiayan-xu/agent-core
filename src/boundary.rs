@@ -1250,6 +1250,17 @@ pub struct ToolClassifier {
     manual_overrides: std::collections::HashMap<String, Option<String>>,
 }
 
+/// pai 个人智能体只读工具清单（模块级单点定义；agent.rs ALWAYS_EXPOSE_TOOLS
+/// 通过单测 pai_read_tools_are_always_exposed 保持同步，见 agent.rs tests）。
+pub(crate) const PAI_READ_TOOLS: &[&str] = &[
+    "pai_calendar_agenda",
+    "pai_class_digest",
+    "pai_qq_mail_list",
+    "pai_qq_mail_read",
+    "pai_ding_mail_recent",
+    "pai_oa_pending",
+];
+
 impl ToolClassifier {
     pub fn new() -> Self {
         let mut c = ToolClassifier {
@@ -1341,6 +1352,10 @@ impl ToolClassifier {
         }
         // cross_* 的只读白名单唯一来源（与 is_read_only_tool 共用 const）
         for t in EXPLICIT_READ_CROSS_TOOLS {
+            c.read_tools.insert(t.to_string());
+        }
+        // pai 只读工具（与 is_read_only_tool 两层共用，见 PAI_READ_TOOLS 文档）
+        for t in PAI_READ_TOOLS {
             c.read_tools.insert(t.to_string());
         }
         for t in [
@@ -1525,6 +1540,16 @@ impl ToolClassifier {
             // 自动学习走 insert_classification，不写 manual_overrides。
             if let Some(level) = classify_memoria_tool(key) {
                 self.insert_classification(key.to_string(), level);
+                continue;
+            }
+            // pai 个人智能体只读工具（OCR high 修复）：精确枚举而非前缀。
+            // 前缀宽放是 fail-open——未来挂载 pai_mail_send / pai_oa_approve 等
+            // 写工具时会被自动分类为 read，绕过 bootstrap 只读门与执行确认闸。
+            // 与同函数其他规则一致：未列出的 pai_* 新工具保持 unknown 黄线。
+            // 清单定义在模块级 PAI_READ_TOOLS（agent.rs ALWAYS_EXPOSE_TOOLS
+            // 经单测 pai_read_tools_are_always_exposed 与之保持同步）。
+            if PAI_READ_TOOLS.contains(&key) {
+                self.insert_classification(key.to_string(), "read");
                 continue;
             }
             // 运维状态查询工具：纯只读，直接归 read，避免被 unknown 黄线触发「执行」确认闸
@@ -1850,6 +1875,12 @@ fn is_read_only_tool_lower(lower: &str) -> bool {
         return false;
     }
     if EXPLICIT_READ_CROSS_TOOLS.iter().any(|t| lower == *t) {
+        return true;
+    }
+    // pai 个人智能体只读工具（OCR round6 medium）：与 classifier 两层共用，
+    // 否则 is_effectively_read 恒 false——组合计划永远触发确认闸、只读调用
+    // 被按「写类」捕获变更前快照（纯开销）。
+    if PAI_READ_TOOLS.iter().any(|t| lower == *t) {
         return true;
     }
     lower.starts_with("query_")
@@ -2318,6 +2349,32 @@ mod tests {
 
     /// 序列化会翻转全局 SANDBOX_ENABLED 的测试，避免并行竞态污染。
     static SANDBOX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn pai_prefix_is_not_auto_read() {
+        // 回归锁（OCR round2 finding 3）：pai_* 不得按前缀自动归 read；
+        // 只读清单走模块级 PAI_READ_TOOLS 精确枚举，未来 pai_mail_send 等
+        // 写工具必须保持 unknown 黄线（走执行确认闸），不得静默过只读门。
+        let mut c = ToolClassifier::new();
+        // OCR round6 low：遍历清单注册+断言——清单扩充时测试自动跟随，
+        // 不会因漏加断言而让新增清单项处于无回归保护状态。
+        let mut names: Vec<(String, String)> =
+            PAI_READ_TOOLS.iter().map(|t| (t.to_string(), String::new())).collect();
+        names.push(("pai_mail_send".to_string(), String::new()));
+        names.push(("pai_oa_approve".to_string(), String::new()));
+        names.push(("pai_calendar_write".to_string(), String::new()));
+        c.register_from_tools(&names);
+        for t in PAI_READ_TOOLS {
+            assert_eq!(c.classify_typed(t), ToolClass::Read);
+            assert!(is_read_only_tool(t));
+        }
+        // 未来写类工具的实际级别可能是 Write（send/approve 动词启发式）而非
+        // Unknown——回归锁的本意是「不得归 Read」，故断言 != Read（fail-closed 均可）。
+        assert_ne!(c.classify_typed("pai_mail_send"), ToolClass::Read);
+        assert_ne!(c.classify_typed("pai_oa_approve"), ToolClass::Read);
+        assert_ne!(c.classify_typed("pai_calendar_write"), ToolClass::Read);
+        assert!(!is_read_only_tool("pai_mail_send"));
+    }
 
     #[test]
     fn test_permission_chain() {

@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Crect width=%22100%22 height=%22100%22 rx=%2222%22 fill=%22%231a2130%22/%3E%3Ccircle cx=%2250%22 cy=%2242%22 r=%2220%22 fill=%22%2363b3ed%22/%3E%3Ccircle cx=%2243%22 cy=%2238%22 r=%225%22 fill=%22%230f1420%22/%3E%3Ccircle cx=%2257%22 cy=%2238%22 r=%225%22 fill=%22%230f1420%22/%3E%3Crect x=%2238%22 y=%2258%22 width=%2224%22 height=%226%22 rx=%223%22 fill=%22%2363b3ed%22/%3E%3C/svg%3E">
+<title>pai · 个人智能体</title>
+<style>
+  :root { --bg:#0f1420; --panel:#1a2130; --line:#2a3347; --me:#2b6cb0; --pai:#233048; --tx:#e6ebf5; --dim:#8b96ab; --accent:#63b3ed; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--tx); font-family:"Segoe UI","Microsoft YaHei",sans-serif; height:100vh; display:flex; flex-direction:column; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px; }
+  header .dot { width:9px; height:9px; border-radius:50%; background:#48bb78; box-shadow:0 0 8px #48bb78; }
+  header h1 { font-size:16px; font-weight:600; }
+  header span { color:var(--dim); font-size:12px; }
+  #log { flex:1; overflow-y:auto; padding:20px; display:flex; flex-direction:column; gap:14px; }
+  .msg { max-width:78%; padding:10px 14px; border-radius:12px; line-height:1.6; white-space:pre-wrap; word-break:break-word; font-size:14px; }
+  .me { align-self:flex-end; background:var(--me); border-bottom-right-radius:4px; }
+  .pai { align-self:flex-start; background:var(--pai); border:1px solid var(--line); border-bottom-left-radius:4px; }
+  .pai.streaming::after { content:"▋"; color:var(--accent); animation:blink 1s infinite; }
+  @keyframes blink { 50% { opacity:0; } }
+  .sys { align-self:center; color:var(--dim); font-size:12px; }
+  #inputbar { display:flex; gap:10px; padding:14px 20px; border-top:1px solid var(--line); background:var(--panel); }
+  #inp { flex:1; background:var(--bg); border:1px solid var(--line); color:var(--tx); border-radius:10px; padding:12px 14px; font-size:14px; resize:none; outline:none; font-family:inherit; }
+  #inp:focus { border-color:var(--accent); }
+  #send { background:var(--accent); color:#0f1420; border:none; border-radius:10px; padding:0 22px; font-size:14px; font-weight:600; cursor:pointer; }
+  #send:disabled { opacity:.45; cursor:default; }
+  #keybar { padding:20px; text-align:center; }
+  #keybar input { width:min(560px,90%); background:var(--bg); border:1px solid var(--line); color:var(--tx); border-radius:8px; padding:10px 12px; font-size:13px; outline:none; }
+  #keybar p { color:var(--dim); font-size:12px; margin-top:8px; }
+  code { background:#0b0f18; padding:1px 5px; border-radius:4px; font-size:13px; }
+</style>
+</head>
+<body>
+<header><div class="dot"></div><h1>pai</h1><span>个人智能体 · 工具面 26 · 记忆 agent/xujiayan</span></header>
+<div id="keybar" style="display:none">
+  <input id="keyin" type="password" placeholder="粘贴 agent 访问密钥（MEMORIA_ADMIN_KEY），仅存本机浏览器">
+  <p>密钥只存本机浏览器 localStorage，不经过任何第三方。</p>
+</div>
+<div id="log"></div>
+<div id="inputbar">
+  <textarea id="inp" rows="1" placeholder="问 pai 任何事…（Enter 发送，Shift+Enter 换行）"></textarea>
+  <button id="send">发送</button>
+</div>
+<script>
+(function(){
+  var $log=document.getElementById('log'), $inp=document.getElementById('inp'), $send=document.getElementById('send'), $keybar=document.getElementById('keybar');
+  var KEY=localStorage.getItem('pai_agent_key')||'';
+  var CONV='web-'+Math.random().toString(36).slice(2,10);
+  var HISTORY=[];
+  function ready(){ return !!KEY; }
+  function show(){ $keybar.style.display=ready()?'none':'block'; }
+  document.getElementById('keyin').addEventListener('change',function(){
+    KEY=this.value.trim();
+    if(KEY){ localStorage.setItem('pai_agent_key',KEY); show(); sysline('密钥已保存，开始对话吧。'); }
+  });
+  function bubble(cls,text){ var d=document.createElement('div'); d.className='msg '+cls; d.textContent=text; $log.appendChild(d); $log.scrollTop=$log.scrollHeight; return d; }
+  function sysline(t){ var d=document.createElement('div'); d.className='sys'; d.textContent=t; $log.appendChild(d); }
+  function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function md(s){ return esc(s).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>').replace(/\n/g,'<br>'); }
+  function send(){
+    var text=$inp.value.trim(); if(!text) return;
+    if(!ready()){ sysline('请先在上方粘贴访问密钥。'); show(); return; }
+    $inp.value=''; bubble('me',text);
+    HISTORY.push({role:'user',content:text});
+    var b=bubble('pai',''); b.classList.add('streaming');
+    $send.disabled=true;
+    fetch('/v1/chat/completions',{
+      method:'POST',
+      headers:{'content-type':'application/json','x-agent-id':'user','x-agent-key':KEY,'x-user-tag':'pai','x-conversation-id':CONV},
+      body:JSON.stringify({model:'glm-5.3-flash',messages:HISTORY.slice(-30),stream:true})
+    }).then(function(res){
+      if(!res.ok) return res.text().then(function(t){ throw new Error('HTTP '+res.status+': '+t.slice(0,200)); });
+      var reader=res.body.getReader(), dec=new TextDecoder(), buf='', full='';
+      function pump(){
+        return reader.read().then(function(r){
+          if(r.done){ b.classList.remove('streaming'); b.innerHTML=md(full||'（空回复）'); HISTORY.push({role:'assistant',content:full}); $send.disabled=false; $inp.focus(); return; }
+          buf+=dec.decode(r.value,{stream:true});
+          var lines=buf.split('\n'); buf=lines.pop();
+          lines.forEach(function(l){
+            l=l.trim(); if(!l.startsWith('data:')) return;
+            var payload=l.slice(5).trim(); if(payload==='[DONE]') return;
+            try{
+              var j=JSON.parse(payload);
+              var piece=(j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content)||'';
+              if(piece){ full+=piece; b.textContent=full; $log.scrollTop=$log.scrollHeight; }
+            }catch(e){}
+          });
+          return pump();
+        });
+      }
+      return pump();
+    }).catch(function(e){
+      b.classList.remove('streaming'); b.textContent='⚠️ '+e.message;
+      HISTORY.pop(); $send.disabled=false;
+    });
+  }
+  $send.addEventListener('click',send);
+  $inp.addEventListener('keydown',function(e){ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); send(); } });
+  show();
+  if(!ready()){ sysline('首次使用：请粘贴访问密钥（向运维获取）。'); }
+  else { sysline('会话 '+CONV+' 已就绪（persona=pai，长按记忆来自 agent/xujiayan）。'); }
+  $inp.focus();
+})();
+</script>
+</body>
+</html>
