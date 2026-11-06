@@ -9045,7 +9045,14 @@ impl AgentCore {
         }
         let goal_s: String = goal.chars().take(500).collect();
         let result_s: String = result.chars().take(1500).collect();
-        let content = format!("[persona task | {}]\n目标：{}\n结果：{}", pid, goal_s, result_s);
+let content = format!(
+            // P5: 头部日期戳——夜间日记归纳按日期确定性过滤（search 结果无 created_at）
+            "[persona task | {} | {}]\n目标：{}\n结果：{}",
+            pid,
+            chrono::Local::now().format("%Y-%m-%d"),
+            goal_s,
+            result_s
+        );
         let args = serde_json::json!({
             "content": content,
             "category": "persona_task",
