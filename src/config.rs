@@ -207,6 +207,9 @@ pub(crate) struct PersonaConfig {
     /// 启动即压入的目标栈（goals）
     #[serde(default)]
     pub(crate) goals: Vec<String>,
+    /// P5: 分身专属指令（chat system prompt 注入；如 pai 工作日记协议）。空 = 无
+    #[serde(default)]
+    pub(crate) instructions: String,
     /// 该分身专属 LLM 配置；缺省空 = 圆桌/tick 时回退全局 client，并由圆桌自动从 LLM 池分配
     #[serde(default)]
     pub(crate) llm: Option<LlmConfig>,

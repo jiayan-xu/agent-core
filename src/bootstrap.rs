@@ -269,6 +269,7 @@ pub(crate) fn spawn_server(
                                             pc.memory_namespace.clone(),
                                             pc.llm.clone(),
                                             false,
+                                            pc.instructions.clone(),
                                         );
                                         for goal in &pc.goals {
                                             let _ = a.push_persona_goal(&pc.id, goal);

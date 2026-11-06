@@ -13,6 +13,8 @@ pub struct Persona {
     pub workspace_dir: Option<std::path::PathBuf>,
     pub tool_allowlist: Vec<String>,
     pub memory_namespace: String,
+    /// P5: 分身专属 system 指令（chat 时注入 system prompt；空 = 无，default 恒空）
+    pub instructions: String,
     pub badge_token: String,
     pub ns_full_path: Option<String>,
     /// 该分身专属 LLM（None = 圆桌/ tick 时回退到全局 client）

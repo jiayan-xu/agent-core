@@ -1741,6 +1741,7 @@ impl AgentCore {
             workspace_dir: None,
             tool_allowlist: Vec::new(),
             memory_namespace: String::new(),
+            instructions: String::new(),
             badge_token: config.identity.badge_token.clone(),
             ns_full_path: config.identity.ns_full_path.clone(),
             llm: None,
@@ -1884,6 +1885,7 @@ impl AgentCore {
             workspace_dir: None,
             tool_allowlist: Vec::new(),
             memory_namespace: String::new(),
+            instructions: String::new(),
             badge_token: self.config.identity.badge_token.clone(),
             ns_full_path: self.config.identity.ns_full_path.clone(),
             llm: None,
@@ -1968,6 +1970,7 @@ impl AgentCore {
         memory_namespace: String,
         llm: Option<LlmConfig>,
         is_private: bool,
+        instructions: String,
     ) -> Result<(), String> {
         if persona_id == "default" {
             return Err("default 分身不可重建".to_string());
@@ -1980,6 +1983,7 @@ impl AgentCore {
             workspace_dir: None,
             tool_allowlist,
             memory_namespace: memory_namespace.clone(),
+            instructions,
             badge_token: self.config.identity.badge_token.clone(),
             ns_full_path: self.config.identity.ns_full_path.clone(),
             llm: llm_client,
@@ -2047,6 +2051,7 @@ impl AgentCore {
                     "owner_user_id": p.owner_user_id,
                     "tool_allowlist": p.tool_allowlist,
                     "memory_namespace": p.memory_namespace,
+                    "instructions": p.instructions,
                     "is_private": p.is_private,
                 })
             })
@@ -2121,6 +2126,7 @@ impl AgentCore {
                         workspace_dir: None,
                         tool_allowlist: allowlist,
                         memory_namespace: ns,
+                        instructions: String::new(),
                         badge_token: self.config.identity.badge_token.clone(),
                         ns_full_path: self.config.identity.ns_full_path.clone(),
                         llm: None,
@@ -6224,6 +6230,18 @@ impl AgentCore {
 
         // ── 4. 构建消息列表 ──
         let mut system_prompt = self.build_system_prompt(&knowledge);
+        // P5: 分身专属指令（persona instructions）——置于 prefs 之后注入（最终顺序
+        // prefs 硬规则 → persona 契约 → 内置身份模板）；default 分身恒空，行为逐字不变。
+        let persona_now = self.persona_for_session(session_id);
+        if persona_now != "default" {
+            let pinstr = self.get_persona(&persona_now).instructions;
+            if !pinstr.is_empty() {
+                system_prompt = format!(
+                    "## 分身专属指令（{}）\n{}\n\n{}",
+                    persona_now, pinstr, system_prompt
+                );
+            }
+        }
         if let Some(p) = &prefs_block {
             system_prompt = format!("{}\n\n{}", p, system_prompt);
         }
@@ -9049,6 +9067,37 @@ impl AgentCore {
             Ok(_) => tracing::info!(pid = %pid, ns = %ns, "分身任务记忆已写入 Memoria"),
             Err(e) => tracing::warn!(pid = %pid, ns = %ns, "分身任务记忆写入失败: {}", e),
         }
+        // P5: 工作日记确定性兜底——goal 匹配日记意图时额外写结构化条目
+        //（tags=工作日记+occurred:日期，content「YYYY-MM-DD 工作日记：」前缀与
+        // pai_journal_list 的前缀过滤对齐）。LLM 工具调用习惯不可靠（实测意图正确
+        // 却不发起 tool_call），平台侧确定性写入是最后一道防线。
+        if Self::looks_like_journal_intent(goal) {
+            let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let goal_s2: String = goal.chars().take(300).collect();
+            let jargs = serde_json::json!({
+                "content": format!("{} 工作日记：{}", day, goal_s2),
+                "category": "fact",
+                "tags": ["工作日记", format!("occurred:{}", day)],
+                "importance": 3,
+                "namespace": ns,
+            });
+            match client.call_json("memory_remember", &jargs).await {
+                Ok(_) => tracing::info!(pid = %pid, "工作日记确定性写入成功"),
+                Err(e) => tracing::warn!(pid = %pid, "工作日记确定性写入失败: {}", e),
+            }
+        }
+    }
+
+    /// P5: 日记意图判定——显式前缀/关键词 + 长度上限防误伤普通闲聊
+    fn looks_like_journal_intent(msg: &str) -> bool {
+        let m = msg.trim();
+        let hits = m.starts_with("记一下")
+            || m.starts_with("记入")
+            || m.starts_with("记录一下")
+            || m.contains("记入工作日记")
+            || m.contains("写入工作日记")
+            || m.contains("帮我记一下");
+        hits && m.chars().count() <= 200
     }
 
     /// 检查 A2A 收件箱（带 30s 缓存）

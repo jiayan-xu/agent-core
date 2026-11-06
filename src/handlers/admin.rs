@@ -199,11 +199,13 @@ pub(crate) async fn handle_persona_create(
     let llm: Option<LlmConfig> = v
         .get("llm")
         .and_then(|x| serde_json::from_value(x.clone()).ok());
+    // P5: 分身专属指令（运行时创建也可声明；属主自己 persona 的行为契约）
+    let instructions = v.get("instructions").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let g = st.agent.lock().await;
     let Some(ref agent) = *g else {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
     };
-    match agent.create_persona(&persona_id, &display_name, &owner_user_id, tool_allowlist, memory_namespace, llm, is_private) {
+    match agent.create_persona(&persona_id, &display_name, &owner_user_id, tool_allowlist, memory_namespace, llm, is_private, instructions) {
         Ok(()) => {
             agent.save_personas();
             Json(serde_json::json!({"ok": true, "persona_id": persona_id, "owner_user_id": owner_user_id, "is_private": is_private})).into_response()

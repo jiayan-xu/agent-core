@@ -439,6 +439,7 @@ mod tests {
             workspace_dir: None,
             tool_allowlist: Vec::new(),
             memory_namespace: format!("agent/tester_{}", pid),
+            instructions: String::new(),
             badge_token: String::new(),
             ns_full_path: None,
             llm: None,
