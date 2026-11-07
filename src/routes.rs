@@ -151,6 +151,7 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/collab/peers", get(handle_collab_peers))
         .route("/api/collab/profile", get(handle_collab_profile))
         .route("/api/memory/feedback", post(handle_memory_feedback))
+        .route("/api/memoria-info", get(handle_memoria_info))
         .route("/api/tool/execute", post(handle_tool_execute))
         .route("/api/tool/execute/{id}", get(handle_tool_execute_get))
         .route("/api/tool/auto-writes", get(handle_auto_writes_list))

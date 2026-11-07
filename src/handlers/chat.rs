@@ -754,3 +754,30 @@ pub(crate) async fn handle_v1_chat(
         }],
     })).into_response()
 }
+
+/// v1.2 P2-⑥（2026-11-07）：Memoria Web 自助凭证——返回调用者自己的 badge，
+/// 供 PFAiX 设置页「Memoria 知识库」展示地址与 KEY（粘贴到 memoria 页面凭证栏，
+/// 查看个人记忆与知识图谱）。登录态回显其 x-agent-key；legacy 安装身份取
+/// auth_cache 中注册返回的 badge（作用域=其个人 NS，与代理路径同权，无越权放大）。
+/// 无凭证时提示先完成一次对话（首次请求会自注册并缓存）。
+pub(crate) async fn handle_memoria_info(
+    State(st): State<Arc<AppState>>,
+    Extension(ctx): Extension<AuthContext>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    // OCR v1.2 security·high 修复：不回显请求头里的裸 x-agent-key——legacy PFAiX
+    // 历史上会在该头携带 jarvis/admin badge（middleware 同样弃用之），回显即跨身份。
+    // 复用 collab 既有 cache-first 解析（cache 校验过 > 头 > admin 兜底注册）。
+    let key = crate::handlers::collab::resolve_caller_memoria_key(&st, &ctx.agent_id, &headers).await;
+    let hint = if key.is_empty() {
+        "尚未取得凭证——先在对话里发一条消息完成注册，再回来点「获取 KEY」"
+    } else {
+        ""
+    };
+    axum::response::Json(serde_json::json!({
+        "agent_id": ctx.agent_id,
+        "key": key,
+        "hint": hint,
+    }))
+    .into_response()
+}
