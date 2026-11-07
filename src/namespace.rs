@@ -605,6 +605,10 @@ pub struct NamespaceConfig {
     pub write_deny_ns: Vec<String>,
     /// P0-0 观测开关：每次解析写 ns_audit 结构化日志
     pub log_origin: bool,
+    /// NS 命名对齐（v1.2 P1-2，2026-11-07）：`alias` = Identity 分支优先用
+    /// `allowed_ns[0]`（= 注册表 namespace = badge 作用域 = canonical）；
+    /// `direct` = 一律按 `agent/<user_id>` 推导（现行为，秒级回滚）。
+    pub identity_mapping: String,
 }
 
 impl Default for NamespaceConfig {
@@ -620,6 +624,7 @@ impl Default for NamespaceConfig {
                 "agent/user/user/user".to_string(),
             ],
             log_origin: true,
+            identity_mapping: "alias".to_string(),
         }
     }
 }
@@ -658,6 +663,8 @@ pub enum NsOrigin {
     Persona,
     IdentityAdmin,
     Identity,
+    /// 命中注册表 canonical（allowed_ns[0]，v1.2 P1-2 命名对齐）
+    IdentityCanonical,
     Quarantine,
     /// policy=legacy 回滚路径（旧行为，不参与身份判定）
     Legacy,
@@ -671,6 +678,7 @@ impl std::fmt::Display for NsOrigin {
             NsOrigin::Persona => "Persona",
             NsOrigin::IdentityAdmin => "IdentityAdmin",
             NsOrigin::Identity => "Identity",
+            NsOrigin::IdentityCanonical => "IdentityCanonical",
             NsOrigin::Quarantine => "Quarantine",
             NsOrigin::Legacy => "Legacy",
         };
@@ -778,16 +786,30 @@ pub fn resolve_memory_ns(
             origin: NsOrigin::IdentityAdmin,
         });
     }
-    // Identity（R1/D4）：真实登录用户；排除默认身份 "user" 与 legacy 安装ID
+    // Identity（R1/D4）：真实登录用户；排除默认身份 "user" 与 legacy 安装ID。
+    // v1.2 P1-2 命名对齐（2026-11-07）：identity_mapping=alias 时 canonical =
+    // allowed_ns[0]（memoria authenticate 从 agent_registry.namespace 直出 =
+    // badge 作用域本身，无需新增 RPC/列）；direct 或无映射时回退原推导。
     if !c.from_usertag && !c.user_id.is_empty() && c.user_id != "user" {
-        let ns = format!("{}/{}", cfg.user_prefix, c.user_id);
+        let canonical = if cfg.identity_mapping.eq_ignore_ascii_case("alias") {
+            c.allowed_ns
+                .first()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s != "*")
+        } else {
+            None
+        };
+        let (ns, origin) = match canonical {
+            Some(k) => (k, NsOrigin::IdentityCanonical),
+            None => (
+                format!("{}/{}", cfg.user_prefix, c.user_id),
+                NsOrigin::Identity,
+            ),
+        };
         if cfg.is_write_denied(&ns) {
             return Err(NsError::WriteDenied(ns));
         }
-        return Ok(NsDecision {
-            ns,
-            origin: NsOrigin::Identity,
-        });
+        return Ok(NsDecision { ns, origin });
     }
     // 无身份 / legacy 安装ID / 默认身份（R2，§14-2 拍板：隔离）
     if cfg.reject_unattributed {
@@ -876,7 +898,7 @@ mod ns_resolver_tests {
     fn persona_owner_mismatch_falls_through() {
         let c = caller("u_x", &["agent/u_x"]);
         let d = resolve_memory_ns(&cfg(), Some(&c), Some(("agent/xujiayan", "user")), None).unwrap();
-        assert_eq!(d.origin, NsOrigin::Identity);
+        assert_eq!(d.origin, NsOrigin::IdentityCanonical);
         assert_eq!(d.ns, "agent/u_x");
     }
 
@@ -899,7 +921,8 @@ mod ns_resolver_tests {
         let c = caller("许有康_u_e864p91o736d", &["agent/许有康_u_e864p91o736d"]);
         let d = resolve_memory_ns(&cfg(), Some(&c), None, None).unwrap();
         assert_eq!(d.ns, "agent/许有康_u_e864p91o736d");
-        assert_eq!(d.origin, NsOrigin::Identity);
+        // v1.2 P1-2：授权首项即 canonical（与推导同值时 origin 仍标 IdentityCanonical）
+        assert_eq!(d.origin, NsOrigin::IdentityCanonical);
     }
 
     #[test]
@@ -947,6 +970,60 @@ mod ns_resolver_tests {
         assert!(should_reject_unattributed(&c, true, false)); // 无身份写 → 拒
         assert!(!should_reject_unattributed(&c, true, true)); // 只读工具 → 放行
         assert!(!should_reject_unattributed(&c, false, false)); // 其它 NsError → 隔离区兜底
+    }
+
+    // ── v1.2 P1-2 命名对齐（identity_mapping）──
+
+    #[test]
+    fn canonical_from_allowed_ns_first() {
+        let c = caller("许有康_u_e864p91o736d", &["agent/xuyoukang", "org/x/dept/y"]);
+        let d = resolve_memory_ns(&cfg(), Some(&c), None, None).unwrap();
+        assert_eq!((d.ns.as_str(), d.origin), ("agent/xuyoukang", NsOrigin::IdentityCanonical));
+    }
+
+    #[test]
+    fn canonical_takes_allowed_ns_first_element() {
+        let c = caller("u1", &["agent/u1", "org/c/div/d", "org/c/dept/e"]);
+        let d = resolve_memory_ns(&cfg(), Some(&c), None, None).unwrap();
+        assert_eq!(d.ns, "agent/u1");
+        assert_eq!(d.origin, NsOrigin::IdentityCanonical);
+    }
+
+    // 文档化现状（OCR v1.2）：canonical = allowed_ns[0] 纯首项语义，不做个人库优选
+    // ——memoria 注册表把个人 NS 放首位，顺序由开户配置保证；org 在首则 org 为 canonical
+    #[test]
+    fn canonical_org_first_resolves_to_org() {
+        let c = caller("u1", &["org/c/div/d", "agent/u1"]);
+        let d = resolve_memory_ns(&cfg(), Some(&c), None, None).unwrap();
+        assert_eq!(d.ns, "org/c/div/d");
+        assert_eq!(d.origin, NsOrigin::IdentityCanonical);
+    }
+
+    #[test]
+    fn direct_mapping_falls_back_to_derivation() {
+        let mut cfg = cfg();
+        cfg.identity_mapping = "direct".to_string();
+        let c = caller("u1", &["agent/xuyoukang"]);
+        let d = resolve_memory_ns(&cfg, Some(&c), None, None).unwrap();
+        assert_eq!((d.ns.as_str(), d.origin), ("agent/u1", NsOrigin::Identity));
+    }
+
+    #[test]
+    fn canonical_denied_value_rejected() {
+        let c = caller("bad", &["agent/user"]);
+        assert!(matches!(
+            resolve_memory_ns(&cfg(), Some(&c), None, None),
+            Err(NsError::WriteDenied(_))
+        ));
+    }
+
+    #[test]
+    fn canonical_empty_or_wildcard_falls_back() {
+        // 注意：allowed_ns 含 "*" 即视为 admin（走 main_ns），这里用空串测纯回退
+        let c = caller("u2", &["", ""]);
+        let d = resolve_memory_ns(&cfg(), Some(&c), None, None).unwrap();
+        assert_eq!(d.ns, "agent/u2");
+        assert_eq!(d.origin, NsOrigin::Identity);
     }
 
     #[test]

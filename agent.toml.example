@@ -114,7 +114,8 @@ user_prefix = "agent"
 main_ns = "agent/xujiayan"
 quarantine_ns = "agent/_unattributed"
 reject_unattributed = false
-write_deny_ns = ["agent/user", "agent/user/user/user"]
+write_deny_ns = identity_mapping = "alias"
+["agent/user", "agent/user/user/user"]
 log_origin = true
 
 # ── Memoria 服务写入封存名单（与上方 write_deny_ns 保持一致）──────────
