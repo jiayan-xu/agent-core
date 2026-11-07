@@ -1,6 +1,7 @@
 # agent-core 配置示例模板（占位符版）
 #
-# 复制为 agent.toml 后按需修改。本文件不进入版本控制（已在 .gitignore）。
+# 复制为 agent.toml 后按需修改。本模板已纳入版本控制；
+# 实际的 agent.toml 被 .gitignore 忽略（含本机配置，不入库）。
 # 安全约定（P2-6）：
 #   - 所有密钥一律通过环境变量注入，禁止在配置中写明文。
 #   - 支持 ${ENV_VAR} 语法，运行时自动替换为环境变量值。
@@ -102,3 +103,21 @@ args = ["examples/skills/echo/server.py"]
 #   [[boundary.tool_overrides]]
 #   tool = "query_secret"
 #   level = "dangerous"
+
+# ── 记忆命名空间策略（2026-11-07 补入模板）──────────────────────────────
+# identity = 落库 NS 由认证身份决定；legacy = 旧行为（session_id 推导，可秒级回滚）
+# 环境变量 NAMESPACE_POLICY=legacy|identity 可覆盖本节（回滚杠杆）
+# 注意：实际 agent.toml 中本节存在时，须与 memoria 侧 MEMORIA_WRITE_DENY_NS 对齐。
+[namespace]
+policy = "identity"
+user_prefix = "agent"
+main_ns = "agent/xujiayan"
+quarantine_ns = "agent/_unattributed"
+reject_unattributed = false
+write_deny_ns = ["agent/user", "agent/user/user/user"]
+log_origin = true
+
+# ── Memoria 服务写入封存名单（与上方 write_deny_ns 保持一致）──────────
+# agent.toml 的 [[services]] 中 key = "mem" 的 env 追加：
+#   MEMORIA_WRITE_DENY_NS = "agent/user,agent/user/user/user"
+# 未显式注入时，memoria 侧使用同名默认值。
