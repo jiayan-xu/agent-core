@@ -57,7 +57,7 @@ pub(crate) async fn handle_meetings_create(
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
-    let (caller, caller_ns) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -318,7 +318,7 @@ pub(crate) async fn handle_meeting_ask(
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
-    let (caller, caller_ns) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -495,7 +495,7 @@ pub(crate) async fn handle_meeting_invite(
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
-    let (caller, caller_ns) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };

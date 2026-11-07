@@ -37,6 +37,9 @@ pub(crate) struct Config {
     /// 公司根标识（命名空间 org/<org_company> 前缀）。默认 cs-pufa-2nd-thermal。
     #[serde(default = "default_org_company")]
     pub(crate) org_company: String,
+    /// D0-NS（2026-11-06）：记忆命名空间分流配置。缺省 = identity 策略默认值。
+    #[serde(default)]
+    pub(crate) namespace: agent_core::namespace::NamespaceConfig,
     #[serde(default)]
     pub(crate) api_key: String,
     #[serde(default = "default_server")]
@@ -710,6 +713,7 @@ pub(crate) fn load_or_create_config() -> Config {
         agent_id: whoami().unwrap_or_else(|| "default".to_string()),
         domain_mode: default_domain_mode(),
         org_company: default_org_company(),
+        namespace: agent_core::namespace::NamespaceConfig::default(),
         api_key: String::new(),
         server: default_server(),
         port: 9753,

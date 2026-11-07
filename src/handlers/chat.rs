@@ -45,11 +45,30 @@ pub(crate) struct SetupResponse {
     pub(crate) error: Option<String>,
 }
 
+/// D0-NS P0-2（E14）：入口 A session_id 白名单——与会话历史实测格式一致
+/// （字母数字 / `-` / `_` / `/`，≤128，非空），杜绝借构造 session_id 影响服务端行为。
+fn validate_session_id(sid: &str) -> Result<(), &'static str> {
+    if sid.is_empty() {
+        return Err("session_id 不能为空");
+    }
+    if sid.len() > 128 {
+        return Err("session_id 过长（>128）");
+    }
+    if !sid.chars().all(|c| c.is_alphanumeric() || c == '/' || c == '-' || c == '_') {
+        return Err("session_id 含非法字符");
+    }
+    Ok(())
+}
+
 pub(crate) async fn handle_chat(
     State(st): State<Arc<AppState>>,
     Extension(ctx): Extension<AuthContext>,
     Json(req): Json<ChatRequest>,
 ) -> axum::response::Response {
+    // D0-NS P0-2：入口 A session_id 白名单
+    if let Err(e) = validate_session_id(&req.session_id) {
+        return axum::response::Json(serde_json::json!({ "error": e })).into_response();
+    }
     // A2: 白龙马 TICK 心跳 —— 用户消息到达，抢占在途空闲 tick
     if let Some(ref c) = *st.consciousness.lock().await {
         c.interrupt();
@@ -60,6 +79,15 @@ pub(crate) async fn handle_chat(
         g.as_ref().map(|a| a.clone())
     };
     if let Some(agent) = agent {
+        // D0-NS：绑定认证调用方（chat 内 caller_ns 据此解析个人 NS）
+        agent.bind_session_caller(
+            &req.session_id,
+            agent_core::namespace::NsCaller {
+                user_id: ctx.agent_id.clone(),
+                allowed_ns: ctx.allowed_ns.clone(),
+                from_usertag: ctx.from_usertag,
+            },
+        );
         let start = std::time::Instant::now();
         let reply = agent
             .chat(
@@ -92,6 +120,10 @@ pub(crate) async fn handle_chat_stream(
     Extension(ctx): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<ChatRequest>,
 ) -> axum::response::Response {
+    // D0-NS P0-2：入口 A session_id 白名单
+    if let Err(e) = validate_session_id(&params.session_id) {
+        return axum::response::Json(serde_json::json!({ "error": e })).into_response();
+    }
     let (tx, rx): (
         tokio::sync::mpsc::UnboundedSender<Result<SseEvent, Infallible>>,
         tokio::sync::mpsc::UnboundedReceiver<Result<SseEvent, Infallible>>,
@@ -111,6 +143,7 @@ pub(crate) async fn handle_chat_stream(
         let sid = params.session_id.clone();
         let agent_id = ctx.agent_id.clone();
         let allowed_ns = ctx.allowed_ns.clone();
+        let from_usertag = ctx.from_usertag;
         tokio::spawn(async move {
             // 解串行：克隆 Arc 后释放锁，chat() 并发执行
             let agent = {
@@ -118,6 +151,15 @@ pub(crate) async fn handle_chat_stream(
                 g.as_ref().map(|a| a.clone())
             };
             if let Some(agent) = agent {
+                // D0-NS：绑定认证调用方（spawn 后 ctx 不可达，用捕获值）
+                agent.bind_session_caller(
+                    &sid,
+                    agent_core::namespace::NsCaller {
+                        user_id: agent_id.clone(),
+                        allowed_ns: allowed_ns.clone(),
+                        from_usertag,
+                    },
+                );
                 let start = std::time::Instant::now();
                 let reply = agent.chat(&msg, &agent_id, &sid, &allowed_ns, None).await;
                 st_clone
@@ -419,6 +461,15 @@ pub(crate) async fn handle_v1_chat(
         Some(folded.history)
     };
     let reply = if let Some(ref agent) = *agent_guard {
+        // D0-NS：绑定认证调用方（入口 B 服务端构造的 jan 串只作会话键）
+        agent.bind_session_caller(
+            &session_id,
+            agent_core::namespace::NsCaller {
+                user_id: ctx.agent_id.clone(),
+                allowed_ns: ctx.allowed_ns.clone(),
+                from_usertag: ctx.from_usertag,
+            },
+        );
         // 输入校验：消息长度限制 32KB，消息数限制 100
         if req.messages.len() > 100 {
             return axum::response::Json(serde_json::json!({

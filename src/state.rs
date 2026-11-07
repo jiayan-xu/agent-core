@@ -409,6 +409,7 @@ impl Consciousness {
                 &serde_json::json!({}),
                 &allowed_ns,
                 &trace_id,
+                None,
             ),
         )
         .await;

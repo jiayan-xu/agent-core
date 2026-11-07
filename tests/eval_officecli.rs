@@ -168,6 +168,7 @@ fn agent_with_officecli() -> AgentCore {
     let tools_dir = office_tools_dir();
     let stdio = tools_dir.join("officecli_mcp_bridge.py");
     let config = AgentConfig {
+        namespace: agent_core::namespace::NamespaceConfig::default(),
         identity: AgentIdentity {
             agent_id: "eval-officecli".into(),
             namespace: "agent/eval-officecli".into(),
@@ -271,6 +272,7 @@ async fn officecli_read_routes_and_calls() {
             &serde_json::json!({"file": fixture, "max_lines": 3}),
             &["agent/eval-officecli".to_string()],
             "officecli-e2e",
+            None,
         ))
         .await
         .expect("officecli_read 应在 60s 内返回")
@@ -306,6 +308,7 @@ async fn officecli_rejects_traversal() {
             &payload,
             &["agent/eval-officecli".to_string()],
             "officecli-e2e-traversal",
+            None,
         ))
         .await
         .expect("穿越调用应在 60s 内返回");
@@ -330,6 +333,7 @@ async fn officecli_create_adds_and_query() {
             }),
             &["agent/eval-officecli".to_string()],
             "officecli-e2e-create",
+            None,
         ))
         .await
         .expect("officecli_create 应在 60s 内返回")
@@ -369,6 +373,7 @@ async fn officecli_create_adds_and_query() {
             &serde_json::json!({"file": query_file, "selector": "paragraph"}),
             &["agent/eval-officecli".to_string()],
             "officecli-e2e-query",
+            None,
         ))
         .await
         .expect("officecli_query 应在 60s 内返回")
@@ -397,6 +402,7 @@ async fn officecli_query_rejects_write_selector() {
             &serde_json::json!({"file": fixture, "selector": "add /body paragraph"}),
             &["agent/eval-officecli".to_string()],
             "officecli-e2e-query-guard",
+            None,
         ))
         .await
         .expect("query 调用应在 60s 内返回");
@@ -418,6 +424,7 @@ async fn officecli_pdf_exports_valid_pdf() {
             &serde_json::json!({"file": fixture, "output": out_name}),
             &["agent/eval-officecli".to_string()],
             "officecli-e2e-pdf",
+            None,
         ))
         .await
         .expect("officecli_pdf 应在 60s 内返回")

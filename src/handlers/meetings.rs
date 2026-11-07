@@ -25,7 +25,7 @@ pub(crate) async fn handle_meetings_list(
     headers: axum::http::HeaderMap,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let (caller, caller_ns) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -64,7 +64,7 @@ pub(crate) async fn handle_meeting_delete(
     axum::extract::Path(id): axum::extract::Path<String>,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let (caller, caller_ns) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -143,7 +143,7 @@ pub(crate) async fn handle_meeting_message(
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
-    let (caller, caller_ns) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -277,7 +277,7 @@ pub(crate) async fn handle_meeting_end(
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
-    let (caller, caller_ns) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -764,7 +764,7 @@ pub(crate) async fn handle_meeting_stream(
     axum::extract::Path(id): axum::extract::Path<String>,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let (caller, caller_ns) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -1084,7 +1084,7 @@ pub(crate) async fn handle_meeting_heartbeat(
     axum::extract::Path(id): axum::extract::Path<String>,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let (caller, caller_ns) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -1149,7 +1149,7 @@ pub(crate) async fn handle_panel_discuss(
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
-    let (caller, caller_ns) = match authenticate(&headers, &st).await {
+    let (caller, caller_ns, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };

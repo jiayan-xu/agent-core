@@ -112,7 +112,7 @@ pub(crate) async fn handle_approval_pending(
 ) -> Response {
     if !(approval_open_lan() || is_admin(&headers, &st).await) {
         // 部门经理：仅见本部门成员发起的待审项（memoria 注册表 read_write+dept ns 为权威）
-        let (caller, _) = match authenticate(&headers, &st).await {
+        let (caller, _, _) = match authenticate(&headers, &st).await {
             Ok(a) => a,
             Err(r) => return r,
         };
@@ -158,7 +158,7 @@ pub(crate) async fn handle_approval_history(
 ) -> Response {
     // 审批历史绑定注册人身份：任何已注册 agent（badge 认证通过）可查看，
     // 无需 admin key（审批人即注册用户本人）。写操作 respond 仍要求 admin。
-    let (agent_id, _allowed_ns) = match authenticate(&headers, &st).await {
+    let (agent_id, _allowed_ns, _) = match authenticate(&headers, &st).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -183,7 +183,7 @@ pub(crate) async fn handle_approval_respond(
     // 部门经理 → 其 agent_id（仅能批本部门成员的项，可见性与 pending 同规则）
     let mut approver_id = "dashboard-admin".to_string();
     if !(approval_open_lan() || is_admin(&headers, &st).await) {
-        let (caller, _) = match authenticate(&headers, &st).await {
+        let (caller, _, _) = match authenticate(&headers, &st).await {
             Ok(a) => a,
             Err(r) => return r,
         };
@@ -298,7 +298,7 @@ pub(crate) async fn handle_approval_respond(
                             }
                         }
                         let result = agent_clone
-                            .call_tool_routed(&tool_name_gw, "default", &exec_args, &allowed_ns, "")
+                            .call_tool_routed(&tool_name_gw, "default", &exec_args, &allowed_ns, "", None)
                             .await;
                         if let Some(exe_id) = &execution_id {
                             match &result {

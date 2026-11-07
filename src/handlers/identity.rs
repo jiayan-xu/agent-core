@@ -150,7 +150,7 @@ pub(crate) async fn handle_documents_archive(
     headers: axum::http::HeaderMap,
     Json(req): Json<ArchiveDocumentRequest>,
 ) -> axum::response::Response {
-    let (agent_id, allowed_ns) = match authenticate(&headers, &st).await {
+    let (agent_id, allowed_ns, _) = match authenticate(&headers, &st).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -506,7 +506,7 @@ pub(crate) async fn handle_agent_repair(
     headers: axum::http::HeaderMap,
     Json(req): Json<AgentRepairRequest>,
 ) -> axum::response::Response {
-    let (caller_id, allowed_ns) = match authenticate(&headers, &st).await {
+    let (caller_id, allowed_ns, _) = match authenticate(&headers, &st).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -966,6 +966,7 @@ pub(crate) async fn build_agent(
     };
     let agent_config = AgentConfig {
         identity,
+        namespace: config.namespace.clone(),
         llm: llm_config,
         memoria_url: config.server.clone(),
         additional_mcp,

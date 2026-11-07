@@ -165,7 +165,7 @@ pub(crate) async fn handle_persona_create(
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, _, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -219,7 +219,7 @@ pub(crate) async fn handle_persona_list(
     headers: axum::http::HeaderMap,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, _, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -252,7 +252,7 @@ pub(crate) async fn handle_persona_delete(
     axum::extract::Path(id): axum::extract::Path<String>,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, _, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -327,7 +327,7 @@ pub(crate) async fn handle_persona_get(
     axum::extract::Path(id): axum::extract::Path<String>,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, _, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };

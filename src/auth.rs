@@ -51,7 +51,7 @@ pub(crate) fn percent_decode_agent_id(s: &str) -> String {
 pub(crate) async fn authenticate(
     headers: &axum::http::HeaderMap,
     st: &Arc<AppState>,
-) -> Result<(String, Vec<String>), axum::response::Response> {
+) -> Result<(String, Vec<String>, bool), axum::response::Response> {
     // 主身份来自 x-agent-id；PFAiX 分发版只发 x-user-tag（随机安装ID），
     // 故在其为空时回退到 x-user-tag，实现「安装即身份」。
     let raw_agent_id = headers
@@ -229,13 +229,15 @@ pub(crate) async fn authenticate(
             (allowed_ns.clone(), std::time::Instant::now()),
         );
     }
-    Ok((agent_id, allowed_ns))
+    Ok((agent_id, allowed_ns, from_usertag))
 }
 
 #[derive(Clone)]
 pub(crate) struct AuthContext {
     pub(crate) agent_id: String,
     pub(crate) allowed_ns: Vec<String>,
+    /// D0-NS（D4）：仅 x-user-tag（无 x-agent-id）的 legacy 安装身份
+    pub(crate) from_usertag: bool,
 }
 
 /// 统一鉴权中间件。成功时把身份写入 extension；失败直接返回 401。
@@ -256,11 +258,12 @@ pub(crate) async fn auth_middleware(
         return next.run(request).await;
     }
     match authenticate(request.headers(), &st).await {
-        Ok((agent_id, allowed_ns)) => {
+        Ok((agent_id, allowed_ns, from_usertag)) => {
             let mut req = request;
             req.extensions_mut().insert(AuthContext {
                 agent_id,
                 allowed_ns,
+                from_usertag,
             });
             next.run(req).await
         }

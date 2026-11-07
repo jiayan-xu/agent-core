@@ -350,7 +350,7 @@ pub(crate) async fn handle_tool_execute(
     });
     let ns = auth.allowed_ns.clone();
     match agent
-        .call_tool_routed(&body.tool, &persona, &body.arguments, &ns, &trace_id)
+        .call_tool_routed(&body.tool, &persona, &body.arguments, &ns, &trace_id, None)
         .await
     {
         Ok(result) => {
@@ -432,7 +432,7 @@ async fn capture_before_state(
     let q = serde_json::json!({"action": "query", "plate": plate, "confirmed": true});
     // allowed_ns 不能为空：源级门控拒空授权域（网关 R2 同坑）
     let res = agent
-        .call_tool_routed(tool, "default", &q, allowed_ns, "")
+        .call_tool_routed(tool, "default", &q, allowed_ns, "", None)
         .await
         .ok()?;
     let text = res;
@@ -527,7 +527,7 @@ async fn execute_auto_approved(
     }
     let exec_ns: Vec<String> = if ns.is_empty() { allowed_ns } else { ns };
     let result = agent
-        .call_tool_routed(&tool, "default", &exec_args, &exec_ns, "")
+        .call_tool_routed(&tool, "default", &exec_args, &exec_ns, "", None)
         .await;
     match &result {
         Ok(text) => {
@@ -673,7 +673,7 @@ pub(crate) async fn handle_auto_write_undo(
     }
     // 撤销是人工发起的纠正：直接执行（undo 参数已带 confirmed），全程审计
     let result = agent
-        .call_tool_routed(tool, "default", &undo_args, &auth.allowed_ns.clone(), "")
+        .call_tool_routed(tool, "default", &undo_args, &auth.allowed_ns.clone(), "", None)
         .await;
     agent
         .audit_logger

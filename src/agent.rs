@@ -164,6 +164,8 @@ impl AgentIdentity {
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub identity: AgentIdentity,
+    /// D0-NS（2026-11-06）：记忆命名空间分流配置（identity | legacy，含封存/隔离区/观测开关）
+    pub namespace: crate::namespace::NamespaceConfig,
     pub llm: LlmConfig,
     pub memoria_url: String,
     /// 可选 MCP 源（名称 + URL + 令牌 + 可选的 stdio (命令, 参数) + 可选的命名空间），
@@ -432,6 +434,10 @@ pub struct AgentCore {
     persist_lock: std::sync::Mutex<()>,
     /// Phase 2：会话 → 分身 绑定（分身级工具白名单接线）
     pub session_personas: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// D0-NS（2026-11-06）：会话 → 认证调用方（chat 三入口在调用 chat() 前绑定；
+    /// 未注册 = System 内部任务）。与 session_personas 同生命周期模式。
+    pub session_callers:
+        std::sync::Mutex<std::collections::HashMap<String, crate::namespace::NsCaller>>,
     /// Phase 2：分身 tick 调度器注册表（真实 tick 由 AgentCore 驱动，避免循环依赖）
     pub tick_scheduler: crate::scheduler::tick_scheduler::TickScheduler,
     /// PR5: 审批闸门（P-D 门控；默认 Auto 免人工审批，分类逻辑保留）
@@ -1849,6 +1855,7 @@ impl AgentCore {
             meetings: std::sync::Mutex::new(Vec::new()),
             persist_lock: std::sync::Mutex::new(()),
             session_personas: std::sync::Mutex::new(std::collections::HashMap::new()),
+            session_callers: std::sync::Mutex::new(std::collections::HashMap::new()),
             tick_scheduler: crate::scheduler::tick_scheduler::TickScheduler::default(),
             approval_gate,
             meta_evolver,
@@ -1919,6 +1926,27 @@ impl AgentCore {
     pub fn persona_for_session(&self, session_id: &str) -> String {
         let m = self.session_personas.lock().unwrap_or_else(|p| p.into_inner());
         m.get(session_id).cloned().unwrap_or_else(|| "default".to_string())
+    }
+
+    /// D0-NS：绑定会话的认证调用方（chat 三入口在调用 chat() 前调用）。
+    /// 上限防泄漏：超过 8192 且非本会话时逐出任意一条（活跃会话下轮会重新绑定）。
+    pub fn bind_session_caller(&self, session_id: &str, caller: crate::namespace::NsCaller) {
+        let mut m = self.session_callers.lock().unwrap_or_else(|p| p.into_inner());
+        if m.len() >= 8192 && !m.contains_key(session_id) {
+            if let Some(k) = m.keys().next().cloned() {
+                m.remove(&k);
+            }
+        }
+        m.insert(session_id.to_string(), caller);
+    }
+
+    /// D0-NS：查会话认证调用方；未注册 = System 内部任务（返回 None）
+    pub fn caller_for_session(&self, session_id: &str) -> Option<crate::namespace::NsCaller> {
+        self.session_callers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_id)
+            .cloned()
     }
 
     /// Phase 2：分身真实 tick —— 用该分身目标驱动一次真实 LLM 调用（仅规划，不执行工具）
@@ -2878,12 +2906,57 @@ impl AgentCore {
         }
     }
 
-    /// NS 解析（OCR round5 medium2 前置条件说明）：
-    /// - persona 绑定会话（chat_inner 开头自动绑定）→ persona.memory_namespace；
-    /// - 未绑定会话 → legacy `agent/{agent_id}/user/{agent_id}`。
-    /// ⚠️ 本函数不做绑定——必须先经 chat_inner 入口；旁路入口（如 meetings SSE）
-    /// 的 persona 会话会走 legacy NS（数据分裂，见 pai Phase 3 执行记录 §7.3 finding 2）。
+    /// NS 解析（D0-NS 修复，2026-11-06）：
+    /// - `policy=identity`（新）：`resolve_memory_ns` 单一决策入口——认证身份（session_callers
+    ///   绑定，chat 入口写入）+ persona 归属决定 NS；session_id 仅做会话隔离（R1）。
+    /// - `policy=legacy`：旧行为逐字保留（回滚路径）。
+    /// ⚠️ 本函数不做绑定——persona 绑定仍必须先经 chat_inner 入口。
     pub fn caller_ns(&self, session_id: &str) -> String {
+        let cfg = &self.config.namespace;
+        if cfg.effective_policy() == crate::namespace::NsPolicy::Legacy {
+            return self.caller_ns_legacy(session_id);
+        }
+        let persona = {
+            let pid = self.persona_for_session(session_id);
+            if pid != "default" {
+                let p = self.get_persona(&pid);
+                if p.memory_namespace.trim().is_empty() {
+                    None
+                } else {
+                    Some((p.memory_namespace.clone(), p.owner_user_id.clone()))
+                }
+            } else {
+                None
+            }
+        };
+        let caller = self.caller_for_session(session_id);
+        match crate::namespace::resolve_memory_ns(
+            cfg,
+            caller.as_ref(),
+            persona.as_ref().map(|(n, o)| (n.as_str(), o.as_str())),
+            None,
+        ) {
+            Ok(d) => {
+                if cfg.log_origin {
+                    tracing::info!(
+                        target: "ns_audit",
+                        session = %session_id,
+                        ns = %d.ns,
+                        origin = %d.origin,
+                        "memory ns resolved"
+                    );
+                }
+                d.ns
+            }
+            Err(e) => {
+                tracing::warn!(target: "ns_audit", session = %session_id, error = %e, "memory ns resolve failed → quarantine");
+                cfg.quarantine_ns.clone()
+            }
+        }
+    }
+
+    /// 旧行为（`policy=legacy` 回滚路径；2026-11-06 前逻辑逐字保留）。
+    fn caller_ns_legacy(&self, session_id: &str) -> String {
         // persona 绑定会话：记忆归 persona.memory_namespace（如 pai → agent/xujiayan），
         // 使 pai 对话的沉淀/召回与所属员工主记忆区对齐（10-22 命名空间规范）。
         let bound_pid = self.persona_for_session(session_id);
@@ -3445,7 +3518,7 @@ impl AgentCore {
                     }
                 }
                 let exec_res = self
-                    .call_tool_routed(&action.tool_name, &self.persona_for_session(session_id), &action.arguments, allowed_ns, &trace_id)
+                    .call_tool_routed(&action.tool_name, &self.persona_for_session(session_id), &action.arguments, allowed_ns, &trace_id, Some(session_id))
                     .await;
                 let desc = action.description.chars().take(120).collect::<String>();
                 let result_text = match &exec_res {
@@ -5725,6 +5798,7 @@ impl AgentCore {
                     &args,
                     &ns_vec,
                     "preroute-whitelist-query",
+                    Some(session_id),
                 )
                 .await;
             let exec_ok = result.is_ok();
@@ -6302,7 +6376,7 @@ impl AgentCore {
                 let direct = Self::direct_fast_tool(message);
                 if let Some((tool, tool_args)) = direct {
                     match self
-                        .call_tool_routed(&tool, &self.persona_for_session(session_id), &tool_args, allowed_ns, trace_id)
+                        .call_tool_routed(&tool, &self.persona_for_session(session_id), &tool_args, allowed_ns, trace_id, Some(session_id))
                         .await
                     {
                         // 确定性工具返回 JSON 数据。只接受"看起来像成功数据"的载荷：
@@ -6331,7 +6405,7 @@ impl AgentCore {
                         "period": "",
                     });
                     match self
-                        .call_tool_routed("nl_query", &self.persona_for_session(session_id), &args, allowed_ns, trace_id)
+                        .call_tool_routed("nl_query", &self.persona_for_session(session_id), &args, allowed_ns, trace_id, Some(session_id))
                         .await
                     {
                         Ok(t) => {
@@ -6731,7 +6805,7 @@ impl AgentCore {
                         }
                     }
 
-                    match this.call_tool_routed(&tool, "default", &args, allowed_ns, "").await {
+                    match this.call_tool_routed(&tool, "default", &args, allowed_ns, "", Some(session_id)).await {
                         Ok(result) => {
                             this.audit_logger.log_tool_call(
                                 &this.config.identity.agent_id, &tool, &args, true
@@ -9897,8 +9971,9 @@ let content = format!(
                     let persona = persona.clone();
                     let ns = allowed_ns.to_vec();
                     let trace = trace_id.to_string();
+                    let sess = session_id.to_string();
                     async move {
-                        self.call_tool_routed(&name, &persona, &args, &ns, &trace).await
+                        self.call_tool_routed(&name, &persona, &args, &ns, &trace, Some(sess.as_str())).await
                     }
                 })
                 .collect();
@@ -10416,7 +10491,7 @@ let content = format!(
 
             // 通过 MCP 调用工具（按名称路由到正确的源）
             let result = match self
-                .call_tool_routed(&tc.name, &self.persona_for_session(session_id), &tc.arguments, allowed_ns, trace_id)
+                .call_tool_routed(&tc.name, &self.persona_for_session(session_id), &tc.arguments, allowed_ns, trace_id, Some(session_id))
                 .await
             {
                 Ok(text) => {
@@ -11235,7 +11310,7 @@ let content = format!(
                 }
             }
             let exec_result = self
-                .call_tool_routed(&approval.tool_name, "default", &exec_args, allowed_ns, "")
+                .call_tool_routed(&approval.tool_name, "default", &exec_args, allowed_ns, "", Some(session_id))
                 .await;
             let desc = approval.description.chars().take(120).collect::<String>();
             // 任务 649：按工具真实返回如实上报，杜绝「假成功」
@@ -11338,6 +11413,7 @@ let content = format!(
                                 &serde_json::json!({ "sql": sql }),
                                 allowed_ns,
                                 "",
+                                None,
                             )
                             .await
                         {
@@ -11413,6 +11489,7 @@ let content = format!(
                         &sql_args,
                         allowed_ns,
                         "",
+                        None,
                     )
                     .await
                 {
@@ -11841,6 +11918,7 @@ let content = format!(
         args: &serde_json::Value,
         allowed_ns: &[String],
         trace_id: &str,
+        session_id: Option<&str>,
     ) -> Result<String, String> {
         // ── P2-3 澄清工具：暂停执行向用户澄清（Palantir Request clarification 对标） ──
         // 必须在 resolve_tool_name_middleware 之前拦截：该中间件不识别本内置工具，
@@ -11985,7 +12063,7 @@ let content = format!(
                         );
                     }
                     return Box::pin(
-                        self.call_tool_routed("execute_sql", persona_id, &ea, allowed_ns, trace_id),
+                        self.call_tool_routed("execute_sql", persona_id, &ea, allowed_ns, trace_id, session_id),
                     )
                     .await;
                 }
@@ -12000,6 +12078,7 @@ let content = format!(
                         &validated,
                         allowed_ns,
                         trace_id,
+                        session_id,
                     ))
                     .await;
                 }
@@ -12144,11 +12223,15 @@ let content = format!(
 
         // Memoria NamespaceArg 工具：LLM/Composer 常漏传 namespace → -32002。
         // 由引擎注入调用者主 ns（allowed_ns 首个非 *；否则 identity.ns()）。
+        // D0-NS：session 已知时以身份解析结果为注入源（legacy 安装ID → 隔离区、
+        // admin → main_ns、同事 → 个人 NS）；旁路旧路径保持原优先级。
+        let session_ns = session_id.map(|s| self.caller_ns(s));
         Self::inject_namespace_arg(
             tool_name,
             &mut call_args,
             allowed_ns,
             &self.config.identity.ns(),
+            session_ns.as_deref(),
         );
 
         // ── A2 文件级 checkpoint：WRITE/dangerous 工具执行前快照其 path 参数指向的现有文件 ──
@@ -12282,6 +12365,7 @@ let content = format!(
                             &verify_args,
                             allowed_ns,
                             trace_id,
+                            session_id,
                         ))
                         .await
                         {
@@ -12613,7 +12697,8 @@ let content = format!(
         tool_name: &str,
         args: &mut serde_json::Value,
         allowed_ns: &[String],
-        identity_ns: &str,
+        _identity_ns: &str,
+        session_ns: Option<&str>,
     ) {
         let has_ns = args
             .get("namespace")
@@ -12629,13 +12714,17 @@ let content = format!(
         // 2026-10-29：全权限身份（allowed_ns=["*"]，如 admin）无具体 ns 可注入——
         // 注意 identity_ns（=agent_id，如 "admin"）不是有效记忆 ns，不能作 fallback
         // （实测注入 "admin" 后跨会话检索永远落空）。一律兜底主记忆区。
-        let ns = match allowed_ns
-            .iter()
-            .find(|s| !s.is_empty() && *s != "*")
-        {
-            Some(s) => s.as_str().to_string(),
-            None => Self::memoria_main_ns(),
-        };
+        let ns = session_ns
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "*")
+            .map(str::to_string)
+            .or_else(|| {
+                allowed_ns
+                    .iter()
+                    .find(|s| !s.is_empty() && *s != "*")
+                    .cloned()
+            })
+            .unwrap_or_else(Self::memoria_main_ns);
         if ns.is_empty() || ns == "*" {
             return;
         }
@@ -12851,7 +12940,7 @@ let content = format!(
                     break;
                 }
                 let result = self
-                    .call_tool_routed(tool_name, "default", &args, allowed_ns, "")
+                    .call_tool_routed(tool_name, "default", &args, allowed_ns, "", None)
                     .await;
                 if result.is_err() {
                     all_ok = false;
@@ -13322,6 +13411,7 @@ let content = format!(
                 }),
                 allowed_ns,
                 "",
+                None,
             )
             .await
             .unwrap_or_default();
@@ -13334,6 +13424,7 @@ let content = format!(
                 }),
                 allowed_ns,
                 "",
+                None,
             )
             .await
             .unwrap_or_default();

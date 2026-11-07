@@ -574,3 +574,361 @@ mod tests {
         assert_eq!(reg.count(), 3);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// D0 命名空间分流修复（2026-11-06，方案 tech-docs/2026-11-06_D0-命名空间分流缺陷修复方案_v1.1.md）
+//
+// 单一决策入口 resolve_memory_ns：落库 NS 只由认证身份（NsCaller）+ persona 归属
+// 决定，session_id 永远只做会话隔离（R1）。策略配置驱动，legacy = 旧行为秒级回滚。
+// ═══════════════════════════════════════════════════════════════════════════
+
+use serde::{Deserialize, Serialize};
+
+/// NS 解析策略：`identity` = 认证身份路由（新）；`legacy` = 旧行为（session_id 推导，回滚用）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NsPolicy {
+    Identity,
+    Legacy,
+}
+
+/// `[namespace]` 配置块（agent.toml）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NamespaceConfig {
+    pub policy: NsPolicy,
+    pub user_prefix: String,
+    pub main_ns: String,
+    pub quarantine_ns: String,
+    pub reject_unattributed: bool,
+    /// 只读封存名单：任何调用方（含 admin）不得写入；读不受限（D3）
+    pub write_deny_ns: Vec<String>,
+    /// P0-0 观测开关：每次解析写 ns_audit 结构化日志
+    pub log_origin: bool,
+}
+
+impl Default for NamespaceConfig {
+    fn default() -> Self {
+        NamespaceConfig {
+            policy: NsPolicy::Identity,
+            user_prefix: "agent".to_string(),
+            main_ns: "agent/xujiayan".to_string(),
+            quarantine_ns: "agent/_unattributed".to_string(),
+            reject_unattributed: false,
+            write_deny_ns: vec![
+                "agent/user".to_string(),
+                "agent/user/user/user".to_string(),
+            ],
+            log_origin: true,
+        }
+    }
+}
+
+impl NamespaceConfig {
+    /// 生效策略：环境变量 `NAMESPACE_POLICY=legacy|identity` 覆盖 toml（回滚杠杆）
+    pub fn effective_policy(&self) -> NsPolicy {
+        match std::env::var("NAMESPACE_POLICY").ok().as_deref().map(str::trim) {
+            Some("legacy") => NsPolicy::Legacy,
+            Some("identity") => NsPolicy::Identity,
+            _ => self.policy,
+        }
+    }
+
+    pub fn is_write_denied(&self, ns: &str) -> bool {
+        self.write_deny_ns.iter().any(|d| d == ns)
+    }
+}
+
+/// 认证后的请求调用方（agent-core `authenticate` 解析结果；System 内部任务传 None）
+#[derive(Debug, Clone)]
+pub struct NsCaller {
+    /// authenticate 解析的身份（登录态 = 真实 user_id；legacy = 随机安装ID）
+    pub user_id: String,
+    /// memoria 反查授权
+    pub allowed_ns: Vec<String>,
+    /// 仅 x-user-tag（无 x-agent-id）的 legacy 安装身份（D4：不建 NS）
+    pub from_usertag: bool,
+}
+
+/// NS 决策来源（审计用）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NsOrigin {
+    ExplicitAllowed,
+    System,
+    Persona,
+    IdentityAdmin,
+    Identity,
+    Quarantine,
+}
+
+impl std::fmt::Display for NsOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            NsOrigin::ExplicitAllowed => "ExplicitAllowed",
+            NsOrigin::System => "System",
+            NsOrigin::Persona => "Persona",
+            NsOrigin::IdentityAdmin => "IdentityAdmin",
+            NsOrigin::Identity => "Identity",
+            NsOrigin::Quarantine => "Quarantine",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NsDecision {
+    pub ns: String,
+    pub origin: NsOrigin,
+}
+
+#[derive(Debug)]
+pub enum NsError {
+    /// 显式 ns 未获授权（R4）
+    Forbidden(String),
+    /// 命中只读封存黑名单（D3）
+    WriteDenied(String),
+    /// 无身份且 reject_unattributed=true
+    NoIdentity,
+}
+
+impl std::fmt::Display for NsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NsError::Forbidden(ns) => write!(f, "namespace 未授权: {}", ns),
+            NsError::WriteDenied(ns) => write!(f, "namespace 只读封存: {}", ns),
+            NsError::NoIdentity => write!(f, "无认证身份且策略拒绝无归属写入"),
+        }
+    }
+}
+
+/// 授权判定：target == granted，或 target 是 granted 的**子级**（仅子树向下；禁止祖先方向，R4/D3）
+pub fn ns_grants_access(allowed_ns: &[String], target: &str) -> bool {
+    allowed_ns
+        .iter()
+        .any(|g| g == target || target.starts_with(&format!("{}/", g)))
+}
+
+fn caller_is_admin(caller: &NsCaller) -> bool {
+    caller.user_id == "admin" || caller.allowed_ns.iter().any(|s| s == "*")
+}
+
+/// 记忆 NS 单一决策入口（D0 修复核心）。
+///
+/// 决策优先级：显式(校验后) > System > 本人 persona > admin 主库 > 认证 user_id > 拒绝/隔离。
+///
+/// - `caller`: Request 身份（chat 三入口绑定）；`None` = 服务内部任务（tick/oncall，R6）
+/// - `persona`: 会话绑定的 persona `(memory_namespace, owner_user_id)`
+/// - `explicit`: 客户端显式传入的 namespace（必须过授权校验）。
+///   ⚠️ 当前生产调用方 `caller_ns` 恒传 None——chat 链路的显式 namespace 参数由
+///   memoria 侧 `check_ns_access` 强制执行（web_api 各路由）；本分支为防御纵深 +
+///   后续入口接线预留（OCR round2 low，备忘）
+pub fn resolve_memory_ns(
+    cfg: &NamespaceConfig,
+    caller: Option<&NsCaller>,
+    persona: Option<(&str, &str)>,
+    explicit: Option<&str>,
+) -> Result<NsDecision, NsError> {
+    // 0) 显式 ns：黑名单 → 授权（仅 ==/子级；admin/System 信任）→ ExplicitAllowed
+    if let Some(ns) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        if cfg.is_write_denied(ns) {
+            return Err(NsError::WriteDenied(ns.to_string()));
+        }
+        let ok = match caller {
+            None => true,
+            Some(c) => caller_is_admin(c) || ns_grants_access(&c.allowed_ns, ns),
+        };
+        return if ok {
+            Ok(NsDecision {
+                ns: ns.to_string(),
+                origin: NsOrigin::ExplicitAllowed,
+            })
+        } else {
+            Err(NsError::Forbidden(ns.to_string()))
+        };
+    }
+    // System（R6）：persona 绑定 → persona ns；否则隔离区（保护主库纯净；origin=System 可审计）
+    let Some(c) = caller else {
+        return Ok(match persona {
+            Some((ns, _)) if !ns.trim().is_empty() => NsDecision {
+                ns: ns.to_string(),
+                origin: NsOrigin::System,
+            },
+            _ => NsDecision {
+                ns: cfg.quarantine_ns.clone(),
+                origin: NsOrigin::System,
+            },
+        });
+    };
+    // persona：owner 严格相等（与 chat_inner 绑定处同规则，D1）
+    if let Some((ns, owner)) = persona {
+        if !ns.trim().is_empty() && owner == c.user_id {
+            return Ok(NsDecision {
+                ns: ns.to_string(),
+                origin: NsOrigin::Persona,
+            });
+        }
+    }
+    // admin（D2）：先于 Identity —— user_id="admin" 不得新建 agent/admin
+    if caller_is_admin(c) {
+        return Ok(NsDecision {
+            ns: cfg.main_ns.clone(),
+            origin: NsOrigin::IdentityAdmin,
+        });
+    }
+    // Identity（R1/D4）：真实登录用户；排除默认身份 "user" 与 legacy 安装ID
+    if !c.from_usertag && !c.user_id.is_empty() && c.user_id != "user" {
+        let ns = format!("{}/{}", cfg.user_prefix, c.user_id);
+        if cfg.is_write_denied(&ns) {
+            return Err(NsError::WriteDenied(ns));
+        }
+        return Ok(NsDecision {
+            ns,
+            origin: NsOrigin::Identity,
+        });
+    }
+    // 无身份 / legacy 安装ID / 默认身份（R2，§14-2 拍板：隔离）
+    if cfg.reject_unattributed {
+        return Err(NsError::NoIdentity);
+    }
+    Ok(NsDecision {
+        ns: cfg.quarantine_ns.clone(),
+        origin: NsOrigin::Quarantine,
+    })
+}
+
+#[cfg(test)]
+mod ns_resolver_tests {
+    use super::*;
+
+    fn cfg() -> NamespaceConfig {
+        NamespaceConfig::default()
+    }
+
+    fn caller(user_id: &str, allowed: &[&str]) -> NsCaller {
+        NsCaller {
+            user_id: user_id.to_string(),
+            allowed_ns: allowed.iter().map(|s| s.to_string()).collect(),
+            from_usertag: false,
+        }
+    }
+
+    #[test]
+    fn explicit_allowed_for_granted_user() {
+        let c = caller("u_x", &["agent/u_x"]);
+        let d = resolve_memory_ns(&cfg(), Some(&c), None, Some("agent/u_x/sub")).unwrap();
+        assert_eq!((d.ns.as_str(), d.origin), ("agent/u_x/sub", NsOrigin::ExplicitAllowed));
+    }
+
+    #[test]
+    fn explicit_forbidden_without_grant() {
+        let c = caller("u_x", &["agent/u_x"]);
+        assert!(matches!(
+            resolve_memory_ns(&cfg(), Some(&c), None, Some("agent/xujiayan")),
+            Err(NsError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn explicit_deny_list_blocks_even_admin() {
+        let c = caller("admin", &["*"]);
+        assert!(matches!(
+            resolve_memory_ns(&cfg(), Some(&c), None, Some("agent/user")),
+            Err(NsError::WriteDenied(_))
+        ));
+    }
+
+    #[test]
+    fn system_with_persona_uses_persona_ns() {
+        let d = resolve_memory_ns(&cfg(), None, Some(("agent/xujiayan", "pai")), None).unwrap();
+        assert_eq!((d.ns.as_str(), d.origin), ("agent/xujiayan", NsOrigin::System));
+    }
+
+    #[test]
+    fn system_without_persona_goes_quarantine() {
+        let d = resolve_memory_ns(&cfg(), None, None, None).unwrap();
+        assert_eq!((d.ns.as_str(), d.origin), ("agent/_unattributed", NsOrigin::System));
+    }
+
+    #[test]
+    fn persona_owner_match() {
+        let c = caller("user", &[]);
+        let d = resolve_memory_ns(&cfg(), Some(&c), Some(("agent/xujiayan", "user")), None).unwrap();
+        assert_eq!((d.ns.as_str(), d.origin), ("agent/xujiayan", NsOrigin::Persona));
+    }
+
+    #[test]
+    fn persona_owner_mismatch_falls_through() {
+        let c = caller("u_x", &["agent/u_x"]);
+        let d = resolve_memory_ns(&cfg(), Some(&c), Some(("agent/xujiayan", "user")), None).unwrap();
+        assert_eq!(d.origin, NsOrigin::Identity);
+        assert_eq!(d.ns, "agent/u_x");
+    }
+
+    #[test]
+    fn admin_role_uses_main_ns() {
+        let c = caller("admin", &["*"]);
+        let d = resolve_memory_ns(&cfg(), Some(&c), None, None).unwrap();
+        assert_eq!((d.ns.as_str(), d.origin), ("agent/xujiayan", NsOrigin::IdentityAdmin));
+    }
+
+    #[test]
+    fn admin_literal_user_id_never_creates_agent_admin() {
+        let c = caller("admin", &[]);
+        let d = resolve_memory_ns(&cfg(), Some(&c), None, None).unwrap();
+        assert_eq!(d.ns, "agent/xujiayan");
+    }
+
+    #[test]
+    fn identity_resolves_single_layer() {
+        let c = caller("许有康_u_e864p91o736d", &["agent/许有康_u_e864p91o736d"]);
+        let d = resolve_memory_ns(&cfg(), Some(&c), None, None).unwrap();
+        assert_eq!(d.ns, "agent/许有康_u_e864p91o736d");
+        assert_eq!(d.origin, NsOrigin::Identity);
+    }
+
+    #[test]
+    fn legacy_usertag_quarantines() {
+        let mut c = caller("install-abc123", &[]);
+        c.from_usertag = true;
+        let d = resolve_memory_ns(&cfg(), Some(&c), None, None).unwrap();
+        assert_eq!(d.origin, NsOrigin::Quarantine);
+    }
+
+    #[test]
+    fn default_identity_user_quarantines() {
+        let c = caller("user", &[]);
+        let d = resolve_memory_ns(&cfg(), Some(&c), None, None).unwrap();
+        assert_eq!(d.origin, NsOrigin::Quarantine);
+    }
+
+    #[test]
+    fn reject_unattributed_errors() {
+        let mut c = cfg();
+        c.reject_unattributed = true;
+        let caller = caller("user", &[]);
+        assert!(matches!(
+            resolve_memory_ns(&c, Some(&caller), None, None),
+            Err(NsError::NoIdentity)
+        ));
+    }
+
+    #[test]
+    fn grants_access_child_only_not_ancestor() {
+        let allowed = vec!["agent/u_x".to_string()];
+        assert!(ns_grants_access(&allowed, "agent/u_x"));
+        assert!(ns_grants_access(&allowed, "agent/u_x/sub"));
+        // 祖先方向必须拒绝（D3：普通账号不得借父级写入共享桶）
+        assert!(!ns_grants_access(&allowed, "agent"));
+    }
+
+    #[test]
+    fn default_config_values() {
+        let c = NamespaceConfig::default();
+        // 仅断言 toml 解析值；effective_policy() 读进程环境变量 NAMESPACE_POLICY，
+        // 回滚 shell 中可能被置 legacy，不作测试输入（OCR round2 low）。
+        assert_eq!(c.policy, NsPolicy::Identity);
+        assert!(c.is_write_denied("agent/user"));
+        assert!(c.is_write_denied("agent/user/user/user"));
+        assert!(!c.is_write_denied("agent/xujiayan"));
+    }
+}

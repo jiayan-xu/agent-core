@@ -313,7 +313,7 @@ pub(crate) fn spawn_server(
                         agent_core::dept_ops::enrich_allowed_ns(&mut agent_ns);
                         let tasks = [("system_ops", serde_json::json!({"action": "status"}))];
                         for (tool, args) in &tasks {
-                            match agent.call_tool_routed(tool, "default", args, &agent_ns, "").await {
+                            match agent.call_tool_routed(tool, "default", args, &agent_ns, "", None).await {
                                 Ok(reply) => {
                                     fail_count = 0;
                                     tracing::info!(
@@ -357,7 +357,7 @@ pub(crate) fn spawn_server(
                                 "date": nvr_ymd,
                                 "workers": 1
                             });
-                            match agent.call_tool_routed("download_nvr_videos", "default", &nvr_args, &agent_ns, "").await {
+                            match agent.call_tool_routed("download_nvr_videos", "default", &nvr_args, &agent_ns, "", None).await {
                                 Ok(reply) => {
                                     tracing::info!("NVR定时下载(白名单全量): {}", &reply.chars().take(120).collect::<String>());
                                 }
