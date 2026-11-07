@@ -2911,10 +2911,18 @@ impl AgentCore {
     ///   绑定，chat 入口写入）+ persona 归属决定 NS；session_id 仅做会话隔离（R1）。
     /// - `policy=legacy`：旧行为逐字保留（回滚路径）。
     /// ⚠️ 本函数不做绑定——persona 绑定仍必须先经 chat_inner 入口。
-    pub fn caller_ns(&self, session_id: &str) -> String {
+    /// 解析会话 NS，**保留错误**（2026-11-07 修：供写路径判定 `NoIdentity`）。
+    /// `caller_ns` 会把错误降级成隔离区，写工具执行前必须用本方法才能真正确认身份。
+    pub fn resolve_session_ns(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::namespace::NsDecision, crate::namespace::NsError> {
         let cfg = &self.config.namespace;
         if cfg.effective_policy() == crate::namespace::NsPolicy::Legacy {
-            return self.caller_ns_legacy(session_id);
+            return Ok(crate::namespace::NsDecision {
+                ns: self.caller_ns_legacy(session_id),
+                origin: crate::namespace::NsOrigin::Legacy,
+            });
         }
         let persona = {
             let pid = self.persona_for_session(session_id);
@@ -2930,12 +2938,17 @@ impl AgentCore {
             }
         };
         let caller = self.caller_for_session(session_id);
-        match crate::namespace::resolve_memory_ns(
+        crate::namespace::resolve_memory_ns(
             cfg,
             caller.as_ref(),
             persona.as_ref().map(|(n, o)| (n.as_str(), o.as_str())),
             None,
-        ) {
+        )
+    }
+
+    pub fn caller_ns(&self, session_id: &str) -> String {
+        let cfg = &self.config.namespace;
+        match self.resolve_session_ns(session_id) {
             Ok(d) => {
                 if cfg.log_origin {
                     tracing::info!(
@@ -12221,11 +12234,69 @@ let content = format!(
             }
         }
 
+        // 工具分级提前到 namespace 注入之前（供 reject_unattributed 判定与 A2 文件快照复用）
+        let fc_level = {
+            let b = self.boundary.lock().await;
+            b.classifier
+                .lock()
+                .map(|c| c.classify(tool_name).to_string())
+                .unwrap_or_else(|_| "unknown".to_string())
+        };
+
         // Memoria NamespaceArg 工具：LLM/Composer 常漏传 namespace → -32002。
         // 由引擎注入调用者主 ns（allowed_ns 首个非 *；否则 identity.ns()）。
         // D0-NS：session 已知时以身份解析结果为注入源（legacy 安装ID → 隔离区、
         // admin → main_ns、同事 → 个人 NS）；旁路旧路径保持原优先级。
-        let session_ns = session_id.map(|s| self.caller_ns(s));
+        //
+        // 2026-11-07 修：原实现用 caller_ns()，其 Err 分支把所有 NsError 降级成隔离区，
+        // 导致 reject_unattributed=true 时 NoIdentity 也被吞掉、写入照样落库（假开关）。
+        // 改用 resolve_session_ns() 保留错误：无身份 + 写工具 + 开关打开 → 直接拒绝执行；
+        // 只读工具仍放行（隔离区可读），其它错误维持隔离区兜底，false 下行为逐字不变。
+        let session_ns = match session_id {
+            Some(s) => match self.resolve_session_ns(s) {
+                Ok(d) => {
+                    if self.config.namespace.log_origin {
+                        tracing::info!(
+                            target: "ns_audit",
+                            session = %s,
+                            ns = %d.ns,
+                            origin = %d.origin,
+                            tool = %tool_name,
+                            "memory ns resolved for tool"
+                        );
+                    }
+                    Some(d.ns)
+                }
+                Err(crate::namespace::NsError::NoIdentity)
+                    if crate::namespace::should_reject_unattributed(
+                        &self.config.namespace,
+                        true,
+                        fc_level == "read",
+                    ) =>
+                {
+                    tracing::warn!(
+                        target: "ns_audit",
+                        session = %s,
+                        tool = %tool_name,
+                        "unattributed write rejected (reject_unattributed=true)"
+                    );
+                    return Err(
+                        "无认证身份：写入已被拒绝（reject_unattributed=true）。请先完成登录绑定。"
+                            .to_string(),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "ns_audit",
+                        session = %s,
+                        error = %e,
+                        "memory ns resolve failed → quarantine"
+                    );
+                    Some(self.config.namespace.quarantine_ns.clone())
+                }
+            },
+            None => None,
+        };
         Self::inject_namespace_arg(
             tool_name,
             &mut call_args,
@@ -12235,13 +12306,6 @@ let content = format!(
         );
 
         // ── A2 文件级 checkpoint：WRITE/dangerous 工具执行前快照其 path 参数指向的现有文件 ──
-        let fc_level = {
-            let b = self.boundary.lock().await;
-            b.classifier
-                .lock()
-                .map(|c| c.classify(tool_name).to_string())
-                .unwrap_or_else(|_| "unknown".to_string())
-        };
         let fc_snapshots: Vec<String> =
             if fc_level == "write" || fc_level == "dangerous" {
                 crate::file_checkpoint::snapshot_args(args)

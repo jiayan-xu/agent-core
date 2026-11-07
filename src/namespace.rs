@@ -659,6 +659,8 @@ pub enum NsOrigin {
     IdentityAdmin,
     Identity,
     Quarantine,
+    /// policy=legacy 回滚路径（旧行为，不参与身份判定）
+    Legacy,
 }
 
 impl std::fmt::Display for NsOrigin {
@@ -670,6 +672,7 @@ impl std::fmt::Display for NsOrigin {
             NsOrigin::IdentityAdmin => "IdentityAdmin",
             NsOrigin::Identity => "Identity",
             NsOrigin::Quarantine => "Quarantine",
+            NsOrigin::Legacy => "Legacy",
         };
         write!(f, "{}", s)
     }
@@ -796,6 +799,19 @@ pub fn resolve_memory_ns(
     })
 }
 
+/// 无身份会话的写调用是否应被拒绝（2026-11-07）。
+///
+/// 抽成纯函数以便单测覆盖 `call_tool_routed` 的判定分支：
+/// 只有「开关打开 + 错误确为 NoIdentity + 工具非只读」三者同时成立才拒绝；
+/// 只读工具、其它 NsError、开关关闭时一律放行/走隔离区兜底（fail-open 保持旧行为）。
+pub fn should_reject_unattributed(
+    cfg: &NamespaceConfig,
+    no_identity: bool,
+    tool_is_read_only: bool,
+) -> bool {
+    cfg.reject_unattributed && no_identity && !tool_is_read_only
+}
+
 #[cfg(test)]
 mod ns_resolver_tests {
     use super::*;
@@ -919,6 +935,18 @@ mod ns_resolver_tests {
         assert!(ns_grants_access(&allowed, "agent/u_x/sub"));
         // 祖先方向必须拒绝（D3：普通账号不得借父级写入共享桶）
         assert!(!ns_grants_access(&allowed, "agent"));
+    }
+
+    /// 2026-11-07：reject_unattributed 判定矩阵——确保开关真正生效且不误伤读/其它错误
+    #[test]
+    fn unattributed_write_reject_decision() {
+        let mut c = cfg();
+        // 默认 false：即便无身份 + 写工具也不拒绝（生产现状，行为不变）
+        assert!(!should_reject_unattributed(&c, true, false));
+        c.reject_unattributed = true;
+        assert!(should_reject_unattributed(&c, true, false)); // 无身份写 → 拒
+        assert!(!should_reject_unattributed(&c, true, true)); // 只读工具 → 放行
+        assert!(!should_reject_unattributed(&c, false, false)); // 其它 NsError → 隔离区兜底
     }
 
     #[test]
