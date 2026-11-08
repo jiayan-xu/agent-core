@@ -592,6 +592,14 @@ pub enum NsPolicy {
     Legacy,
 }
 
+/// 命名对齐映射开关（OCR：枚举化，配置拼错在反序列化期报错而非静默走 direct）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NsMapping {
+    Alias,
+    Direct,
+}
+
 /// `[namespace]` 配置块（agent.toml）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -608,7 +616,7 @@ pub struct NamespaceConfig {
     /// NS 命名对齐（v1.2 P1-2，2026-11-07）：`alias` = Identity 分支优先用
     /// `allowed_ns[0]`（= 注册表 namespace = badge 作用域 = canonical）；
     /// `direct` = 一律按 `agent/<user_id>` 推导（现行为，秒级回滚）。
-    pub identity_mapping: String,
+    pub identity_mapping: NsMapping,
 }
 
 impl Default for NamespaceConfig {
@@ -624,7 +632,7 @@ impl Default for NamespaceConfig {
                 "agent/user/user/user".to_string(),
             ],
             log_origin: true,
-            identity_mapping: "alias".to_string(),
+            identity_mapping: NsMapping::Alias,
         }
     }
 }
@@ -760,7 +768,8 @@ pub fn resolve_memory_ns(
     // System（R6）：persona 绑定 → persona ns；否则隔离区（保护主库纯净；origin=System 可审计）
     let Some(c) = caller else {
         return Ok(match persona {
-            Some((ns, _)) if !ns.trim().is_empty() => NsDecision {
+            // OCR security·high：persona ns 同受封存名单约束（防 toml 配置指向封存桶绕行）
+            Some((ns, _)) if !ns.trim().is_empty() && !cfg.is_write_denied(ns.trim()) => NsDecision {
                 ns: ns.to_string(),
                 origin: NsOrigin::System,
             },
@@ -773,6 +782,10 @@ pub fn resolve_memory_ns(
     // persona：owner 严格相等（与 chat_inner 绑定处同规则，D1）
     if let Some((ns, owner)) = persona {
         if !ns.trim().is_empty() && owner == c.user_id {
+            // OCR security·high：persona ns 同受封存名单约束
+            if cfg.is_write_denied(ns.trim()) {
+                return Err(NsError::WriteDenied(ns.trim().to_string()));
+            }
             return Ok(NsDecision {
                 ns: ns.to_string(),
                 origin: NsOrigin::Persona,
@@ -791,7 +804,7 @@ pub fn resolve_memory_ns(
     // allowed_ns[0]（memoria authenticate 从 agent_registry.namespace 直出 =
     // badge 作用域本身，无需新增 RPC/列）；direct 或无映射时回退原推导。
     if !c.from_usertag && !c.user_id.is_empty() && c.user_id != "user" {
-        let canonical = if cfg.identity_mapping.eq_ignore_ascii_case("alias") {
+        let canonical = if cfg.identity_mapping == NsMapping::Alias {
             c.allowed_ns
                 .first()
                 .map(|s| s.trim().to_string())
@@ -816,7 +829,7 @@ pub fn resolve_memory_ns(
     // u_k4mk3fwmln0p → agent/xujiayan、徐凯 → agent/xukai）即视为已入册，
     // 走授权首项——同事 PFAiX 免改客户端即落个人 canonical；未 provisioning
     // 的随机安装维持隔离（D4 不变，防安装级 NS 膨胀）。authenticate 已拒归档行。
-    if c.from_usertag && cfg.identity_mapping.eq_ignore_ascii_case("alias") {
+    if c.from_usertag && cfg.identity_mapping == NsMapping::Alias {
         if let Some(first) = c
             .allowed_ns
             .iter()
@@ -1043,7 +1056,7 @@ mod ns_resolver_tests {
     #[test]
     fn direct_mapping_falls_back_to_derivation() {
         let mut cfg = cfg();
-        cfg.identity_mapping = "direct".to_string();
+        cfg.identity_mapping = NsMapping::Direct;
         let c = caller("u1", &["agent/xuyoukang"]);
         let d = resolve_memory_ns(&cfg, Some(&c), None, None).unwrap();
         assert_eq!((d.ns.as_str(), d.origin), ("agent/u1", NsOrigin::Identity));

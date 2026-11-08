@@ -6231,7 +6231,10 @@ impl AgentCore {
         }
 
         // ── 1. 快速路径（Harness 匹配）──
-        if let Some(reply) = self.try_harness_match(message, allowed_ns).await {
+        if let Some(reply) = self
+            .try_harness_match(message, allowed_ns, Some(session_id))
+            .await
+        {
             return reply;
         }
 
@@ -12252,6 +12255,10 @@ let content = format!(
         // 导致 reject_unattributed=true 时 NoIdentity 也被吞掉、写入照样落库（假开关）。
         // 改用 resolve_session_ns() 保留错误：无身份 + 写工具 + 开关打开 → 直接拒绝执行；
         // 只读工具仍放行（隔离区可读），其它错误维持隔离区兜底，false 下行为逐字不变。
+        // ⚠️ 残留缺口（OCR security·medium，2026-11-08）：caller_ns() 仍把 NoIdentity
+        // 塌缩为隔离区——quota/memory 直写、meetings.rs 等非 call_tool_routed 路径在
+        // reject_unattributed=true 下不拒绝，只落隔离区。该开关当前仅对工具路径完全
+        // 生效；直写路径迁移见方案 §13.5 待办。
         let session_ns = match session_id {
             Some(s) => match self.resolve_session_ns(s) {
                 Ok(d) => {
@@ -12297,6 +12304,16 @@ let content = format!(
             },
             None => None,
         };
+        // OCR bug·medium：legacy 回滚路径注入优先级逐字保留——旧实现注入源是
+        // 首个非 * 授权项（inject 内部旧链），不使用会话解析结果。
+        let session_ns = if self.config.namespace.effective_policy()
+            == crate::namespace::NsPolicy::Legacy
+        {
+            None
+        } else {
+            session_ns
+        };
+
         Self::inject_namespace_arg(
             tool_name,
             &mut call_args,
@@ -12954,7 +12971,12 @@ let content = format!(
 
     /// 快速路径：Harness 模板匹配
     #[tracing::instrument(skip_all, fields(message_len = message.len()))]
-    async fn try_harness_match(&self, message: &str, allowed_ns: &[String]) -> Option<String> {
+    async fn try_harness_match(
+        &self,
+        message: &str,
+        allowed_ns: &[String],
+        session_id: Option<&str>,
+    ) -> Option<String> {
         let context = serde_json::json!({
             "query": message,
             "agent_id": self.config.identity.agent_id,
@@ -13004,7 +13026,7 @@ let content = format!(
                     break;
                 }
                 let result = self
-                    .call_tool_routed(tool_name, "default", &args, allowed_ns, "", None)
+                    .call_tool_routed(tool_name, "default", &args, allowed_ns, "", session_id)
                     .await;
                 if result.is_err() {
                     all_ok = false;
