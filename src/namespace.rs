@@ -648,7 +648,13 @@ impl NamespaceConfig {
     }
 
     pub fn is_write_denied(&self, ns: &str) -> bool {
-        self.write_deny_ns.iter().any(|d| d == ns)
+        // OCR security·low：与 ns_grants_access 同强度——前缀语义 + 归一化，
+        // 防 `agent/user/子路径` 或尾斜杠变体绕过封存。
+        let ns = ns.trim().trim_end_matches('/');
+        self.write_deny_ns.iter().any(|d| {
+            let d = d.trim().trim_end_matches('/');
+            ns == d || ns.starts_with(&format!("{}/", d))
+        })
     }
 }
 

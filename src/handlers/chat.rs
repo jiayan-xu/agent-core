@@ -47,6 +47,20 @@ pub(crate) struct SetupResponse {
 
 /// D0-NS P0-2（E14）：入口 A session_id 白名单——与会话历史实测格式一致
 /// （字母数字 / `-` / `_` / `/`，≤128，非空），杜绝借构造 session_id 影响服务端行为。
+/// OCR security·medium：`jan/<agent>/…` 形态的 session_id 只允许绑定自己的
+/// 身份段（防同 sid 跨用户改绑的第二道防线；bind 处还有 user_id 比对兜底）。
+fn ensure_session_ownership(sid: &str, agent_id: &str) -> Result<(), &'static str> {
+    let mut it = sid.split('/');
+    if it.next() == Some("jan") {
+        if let Some(owner) = it.next() {
+            if !owner.is_empty() && owner != agent_id {
+                return Err("session_id 归属其他身份，拒绝绑定");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_session_id(sid: &str) -> Result<(), &'static str> {
     if sid.is_empty() {
         return Err("session_id 不能为空");
@@ -67,6 +81,9 @@ pub(crate) async fn handle_chat(
 ) -> axum::response::Response {
     // D0-NS P0-2：入口 A session_id 白名单
     if let Err(e) = validate_session_id(&req.session_id) {
+        return axum::response::Json(serde_json::json!({ "error": e })).into_response();
+    }
+    if let Err(e) = ensure_session_ownership(&req.session_id, &ctx.agent_id) {
         return axum::response::Json(serde_json::json!({ "error": e })).into_response();
     }
     // A2: 白龙马 TICK 心跳 —— 用户消息到达，抢占在途空闲 tick
@@ -122,6 +139,9 @@ pub(crate) async fn handle_chat_stream(
 ) -> axum::response::Response {
     // D0-NS P0-2：入口 A session_id 白名单
     if let Err(e) = validate_session_id(&params.session_id) {
+        return axum::response::Json(serde_json::json!({ "error": e })).into_response();
+    }
+    if let Err(e) = ensure_session_ownership(&params.session_id, &ctx.agent_id) {
         return axum::response::Json(serde_json::json!({ "error": e })).into_response();
     }
     let (tx, rx): (

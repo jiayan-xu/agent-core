@@ -436,8 +436,10 @@ pub struct AgentCore {
     pub session_personas: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// D0-NS（2026-11-06）：会话 → 认证调用方（chat 三入口在调用 chat() 前绑定；
     /// 未注册 = System 内部任务）。与 session_personas 同生命周期模式。
-    pub session_callers:
-        std::sync::Mutex<std::collections::HashMap<String, crate::namespace::NsCaller>>,
+    /// value 带绑定时刻——OCR：容量逐出按最旧（HashMap 任意序会伤在途会话）。
+    pub session_callers: std::sync::Mutex<
+        std::collections::HashMap<String, (crate::namespace::NsCaller, std::time::Instant)>,
+    >,
     /// Phase 2：分身 tick 调度器注册表（真实 tick 由 AgentCore 驱动，避免循环依赖）
     pub tick_scheduler: crate::scheduler::tick_scheduler::TickScheduler,
     /// PR5: 审批闸门（P-D 门控；默认 Auto 免人工审批，分类逻辑保留）
@@ -1932,12 +1934,31 @@ impl AgentCore {
     /// 上限防泄漏：超过 8192 且非本会话时逐出任意一条（活跃会话下轮会重新绑定）。
     pub fn bind_session_caller(&self, session_id: &str, caller: crate::namespace::NsCaller) {
         let mut m = self.session_callers.lock().unwrap_or_else(|p| p.into_inner());
-        if m.len() >= 8192 && !m.contains_key(session_id) {
-            if let Some(k) = m.keys().next().cloned() {
-                m.remove(&k);
+        // OCR security·high：同一 session_id 已被其他身份绑定时拒绝改绑——
+        // 防止知道他人 session_id 的调用方覆盖其身份归因（跨用户读写）。
+        if let Some(existing) = m.get(session_id) {
+            if existing.0.user_id != caller.user_id {
+                tracing::warn!(
+                    target: "ns_audit",
+                    session = %session_id,
+                    existing = %existing.0.user_id,
+                    attempted = %caller.user_id,
+                    "session 身份冲突，拒绝改绑（保留原绑定）"
+                );
+                return;
             }
         }
-        m.insert(session_id.to_string(), caller);
+        if m.len() >= 8192 && !m.contains_key(session_id) {
+            // OCR bug·medium：按绑定时刻逐出最旧（HashMap 任意序会伤在途会话）
+            if let Some(oldest) = m
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone())
+            {
+                m.remove(&oldest);
+            }
+        }
+        m.insert(session_id.to_string(), (caller, std::time::Instant::now()));
     }
 
     /// D0-NS：查会话认证调用方；未注册 = System 内部任务（返回 None）
@@ -1946,7 +1967,7 @@ impl AgentCore {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(session_id)
-            .cloned()
+            .map(|(c, _)| c.clone())
     }
 
     /// Phase 2：分身真实 tick —— 用该分身目标驱动一次真实 LLM 调用（仅规划，不执行工具）
@@ -12255,10 +12276,13 @@ let content = format!(
         // 导致 reject_unattributed=true 时 NoIdentity 也被吞掉、写入照样落库（假开关）。
         // 改用 resolve_session_ns() 保留错误：无身份 + 写工具 + 开关打开 → 直接拒绝执行；
         // 只读工具仍放行（隔离区可读），其它错误维持隔离区兜底，false 下行为逐字不变。
-        // ⚠️ 残留缺口（OCR security·medium，2026-11-08）：caller_ns() 仍把 NoIdentity
-        // 塌缩为隔离区——quota/memory 直写、meetings.rs 等非 call_tool_routed 路径在
-        // reject_unattributed=true 下不拒绝，只落隔离区。该开关当前仅对工具路径完全
-        // 生效；直写路径迁移见方案 §13.5 待办。
+        // ⚠️ 残留缺口（OCR security·medium，2026-11-08，已定性收口）：caller_ns() 仍把
+        // NoIdentity 塌缩为隔离区——reject_unattributed=true 时以下直写路径不拒绝、
+        // 只落隔离区：① 3345 配额键（纯计数，无害）② 3371 注入拦截历史（本地
+        // chat_history 行，非 memoria）③ 11041 检索目标/兴趣词键（读侧，无害）
+        // ④ meetings.rs:1291 会议通知归档。工具执行路径（call_tool_routed）已全量
+        // 保留错误——开关对 LLM 驱动的写路径完全生效；直写路径迁移（各点语义不同：
+        // 计数键/本地行/读目标）留待 §13.5 P3 重构，不宜本轮一刀切。
         let session_ns = match session_id {
             Some(s) => match self.resolve_session_ns(s) {
                 Ok(d) => {
