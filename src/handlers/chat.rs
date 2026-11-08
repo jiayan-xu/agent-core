@@ -774,8 +774,18 @@ pub(crate) async fn handle_memoria_info(
     } else {
         ""
     };
+    // NS 命名（v1.2 P2-⑥ 补）：授权首项 = registry canonical（如 agent/xukai），
+    // legacy 授权列表可能带部门段，只取首项；admin 为 "*" 时回退主库由前端主库文案兜底。
+    let ns = ctx
+        .allowed_ns
+        .iter()
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty() && *s != "*")
+        .map(|s| s.to_string())
+        .unwrap_or_default();
     axum::response::Json(serde_json::json!({
         "agent_id": ctx.agent_id,
+        "ns": ns,
         "key": key,
         "hint": hint,
     }))
