@@ -811,7 +811,30 @@ pub fn resolve_memory_ns(
         }
         return Ok(NsDecision { ns, origin });
     }
-    // 无身份 / legacy 安装ID / 默认身份（R2，§14-2 拍板：隔离）
+    // legacy 安装身份的「已 provisioning」例外（v1.2 P2-⑥ 补，2026-11-08）：
+    // 注册表 namespace 首项被显式指定为 ≠ agent/<tag> 默认推导（如本机
+    // u_k4mk3fwmln0p → agent/xujiayan、徐凯 → agent/xukai）即视为已入册，
+    // 走授权首项——同事 PFAiX 免改客户端即落个人 canonical；未 provisioning
+    // 的随机安装维持隔离（D4 不变，防安装级 NS 膨胀）。authenticate 已拒归档行。
+    if c.from_usertag && cfg.identity_mapping.eq_ignore_ascii_case("alias") {
+        if let Some(first) = c
+            .allowed_ns
+            .iter()
+            .map(|s| s.trim())
+            .find(|s| !s.is_empty() && *s != "*")
+        {
+            if first != &format!("{}/{}", cfg.user_prefix, c.user_id) {
+                if cfg.is_write_denied(first) {
+                    return Err(NsError::WriteDenied(first.to_string()));
+                }
+                return Ok(NsDecision {
+                    ns: first.to_string(),
+                    origin: NsOrigin::IdentityCanonical,
+                });
+            }
+        }
+    }
+    // 无身份 / 未 provisioning 的 legacy 安装ID / 默认身份（R2，§14-2 拍板：隔离）
     if cfg.reject_unattributed {
         return Err(NsError::NoIdentity);
     }
@@ -923,6 +946,24 @@ mod ns_resolver_tests {
         assert_eq!(d.ns, "agent/许有康_u_e864p91o736d");
         // v1.2 P1-2：授权首项即 canonical（与推导同值时 origin 仍标 IdentityCanonical）
         assert_eq!(d.origin, NsOrigin::IdentityCanonical);
+    }
+
+    #[test]
+    fn provisioned_legacy_usertag_uses_registry_canonical() {
+        // 已 provisioning 的 legacy 安装（注册表首项 ≠ agent/<tag>）：走 canonical
+        let mut c = caller("u_k4mk3fwmln0p", &["agent/xujiayan"]);
+        c.from_usertag = true;
+        let d = resolve_memory_ns(&cfg(), Some(&c), None, None).unwrap();
+        assert_eq!((d.ns.as_str(), d.origin), ("agent/xujiayan", NsOrigin::IdentityCanonical));
+    }
+
+    #[test]
+    fn unprovisioned_legacy_usertag_still_quarantines() {
+        // 未 provisioning（授权首项 = 默认推导 agent/<tag>）：D4 隔离不变
+        let mut c = caller("u_random_install", &["agent/u_random_install"]);
+        c.from_usertag = true;
+        let d = resolve_memory_ns(&cfg(), Some(&c), None, None).unwrap();
+        assert_eq!(d.origin, NsOrigin::Quarantine);
     }
 
     #[test]
