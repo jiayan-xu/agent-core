@@ -1261,11 +1261,11 @@ pub struct Message {
 /// `needs_redaction` 门控，无敏感的单条消息跳过 sanitize 分配（ocr 2026-08-12
 /// 第四轮 perf·medium）。
 ///
-/// 残余风险（已知边界，security·medium 文档化）：仅覆盖 `role=user` 的 `content`
-/// 字段；`role=tool`（MCP 输出，可能含连接串/命令回显）、`assistant`（回显粘贴的
-/// 密钥）以及 `tool_calls`/`tool_call_id` 字段仍原样上送。历史全量重发时上述向量
-/// 可持续泄漏——如需覆盖须扩展脱敏范围（当前设计有意限定 user 正文，避免误伤
-/// 工具语义输出）。
+/// 残余风险（已知边界，security·medium 文档化 → **P0-5 部分收口 2026-11-11**）：
+/// stage 1（凭证）仅覆盖 `role=user` 的 `content`；stage 2（privacy，见
+/// `privacy_stage`）把车牌/公司/手机/证件占位符化扩展到**所有角色的 content 与
+/// 历史 tool_calls 参数**（含 `role=tool` 的 MCP 输出）。凭证类（连接串/命令回显）
+/// 在 tool/assistant 消息中仍原样上送——PII 已收口，凭证向量如需覆盖须另行扩展。
 pub(crate) fn sanitize_messages(messages: &[Message]) -> Cow<'_, [Message]> {
     let mut needs_redact = false;
     for m in messages.iter().filter(|m| m.role == "user") {
@@ -1277,7 +1277,7 @@ pub(crate) fn sanitize_messages(messages: &[Message]) -> Cow<'_, [Message]> {
         }
     }
     if !needs_redact {
-        return Cow::Borrowed(messages);
+        return privacy_stage(Cow::Borrowed(messages));
     }
     let out: Vec<Message> = messages
         .iter()
@@ -1303,6 +1303,58 @@ pub(crate) fn sanitize_messages(messages: &[Message]) -> Cow<'_, [Message]> {
                 }
             }
             m.clone()
+        })
+        .collect();
+    privacy_stage(Cow::Owned(out))
+}
+
+/// 传输层脱敏 stage 2：PII 隐私掩码（P0-5，2026-11-11）。
+///
+/// stage 1（凭证）只覆盖 user 正文；本层把车牌/公司/手机/证件占位符化扩展到
+/// **所有角色的 content 与历史 tool_calls 参数**（含 role=tool 的 MCP 输出——
+/// 原「已知边界」中明文上送的向量）。只改外发副本，不改历史存储；开关关闭或
+/// `may_contain` 零命中时零克隆直通（闲聊路径保持 Borrowed）。
+fn privacy_stage(stage1: Cow<'_, [Message]>) -> Cow<'_, [Message]> {
+    if crate::privacy::disabled() {
+        return stage1;
+    }
+    // 探测轮（零克隆；mask_text 零命中零分配）：任何 PII 命中才进入应用轮，
+    // 干净历史保持 Borrowed（tool_message_untouched 语义——含数字但无 PII 的
+    // 工具结果不应破坏零克隆直通）
+    let hit = stage1.iter().any(|m| {
+        m.content
+            .as_ref()
+            .is_some_and(|c| crate::privacy::may_contain(c) && crate::privacy::mask_text(c).is_some())
+            || m.tool_calls.as_ref().is_some_and(|tcs| {
+                tcs.iter().any(|tc| {
+                    crate::privacy::may_contain(&tc.function.arguments)
+                        && crate::privacy::mask_text(&tc.function.arguments).is_some()
+                })
+            })
+    });
+    if !hit {
+        return stage1;
+    }
+    // 应用轮（已确定有命中）
+    let out: Vec<Message> = stage1
+        .iter()
+        .map(|m| {
+            let mut m2 = m.clone();
+            if let Some(c) = &m2.content {
+                if let Some(masked) = crate::privacy::mask_text(c) {
+                    m2.content = Some(masked);
+                }
+            }
+            if let Some(tcs) = &mut m2.tool_calls {
+                for tc in tcs.iter_mut() {
+                    // arguments 是 JSON 字符串：值域为车牌/公司/电话等朴素标量，
+                    // 直接对字符串掩码（值内不含引号/转义，不改 JSON 结构）
+                    if let Some(masked) = crate::privacy::mask_text(&tc.function.arguments) {
+                        tc.function.arguments = masked;
+                    }
+                }
+            }
+            m2
         })
         .collect();
     Cow::Owned(out)
@@ -1602,6 +1654,9 @@ impl LlmClient {
                     .unwrap_or(0),
             })
         });
+        // P0-5：回复与工具入参反掩码（历史/工具执行侧见原文；LLM 侧只见 token）
+        let text = crate::privacy::unmask_text(&text).unwrap_or(text);
+        let tool_calls = crate::privacy::unmask_tool_calls(tool_calls);
         Ok(LlmResponse { text, tool_calls, usage })
     }
 
@@ -1872,6 +1927,8 @@ impl LlmClient {
                                 "budgeted 响应缺少 finish_reason 且未上报 usage，截断判定不可用");
                         }
 
+                        // P0-5：回复与工具入参反掩码（与 chat_impl 出口同规）
+                        let response = crate::privacy::unmask_response(response);
                         return Ok(response);
                     }
                     Err(e) => {
@@ -2009,6 +2066,9 @@ impl LlmClient {
         // 注：仅累积 delta.content（与 TextEvt 一致）；reasoning_content 经 ThinkingEvt
         // 单独推送、不进历史（历史记录只需最终回答），tool_calls 参数增量同理。
         let mut full_text = String::new();
+        // P0-5：流式反掩码（跨 chunk token 可能切断，carry 保尾拼接还原）
+        let mut text_unmasker = crate::privacy::StreamUnmasker::new();
+        let mut think_unmasker = crate::privacy::StreamUnmasker::new();
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result.map_err(|e| format!("stream read: {}", e))?;
@@ -2021,7 +2081,7 @@ impl LlmClient {
                 let data = &line[6..];
                 if data == "[DONE]" {
                     let _ = sender.send(SseEvent::DoneEvt);
-                    return Ok(full_text);
+                    return Ok(crate::privacy::unmask_text(&full_text).unwrap_or(full_text));
                 }
 
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
@@ -2034,9 +2094,10 @@ impl LlmClient {
                         // thinking
                         if let Some(tc) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
                             if !tc.is_empty() {
-                                let _ = sender.send(SseEvent::ThinkingEvt {
-                                    content: tc.to_string(),
-                                });
+                                let out = think_unmasker.push(tc);
+                                if !out.is_empty() {
+                                    let _ = sender.send(SseEvent::ThinkingEvt { content: out });
+                                }
                             }
                         }
 
@@ -2044,9 +2105,10 @@ impl LlmClient {
                         if let Some(tc) = delta.get("content").and_then(|c| c.as_str()) {
                             if !tc.is_empty() {
                                 full_text.push_str(tc);
-                                let _ = sender.send(SseEvent::TextEvt {
-                                    content: tc.to_string(),
-                                });
+                                let out = text_unmasker.push(tc);
+                                if !out.is_empty() {
+                                    let _ = sender.send(SseEvent::TextEvt { content: out });
+                                }
                             }
                         }
 
@@ -2057,7 +2119,9 @@ impl LlmClient {
                                 let name =
                                     tc["function"]["name"].as_str().unwrap_or("").to_string();
                                 let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
-                                if let Ok(args) = serde_json::from_str(args_str) {
+                                if let Ok(mut args) = serde_json::from_str::<serde_json::Value>(args_str) {
+                                    // P0-5：LLM 可能用占位符构造查询参数，转发前还原
+                                    crate::privacy::unmask_value(&mut args);
                                     let _ = sender.send(SseEvent::ToolCallEvt {
                                         name,
                                         arguments: args,
@@ -2072,7 +2136,7 @@ impl LlmClient {
         }
 
         let _ = sender.send(SseEvent::DoneEvt);
-        Ok(full_text)
+        Ok(crate::privacy::unmask_text(&full_text).unwrap_or(full_text))
     }
 }
 
@@ -2592,7 +2656,8 @@ mod sanitize_messages_tests {
 
     #[test]
     fn tool_message_untouched() {
-        // tool 消息含类似 key 的文本也不应脱敏（只处理 role=user）
+        // tool 消息含类似 key 的文本也不应脱敏（凭证 stage 只处理 role=user；
+        // privacy stage 探测 sk- 类文本无 PII 命中 → 零克隆直通保持 Borrowed）
         let msgs = vec![Message {
             role: "tool".into(),
             content: Some("result sk-abc1234567890abcdefgh".into()),
@@ -2602,6 +2667,38 @@ mod sanitize_messages_tests {
         let out = sanitize_messages(&msgs);
         assert!(matches!(out, Cow::Borrowed(_)), "tool 消息不在脱敏范围，应走 Borrowed");
         assert_eq!(out[0].content.as_ref().unwrap(), "result sk-abc1234567890abcdefgh");
+    }
+
+    #[test]
+    fn tool_message_pii_masked() {
+        // P0-5 新契约：tool 结果中的车牌/公司名必须掩码后再上送 LLM
+        //（原「已知边界：role=tool 原样上送」向量就此收口）
+        let msgs = vec![Message {
+            role: "tool".into(),
+            content: Some("今日进场：苏E12345 苏州天悦环保科技有限公司 2车".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let out = sanitize_messages(&msgs);
+        assert!(matches!(out, Cow::Owned(_)), "tool 消息含 PII 应走 Owned");
+        let c = out[0].content.as_ref().unwrap();
+        assert!(!c.contains("苏E12345") && !c.contains("天悦"), "PII 未掩码: {}", c);
+        assert!(c.contains("「车牌") && c.contains("「公司"), "缺占位符: {}", c);
+    }
+
+    #[test]
+    fn user_phone_masked_outbound() {
+        // P0-5：user 消息中的手机号（含 +86 前缀）出站前占位符化
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: Some("联系 +8613812345678 核对".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let out = sanitize_messages(&msgs);
+        let c = out[0].content.as_ref().unwrap();
+        assert!(!c.contains("13812345678"), "手机号未掩码: {}", c);
+        assert!(c.contains("「手机"), "缺占位符: {}", c);
     }
 
     #[test]
