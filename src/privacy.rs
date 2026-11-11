@@ -11,7 +11,10 @@
 //! - 手机：`(?<!\d)(?:\+?86)?1[3-9]\d{9}(?!\d)`
 //! - 证件：`(?<!\d)\d{17}[0-9Xx](?!\d)`
 //! - 公司：后缀（有限公司/股份公司/集团/合伙企业，前导 CJK/括号 2-24）+
-//!   无后缀供应商字典（~/.pfaix_org_dict.json，≥3 字符，仅缓存成功加载）
+//!   无后缀供应商字典（~/.pfaix_org_dict.json，≥3 字符）。**字典加载语义与
+//!   Python 端有意不同**：Python（mcp_server.py/proxy.py）失败后每次调用重试；
+//!   本模块为负缓存 + ORG_DICT_RETRY_SECS=300s 周期重试——代价是字典文件
+//!   新建/修复后最迟 5 分钟生效。
 //! - 总开关：AGENTCORE_MASK_DISABLE env 或标记文件 ~/.agent-core-mask-off
 //!   （与 Python 双通道同款；演示后删文件即恢复）
 //!
@@ -29,7 +32,6 @@ const PROVINCES: &str = "京津沪渝冀豫云辽黑吉苏浙皖闽赣鲁湘鄂�
 /// 车牌分隔符（P0-2 审计修订：苏E·1A2B3 等写法此前漏脱敏）
 const PLATE_SEPS: &str = "·•.・";
 const ORG_SUFFIXES: [&str; 4] = ["有限公司", "股份公司", "集团", "合伙企业"];
-const KIND_CN: [&str; 4] = ["车牌", "公司", "手机", "证件"];
 /// org 字典加载结果（含空表与失败负缓存）的重试间隔——ocr perf·medium 修复：
 /// 无字典部署此前每次 mask_text 持全局锁做阻塞 FS 读，探测/应用双扫再翻倍。
 const ORG_DICT_RETRY_SECS: u64 = 300;
@@ -46,8 +48,16 @@ impl PiiKind {
     fn idx(self) -> usize {
         self as usize
     }
+    /// 穷举 match（ocr maint·low 修复）：token 标签的正确性不再依赖枚举顺序与
+    /// KIND_CN 数组顺序的隐式同步——unmask 侧（含 Python _max_idx）按这些
+    /// 精确标签匹配，错位会让「手机」被掩成「证件N」并破坏反掩码。
     fn cn(self) -> &'static str {
-        KIND_CN[self.idx()]
+        match self {
+            PiiKind::Car => "车牌",
+            PiiKind::Org => "公司",
+            PiiKind::Phone => "手机",
+            PiiKind::Id => "证件",
+        }
     }
 }
 
