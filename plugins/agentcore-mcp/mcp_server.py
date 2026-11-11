@@ -335,6 +335,7 @@ def _load_org_dict():
     path = os.environ.get("AGENTCORE_ORG_DICT") or os.path.join(
         os.path.expanduser("~"), ".pfaix_org_dict.json")
     names = []
+    ok = False
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
@@ -342,9 +343,14 @@ def _load_org_dict():
             # 去重 + 仅保留 ≥3 字符（过短易误伤）+ 长名优先（防子串先命中截断）
             names = sorted({s for s in data if isinstance(s, str) and len(s) >= 3},
                            key=lambda s: -len(s))
-    except (OSError, ValueError):
-        names = []
-    _ORG_DICT_CACHE = names
+            ok = True
+    except (OSError, ValueError) as e:
+        sys.stderr.write("[mask] WARN: org dict load failed ({}) {}\n".format(e, path))
+    # 仅缓存成功加载（含合法空表）：文件缺失/损坏时下轮调用重试，不把失败
+    # 钉死为空字典（否则共享字典后建时静默失效到重启——ocr 审查 bug·medium，
+    # 与 office_proxy 同规）
+    if ok:
+        _ORG_DICT_CACHE = names
     return names
 
 
