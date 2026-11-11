@@ -21,7 +21,7 @@
 //! 重新编号（历史存原文，无跨进程一致性需求）。
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// 车牌省份简称（与 Python `_PLATE_RE` 逐字一致——28 个，琼/晋/蒙不在其中，
 /// 属已知覆盖边界，与既有审计口径保持 parity）
@@ -30,10 +30,26 @@ const PROVINCES: &str = "京津沪渝冀豫云辽黑吉苏浙皖闽赣鲁湘鄂�
 const PLATE_SEPS: &str = "·•.・";
 const ORG_SUFFIXES: [&str; 4] = ["有限公司", "股份公司", "集团", "合伙企业"];
 const KIND_CN: [&str; 4] = ["车牌", "公司", "手机", "证件"];
-const K_CAR: usize = 0;
-const K_ORG: usize = 1;
-const K_PH: usize = 2;
-const K_ID: usize = 3;
+/// org 字典加载结果（含空表与失败负缓存）的重试间隔——ocr perf·medium 修复：
+/// 无字典部署此前每次 mask_text 持全局锁做阻塞 FS 读，探测/应用双扫再翻倍。
+const ORG_DICT_RETRY_SECS: u64 = 300;
+
+/// PII 类别（ocr maint·low 修复：替代裸 usize 下标，非法值不可表示）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PiiKind {
+    Car,
+    Org,
+    Phone,
+    Id,
+}
+impl PiiKind {
+    fn idx(self) -> usize {
+        self as usize
+    }
+    fn cn(self) -> &'static str {
+        KIND_CN[self.idx()]
+    }
+}
 
 fn is_plate_body(c: char) -> bool {
     c.is_ascii_digit() || is_plate_letter(c)
@@ -86,9 +102,9 @@ fn mask_map_path() -> std::path::PathBuf {
 struct State {
     map: BTreeMap<String, String>, // 原文 → token
     counters: [u32; 4],
-    /// None=未成功加载过（失败不缓存，下次调用重试——对齐 P0-2 审计
-    /// 「仅缓存成功加载」语义）；Some(空表)=成功加载且字典确为空
-    org_dict: Option<Vec<String>>,
+    /// 上次字典加载结果（成功/空表/失败负缓存同形）+ 时间戳；
+    /// ORG_DICT_RETRY_SECS 内直接复用 Arc，不重试 FS。
+    org_dict: Option<(Arc<Vec<String>>, std::time::Instant)>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -97,12 +113,12 @@ static STATE: Mutex<State> = Mutex::new(State {
     org_dict: None,
 });
 
-fn token_for(state: &mut State, kind: usize, val: &str) -> String {
+fn token_for(state: &mut State, kind: PiiKind, val: &str) -> String {
     if let Some(tok) = state.map.get(val) {
         return tok.clone();
     }
-    state.counters[kind] += 1;
-    let tok = format!("「{}{}」", KIND_CN[kind], state.counters[kind]);
+    state.counters[kind.idx()] += 1;
+    let tok = format!("「{}{}」", kind.cn(), state.counters[kind.idx()]);
     state.map.insert(val.to_string(), tok.clone());
     persist_map(&state.map);
     tok
@@ -130,11 +146,20 @@ fn persist_map(map: &BTreeMap<String, String>) {
     }
 }
 
-/// 供应商简称字典（≥3 字符、去重、长名优先）。
-fn org_dict(state: &mut State) -> Vec<String> {
-    if let Some(v) = &state.org_dict {
-        return v.clone();
+/// 供应商简称字典（≥3 字符、去重、长名优先）。结果 Arc 共享 + 周期门控重试
+/// （失败/缺失也负缓存 ORG_DICT_RETRY_SECS，每周期至多一次 FS 读与一条 WARN）。
+fn org_dict(state: &mut State) -> Arc<Vec<String>> {
+    if let Some((arc, at)) = &state.org_dict {
+        if at.elapsed().as_secs() < ORG_DICT_RETRY_SECS {
+            return arc.clone();
+        }
     }
+    let arc = Arc::new(load_org_dict());
+    state.org_dict = Some((arc.clone(), std::time::Instant::now()));
+    arc
+}
+
+fn load_org_dict() -> Vec<String> {
     let path = std::env::var("AGENTCORE_ORG_DICT")
         .ok()
         .filter(|p| !p.trim().is_empty())
@@ -144,7 +169,6 @@ fn org_dict(state: &mut State) -> Vec<String> {
             std::path::Path::new(&home).join(".pfaix_org_dict.json")
         });
     let mut names: Vec<String> = Vec::new();
-    let mut ok = false;
     match std::fs::read_to_string(&path) {
         Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
             Ok(serde_json::Value::Array(items)) => {
@@ -156,20 +180,16 @@ fn org_dict(state: &mut State) -> Vec<String> {
                         }
                     }
                 }
-                ok = true;
             }
             _ => tracing::warn!(target: "agent.privacy", "org dict 形态非数组: {}", path.display()),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // 缺省即无字典文件（文档承诺零影响），静默、不告警、不缓存
+            // 缺省即无字典文件（文档承诺零影响），静默；负缓存由外层周期门控承担
         }
         Err(e) => tracing::warn!(target: "agent.privacy", "org dict 读取失败: {}", e),
     }
-    if ok {
-        names.sort_by_key(|b| std::cmp::Reverse(b.chars().count()));
-        names.dedup();
-        state.org_dict = Some(names.clone());
-    }
+    names.sort_by_key(|b| std::cmp::Reverse(b.chars().count()));
+    names.dedup();
     names
 }
 
@@ -181,10 +201,11 @@ struct OrgSpan {
 
 fn org_spans(chars: &[char], dict: &[String]) -> Vec<OrgSpan> {
     let mut spans: Vec<OrgSpan> = Vec::new();
+    // ocr perf·low 修复：后缀 char 集合每调用收集一次，不在逐位循环里重分配
+    let suffix_sets: Vec<Vec<char>> = ORG_SUFFIXES.iter().map(|s| s.chars().collect()).collect();
     // ① 后缀匹配（前导 CJK/括号 2-24，正则 {2,24} 语义：可用则取满 24，≥2 才成 span）
     for i in 0..chars.len() {
-        for suf in ORG_SUFFIXES {
-            let sc: Vec<char> = suf.chars().collect();
+        for sc in &suffix_sets {
             if chars.len() >= i + sc.len() && chars[i..i + sc.len()] == sc[..] {
                 let mut run = 0usize;
                 while run < 24 && run < i && is_org_lead(chars[i - run - 1]) {
@@ -222,7 +243,7 @@ fn org_spans(chars: &[char], dict: &[String]) -> Vec<OrgSpan> {
 }
 
 /// 各匹配器统一返回 (kind, 匹配原文, 消费字符数)。
-fn match_plate(chars: &[char], i: usize) -> Option<(usize, String, usize)> {
+fn match_plate(chars: &[char], i: usize) -> Option<(PiiKind, String, usize)> {
     let n = chars.len();
     if !PROVINCES.contains(chars[i]) || i + 1 >= n || !is_plate_letter(chars[i + 1]) {
         return None;
@@ -238,10 +259,10 @@ fn match_plate(chars: &[char], i: usize) -> Option<(usize, String, usize)> {
     if !(4..=6).contains(&(j - body_start)) {
         return None;
     }
-    Some((K_CAR, chars[i..j].iter().collect(), j - i))
+    Some((PiiKind::Car, chars[i..j].iter().collect(), j - i))
 }
 
-fn match_phone(chars: &[char], i: usize) -> Option<(usize, String, usize)> {
+fn match_phone(chars: &[char], i: usize) -> Option<(PiiKind, String, usize)> {
     let n = chars.len();
     // 前缀 +86 / 86（前邻非数字），随后 1[3-9]\d{9}；裸 1 开头 11 位
     let (p, start_check) = if chars[i] == '+' && i + 3 < n && chars[i + 1] == '8' && chars[i + 2] == '6' {
@@ -268,10 +289,10 @@ fn match_phone(chars: &[char], i: usize) -> Option<(usize, String, usize)> {
     if p + 11 < n && chars[p + 11].is_ascii_digit() {
         return None; // (?!\d)
     }
-    Some((K_PH, chars[i..p + 11].iter().collect(), p + 11 - i))
+    Some((PiiKind::Phone, chars[i..p + 11].iter().collect(), p + 11 - i))
 }
 
-fn match_idcard(chars: &[char], i: usize) -> Option<(usize, String, usize)> {
+fn match_idcard(chars: &[char], i: usize) -> Option<(PiiKind, String, usize)> {
     let n = chars.len();
     if i > 0 && chars[i - 1].is_ascii_digit() {
         return None; // (?<!\d)
@@ -291,7 +312,7 @@ fn match_idcard(chars: &[char], i: usize) -> Option<(usize, String, usize)> {
     if i + 18 < n && chars[i + 18].is_ascii_digit() {
         return None; // (?!\d)
     }
-    Some((K_ID, chars[i..i + 18].iter().collect(), 18))
+    Some((PiiKind::Id, chars[i..i + 18].iter().collect(), 18))
 }
 
 /// 便宜的 org 后缀存在性预判（避免字典为空且无后缀时白建 span 表）。
@@ -329,7 +350,7 @@ pub fn mask_text(text: &str) -> Option<String> {
         }
         if matches!(spans.first(), Some(s) if s.start == i) {
             let span = spans.remove(0);
-            let tok = token_for(&mut guard, K_ORG, &span.text);
+            let tok = token_for(&mut guard, PiiKind::Org, &span.text);
             out.push_str(&tok);
             i = span.end;
             changed = true;
@@ -494,8 +515,31 @@ impl Default for StreamUnmasker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Once;
+
+    /// 测试环境隔离（ocr 修复）：映射写穿与临时字典均指向 %TEMP% 专用目录——
+    /// 此前 cargo test 会把测试语料写进生产路径 D:\pfaix_agents\...\pfaix_mask_map.json，
+    /// 且 roundtrip 用例依赖机器上真实 ~/.pfaix_org_dict.json（非自包含）。
+    static ENV_INIT: Once = Once::new();
+
+    fn init_env() {
+        ENV_INIT.call_once(|| {
+            let dir = std::env::temp_dir().join("agent_core_privacy_tests");
+            let _ = std::fs::create_dir_all(&dir);
+            let map = dir.join("mask_map.json");
+            let _ = std::fs::remove_file(&map);
+            std::env::set_var("AGENTCORE_MASK_FILE", &map);
+            let dict = dir.join("org_dict.json");
+            let _ = std::fs::write(
+                &dict,
+                "[\"江苏理文造纸\",\"理文造纸\",\"苏州天悦环保\",\"天悦环保\",\"舒心环境\",\"苏州新立丰\"]",
+            );
+            std::env::set_var("AGENTCORE_ORG_DICT", &dict);
+        });
+    }
 
     fn mask(s: &str) -> String {
+        init_env();
         mask_text(s).unwrap_or_else(|| s.to_string())
     }
 
