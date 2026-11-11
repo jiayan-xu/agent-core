@@ -326,10 +326,11 @@ _IDCARD_RE = re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)")
 # ~/.pfaix_org_dict.json，env AGENTCORE_ORG_DICT 可覆盖；文件缺失=空字典（零影响）。
 # 进程内缓存一次（改字典需重启 MCP 宿主）。
 _ORG_DICT_CACHE = None
+_ORG_DICT_WARNED = False  # ocr 审查：load 失败 WARN 一次性去重（mask_text 热路径防刷屏）
 
 
 def _load_org_dict():
-    global _ORG_DICT_CACHE
+    global _ORG_DICT_CACHE, _ORG_DICT_WARNED
     if _ORG_DICT_CACHE is not None:
         return _ORG_DICT_CACHE
     path = os.environ.get("AGENTCORE_ORG_DICT") or os.path.join(
@@ -344,8 +345,14 @@ def _load_org_dict():
             names = sorted({s for s in data if isinstance(s, str) and len(s) >= 3},
                            key=lambda s: -len(s))
             ok = True
+        else:
+            # ocr 审查：合法 JSON 但形态不对（非数组）——静默失败要可见
+            if not _ORG_DICT_WARNED:
+                sys.stderr.write("[mask] WARN: org dict invalid (not a list): {}\n".format(path))
     except (OSError, ValueError) as e:
-        sys.stderr.write("[mask] WARN: org dict load failed ({}) {}\n".format(e, path))
+        if not _ORG_DICT_WARNED:
+            _ORG_DICT_WARNED = True
+            sys.stderr.write("[mask] WARN: org dict load failed ({}) {}\n".format(e, path))
     # 仅缓存成功加载（含合法空表）：文件缺失/损坏时下轮调用重试，不把失败
     # 钉死为空字典（否则共享字典后建时静默失效到重启——ocr 审查 bug·medium，
     # 与 office_proxy 同规）
