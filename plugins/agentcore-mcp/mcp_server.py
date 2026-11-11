@@ -313,10 +313,39 @@ def _mask_file():
 
 
 _CN_KIND = {"CAR": "车牌", "ORG": "公司", "PH": "手机", "ID": "证件"}
-_PLATE_RE = re.compile(r"[京津沪渝冀豫云辽黑吉苏浙皖闽赣鲁湘鄂粤桂川贵藏陕甘青宁新][A-HJ-NP-Z][A-HJ-NP-Z0-9]{4,6}")
+# 2026-11-11 P0-2 脱敏覆盖度审计修订（与 office_proxy/proxy.py 保持同规同步）：
+# ① 车牌允许一位分隔符（苏E·1A2B3 / 苏E.12345 等 ·•.・ 写法此前漏脱敏）
+# ② 手机号允许 +86/86 前缀（+8613812345678 此前被前邻数字 (?<!\d) 拦下漏脱敏）
+_PLATE_RE = re.compile(r"[京津沪渝冀豫云辽黑吉苏浙皖闽赣鲁湘鄂粤桂川贵藏陕甘青宁新][A-HJ-NP-Z][·•.・]?[A-HJ-NP-Z0-9]{4,6}")
 _ORG_RE = re.compile(r"[\u4e00-\u9fff（）()]{2,24}(?:有限公司|股份公司|集团|合伙企业)")
-_PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_PHONE_RE = re.compile(r"(?<!\d)(?:\+?86)?1[3-9]\d{9}(?!\d)")
 _IDCARD_RE = re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)")
+
+# 2026-11-11 P0-2：无后缀供应商简称字典（「理文造纸」「舒心环境」等无公司后缀，
+# 不走 _ORG_RE 后缀匹配，此前漏脱敏）。JSON 数组、条目 ≥3 字符；缺省
+# ~/.pfaix_org_dict.json，env AGENTCORE_ORG_DICT 可覆盖；文件缺失=空字典（零影响）。
+# 进程内缓存一次（改字典需重启 MCP 宿主）。
+_ORG_DICT_CACHE = None
+
+
+def _load_org_dict():
+    global _ORG_DICT_CACHE
+    if _ORG_DICT_CACHE is not None:
+        return _ORG_DICT_CACHE
+    path = os.environ.get("AGENTCORE_ORG_DICT") or os.path.join(
+        os.path.expanduser("~"), ".pfaix_org_dict.json")
+    names = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            # 去重 + 仅保留 ≥3 字符（过短易误伤）+ 长名优先（防子串先命中截断）
+            names = sorted({s for s in data if isinstance(s, str) and len(s) >= 3},
+                           key=lambda s: -len(s))
+    except (OSError, ValueError):
+        names = []
+    _ORG_DICT_CACHE = names
+    return names
 
 
 def _load_mask_context():
@@ -402,20 +431,26 @@ def mask_text(text, mctx=None):
 
     # ocr 修复：先查 mapping 再分配（原 mk() 在 lambda 里无条件先求值，重复值浪费
     # 计数器导致 token 编号复用 → 掩码歧义）
+    def _put(kind, val):
+        if val not in mapping:
+            counters[kind] += 1
+            mapping[val] = "\u300c%s%d\u300d" % (_CN_KIND[kind], counters[kind])
+            dirty[0] = True
+        return mapping[val]
+
     def _sub(kind):
         def f(m):
-            val = m.group(0)
-            if val not in mapping:
-                counters[kind] += 1
-                mapping[val] = "\u300c%s%d\u300d" % (_CN_KIND[kind], counters[kind])
-                dirty[0] = True
-            return mapping[val]
+            return _put(kind, m.group(0))
         return f
 
     text = _PLATE_RE.sub(_sub("CAR"), text)
     text = _ORG_RE.sub(_sub("ORG"), text)
     text = _PHONE_RE.sub(_sub("PH"), text)
     text = _IDCARD_RE.sub(_sub("ID"), text)
+    # P0-2：无后缀供应商简称字典（后缀正则先跑，整名已掩码的文本不受影响）
+    for name in _load_org_dict():
+        if name in text:
+            text = text.replace(name, _put("ORG", name))
 
     if own:
         _flush_mask_context(mctx)
