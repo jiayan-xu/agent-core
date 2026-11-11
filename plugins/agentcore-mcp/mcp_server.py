@@ -309,7 +309,22 @@ def _redact_badge_token(body, include_token: bool) -> None:
 
 
 def _mask_file():
-    return env("AGENTCORE_MASK_FILE") or os.path.join(os.getcwd(), "pfaix_mask_map.json")
+    """映射文件路径：env 显式指定优先；否则按 cwd（= codex 拉起时的
+    <AGENTS_ROOT>/<tag>/work，与 office_proxy 反掩码同文件配对）。
+
+    P1-4 顺带收口（2026-11-11，PR#64 遗留"cwd 安全边界"）：cwd 派生路径必须
+    落在 AGENTS_ROOT 内——越界（异常拉起目录）时不落盘（掩码仍在内存生效，
+    仅失去与 office_proxy 的共享映射），防止向任意目录写映射文件。
+    """
+    explicit = env("AGENTCORE_MASK_FILE")
+    if explicit:
+        return explicit
+    cwd = os.path.realpath(os.getcwd())
+    root = os.path.realpath(env("PFAIX_AGENTS_ROOT") or r"D:\pfaix_agents")
+    if os.path.normcase(cwd).startswith(os.path.normcase(root) + os.sep):
+        return os.path.join(cwd, "pfaix_mask_map.json")
+    sys.stderr.write("[mask] WARN: cwd 不在 AGENTS_ROOT 内，映射仅内存态不落盘: %s\n" % cwd)
+    return None
 
 
 _CN_KIND = {"CAR": "车牌", "ORG": "公司", "PH": "手机", "ID": "证件"}
@@ -369,6 +384,9 @@ def _load_mask_context():
     叶子都调用一次 → 单次 tools/call 成本 O(叶子数 × 映射大小)。"""
     path = _mask_file()
     load_failed = [False]
+    if path is None:
+        # cwd 越界：仅内存态（掩码生效，不共享 office_proxy 映射、不落盘）
+        return {}, {k: 0 for k in ("CAR", "ORG", "PH", "ID")}, [False], [True]
     try:
         with open(path, encoding="utf-8") as f:
             mapping = json.load(f)
@@ -404,6 +422,8 @@ def _flush_mask_context(mctx):
     if not (dirty[0] and not load_failed[0]):
         return
     path = _mask_file()
+    if path is None:
+        return  # cwd 越界：不落盘（load 侧已按内存态处理）
     try:
         tmp = path + ".tmp"
         with pathlib.Path(tmp).open("w", encoding="utf-8") as f:
