@@ -321,7 +321,13 @@ def _mask_file():
         return explicit
     cwd = os.path.realpath(os.getcwd())
     root = os.path.realpath(env("PFAIX_AGENTS_ROOT") or r"D:\pfaix_agents")
-    if os.path.normcase(cwd).startswith(os.path.normcase(root) + os.sep):
+    # ocr 审查修复：盘符根（D:\）等场景 startswith(root+sep) 恒假——改用
+    # commonpath（跨盘符 ValueError 按越界处理，fail-closed 不变）
+    try:
+        inside = os.path.commonpath([os.path.normcase(cwd), os.path.normcase(root)]) == os.path.normcase(root)
+    except ValueError:
+        inside = False
+    if inside:
         return os.path.join(cwd, "pfaix_mask_map.json")
     sys.stderr.write("[mask] WARN: cwd 不在 AGENTS_ROOT 内，映射仅内存态不落盘: %s\n" % cwd)
     return None
@@ -386,7 +392,9 @@ def _load_mask_context():
     load_failed = [False]
     if path is None:
         # cwd 越界：仅内存态（掩码生效，不共享 office_proxy 映射、不落盘）
-        return {}, {k: 0 for k in ("CAR", "ORG", "PH", "ID")}, [False], [True]
+        # ocr 审查修复：计数器键种从 _CN_KIND 派生，防未来新增类别时
+        # _put() KeyError 把降级路径变硬崩
+        return {}, {k: 0 for k in _CN_KIND}, [False], [True]
     try:
         with open(path, encoding="utf-8") as f:
             mapping = json.load(f)
