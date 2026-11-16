@@ -264,7 +264,11 @@ pub(crate) async fn handle_collab_inbox(
         let agent_guard = st.agent.lock().await;
         if let Some(ref agent) = *agent_guard {
             let limit = q.limit.unwrap_or(50).clamp(1, 200) as u32;
-            match agent.collab_inbox_raw(&agent_id, &agent_key, limit).await {
+            // 2026-11-16：同人别名合并——同一 display_name 的多条注册行（部门规范
+            // 漂移 operation/yunxing、登录态 u_xxx 与安装 tag 并存）互为别名。
+            // 发送按通讯录 username 投递、会话身份可能解析到另一条行，不合并则
+            // 「发得出、对方收件箱看不到」。
+            match agent.collab_inbox_merged(&agent_id, &agent_key, limit).await {
                 Ok(v) => v,
                 Err(e) => {
                     return (

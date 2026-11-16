@@ -33,6 +33,17 @@ pub const CONFIRM_PREFIXES: &[&str] = &["确认", "同意", "批准", "执行吧
 /// 与 `std::process::id()` 拼成唯一临时名 `meetings.tmp.<pid>.<计数>`，每次写入都落在新文件上，
 /// 崩溃残留的陈旧 tmp 不再阻塞后续落盘（固定名 + create_new 的可恢复性回归，见 write_meetings_file）。
 static WRITE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 同人别名收件箱缓存（2026-11-16）：agent_id → 同 display_name 的其他注册行 id。
+/// 60s TTL——收件箱 30s 轮询，避免每次请求打 memoria agent_list。
+static COLLAB_ALIAS_CACHE: std::sync::Mutex<
+    Option<(std::time::Instant, std::collections::HashMap<String, Vec<String>>)>,
+> = std::sync::Mutex::new(None);
+/// 别名 badge 缓存（2026-11-16）：agent_id → badge。register_agent 对存量 id
+/// 回传原 badge 且不轮换，可安全缓存；10 分钟 TTL。无此缓存时每轮收件箱轮询
+/// 要为每个别名行代取一次 badge（徐佳琰 23 个别名行 = 44 次 memoria 调用/轮）。
+static COLLAB_BADGE_CACHE: std::sync::Mutex<
+    Option<(std::time::Instant, std::collections::HashMap<String, String>)>,
+> = std::sync::Mutex::new(None);
 /// 临时文件写入的自愈重试上限（reviewer round-22 #2 security·low）：create_new 遇 AlreadyExists
 /// （目标被预创建 / 残留）时换下一计数重试，最多本上限次。有界防止本地攻击者预创建大量文件
 /// 无限拖长落盘，同时保留 create_new 防 symlink —— 攻击者需预创建全部上线数量的文件才可能让
@@ -9275,6 +9286,132 @@ let content = format!(
             out.push(Self::map_a2a_message(m));
         }
         Ok(out)
+    }
+
+    // ── 同人别名收件箱合并（2026-11-16，修复「发得出、对方看不到」）──
+    // 背景：同一自然人在 Memoria 注册表可有多条 agent_id 行——部门段规范化漂移
+    // （operation↔yunxing）、登录态 `cs-pufa-2nd-thermal_{dept}_{user_id}` 与
+    // 安装 tag 行并存。发送侧按通讯录 username（目录去重后的规范行）投递，消息落
+    // agent/{目录id}；接收侧会话身份（office_proxy 按 tag+当前部门 register 派生）
+    // 可能解析到另一条注册行，收件箱只读 agent/{会话id} → 永远为空。
+    // 修复：以注册表 display_name 为人物主键，合并全部同名 id 的收件箱。
+    // badge 经 admin 代取（memoria register_agent 对存量 id 回传原 badge、不轮换，
+    // 不破坏 office_proxy 会话缓存）；安全边界：仅合并同 display_name 的 id，且
+    // 全部为本厂注册身份（agent-core 持 admin key，属受托基础设施操作）。
+    pub async fn collab_inbox_merged(
+        &self,
+        caller_agent_id: &str,
+        caller_agent_key: &str,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let mut msgs = self
+            .collab_inbox_raw(caller_agent_id, caller_agent_key, limit)
+            .await?;
+        for aid in self.collab_alias_ids(caller_agent_id).await {
+            if let Some(badge) = self.collab_fetch_badge(&aid).await {
+                let mcp = McpClient::new(&self.config.memoria_url, &aid, &badge);
+                if let Ok(val) = mcp.call_json("a2a_recv", &serde_json::json!({ "limit": limit })).await {
+                    if let Some(arr) = val["messages"].as_array() {
+                        for m in arr {
+                            let mapped = Self::map_a2a_message(m);
+                            // 跨别名去重：同 id 只留一条（自发副本等）
+                            if !msgs.iter().any(|x| x["id"] == mapped["id"]) {
+                                msgs.push(mapped);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 新在前（与单 ns 的 ORDER BY created_at DESC 一致）；ISO/T 与空格两种
+        // 时间格式归一后比较，避免混排乱序
+        msgs.sort_by(|a, b| {
+            let ta = a["created_at"].as_str().unwrap_or("").replace('T', " ");
+            let tb = b["created_at"].as_str().unwrap_or("").replace('T', " ");
+            tb.cmp(&ta)
+        });
+        msgs.truncate(limit as usize);
+        Ok(msgs)
+    }
+
+    /// 同 display_name 的其他注册行 id（60s TTL 缓存，避免每次轮询打 agent_list）。
+    /// 返回空 = 本人无别名行或注册表不可达（降级为单 ns 收件箱，行为不变）。
+    pub async fn collab_alias_ids(&self, caller_agent_id: &str) -> Vec<String> {
+        {
+            let guard = COLLAB_ALIAS_CACHE.lock().unwrap();
+            if let Some((at, map)) = &*guard {
+                if at.elapsed() < std::time::Duration::from_secs(60) {
+                    return map.get(caller_agent_id).cloned().unwrap_or_default();
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Ok(peers) = self.collab_list_peers().await {
+            let dn = peers
+                .iter()
+                .find(|p| p["agent_id"].as_str() == Some(caller_agent_id))
+                .and_then(|p| p["display_name"].as_str())
+                .unwrap_or("")
+                .to_string();
+            if !dn.is_empty() {
+                out = peers
+                    .iter()
+                    .filter(|p| p["display_name"].as_str() == Some(dn.as_str()))
+                    .filter_map(|p| p["agent_id"].as_str().map(|s| s.to_string()))
+                    .filter(|id| id != caller_agent_id)
+                    .collect();
+            }
+        }
+        let mut guard = COLLAB_ALIAS_CACHE.lock().unwrap();
+        let map = guard
+            .get_or_insert_with(|| (std::time::Instant::now(), std::collections::HashMap::new()));
+        map.1.insert(caller_agent_id.to_string(), out.clone());
+        out
+    }
+
+    /// 经 admin 代取指定 id 的 badge（register_agent 对存量 id 回传原 badge）。
+    /// 10 分钟 TTL 缓存——存量 badge 不轮换，缓存安全；未命中才打 memoria。
+    async fn collab_fetch_badge(&self, agent_id: &str) -> Option<String> {
+        {
+            let guard = COLLAB_BADGE_CACHE.lock().unwrap();
+            if let Some((at, map)) = &*guard {
+                if at.elapsed() < std::time::Duration::from_secs(600) {
+                    if let Some(b) = map.get(agent_id) {
+                        return Some(b.clone());
+                    }
+                }
+            }
+        }
+        let admin_key = std::env::var("MEMORIA_ADMIN_KEY").unwrap_or_default();
+        let val = self
+            .mcp
+            .call_json(
+                "register_agent",
+                &serde_json::json!({
+                    "agent_id": agent_id,
+                    "display_name": agent_id,
+                    "admin_key": admin_key,
+                    // memoria 工具门（NamespaceArg 必填，-32002）；存量 id 时该参数
+                    // 被 INSERT OR IGNORE 忽略，仅用于通过参数校验
+                    "namespace": format!("agent/{}", agent_id),
+                }),
+            )
+            .await
+            .ok()?;
+        // 内联解析（config 模块仅 bin 可见；与 config::extract_register_badge 同逻辑）
+        let badge = if let Some(s) = val.get("badge").and_then(|x| x.as_str()) {
+            Some(s.to_string())
+        } else {
+            val.get("badge")
+                .and_then(|x| x.get("badge_token"))
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+        }?;
+        let mut guard = COLLAB_BADGE_CACHE.lock().unwrap();
+        let map = guard
+            .get_or_insert_with(|| (std::time::Instant::now(), std::collections::HashMap::new()));
+        map.1.insert(agent_id.to_string(), badge.clone());
+        Some(badge)
     }
 
     /// 将 Memoria 原始 A2A 消息规范化为协作信封。
