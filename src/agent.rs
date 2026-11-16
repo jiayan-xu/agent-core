@@ -11147,11 +11147,17 @@ let content = format!(
         for aid in self.collab_alias_ids(caller_agent_id).await {
             if let Some(badge) = self.collab_fetch_badge(&aid).await {
                 let mcp2 = McpClient::new(&self.config.memoria_url, &aid, &badge);
-                if let Ok(v2) = mcp2
+                match mcp2
                     .call_json("a2a_delete", &serde_json::json!({ "id": msg_id }))
                     .await
                 {
-                    total += v2["deleted"].as_u64().unwrap_or(0);
+                    Ok(v2) => total += v2["deleted"].as_u64().unwrap_or(0),
+                    Err(e) => {
+                        // 2026-11-16（ocr low）：别名副本删除失败不能静默——本轮仍报
+                        // ok，下轮合并轮询该 id 会「复活」。至少留痕供诊断。
+                        tracing::warn!(target: "collab", aid = %aid, id = %msg_id, err = %e,
+                            "collab_delete_message: 别名 ns 副本删除失败，消息可能复活");
+                    }
                 }
             }
         }
