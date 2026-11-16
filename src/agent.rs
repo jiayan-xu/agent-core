@@ -9310,7 +9310,18 @@ let content = format!(
         for aid in self.collab_alias_ids(caller_agent_id).await {
             if let Some(badge) = self.collab_fetch_badge(&aid).await {
                 let mcp = McpClient::new(&self.config.memoria_url, &aid, &badge);
-                if let Ok(val) = mcp.call_json("a2a_recv", &serde_json::json!({ "limit": limit })).await {
+                if let Ok(val) = mcp
+                    .call_json(
+                        "a2a_recv",
+                        &serde_json::json!({
+                            "limit": limit,
+                            // 与全部既有调用点一致显式传 namespace（memoria 工具门
+                            // NamespaceArg 惯例；漏传若网关强制会 -32002 静默 no-op）
+                            "namespace": format!("agent/{}", aid),
+                        }),
+                    )
+                    .await
+                {
                     if let Some(arr) = val["messages"].as_array() {
                         for m in arr {
                             let mapped = Self::map_a2a_message(m);
@@ -9336,12 +9347,16 @@ let content = format!(
 
     /// 同 display_name 的其他注册行 id（60s TTL 缓存，避免每次轮询打 agent_list）。
     /// 返回空 = 本人无别名行或注册表不可达（降级为单 ns 收件箱，行为不变）。
+    /// 缓存只缓存「已计算过的 caller」；缓存期内新出现的 caller 必须回源计算，
+    /// 不能被 unwrap_or_default 短路（多同事轮询场景，除第一人外全部误判无别名）。
     pub async fn collab_alias_ids(&self, caller_agent_id: &str) -> Vec<String> {
         {
             let guard = COLLAB_ALIAS_CACHE.lock().unwrap();
             if let Some((at, map)) = &*guard {
                 if at.elapsed() < std::time::Duration::from_secs(60) {
-                    return map.get(caller_agent_id).cloned().unwrap_or_default();
+                    if let Some(v) = map.get(caller_agent_id) {
+                        return v.clone();
+                    }
                 }
             }
         }
@@ -11077,8 +11092,10 @@ let content = format!(
         caller_agent_key: &str,
         msg_id: &str,
     ) -> Result<Option<serde_json::Value>, String> {
+        // 2026-11-16（ocr high 修复）：走合并视图查找——审批信封可能落在别名 ns
+        // （身份漂移场景），单 ns 查找会让非管理员审批恒落 admin-only 分支 403。
         let inbox = self
-            .collab_inbox_raw(caller_agent_id, caller_agent_key, 200)
+            .collab_inbox_merged(caller_agent_id, caller_agent_key, 200)
             .await?;
         Ok(inbox
             .into_iter()
@@ -11103,7 +11120,28 @@ let content = format!(
             )
             .await
             .map_err(|e| format!("a2a_delete 失败: {}", e))?;
-        Ok(val["deleted"].as_u64().unwrap_or(0))
+        let deleted = val["deleted"].as_u64().unwrap_or(0);
+        if deleted > 0 {
+            return Ok(deleted);
+        }
+        // 2026-11-16（ocr high 修复）：合并视图的消息 id 可能归属别名 ns（同人
+        // 多注册行）。本 ns 删不到时按别名逐个回退删除（以别名身份调 a2a_delete，
+        // memoria 按调用方 _auth.agent_id 的 ns 删除）。
+        for aid in self.collab_alias_ids(caller_agent_id).await {
+            if let Some(badge) = self.collab_fetch_badge(&aid).await {
+                let mcp2 = McpClient::new(&self.config.memoria_url, &aid, &badge);
+                if let Ok(v2) = mcp2
+                    .call_json("a2a_delete", &serde_json::json!({ "id": msg_id }))
+                    .await
+                {
+                    let d2 = v2["deleted"].as_u64().unwrap_or(0);
+                    if d2 > 0 {
+                        return Ok(d2);
+                    }
+                }
+            }
+        }
+        Ok(0)
     }
 
     /// 解析旧版 `[subject] body` 文本消息为信封各部分（type 降级为 `message`）。
