@@ -9378,6 +9378,16 @@ let content = format!(
             }
         }
         let mut guard = COLLAB_ALIAS_CACHE.lock().unwrap();
+        // 2026-11-16（ocr low 修复）：写回时若窗口已过期需重置时间戳，否则
+        // get_or_insert_with 永远返回陈旧 instant——60s 后缓存静默失效，
+        // 每轮询都打 agent_list（正是缓存要消除的开销）。
+        let expired = guard
+            .as_ref()
+            .map(|(at, _)| at.elapsed() >= std::time::Duration::from_secs(60))
+            .unwrap_or(true);
+        if expired {
+            *guard = Some((std::time::Instant::now(), std::collections::HashMap::new()));
+        }
         let map = guard
             .get_or_insert_with(|| (std::time::Instant::now(), std::collections::HashMap::new()));
         map.1.insert(caller_agent_id.to_string(), out.clone());
@@ -9423,6 +9433,14 @@ let content = format!(
                 .map(|s| s.to_string())
         }?;
         let mut guard = COLLAB_BADGE_CACHE.lock().unwrap();
+        // 同 alias 缓存：过期重置时间戳（ocr low），否则 TTL 一次后缓存失效
+        let expired = guard
+            .as_ref()
+            .map(|(at, _)| at.elapsed() >= std::time::Duration::from_secs(600))
+            .unwrap_or(true);
+        if expired {
+            *guard = Some((std::time::Instant::now(), std::collections::HashMap::new()));
+        }
         let map = guard
             .get_or_insert_with(|| (std::time::Instant::now(), std::collections::HashMap::new()));
         map.1.insert(agent_id.to_string(), badge.clone());
@@ -11120,13 +11138,12 @@ let content = format!(
             )
             .await
             .map_err(|e| format!("a2a_delete 失败: {}", e))?;
-        let deleted = val["deleted"].as_u64().unwrap_or(0);
-        if deleted > 0 {
-            return Ok(deleted);
-        }
-        // 2026-11-16（ocr high 修复）：合并视图的消息 id 可能归属别名 ns（同人
-        // 多注册行）。本 ns 删不到时按别名逐个回退删除（以别名身份调 a2a_delete，
-        // memoria 按调用方 _auth.agent_id 的 ns 删除）。
+        let mut total = val["deleted"].as_u64().unwrap_or(0);
+        // 2026-11-16（ocr low 修复）：合并视图按 id 去重后只显示一条，但同一 id
+        // 的副本可能同时存在于本 ns 与别名 ns（memoria 按调用方 ns 删除）；删本
+        // ns 成功后仍遍历别名删净并汇总，避免下轮合并轮询同 id 副本「复活」
+        // （memoria 消息 id = timestamp_millis+type，跨 ns 同 id 还可能是不同消息，
+        // 一并清理才符合合并视图语义）。
         for aid in self.collab_alias_ids(caller_agent_id).await {
             if let Some(badge) = self.collab_fetch_badge(&aid).await {
                 let mcp2 = McpClient::new(&self.config.memoria_url, &aid, &badge);
@@ -11134,14 +11151,11 @@ let content = format!(
                     .call_json("a2a_delete", &serde_json::json!({ "id": msg_id }))
                     .await
                 {
-                    let d2 = v2["deleted"].as_u64().unwrap_or(0);
-                    if d2 > 0 {
-                        return Ok(d2);
-                    }
+                    total += v2["deleted"].as_u64().unwrap_or(0);
                 }
             }
         }
-        Ok(0)
+        Ok(total)
     }
 
     /// 解析旧版 `[subject] body` 文本消息为信封各部分（type 降级为 `message`）。
