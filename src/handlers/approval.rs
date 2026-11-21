@@ -220,6 +220,27 @@ pub(crate) async fn handle_approval_respond(
             )
                 .into_response();
         }
+        // SECFIX 2026-11-21：代码写入类审批（edit_code）只允许 admin 决定，
+        // 部门经理不得审批代码改动——防「改权限系统自身源码」被委托审批放行。
+        let is_code_write = {
+            let guard = st.agent.lock().await;
+            match guard.as_ref() {
+                Some(a) => a
+                    .approval_manager
+                    .get_pending(&id)
+                    .await
+                    .map(|p| p.tool_name == "edit_code")
+                    .unwrap_or(false),
+                None => false,
+            }
+        };
+        if is_code_write {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "代码写入审批（edit_code）仅限管理员决定"})),
+            )
+                .into_response();
+        }
         approver_id = caller;
     }
     let guard = st.agent.lock().await;
@@ -384,11 +405,12 @@ fn b64url_nopad(data: &[u8]) -> String {
 
 pub(crate) async fn handle_approval_dingtalk_notify(
     State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    // 鉴权与 pending/respond 同门：APPROVAL_OPEN_LAN（网络位置即身份）
-    // （无 headers 参数——该端点只读审批信息+出站通知，不产生审批决策）
-    if !approval_open_lan() {
+    // SECFIX 2026-11-21：钉钉通知入口与 pending/respond 同门——APPROVAL_OPEN_LAN=0 后
+    // 回退 admin key 校验（否则审批台「推钉钉」按钮在收紧后失效）。
+    if !(approval_open_lan() || is_admin(&headers, &st).await) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error": "此入口未开放（需 APPROVAL_OPEN_LAN）"})),

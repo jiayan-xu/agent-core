@@ -13006,6 +13006,39 @@ let content = format!(
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false);
         if has_ns {
+            // SECFIX 2026-11-21：LLM 显式传入的 namespace 必须落在调用者 allowed_ns
+            // 授权范围内，否则收窄到调用者自身命名空间——堵死跨命名空间读取
+            // （如同事智能体读 agent/xujiayan 主记忆区）。
+            let provided = args
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !Self::ns_allowed(&provided, allowed_ns) {
+                let ns = session_ns
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != "*")
+                    .map(str::to_string)
+                    .or_else(|| {
+                        allowed_ns
+                            .iter()
+                            .find(|s| !s.is_empty() && *s != "*")
+                            .cloned()
+                    })
+                    .unwrap_or_else(Self::memoria_main_ns);
+                if !ns.is_empty() && ns != "*" {
+                    tracing::warn!(
+                        tool = %tool_name,
+                        requested_ns = %provided,
+                        clamped_to = %ns,
+                        "SECFIX: namespace 越权请求已收窄到调用者授权范围"
+                    );
+                    if let Some(obj) = args.as_object_mut() {
+                        obj.insert("namespace".to_string(), serde_json::json!(ns));
+                    }
+                }
+            }
             return;
         }
         if !Self::tool_accepts_namespace(tool_name) {
@@ -13032,6 +13065,25 @@ let content = format!(
             obj.insert("namespace".to_string(), serde_json::json!(ns));
             tracing::debug!(tool = %tool_name, namespace = %ns, "inject namespace for memoria tool");
         }
+    }
+
+    /// SECFIX 2026-11-21：target 是否落在 allowed_ns 任一授权前缀内。
+    /// "*" = 全权限（admin）；允许精确命中或授权 ns 为祖先前缀。
+    /// 不允许 target 是授权 ns 的祖先（防借窄授权扩宽读取面）。
+    fn ns_allowed(target: &str, allowed: &[String]) -> bool {
+        if target.is_empty() {
+            return true;
+        }
+        allowed.iter().any(|a| {
+            let a = a.trim();
+            if a.is_empty() {
+                return false;
+            }
+            if a == "*" {
+                return true;
+            }
+            target == a || target.starts_with(&format!("{}/", a))
+        })
     }
 
     /// 主记忆区命名空间兜底（memoria 交接协议 v1 配套）：全权限身份无具体 ns 时

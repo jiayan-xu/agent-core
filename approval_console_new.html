@@ -54,7 +54,11 @@
 <div class="pf-top"><div class="pf-top-bar"><div class="pf-top-c"><img class="pf-top-logo" src="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Ctext x=%2712%27 y=%2718%27 font-size=%2718%27 text-anchor=%27middle%27%3E%F0%9F%9B%A1%EF%B8%8F%3C/text%3E%3C/svg%3E" alt=""><div class="pf-top-txt"><h1 class="pf-top-t">人工审批台</h1><div class="pf-top-s">危险/红线工具二次确认 · 真人兜底</div></div></div><div class="pf-top-l"></div><div class="pf-top-r"><div class="pf-top-user"><span class="pf-top-un" id="pfUser">…</span></div><span class="pf-top-clock" id="pfClock"></span></div></div></div>
 <div class="wrap">
   <div class="keybar">
-    <span class="auto-note">🔒 身份由办公网 IP 绑定 + 防火墙白名单保证（APPROVAL_OPEN_LAN=1）</span>
+    <span class="auto-note">🔑 管理员密钥：</span>
+    <input id="adminKey" type="password" placeholder="MEMORIA 管理密钥（仅存本机浏览器）"
+           style="min-width:280px;padding:6px 8px;border:1px solid #cfd8e6;border-radius:6px;background:#fbfcfe;color:#1a2332"
+           onchange="saveKey()">
+    <span class="auto-note" id="keyNote">审批已收紧（APPROVAL_OPEN_LAN=0），须填写密钥</span>
     <button class="btn-refresh" onclick="load()">刷新待审</button>
     <button class="btn-history" onclick="loadHistory()">审批历史</button>
     <button class="btn-ding-oa" onclick="openDingOA()">钉钉客户端 ↗</button>
@@ -68,13 +72,23 @@
   <div id="history" style="display:none; margin-top:16px;"></div>
 <script>
 let AUTO = null;
+// SECFIX 2026-11-21：审批已收紧（APPROVAL_OPEN_LAN=0），所有审批端点需管理员密钥。
+function adminKey() { const el = document.getElementById("adminKey"); return el ? el.value.trim() : ""; }
+function saveKey() { try { localStorage.setItem("approval_admin_key", adminKey()); } catch(e) {} }
+function consoleHeaders(extra) {
+  const h = Object.assign({}, extra || {});
+  const k = adminKey();
+  if (k) { h["X-Agent-Key"] = k; h["X-Admin-Key"] = k; }
+  return h;
+}
+try { document.getElementById("adminKey").value = localStorage.getItem("approval_admin_key") || ""; } catch(e) {}
 async function load() {
   const list = document.getElementById("list");
   document.getElementById("history").style.display = "none";
   list.style.display = "";
   list.innerHTML = '<div class="empty">加载中…</div>';
   try {
-    const r = await fetch("/api/approval/pending", {});
+    const r = await fetch("/api/approval/pending", { headers: consoleHeaders() });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) { list.innerHTML = '<div class="empty err">' + esc(j.error || "加载失败") + '</div>'; }
     else if (!j.items || j.items.length === 0) { list.innerHTML = '<div class="empty">无待审批项</div>'; }
@@ -120,7 +134,7 @@ async function loadOps() {
 async function respond(id, hash, approved, reason) {
   const r = await fetch("/api/approval/" + encodeURIComponent(id) + "/respond", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: consoleHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ approved: approved, reason: reason || null, operation_hash: hash })
   });
   const j = await r.json().catch(() => ({}));
@@ -136,7 +150,7 @@ async function loadHistory() {
   hist.style.display = "block";
   hist.innerHTML = '<div class="empty">加载中…</div>';
   try {
-    const r = await fetch("/api/approval/history", {});
+    const r = await fetch("/api/approval/history", { headers: consoleHeaders() });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) { hist.innerHTML = '<div class="empty err">' + esc(j.error || "加载失败") + '</div>'; return; }
     if (!j.items || j.items.length === 0) { hist.innerHTML = '<div class="empty">暂无审批历史</div>'; return; }
@@ -249,7 +263,7 @@ function _dingFallback(url) {
 async function dingNotify(id, btn) {  if (btn.disabled) return;
   btn.disabled = true; var old = btn.textContent; btn.textContent = "推送中…";
   try {
-    const r = await fetch("/api/approval/" + encodeURIComponent(id) + "/dingtalk-notify", { method: "POST" });
+    const r = await fetch("/api/approval/" + encodeURIComponent(id) + "/dingtalk-notify", { method: "POST", headers: consoleHeaders() });
     const j = await r.json().catch(() => ({}));
     if (r.ok && j.ok) { toast("已推送到钉钉 ✓"); btn.textContent = "已推送 ✓"; }
     else if (r.status === 412) { toast("未配置钉钉机器人（缺 webhook）"); btn.textContent = old; }

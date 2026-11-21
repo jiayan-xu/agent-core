@@ -118,9 +118,18 @@ marked.setOptions({ breaks: true, gfm: true });
 
 function esc(t) { return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
+// SECFIX 2026-11-21：注册后除 EventSource 外一律携带身份头；EventSource 无法自定义
+// header，故 chat/stream 通过 query 参数传身份（服务端 auth_middleware 已支持）。
+function authHeaders() {
+  return {
+    'X-Agent-Id': localStorage.getItem('agent_id') || '',
+    'X-Agent-Key': localStorage.getItem('badge_token') || ''
+  };
+}
+
 async function loadSessions() {
   try {
-    const r = await fetch('/api/sessions');
+    const r = await fetch('/api/sessions', { headers: authHeaders() });
     const d = await r.json();
     const sl = $('session-list'); sl.innerHTML = '';
     (d.sessions || []).forEach(s => {
@@ -134,7 +143,7 @@ async function loadSessions() {
       close.onclick = async (e) => { 
         e.stopPropagation(); 
         if (!confirm('删除此对话？')) return;
-        await fetch('/api/sessions/' + encodeURIComponent(s.session_id), { method: 'DELETE' });
+        await fetch('/api/sessions/' + encodeURIComponent(s.session_id), { method: 'DELETE', headers: authHeaders() });
         loadSessions();
         if (s.session_id === sessionId) newChat();
       };
@@ -155,7 +164,7 @@ async function switchSession(sid) {
   $('msgs').innerHTML = '';
   sessionId = sid;
   try {
-    const r = await fetch('/api/sessions/' + encodeURIComponent(sid));
+    const r = await fetch('/api/sessions/' + encodeURIComponent(sid), { headers: authHeaders() });
     const d = await r.json();
     (d.messages || []).forEach(m => {
       addMsg(m.role === 'user' ? 'user' : 'agent',
@@ -266,7 +275,9 @@ async function chat() {
   $('send').disabled = true; $('st').textContent = '\u25CF 处理中'; $('st').className = 'st busy';
   rmWait();
 
-  const url = '/api/chat/stream?message=' + encodeURIComponent(txt) + '&session_id=' + (sessionId || 'default');
+  const url = '/api/chat/stream?message=' + encodeURIComponent(txt) + '&session_id=' + (sessionId || 'default')
+            + '&agent_id=' + encodeURIComponent(localStorage.getItem('agent_id') || '')
+            + '&agent_key=' + encodeURIComponent(localStorage.getItem('badge_token') || '');
   const evtSource = new EventSource(url);
 
   let msgDiv = null;
