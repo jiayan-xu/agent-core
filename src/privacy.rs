@@ -11,7 +11,7 @@
 //! - 手机：`(?<!\d)(?:\+?86)?1[3-9]\d{9}(?!\d)`
 //! - 证件：`(?<!\d)\d{17}[0-9Xx](?!\d)`
 //! - 公司：后缀（有限公司/股份公司/集团/合伙企业，前导 CJK/括号 2-24）+
-//!   无后缀供应商字典（~/.pfaix_org_dict.json，≥3 字符）。**字典加载语义与
+//!   无后缀供应商字典（~/.pfaix_org_dict.json，长度治理归 sync 层）。**字典加载语义与
 //!   Python 端有意不同**：Python（mcp_server.py/proxy.py）失败后每次调用重试；
 //!   本模块为负缓存 + ORG_DICT_RETRY_SECS=300s 周期重试——代价是字典文件
 //!   新建/修复后最迟 5 分钟生效。
@@ -156,7 +156,7 @@ fn persist_map(map: &BTreeMap<String, String>) {
     }
 }
 
-/// 供应商简称字典（≥3 字符、去重、长名优先）。结果 Arc 共享 + 周期门控重试
+/// 供应商简称字典（非空、去重、长名优先；短词由 sync「破例」标记治理）。结果 Arc 共享 + 周期门控重试
 /// （失败/缺失也负缓存 ORG_DICT_RETRY_SECS，每周期至多一次 FS 读与一条 WARN）。
 fn org_dict(state: &mut State) -> Arc<Vec<String>> {
     if let Some((arc, at)) = &state.org_dict {
@@ -184,8 +184,9 @@ fn load_org_dict() -> Vec<String> {
             Ok(serde_json::Value::Array(items)) => {
                 for it in items {
                     if let Some(s) = it.as_str() {
+                        // 长度治理在 source/sync 层（含「破例」短词标记）；运行侧仅防御空串/1字符（与 sync ≥2 契约对齐）
                         let t = s.trim();
-                        if t.chars().count() >= 3 {
+                        if t.chars().count() >= 2 {
                             names.push(t.to_string());
                         }
                     }
