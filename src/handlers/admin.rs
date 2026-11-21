@@ -165,7 +165,7 @@ pub(crate) async fn handle_persona_create(
     State(st): State<Arc<AppState>>,
     body: Option<Json<serde_json::Value>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, _, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -187,14 +187,25 @@ pub(crate) async fn handle_persona_create(
         .map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
     let memory_namespace = v.get("memory_namespace").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    // 安全（OCR round7 high）：运行时 API 创建的 persona 不得声明记忆 NS——
+    // 否则创建者可把召回重定向到他人主记忆区（跨员工越权）。跨员工绑定
+    //（如 pai → agent/xujiayan）仅限 agent.toml 静态配置的管理员通道；
+    // 运行时创建一律走默认 agent/{persona_id}。
+    if !memory_namespace.is_empty() {
+        return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "memory_namespace 仅限 agent.toml 静态配置设置；运行时创建请留空（默认 agent/{persona_id}）"
+        }))).into_response();
+    }
     let llm: Option<LlmConfig> = v
         .get("llm")
         .and_then(|x| serde_json::from_value(x.clone()).ok());
+    // P5: 分身专属指令（运行时创建也可声明；属主自己 persona 的行为契约）
+    let instructions = v.get("instructions").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let g = st.agent.lock().await;
     let Some(ref agent) = *g else {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "agent 尚未就绪").into_response();
     };
-    match agent.create_persona(&persona_id, &display_name, &owner_user_id, tool_allowlist, memory_namespace, llm, is_private) {
+    match agent.create_persona(&persona_id, &display_name, &owner_user_id, tool_allowlist, memory_namespace, llm, is_private, instructions) {
         Ok(()) => {
             agent.save_personas();
             Json(serde_json::json!({"ok": true, "persona_id": persona_id, "owner_user_id": owner_user_id, "is_private": is_private})).into_response()
@@ -208,7 +219,7 @@ pub(crate) async fn handle_persona_list(
     headers: axum::http::HeaderMap,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, _, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -241,7 +252,7 @@ pub(crate) async fn handle_persona_delete(
     axum::extract::Path(id): axum::extract::Path<String>,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, _, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -316,7 +327,7 @@ pub(crate) async fn handle_persona_get(
     axum::extract::Path(id): axum::extract::Path<String>,
     State(st): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let (caller, _) = match authenticate(&headers, &st).await {
+    let (caller, _, _) = match authenticate(&headers, &st).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };

@@ -185,7 +185,10 @@ def http_json(
             detail = str(parsed.get("error") or parsed.get("message") or "")
         elif parsed is None and raw.strip():
             detail = raw.strip()[:500]
-        raise ToolError("HTTP %s %s %s %s" % (status, method, path, detail).strip())
+        # 2026-11-03 修复：原写法 (tuple).strip() —— 属性访问优先级高于 %，
+        # 任何 HTTP>=400 都先炸 AttributeError:'tuple' object has no attribute 'strip'，
+        # 把网关的真实错误信息（如"未找到工具"、参数校验提示）全部吞成天书。
+        raise ToolError(("HTTP %s %s %s %s" % (status, method, path, detail)).strip())
     return {"status": status, "json": parsed, "raw": raw}
 
 
@@ -306,14 +309,77 @@ def _redact_badge_token(body, include_token: bool) -> None:
 
 
 def _mask_file():
-    return env("AGENTCORE_MASK_FILE") or os.path.join(os.getcwd(), "pfaix_mask_map.json")
+    """映射文件路径：env 显式指定优先；否则按 cwd（= codex 拉起时的
+    <AGENTS_ROOT>/<tag>/work，与 office_proxy 反掩码同文件配对）。
+
+    P1-4 顺带收口（2026-11-11，PR#64 遗留"cwd 安全边界"）：cwd 派生路径必须
+    落在 AGENTS_ROOT 内——越界（异常拉起目录）时不落盘（掩码仍在内存生效，
+    仅失去与 office_proxy 的共享映射），防止向任意目录写映射文件。
+    """
+    explicit = env("AGENTCORE_MASK_FILE")
+    if explicit:
+        return explicit
+    cwd = os.path.realpath(os.getcwd())
+    root = os.path.realpath(env("PFAIX_AGENTS_ROOT") or r"D:\pfaix_agents")
+    # ocr 审查修复：盘符根（D:\）等场景 startswith(root+sep) 恒假——改用
+    # commonpath（跨盘符 ValueError 按越界处理，fail-closed 不变）
+    try:
+        inside = os.path.commonpath([os.path.normcase(cwd), os.path.normcase(root)]) == os.path.normcase(root)
+    except ValueError:
+        inside = False
+    if inside:
+        return os.path.join(cwd, "pfaix_mask_map.json")
+    sys.stderr.write("[mask] WARN: cwd 不在 AGENTS_ROOT 内，映射仅内存态不落盘: %s\n" % cwd)
+    return None
 
 
 _CN_KIND = {"CAR": "车牌", "ORG": "公司", "PH": "手机", "ID": "证件"}
-_PLATE_RE = re.compile(r"[京津沪渝冀豫云辽黑吉苏浙皖闽赣鲁湘鄂粤桂川贵藏陕甘青宁新][A-HJ-NP-Z][A-HJ-NP-Z0-9]{4,6}")
+# 2026-11-11 P0-2 脱敏覆盖度审计修订（与 office_proxy/proxy.py 保持同规同步）：
+# ① 车牌允许一位分隔符（苏E·1A2B3 / 苏E.12345 等 ·•.・ 写法此前漏脱敏）
+# ② 手机号允许 +86/86 前缀（+8613812345678 此前被前邻数字 (?<!\d) 拦下漏脱敏）
+_PLATE_RE = re.compile(r"[京津沪渝冀豫云辽黑吉苏浙皖闽赣鲁湘鄂粤桂川贵藏陕甘青宁新][A-HJ-NP-Z][·•.・]?[A-HJ-NP-Z0-9]{4,6}")
 _ORG_RE = re.compile(r"[\u4e00-\u9fff（）()]{2,24}(?:有限公司|股份公司|集团|合伙企业)")
-_PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_PHONE_RE = re.compile(r"(?<!\d)(?:\+?86)?1[3-9]\d{9}(?!\d)")
 _IDCARD_RE = re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)")
+
+# 2026-11-11 P0-2：无后缀供应商简称字典（「理文造纸」「舒心环境」等无公司后缀，
+# 不走 _ORG_RE 后缀匹配，此前漏脱敏）。JSON 数组、条目 ≥3 字符；缺省
+# ~/.pfaix_org_dict.json，env AGENTCORE_ORG_DICT 可覆盖；文件缺失=空字典（零影响）。
+# 进程内缓存一次（改字典需重启 MCP 宿主）。
+_ORG_DICT_CACHE = None
+_ORG_DICT_WARNED = False  # ocr 审查：load 失败 WARN 一次性去重（mask_text 热路径防刷屏）
+
+
+def _load_org_dict():
+    global _ORG_DICT_CACHE, _ORG_DICT_WARNED
+    if _ORG_DICT_CACHE is not None:
+        return _ORG_DICT_CACHE
+    path = os.environ.get("AGENTCORE_ORG_DICT") or os.path.join(
+        os.path.expanduser("~"), ".pfaix_org_dict.json")
+    names = []
+    ok = False
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            # 去重 + 仅保留 ≥3 字符（过短易误伤）+ 长名优先（防子串先命中截断）
+            names = sorted({s for s in data if isinstance(s, str) and len(s) >= 3},
+                           key=lambda s: -len(s))
+            ok = True
+        else:
+            # ocr 审查：合法 JSON 但形态不对（非数组）——静默失败要可见
+            if not _ORG_DICT_WARNED:
+                sys.stderr.write("[mask] WARN: org dict invalid (not a list): {}\n".format(path))
+    except (OSError, ValueError) as e:
+        if not _ORG_DICT_WARNED:
+            _ORG_DICT_WARNED = True
+            sys.stderr.write("[mask] WARN: org dict load failed ({}) {}\n".format(e, path))
+    # 仅缓存成功加载（含合法空表）：文件缺失/损坏时下轮调用重试，不把失败
+    # 钉死为空字典（否则共享字典后建时静默失效到重启——ocr 审查 bug·medium，
+    # 与 office_proxy 同规）
+    if ok:
+        _ORG_DICT_CACHE = names
+    return names
 
 
 def _load_mask_context():
@@ -324,6 +390,11 @@ def _load_mask_context():
     叶子都调用一次 → 单次 tools/call 成本 O(叶子数 × 映射大小)。"""
     path = _mask_file()
     load_failed = [False]
+    if path is None:
+        # cwd 越界：仅内存态（掩码生效，不共享 office_proxy 映射、不落盘）
+        # ocr 审查修复：计数器键种从 _CN_KIND 派生，防未来新增类别时
+        # _put() KeyError 把降级路径变硬崩
+        return {}, {k: 0 for k in _CN_KIND}, [False], [True]
     try:
         with open(path, encoding="utf-8") as f:
             mapping = json.load(f)
@@ -359,6 +430,8 @@ def _flush_mask_context(mctx):
     if not (dirty[0] and not load_failed[0]):
         return
     path = _mask_file()
+    if path is None:
+        return  # cwd 越界：不落盘（load 侧已按内存态处理）
     try:
         tmp = path + ".tmp"
         with pathlib.Path(tmp).open("w", encoding="utf-8") as f:
@@ -368,12 +441,29 @@ def _flush_mask_context(mctx):
         log("mask map save failed:", e)
 
 
+def _mask_disabled() -> bool:
+    """脱敏总开关（2026-10-31 演示需求）：
+    ① AGENTCORE_MASK_DISABLE=1 env（agent-core/office_proxy 直继承链有效）
+    ② 标记文件 ~/.agent-core-mask-off（codex spawn MCP 时 env 可能丢失——文件不丢）
+    演示后删 env+删标记文件重启即恢复。"""
+    if os.environ.get("AGENTCORE_MASK_DISABLE", "").strip() in ("1", "true", "yes"):
+        return True
+    try:
+        flag = os.path.join(os.path.expanduser("~"), ".agent-core-mask-off")
+        # SCM/提权上下文 expanduser 可能指向 systemprofile → 同时探测绝对路径
+        return os.path.isfile(flag) or os.path.isfile(r"C:\Users\user\.agent-core-mask-off")
+    except Exception:
+        return False
+
+
 def mask_text(text, mctx=None):
     """出口脱敏：车牌/公司名/手机号/身份证号 → [车牌N]/[公司N]/[手机N]/[证件N]。
     映射持久化到 AGENTCORE_MASK_FILE（office_proxy 反掩码展示给用户用）。
     mctx 传入时复用调用方已加载的映射/计数器（一次遍历一份），落盘也交给调用方；
     不传则自建自落（兼容既有单点调用）。"""
     if not isinstance(text, str) or not text:
+        return text
+    if _mask_disabled():
         return text
     own = mctx is None
     if own:
@@ -382,20 +472,26 @@ def mask_text(text, mctx=None):
 
     # ocr 修复：先查 mapping 再分配（原 mk() 在 lambda 里无条件先求值，重复值浪费
     # 计数器导致 token 编号复用 → 掩码歧义）
+    def _put(kind, val):
+        if val not in mapping:
+            counters[kind] += 1
+            mapping[val] = "\u300c%s%d\u300d" % (_CN_KIND[kind], counters[kind])
+            dirty[0] = True
+        return mapping[val]
+
     def _sub(kind):
         def f(m):
-            val = m.group(0)
-            if val not in mapping:
-                counters[kind] += 1
-                mapping[val] = "\u300c%s%d\u300d" % (_CN_KIND[kind], counters[kind])
-                dirty[0] = True
-            return mapping[val]
+            return _put(kind, m.group(0))
         return f
 
     text = _PLATE_RE.sub(_sub("CAR"), text)
     text = _ORG_RE.sub(_sub("ORG"), text)
     text = _PHONE_RE.sub(_sub("PH"), text)
     text = _IDCARD_RE.sub(_sub("ID"), text)
+    # P0-2：无后缀供应商简称字典（后缀正则先跑，整名已掩码的文本不受影响）
+    for name in _load_org_dict():
+        if name in text:
+            text = text.replace(name, _put("ORG", name))
 
     if own:
         _flush_mask_context(mctx)
@@ -443,6 +539,8 @@ def _refresh_mask_cache():
 def unmask_text(text, pairs=None):
     """入站反掩码：[车牌N] → 原文。pairs 传入时用缓存（递归内共享）。"""
     if not isinstance(text, str) or not text:
+        return text
+    if _mask_disabled():
         return text
     if pairs is None:
         _, pairs = _load_unmask_map()

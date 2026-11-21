@@ -51,7 +51,7 @@ pub(crate) fn percent_decode_agent_id(s: &str) -> String {
 pub(crate) async fn authenticate(
     headers: &axum::http::HeaderMap,
     st: &Arc<AppState>,
-) -> Result<(String, Vec<String>), axum::response::Response> {
+) -> Result<(String, Vec<String>, bool), axum::response::Response> {
     // 主身份来自 x-agent-id；PFAiX 分发版只发 x-user-tag（随机安装ID），
     // 故在其为空时回退到 x-user-tag，实现「安装即身份」。
     let raw_agent_id = headers
@@ -176,42 +176,11 @@ pub(crate) async fn authenticate(
                 "org/cs-pufa-2nd-thermal".to_string(),
             ];
         }
-        // 登录态 badge 失效自愈（新增）：客户端携带 x-agent-id + 失配/过期 badge，
-        // 因 Memoria 注册表重建或凭证漂移，该 agent 在 audit.db 无有效注册。
-        // 以 jarvis 身份代为重新注册同一 agent_id（沿用 legacy 安装实例相同机制），
-        // 恢复其 ns 授权，免客户端手动重走 Onboarding。仅对已携带 agent_id 的
-        // 请求生效，不开匿名建号。注：会为登录态 agent 重建无口令注册，单组织
-        // 内网可接受；若需严格口令边界，删除此块即可回滚。
-        if allowed_ns.is_empty() && !admin_key.is_empty() && !from_usertag {
-            let reg = memoria_proxy_client(&server, &cfg_admin);
-            if let Ok(text) = reg
-                .call_json(
-                    "register_agent",
-                    &serde_json::json!({
-                        "agent_id": &agent_id,
-                        "display_name": &agent_id,
-                        "admin_key": &admin_key,
-                        "namespace": &format!("agent/{},org/cs-pufa-2nd-thermal", agent_id)
-                    }),
-                )
-                .await
-            {
-                if let Some(b) = extract_register_badge(&text) {
-                    // 自愈后写入 cache；客户端旧 key 仍可能漂移，但下轮 usertag/同 id 可用
-                    st.auth_cache
-                        .lock()
-                        .await
-                        .insert(agent_id.clone(), (b, std::time::Instant::now()));
-                }
-            }
-            // 与 legacy 安装实例自动开户保持一致：注册成功后直接授权该 agent 的
-            // 命名空间，不依赖 register 返回值（register 仅用于恢复 Memoria 注册，
-            // 授权由下方 allowed_ns 兜底，确保登录态 badge 漂移时不再 401）。
-            allowed_ns = vec![
-                format!("agent/{}", agent_id),
-                "org/cs-pufa-2nd-thermal".to_string(),
-            ];
-        }
+        // SECFIX 2026-11-21：移除了「登录态 badge 失效自愈」块。
+        // 原实现允许仅凭自称的 x-agent-id（无有效 x-agent-key）经 admin key
+        // 自动重新注册并授予授权命名空间 —— 等于任意伪造 agent_id 即可冒充
+        // 任意同事身份（渗透测试实证）。现要求登录态身份必须携带有效 badge
+        // （x-agent-key），失效时客户端按正常登录流程重新取 badge。
         if allowed_ns.is_empty() {
             // P2-2：鉴权失败审计（身份校验未通过）
             if let Some(ref a) = *st.agent.lock().await {
@@ -229,13 +198,15 @@ pub(crate) async fn authenticate(
             (allowed_ns.clone(), std::time::Instant::now()),
         );
     }
-    Ok((agent_id, allowed_ns))
+    Ok((agent_id, allowed_ns, from_usertag))
 }
 
 #[derive(Clone)]
 pub(crate) struct AuthContext {
     pub(crate) agent_id: String,
     pub(crate) allowed_ns: Vec<String>,
+    /// D0-NS（D4）：仅 x-user-tag（无 x-agent-id）的 legacy 安装身份
+    pub(crate) from_usertag: bool,
 }
 
 /// 统一鉴权中间件。成功时把身份写入 extension；失败直接返回 401。
@@ -255,12 +226,42 @@ pub(crate) async fn auth_middleware(
     if exempt {
         return next.run(request).await;
     }
-    match authenticate(request.headers(), &st).await {
-        Ok((agent_id, allowed_ns)) => {
+    // SECFIX 2026-11-21：EventSource 无法自定义 header，GET /api/chat/stream 允许
+    // 通过 query 参数 agent_id / agent_key 携带身份（query 值保持原始编码，
+    // authenticate 内部统一做 percent_decode）。
+    let mut headers = request.headers().clone();
+    if !headers.contains_key("x-agent-id") {
+        if let Some(q) = request.uri().query() {
+            let mut q_agent_id = String::new();
+            let mut q_agent_key = String::new();
+            for pair in q.split('&') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    match k {
+                        "agent_id" => q_agent_id = v.to_string(),
+                        "agent_key" => q_agent_key = v.to_string(),
+                        _ => {}
+                    }
+                }
+            }
+            if !q_agent_id.is_empty() {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&q_agent_id) {
+                    headers.insert("x-agent-id", hv);
+                }
+                if !q_agent_key.is_empty() {
+                    if let Ok(hv) = axum::http::HeaderValue::from_str(&q_agent_key) {
+                        headers.insert("x-agent-key", hv);
+                    }
+                }
+            }
+        }
+    }
+    match authenticate(&headers, &st).await {
+        Ok((agent_id, allowed_ns, from_usertag)) => {
             let mut req = request;
             req.extensions_mut().insert(AuthContext {
                 agent_id,
                 allowed_ns,
+                from_usertag,
             });
             next.run(req).await
         }

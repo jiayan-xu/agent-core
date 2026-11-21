@@ -107,7 +107,7 @@ async fn check_admin(
     headers: &HeaderMap, st: &Arc<AppState>,
 ) -> Result<String, (StatusCode, Json<Value>)> {
     match authenticate(headers, st).await {
-        Ok((caller, _)) => {
+        Ok((caller, _, _)) => {
             if is_admin(headers, st).await { Ok(caller) }
             else { Err((StatusCode::FORBIDDEN, Json(json!({"error": "admin required"})))) }
         }

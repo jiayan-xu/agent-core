@@ -105,6 +105,41 @@ pub(crate) fn sanitize_ns_segment(s: &str) -> String {
         .to_string()
 }
 
+/// 部门段规范化：中文部门名（Onboarding 直传）与历史漂移 slug → 唯一 canonical slug。
+///
+/// 背景（2026-11-16 注册表治理）：客户端三代演变迁移——
+///   gufei（项目码误用）→ engineering/yunxing（英文）→ operation（另一英文）
+/// 且现行 PFAiX onboarding 直传中文部门名（如「运行部」），服务端无映射时会产生
+/// dept/运行部 第三种变体，部门可见性（dept_registry 精确匹配）随之碎裂。
+/// 修复：服务端单点收口——handle_register / handle_agent_repair 构造 ns 前统一过本表。
+/// 未知值：保持原样回传（fail-open）+ warn 日志，不阻断注册。
+pub(crate) fn canonicalize_dept(s: &str) -> String {
+    let t = s.trim();
+    let mapped = match t {
+        // 现行客户端（Onboarding 下拉直传中文）
+        "工程部" => Some("engineering"),
+        "运行部" => Some("yunxing"),
+        "环保部" => Some("huanbao"),
+        "检修部" => Some("jianxiu"),
+        "采购部" => Some("caigou"),
+        "财务部" => Some("caiwu"),
+        "综合办" => Some("zongheb"),
+        "安办" => Some("anban"),
+        // 历史漂移 slug 归一（曾由旧版客户端发出）
+        "operation" => Some("yunxing"),
+        _ => None,
+    };
+    match mapped {
+        Some(slug) => slug.to_string(),
+        None => {
+            if !t.is_empty() && !t.is_ascii() {
+                tracing::warn!(target: "identity.register", dept = %t, "未知中文部门名，未映射直接使用（dept ns 可能碎裂，请补映射表）");
+            }
+            t.to_string()
+        }
+    }
+}
+
 /// 协作展示名：纯姓名（2026-09-08 改）。
 ///
 /// 历史：曾拼「{部门展示}部{姓名}」写入 display_name。但通讯录、私信、会议名单等
@@ -150,7 +185,7 @@ pub(crate) async fn handle_documents_archive(
     headers: axum::http::HeaderMap,
     Json(req): Json<ArchiveDocumentRequest>,
 ) -> axum::response::Response {
-    let (agent_id, allowed_ns) = match authenticate(&headers, &st).await {
+    let (agent_id, allowed_ns, _) = match authenticate(&headers, &st).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -323,7 +358,7 @@ pub(crate) async fn handle_register(
     // 须与 agent.toml 的 mcp_source namespace org/ 前缀保持一致。
     const COMPANY: &str = "cs-pufa-2nd-thermal";
     // 命名空间分段做字符白名单清洗，避免 '/' 或特殊字符破坏层级路径（R5）
-    let department = sanitize_ns_segment(&req.department);
+    let department = canonicalize_dept(&sanitize_ns_segment(&req.department));
     let div = sanitize_ns_segment(&req.div);
     let project = sanitize_ns_segment(&req.project);
     let name = sanitize_ns_segment(&req.name);
@@ -506,7 +541,7 @@ pub(crate) async fn handle_agent_repair(
     headers: axum::http::HeaderMap,
     Json(req): Json<AgentRepairRequest>,
 ) -> axum::response::Response {
-    let (caller_id, allowed_ns) = match authenticate(&headers, &st).await {
+    let (caller_id, allowed_ns, _) = match authenticate(&headers, &st).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -529,7 +564,7 @@ pub(crate) async fn handle_agent_repair(
     }
 
     const COMPANY: &str = "cs-pufa-2nd-thermal";
-    let department = sanitize_ns_segment(&req.department);
+    let department = canonicalize_dept(&sanitize_ns_segment(&req.department));
     let project = sanitize_ns_segment(&req.project);
     let namespace = if department.is_empty() {
         String::new()
@@ -966,6 +1001,7 @@ pub(crate) async fn build_agent(
     };
     let agent_config = AgentConfig {
         identity,
+        namespace: config.namespace.clone(),
         llm: llm_config,
         memoria_url: config.server.clone(),
         additional_mcp,
@@ -1035,4 +1071,34 @@ pub(crate) async fn build_agent(
     // A1: 本次启动健康完成，标记后不再计入「不干净启动」。
     agent_core::boot_lifecycle::mark_healthy(boot_id);
     Ok(agent)
+}
+#[cfg(test)]
+mod dept_canonical_tests {
+    use super::canonicalize_dept;
+
+    #[test]
+    fn chinese_dept_names_map_to_canonical_slugs() {
+        assert_eq!(canonicalize_dept("工程部"), "engineering");
+        assert_eq!(canonicalize_dept("运行部"), "yunxing");
+        assert_eq!(canonicalize_dept("环保部"), "huanbao");
+        assert_eq!(canonicalize_dept("检修部"), "jianxiu");
+        assert_eq!(canonicalize_dept("采购部"), "caigou");
+        assert_eq!(canonicalize_dept("财务部"), "caiwu");
+        assert_eq!(canonicalize_dept("综合办"), "zongheb");
+        assert_eq!(canonicalize_dept("安办"), "anban");
+    }
+
+    #[test]
+    fn legacy_drift_slug_unified() {
+        assert_eq!(canonicalize_dept("operation"), "yunxing");
+        assert_eq!(canonicalize_dept("engineering"), "engineering");
+        assert_eq!(canonicalize_dept("yunxing"), "yunxing");
+    }
+
+    #[test]
+    fn unknown_values_pass_through() {
+        assert_eq!(canonicalize_dept("gufei"), "gufei"); // 项目码误用历史值：不映射不阻断
+        assert_eq!(canonicalize_dept(""), "");
+        assert_eq!(canonicalize_dept("  运行部  "), "yunxing"); // trim 后命中
+    }
 }

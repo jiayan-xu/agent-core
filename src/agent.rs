@@ -33,6 +33,17 @@ pub const CONFIRM_PREFIXES: &[&str] = &["确认", "同意", "批准", "执行吧
 /// 与 `std::process::id()` 拼成唯一临时名 `meetings.tmp.<pid>.<计数>`，每次写入都落在新文件上，
 /// 崩溃残留的陈旧 tmp 不再阻塞后续落盘（固定名 + create_new 的可恢复性回归，见 write_meetings_file）。
 static WRITE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 同人别名收件箱缓存（2026-11-16）：agent_id → 同 display_name 的其他注册行 id。
+/// 60s TTL——收件箱 30s 轮询，避免每次请求打 memoria agent_list。
+static COLLAB_ALIAS_CACHE: std::sync::Mutex<
+    Option<(std::time::Instant, std::collections::HashMap<String, Vec<String>>)>,
+> = std::sync::Mutex::new(None);
+/// 别名 badge 缓存（2026-11-16）：agent_id → badge。register_agent 对存量 id
+/// 回传原 badge 且不轮换，可安全缓存；10 分钟 TTL。无此缓存时每轮收件箱轮询
+/// 要为每个别名行代取一次 badge（徐佳琰 23 个别名行 = 44 次 memoria 调用/轮）。
+static COLLAB_BADGE_CACHE: std::sync::Mutex<
+    Option<(std::time::Instant, std::collections::HashMap<String, String>)>,
+> = std::sync::Mutex::new(None);
 /// 临时文件写入的自愈重试上限（reviewer round-22 #2 security·low）：create_new 遇 AlreadyExists
 /// （目标被预创建 / 残留）时换下一计数重试，最多本上限次。有界防止本地攻击者预创建大量文件
 /// 无限拖长落盘，同时保留 create_new 防 symlink —— 攻击者需预创建全部上线数量的文件才可能让
@@ -164,6 +175,8 @@ impl AgentIdentity {
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub identity: AgentIdentity,
+    /// D0-NS（2026-11-06）：记忆命名空间分流配置（identity | legacy，含封存/隔离区/观测开关）
+    pub namespace: crate::namespace::NamespaceConfig,
     pub llm: LlmConfig,
     pub memoria_url: String,
     /// 可选 MCP 源（名称 + URL + 令牌 + 可选的 stdio (命令, 参数) + 可选的命名空间），
@@ -432,6 +445,12 @@ pub struct AgentCore {
     persist_lock: std::sync::Mutex<()>,
     /// Phase 2：会话 → 分身 绑定（分身级工具白名单接线）
     pub session_personas: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// D0-NS（2026-11-06）：会话 → 认证调用方（chat 三入口在调用 chat() 前绑定；
+    /// 未注册 = System 内部任务）。与 session_personas 同生命周期模式。
+    /// value 带绑定时刻——OCR：容量逐出按最旧（HashMap 任意序会伤在途会话）。
+    pub session_callers: std::sync::Mutex<
+        std::collections::HashMap<String, (crate::namespace::NsCaller, std::time::Instant)>,
+    >,
     /// Phase 2：分身 tick 调度器注册表（真实 tick 由 AgentCore 驱动，避免循环依赖）
     pub tick_scheduler: crate::scheduler::tick_scheduler::TickScheduler,
     /// PR5: 审批闸门（P-D 门控；默认 Auto 免人工审批，分类逻辑保留）
@@ -1741,6 +1760,7 @@ impl AgentCore {
             workspace_dir: None,
             tool_allowlist: Vec::new(),
             memory_namespace: String::new(),
+            instructions: String::new(),
             badge_token: config.identity.badge_token.clone(),
             ns_full_path: config.identity.ns_full_path.clone(),
             llm: None,
@@ -1848,6 +1868,7 @@ impl AgentCore {
             meetings: std::sync::Mutex::new(Vec::new()),
             persist_lock: std::sync::Mutex::new(()),
             session_personas: std::sync::Mutex::new(std::collections::HashMap::new()),
+            session_callers: std::sync::Mutex::new(std::collections::HashMap::new()),
             tick_scheduler: crate::scheduler::tick_scheduler::TickScheduler::default(),
             approval_gate,
             meta_evolver,
@@ -1884,6 +1905,7 @@ impl AgentCore {
             workspace_dir: None,
             tool_allowlist: Vec::new(),
             memory_namespace: String::new(),
+            instructions: String::new(),
             badge_token: self.config.identity.badge_token.clone(),
             ns_full_path: self.config.identity.ns_full_path.clone(),
             llm: None,
@@ -1917,6 +1939,46 @@ impl AgentCore {
     pub fn persona_for_session(&self, session_id: &str) -> String {
         let m = self.session_personas.lock().unwrap_or_else(|p| p.into_inner());
         m.get(session_id).cloned().unwrap_or_else(|| "default".to_string())
+    }
+
+    /// D0-NS：绑定会话的认证调用方（chat 三入口在调用 chat() 前调用）。
+    /// 上限防泄漏：超过 8192 且非本会话时逐出任意一条（活跃会话下轮会重新绑定）。
+    pub fn bind_session_caller(&self, session_id: &str, caller: crate::namespace::NsCaller) {
+        let mut m = self.session_callers.lock().unwrap_or_else(|p| p.into_inner());
+        // OCR security·high：同一 session_id 已被其他身份绑定时拒绝改绑——
+        // 防止知道他人 session_id 的调用方覆盖其身份归因（跨用户读写）。
+        if let Some(existing) = m.get(session_id) {
+            if existing.0.user_id != caller.user_id {
+                tracing::warn!(
+                    target: "ns_audit",
+                    session = %session_id,
+                    existing = %existing.0.user_id,
+                    attempted = %caller.user_id,
+                    "session 身份冲突，拒绝改绑（保留原绑定）"
+                );
+                return;
+            }
+        }
+        if m.len() >= 8192 && !m.contains_key(session_id) {
+            // OCR bug·medium：按绑定时刻逐出最旧（HashMap 任意序会伤在途会话）
+            if let Some(oldest) = m
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone())
+            {
+                m.remove(&oldest);
+            }
+        }
+        m.insert(session_id.to_string(), (caller, std::time::Instant::now()));
+    }
+
+    /// D0-NS：查会话认证调用方；未注册 = System 内部任务（返回 None）
+    pub fn caller_for_session(&self, session_id: &str) -> Option<crate::namespace::NsCaller> {
+        self.session_callers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_id)
+            .map(|(c, _)| c.clone())
     }
 
     /// Phase 2：分身真实 tick —— 用该分身目标驱动一次真实 LLM 调用（仅规划，不执行工具）
@@ -1968,6 +2030,7 @@ impl AgentCore {
         memory_namespace: String,
         llm: Option<LlmConfig>,
         is_private: bool,
+        instructions: String,
     ) -> Result<(), String> {
         if persona_id == "default" {
             return Err("default 分身不可重建".to_string());
@@ -1980,6 +2043,7 @@ impl AgentCore {
             workspace_dir: None,
             tool_allowlist,
             memory_namespace: memory_namespace.clone(),
+            instructions,
             badge_token: self.config.identity.badge_token.clone(),
             ns_full_path: self.config.identity.ns_full_path.clone(),
             llm: llm_client,
@@ -2047,6 +2111,7 @@ impl AgentCore {
                     "owner_user_id": p.owner_user_id,
                     "tool_allowlist": p.tool_allowlist,
                     "memory_namespace": p.memory_namespace,
+                    "instructions": p.instructions,
                     "is_private": p.is_private,
                 })
             })
@@ -2121,6 +2186,7 @@ impl AgentCore {
                         workspace_dir: None,
                         tool_allowlist: allowlist,
                         memory_namespace: ns,
+                        instructions: String::new(),
                         badge_token: self.config.identity.badge_token.clone(),
                         ns_full_path: self.config.identity.ns_full_path.clone(),
                         llm: None,
@@ -2850,7 +2916,101 @@ impl AgentCore {
     ///   - 登录模式：agent_id=user_id → `agent/{user_id}/user/{user_id}`，记忆跨设备连续；
     ///   - legacy 模式：agent_id=user_tag=install_id → `agent/{install_id}/user/{install_id}`，与原行为一致。
     /// 旧格式或解析失败时回退到 agent 自身 ns，保持向后兼容。
+    /// session_id 布局（handlers/chat.rs）：jan/{agent_id}/{user_tag}/{conversation_id}。
+    /// 单点解析（OCR round5 low6）：返回 user_tag 段；非 jan 前缀/段数不足/空段返回 None。
+    /// 迭代器实现避免 collect 分配（请求热路径）。persona 自动绑定共用本函数。
+    fn session_user_tag(session_id: &str) -> Option<&str> {
+        let mut it = session_id.split('/');
+        if it.next()? != "jan" {
+            return None;
+        }
+        let agent_id = it.next()?;
+        if agent_id.is_empty() {
+            return None;
+        }
+        let user_tag = it.next()?;
+        if user_tag.is_empty() {
+            return None;
+        }
+        match it.next() {
+            Some(conv) if !conv.is_empty() => Some(user_tag),
+            _ => None,
+        }
+    }
+
+    /// NS 解析（D0-NS 修复，2026-11-06）：
+    /// - `policy=identity`（新）：`resolve_memory_ns` 单一决策入口——认证身份（session_callers
+    ///   绑定，chat 入口写入）+ persona 归属决定 NS；session_id 仅做会话隔离（R1）。
+    /// - `policy=legacy`：旧行为逐字保留（回滚路径）。
+    /// ⚠️ 本函数不做绑定——persona 绑定仍必须先经 chat_inner 入口。
+    /// 解析会话 NS，**保留错误**（2026-11-07 修：供写路径判定 `NoIdentity`）。
+    /// `caller_ns` 会把错误降级成隔离区，写工具执行前必须用本方法才能真正确认身份。
+    pub fn resolve_session_ns(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::namespace::NsDecision, crate::namespace::NsError> {
+        let cfg = &self.config.namespace;
+        if cfg.effective_policy() == crate::namespace::NsPolicy::Legacy {
+            return Ok(crate::namespace::NsDecision {
+                ns: self.caller_ns_legacy(session_id),
+                origin: crate::namespace::NsOrigin::Legacy,
+            });
+        }
+        let persona = {
+            let pid = self.persona_for_session(session_id);
+            if pid != "default" {
+                let p = self.get_persona(&pid);
+                if p.memory_namespace.trim().is_empty() {
+                    None
+                } else {
+                    Some((p.memory_namespace.clone(), p.owner_user_id.clone()))
+                }
+            } else {
+                None
+            }
+        };
+        let caller = self.caller_for_session(session_id);
+        crate::namespace::resolve_memory_ns(
+            cfg,
+            caller.as_ref(),
+            persona.as_ref().map(|(n, o)| (n.as_str(), o.as_str())),
+            None,
+        )
+    }
+
     pub fn caller_ns(&self, session_id: &str) -> String {
+        let cfg = &self.config.namespace;
+        match self.resolve_session_ns(session_id) {
+            Ok(d) => {
+                if cfg.log_origin {
+                    tracing::info!(
+                        target: "ns_audit",
+                        session = %session_id,
+                        ns = %d.ns,
+                        origin = %d.origin,
+                        "memory ns resolved"
+                    );
+                }
+                d.ns
+            }
+            Err(e) => {
+                tracing::warn!(target: "ns_audit", session = %session_id, error = %e, "memory ns resolve failed → quarantine");
+                cfg.quarantine_ns.clone()
+            }
+        }
+    }
+
+    /// 旧行为（`policy=legacy` 回滚路径；2026-11-06 前逻辑逐字保留）。
+    fn caller_ns_legacy(&self, session_id: &str) -> String {
+        // persona 绑定会话：记忆归 persona.memory_namespace（如 pai → agent/xujiayan），
+        // 使 pai 对话的沉淀/召回与所属员工主记忆区对齐（10-22 命名空间规范）。
+        let bound_pid = self.persona_for_session(session_id);
+        if bound_pid != "default" {
+            let mns = self.get_persona(&bound_pid).memory_namespace.clone();
+            if !mns.is_empty() {
+                return mns;
+            }
+        }
         let parts: Vec<&str> = session_id.split('/').collect();
         if parts.len() >= 4 && parts[0] == "jan" {
             let agent_id = parts[1];
@@ -2914,6 +3074,28 @@ impl AgentCore {
         external_history: Option<Vec<(String, String)>>,
         stream_sender: Option<&tokio::sync::mpsc::UnboundedSender<crate::llm::SseEvent>>,
     ) -> String {
+        // persona 自动绑定（Phase 3/4）：user_tag 段（session_user_tag 单点解析）
+        // 与已注册 persona_id 一致时绑定——此后沉淀 NS、记忆召回、工具白名单均按
+        // persona 生效；未匹配会话行为逐字不变。
+        if let Some(pid) = Self::session_user_tag(session_id) {
+            if pid != "default" && self.persona_for_session(session_id) != pid {
+                // 锁作用域（OCR round5 low1）：contains 结果先落 bool 放掉
+                // MutexGuard，避免 personas→session_personas 嵌套锁顺序隐患。
+                let registered = self
+                    .personas
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains_key(pid);
+                // 安全（OCR round4 high）：user_tag 是客户端可控头（仅字符集清洗），
+                // 绑定前必须校验已认证身份（user_id = auth.rs 验证过的 ctx.agent_id）
+                // 是该 persona 的属主——否则任何调用者可借 header 绑定他人 persona、
+                // 经 caller_ns 读写其记忆 NS（跨员工越权）。非属主静默跳过绑定。
+                let persona = self.get_persona(pid);
+                if registered && persona.owner_user_id == *user_id {
+                    self.bind_session_persona(session_id, pid);
+                }
+            }
+        }
         // 确认词判定自 v16 起改为结构化（strong_confirm/review_prefix/explicit_approve_after_review
         // 组合），不再用 confirm_words 宽匹配（其 contains 匹配「执行/确定/去查」等命令动词会误判
         // → 0a 误执行 pending 写）。
@@ -3381,7 +3563,7 @@ impl AgentCore {
                     }
                 }
                 let exec_res = self
-                    .call_tool_routed(&action.tool_name, &self.persona_for_session(session_id), &action.arguments, allowed_ns, &trace_id)
+                    .call_tool_routed(&action.tool_name, &self.persona_for_session(session_id), &action.arguments, allowed_ns, &trace_id, Some(session_id))
                     .await;
                 let desc = action.description.chars().take(120).collect::<String>();
                 let result_text = match &exec_res {
@@ -5661,6 +5843,7 @@ impl AgentCore {
                     &args,
                     &ns_vec,
                     "preroute-whitelist-query",
+                    Some(session_id),
                 )
                 .await;
             let exec_ok = result.is_ok();
@@ -6080,7 +6263,10 @@ impl AgentCore {
         }
 
         // ── 1. 快速路径（Harness 匹配）──
-        if let Some(reply) = self.try_harness_match(message, allowed_ns).await {
+        if let Some(reply) = self
+            .try_harness_match(message, allowed_ns, Some(session_id))
+            .await
+        {
             return reply;
         }
 
@@ -6166,6 +6352,18 @@ impl AgentCore {
 
         // ── 4. 构建消息列表 ──
         let mut system_prompt = self.build_system_prompt(&knowledge);
+        // P5: 分身专属指令（persona instructions）——置于 prefs 之后注入（最终顺序
+        // prefs 硬规则 → persona 契约 → 内置身份模板）；default 分身恒空，行为逐字不变。
+        let persona_now = self.persona_for_session(session_id);
+        if persona_now != "default" {
+            let pinstr = self.get_persona(&persona_now).instructions;
+            if !pinstr.is_empty() {
+                system_prompt = format!(
+                    "## 分身专属指令（{}）\n{}\n\n{}",
+                    persona_now, pinstr, system_prompt
+                );
+            }
+        }
         if let Some(p) = &prefs_block {
             system_prompt = format!("{}\n\n{}", p, system_prompt);
         }
@@ -6226,7 +6424,7 @@ impl AgentCore {
                 let direct = Self::direct_fast_tool(message);
                 if let Some((tool, tool_args)) = direct {
                     match self
-                        .call_tool_routed(&tool, &self.persona_for_session(session_id), &tool_args, allowed_ns, trace_id)
+                        .call_tool_routed(&tool, &self.persona_for_session(session_id), &tool_args, allowed_ns, trace_id, Some(session_id))
                         .await
                     {
                         // 确定性工具返回 JSON 数据。只接受"看起来像成功数据"的载荷：
@@ -6255,7 +6453,7 @@ impl AgentCore {
                         "period": "",
                     });
                     match self
-                        .call_tool_routed("nl_query", &self.persona_for_session(session_id), &args, allowed_ns, trace_id)
+                        .call_tool_routed("nl_query", &self.persona_for_session(session_id), &args, allowed_ns, trace_id, Some(session_id))
                         .await
                     {
                         Ok(t) => {
@@ -6448,9 +6646,15 @@ impl AgentCore {
         // SAD 风格：并行获取上下文（记忆）和可用能力（工具列表）
         // 2026-08-05 提速：单步路径用动态工具选择（select_exposed_tools 按查询相关性
         // 暴露 top-30，而非全量 125）——Easy 查询 prompt 大幅缩小。
+        let persona_id = self.persona_for_session(session_id);
         let (mem_result, tools) = tokio::join!(
             self.search_memory(message, session_id, allowed_ns),
-            self.select_exposed_tools(message, allowed_ns, Self::EXPOSE_TOOL_CAP),
+            self.select_exposed_tools(
+                message,
+                allowed_ns,
+                Self::EXPOSE_TOOL_CAP,
+                &persona_id,
+            ),
         );
 
         let mut knowledge = Vec::new();
@@ -6649,7 +6853,7 @@ impl AgentCore {
                         }
                     }
 
-                    match this.call_tool_routed(&tool, "default", &args, allowed_ns, "").await {
+                    match this.call_tool_routed(&tool, "default", &args, allowed_ns, "", Some(session_id)).await {
                         Ok(result) => {
                             this.audit_logger.log_tool_call(
                                 &this.config.identity.agent_id, &tool, &args, true
@@ -7933,6 +8137,12 @@ impl AgentCore {
         "edit_code",
         "verify_code",
         "organize_folders",
+        // 2026-10-29 跨会话记忆接力三件（memoria 交接协议 v1 配套）：接力最小面常驻，
+        // 避免被相关性裁剪（实测 156 工具只暴露 17，memory_* 落选 → 智能体答「会话隔离」）。
+        // 只常驻这三个，其余 memoria 工具仍走相关性选择，控制工具面膨胀。
+        "memory_search",
+        "memory_context",
+        "memory_observe",
         // 2026-08-05：查询首选 nl_query（自然语言问数，自动汇总统计），
         // query_entrance 是逐车明细，放常驻会诱导 LLM 选它做聚合 → 数据错。
         "nl_query",
@@ -7958,6 +8168,16 @@ impl AgentCore {
         "hhv_list_jobs",
         "hhv_job_status",
         "hhv_get_result",
+        // pai 个人智能体只读工具（Phase 2）：常驻进工具面。
+        // Easy cap 被 20 个固废常驻工具占满时 rest 名额会归零，新接入的
+        // 能力若非常驻会被全裁掉（LLM 因此回复「工具不存在」）。
+        // 这 6 个工具全部只读（发信/写/删未挂载，见 pai_tools_mcp.py 契约）。
+        "pai_calendar_agenda",
+        "pai_class_digest",
+        "pai_qq_mail_list",
+        "pai_qq_mail_read",
+        "pai_ding_mail_recent",
+        "pai_oa_pending",
     ];
 
     fn prefetch_tokens(s: &str) -> Vec<String> {
@@ -8013,6 +8233,26 @@ impl AgentCore {
         download && video
     }
 
+    /// 跨会话问法检测（2026-10-29）：用户问「刚刚/之前和 zcode/workbuddy 等聊过的事」时
+    /// 必须走常规路径（memoria 接力注入 + 常驻三工具只在常规路径注入），并据此豁免
+    /// bootstrap 锚定。误报（普通消息含「刚刚」）无害——只是工具面更大、提示更全。
+    fn mentions_cross_session(q: &str) -> bool {
+        const CROSS_KEYS: &[&str] = &[
+            "zcode", "workbuddy", "work buddy", "记忆库",
+            "别的会话", "上个会话", "之前会话", "另一个会话", "其他会话",
+            "交接", "上次聊", "刚聊", "之前聊", "刚刚说", "刚才说",
+            "你记得吗", "你知道吗", "你还记得",
+        ];
+        let lower = q.to_ascii_lowercase();
+        CROSS_KEYS.iter().any(|k| {
+            if k.is_ascii() {
+                lower.contains(k)
+            } else {
+                q.contains(k)
+            }
+        })
+    }
+
     /// 当前工具面是否至少含一个数据查询类工具（HookContext.query_tool_available）。
     /// 口径与旧内联判断一致；OnPreAct / OnFinalAnswer / OnToolResult 三处共享，
     /// 避免 hook 上下文拿到硬编码 false 的错误快照（ocr bug·low 修复）。
@@ -8030,18 +8270,43 @@ impl AgentCore {
     /// 白龙马 ACI 的 selectTools 等价物：按当前消息(task_context)从全量工具中选 top-K 暴露给 LLM。
     /// 其余工具本轮不进 schema，仅不参与 LLM 提示（execute_tool_calls 对子集外工具跳过 schema
     /// 校验、直接走 call_tool_routed 全量路由——不会 Tool Not Found；见 5648 附近）。
-    async fn select_exposed_tools(&self, message: &str, allowed_ns: &[String], cap: usize) -> Vec<ToolDef> {
+    async fn select_exposed_tools(
+        &self,
+        message: &str,
+        allowed_ns: &[String],
+        cap: usize,
+        persona_id: &str,
+    ) -> Vec<ToolDef> {
         let all = self.fetch_tools_filtered(allowed_ns).await;
+        // persona 门控·源头剔除（OCR round7 high）：pai_* 只读工具仅对 pai persona
+        // 会话存在——在池子源头剔除，覆盖 always/rest/打分/全量所有分支的泄露路径
+        //（round7 指出仅从 always 桶挪到 rest 池会被「全量暴露分支」和「+1000 点名」
+        // 重新带出）。无关会话不付 token 成本、不会被误选，也不占 always 名额。
+        let is_pai_session = persona_id == "pai";
+        let all: Vec<ToolDef> = if is_pai_session {
+            all
+        } else {
+            all.into_iter()
+                .filter(|t| !t.function.name.starts_with("pai_"))
+                .collect()
+        };
         let total = all.len();
+        let always_exposed = |n: &str| {
+            if n.starts_with("pai_") {
+                is_pai_session
+            } else {
+                Self::ALWAYS_EXPOSE_TOOLS.contains(&n)
+            }
+        };
         // 抽离始终暴露的工具（诊断/运维类），剩余走相关性打分
         let always: Vec<ToolDef> = all
             .iter()
-            .filter(|t| Self::ALWAYS_EXPOSE_TOOLS.contains(&t.function.name.as_str()))
+            .filter(|t| always_exposed(t.function.name.as_str()))
             .cloned()
             .collect();
         let rest: Vec<ToolDef> = all
             .into_iter()
-            .filter(|t| !Self::ALWAYS_EXPOSE_TOOLS.contains(&t.function.name.as_str()))
+            .filter(|t| !always_exposed(t.function.name.as_str()))
             .collect();
         if rest.is_empty() {
             tracing::info!(exposed_tools = always.len(), total = total, "prefetch: 仅有常驻工具，直接返回");
@@ -8120,14 +8385,30 @@ impl AgentCore {
         } else {
             Self::EXPOSE_TOOL_CAP
         };
-        let full_tools = self.select_exposed_tools(raw_message, allowed_ns, expose_cap).await;
+        let full_tools = self
+            .select_exposed_tools(
+                raw_message,
+                allowed_ns,
+                expose_cap,
+                &self.persona_for_session(session_id),
+            )
+            .await;
         // ADR-017 P1：flash 锚定引导。仅 bootstrap 开启 + easy 路由 + 非写意图 + 未 promoted 触发；
         // flag-off / 其他条件不满足时 `bootstrap_active=false`，以下所有分支与原路径逐字等价。
+        // 2026-10-29 追加豁免：跨会话问法（「我和 zcode/workbuddy 刚聊的…」）必须走常规路径——
+        // bootstrap 中性提示会剥离 memoria 接力注入与常驻三工具，实测此类问题全部答非所问。
         // per-session 原子预留：同 session 并发 run 只有一个能拿最小工具面，
         // 其余 run 直接走常规路径（拿不到预留不算错误，也不取消其他 run 的预留）。
+        // persona 绑定会话（x-user-tag=persona_id，chat_inner 开头已自动绑定）：
+        // 跳过 bootstrap 最小工具面裁剪，保证 persona 只读工具进入常规工具面并
+        // 注入 system prompt；未绑定会话行为逐字不变。（OCR round5 finding 4：
+        // 与自动绑定同一规则派生，消除两处分歧。）
+        let persona_session = self.persona_for_session(session_id) != "default";
         let bootstrap_eligible = self.orchestration.cfg.bootstrap.enabled
             && is_easy_query
             && !Self::has_write_intent(raw_message)
+            && !Self::mentions_cross_session(raw_message)
+            && !persona_session
             && !self
                 .orchestration
                 .is_promoted_async(session_id.to_string())
@@ -8209,7 +8490,7 @@ impl AgentCore {
             if let Some(sys) = ctx.messages.first_mut() {
                 if sys.role == "system" {
                     sys.content = Some(
-                        "You are a helpful assistant. 请优先调用给定的工具获取真实数据后再回答；没有可用的工具时再直接简洁回答。"
+                        "You are a helpful assistant. 请优先调用给定的工具获取真实数据后再回答；没有可用的工具时再直接简洁回答。若用户询问其他会话/其他智能体（如 zcode、workbuddy）聊过的事，调用 memory_search 或 memory_context 查询 memoria 记忆库后再回答。"
                             .to_string(),
                     );
                 }
@@ -8864,7 +9145,16 @@ impl AgentCore {
         if pid == "default" {
             return; // 仅分身会话
         }
-        let ns = format!("agent/{}", pid);
+        // persona 配置了 memory_namespace（如 pai → agent/xujiayan）时优先使用，
+        // 使任务记忆与该 persona 的对话沉淀同 NS（10-22 命名空间规范）。
+        let ns = {
+            let mns = self.get_persona(&pid).memory_namespace.clone();
+            if mns.is_empty() {
+                format!("agent/{}", pid)
+            } else {
+                mns
+            }
+        };
         // 摄入过滤 Filter1：测试/实验分身命名空间不写任务记忆（避免 lme_*/pm_*/agent/rt* 污染）
         if self
             .config
@@ -8877,7 +9167,14 @@ impl AgentCore {
         }
         let goal_s: String = goal.chars().take(500).collect();
         let result_s: String = result.chars().take(1500).collect();
-        let content = format!("[persona task | {}]\n目标：{}\n结果：{}", pid, goal_s, result_s);
+let content = format!(
+            // P5: 头部日期戳——夜间日记归纳按日期确定性过滤（search 结果无 created_at）
+            "[persona task | {} | {}]\n目标：{}\n结果：{}",
+            pid,
+            chrono::Local::now().format("%Y-%m-%d"),
+            goal_s,
+            result_s
+        );
         let args = serde_json::json!({
             "content": content,
             "category": "persona_task",
@@ -8899,6 +9196,37 @@ impl AgentCore {
             Ok(_) => tracing::info!(pid = %pid, ns = %ns, "分身任务记忆已写入 Memoria"),
             Err(e) => tracing::warn!(pid = %pid, ns = %ns, "分身任务记忆写入失败: {}", e),
         }
+        // P5: 工作日记确定性兜底——goal 匹配日记意图时额外写结构化条目
+        //（tags=工作日记+occurred:日期，content「YYYY-MM-DD 工作日记：」前缀与
+        // pai_journal_list 的前缀过滤对齐）。LLM 工具调用习惯不可靠（实测意图正确
+        // 却不发起 tool_call），平台侧确定性写入是最后一道防线。
+        if Self::looks_like_journal_intent(goal) {
+            let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let goal_s2: String = goal.chars().take(300).collect();
+            let jargs = serde_json::json!({
+                "content": format!("{} 工作日记：{}", day, goal_s2),
+                "category": "fact",
+                "tags": ["工作日记", format!("occurred:{}", day)],
+                "importance": 3,
+                "namespace": ns,
+            });
+            match client.call_json("memory_remember", &jargs).await {
+                Ok(_) => tracing::info!(pid = %pid, "工作日记确定性写入成功"),
+                Err(e) => tracing::warn!(pid = %pid, "工作日记确定性写入失败: {}", e),
+            }
+        }
+    }
+
+    /// P5: 日记意图判定——显式前缀/关键词 + 长度上限防误伤普通闲聊
+    fn looks_like_journal_intent(msg: &str) -> bool {
+        let m = msg.trim();
+        let hits = m.starts_with("记一下")
+            || m.starts_with("记入")
+            || m.starts_with("记录一下")
+            || m.contains("记入工作日记")
+            || m.contains("写入工作日记")
+            || m.contains("帮我记一下");
+        hits && m.chars().count() <= 200
     }
 
     /// 检查 A2A 收件箱（带 30s 缓存）
@@ -8958,6 +9286,165 @@ impl AgentCore {
             out.push(Self::map_a2a_message(m));
         }
         Ok(out)
+    }
+
+    // ── 同人别名收件箱合并（2026-11-16，修复「发得出、对方看不到」）──
+    // 背景：同一自然人在 Memoria 注册表可有多条 agent_id 行——部门段规范化漂移
+    // （operation↔yunxing）、登录态 `cs-pufa-2nd-thermal_{dept}_{user_id}` 与
+    // 安装 tag 行并存。发送侧按通讯录 username（目录去重后的规范行）投递，消息落
+    // agent/{目录id}；接收侧会话身份（office_proxy 按 tag+当前部门 register 派生）
+    // 可能解析到另一条注册行，收件箱只读 agent/{会话id} → 永远为空。
+    // 修复：以注册表 display_name 为人物主键，合并全部同名 id 的收件箱。
+    // badge 经 admin 代取（memoria register_agent 对存量 id 回传原 badge、不轮换，
+    // 不破坏 office_proxy 会话缓存）；安全边界：仅合并同 display_name 的 id，且
+    // 全部为本厂注册身份（agent-core 持 admin key，属受托基础设施操作）。
+    pub async fn collab_inbox_merged(
+        &self,
+        caller_agent_id: &str,
+        caller_agent_key: &str,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let mut msgs = self
+            .collab_inbox_raw(caller_agent_id, caller_agent_key, limit)
+            .await?;
+        for aid in self.collab_alias_ids(caller_agent_id).await {
+            if let Some(badge) = self.collab_fetch_badge(&aid).await {
+                let mcp = McpClient::new(&self.config.memoria_url, &aid, &badge);
+                if let Ok(val) = mcp
+                    .call_json(
+                        "a2a_recv",
+                        &serde_json::json!({
+                            "limit": limit,
+                            // 与全部既有调用点一致显式传 namespace（memoria 工具门
+                            // NamespaceArg 惯例；漏传若网关强制会 -32002 静默 no-op）
+                            "namespace": format!("agent/{}", aid),
+                        }),
+                    )
+                    .await
+                {
+                    if let Some(arr) = val["messages"].as_array() {
+                        for m in arr {
+                            let mapped = Self::map_a2a_message(m);
+                            // 跨别名去重：同 id 只留一条（自发副本等）
+                            if !msgs.iter().any(|x| x["id"] == mapped["id"]) {
+                                msgs.push(mapped);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 新在前（与单 ns 的 ORDER BY created_at DESC 一致）；ISO/T 与空格两种
+        // 时间格式归一后比较，避免混排乱序
+        msgs.sort_by(|a, b| {
+            let ta = a["created_at"].as_str().unwrap_or("").replace('T', " ");
+            let tb = b["created_at"].as_str().unwrap_or("").replace('T', " ");
+            tb.cmp(&ta)
+        });
+        msgs.truncate(limit as usize);
+        Ok(msgs)
+    }
+
+    /// 同 display_name 的其他注册行 id（60s TTL 缓存，避免每次轮询打 agent_list）。
+    /// 返回空 = 本人无别名行或注册表不可达（降级为单 ns 收件箱，行为不变）。
+    /// 缓存只缓存「已计算过的 caller」；缓存期内新出现的 caller 必须回源计算，
+    /// 不能被 unwrap_or_default 短路（多同事轮询场景，除第一人外全部误判无别名）。
+    pub async fn collab_alias_ids(&self, caller_agent_id: &str) -> Vec<String> {
+        {
+            let guard = COLLAB_ALIAS_CACHE.lock().unwrap();
+            if let Some((at, map)) = &*guard {
+                if at.elapsed() < std::time::Duration::from_secs(60) {
+                    if let Some(v) = map.get(caller_agent_id) {
+                        return v.clone();
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Ok(peers) = self.collab_list_peers().await {
+            let dn = peers
+                .iter()
+                .find(|p| p["agent_id"].as_str() == Some(caller_agent_id))
+                .and_then(|p| p["display_name"].as_str())
+                .unwrap_or("")
+                .to_string();
+            if !dn.is_empty() {
+                out = peers
+                    .iter()
+                    .filter(|p| p["display_name"].as_str() == Some(dn.as_str()))
+                    .filter_map(|p| p["agent_id"].as_str().map(|s| s.to_string()))
+                    .filter(|id| id != caller_agent_id)
+                    .collect();
+            }
+        }
+        let mut guard = COLLAB_ALIAS_CACHE.lock().unwrap();
+        // 2026-11-16（ocr low 修复）：写回时若窗口已过期需重置时间戳，否则
+        // get_or_insert_with 永远返回陈旧 instant——60s 后缓存静默失效，
+        // 每轮询都打 agent_list（正是缓存要消除的开销）。
+        let expired = guard
+            .as_ref()
+            .map(|(at, _)| at.elapsed() >= std::time::Duration::from_secs(60))
+            .unwrap_or(true);
+        if expired {
+            *guard = Some((std::time::Instant::now(), std::collections::HashMap::new()));
+        }
+        let map = guard
+            .get_or_insert_with(|| (std::time::Instant::now(), std::collections::HashMap::new()));
+        map.1.insert(caller_agent_id.to_string(), out.clone());
+        out
+    }
+
+    /// 经 admin 代取指定 id 的 badge（register_agent 对存量 id 回传原 badge）。
+    /// 10 分钟 TTL 缓存——存量 badge 不轮换，缓存安全；未命中才打 memoria。
+    async fn collab_fetch_badge(&self, agent_id: &str) -> Option<String> {
+        {
+            let guard = COLLAB_BADGE_CACHE.lock().unwrap();
+            if let Some((at, map)) = &*guard {
+                if at.elapsed() < std::time::Duration::from_secs(600) {
+                    if let Some(b) = map.get(agent_id) {
+                        return Some(b.clone());
+                    }
+                }
+            }
+        }
+        let admin_key = std::env::var("MEMORIA_ADMIN_KEY").unwrap_or_default();
+        let val = self
+            .mcp
+            .call_json(
+                "register_agent",
+                &serde_json::json!({
+                    "agent_id": agent_id,
+                    "display_name": agent_id,
+                    "admin_key": admin_key,
+                    // memoria 工具门（NamespaceArg 必填，-32002）；存量 id 时该参数
+                    // 被 INSERT OR IGNORE 忽略，仅用于通过参数校验
+                    "namespace": format!("agent/{}", agent_id),
+                }),
+            )
+            .await
+            .ok()?;
+        // 内联解析（config 模块仅 bin 可见；与 config::extract_register_badge 同逻辑）
+        let badge = if let Some(s) = val.get("badge").and_then(|x| x.as_str()) {
+            Some(s.to_string())
+        } else {
+            val.get("badge")
+                .and_then(|x| x.get("badge_token"))
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+        }?;
+        let mut guard = COLLAB_BADGE_CACHE.lock().unwrap();
+        // 同 alias 缓存：过期重置时间戳（ocr low），否则 TTL 一次后缓存失效
+        let expired = guard
+            .as_ref()
+            .map(|(at, _)| at.elapsed() >= std::time::Duration::from_secs(600))
+            .unwrap_or(true);
+        if expired {
+            *guard = Some((std::time::Instant::now(), std::collections::HashMap::new()));
+        }
+        let map = guard
+            .get_or_insert_with(|| (std::time::Instant::now(), std::collections::HashMap::new()));
+        map.1.insert(agent_id.to_string(), badge.clone());
+        Some(badge)
     }
 
     /// 将 Memoria 原始 A2A 消息规范化为协作信封。
@@ -9691,8 +10178,9 @@ impl AgentCore {
                     let persona = persona.clone();
                     let ns = allowed_ns.to_vec();
                     let trace = trace_id.to_string();
+                    let sess = session_id.to_string();
                     async move {
-                        self.call_tool_routed(&name, &persona, &args, &ns, &trace).await
+                        self.call_tool_routed(&name, &persona, &args, &ns, &trace, Some(sess.as_str())).await
                     }
                 })
                 .collect();
@@ -10210,7 +10698,7 @@ impl AgentCore {
 
             // 通过 MCP 调用工具（按名称路由到正确的源）
             let result = match self
-                .call_tool_routed(&tc.name, &self.persona_for_session(session_id), &tc.arguments, allowed_ns, trace_id)
+                .call_tool_routed(&tc.name, &self.persona_for_session(session_id), &tc.arguments, allowed_ns, trace_id, Some(session_id))
                 .await
             {
                 Ok(text) => {
@@ -10622,8 +11110,10 @@ impl AgentCore {
         caller_agent_key: &str,
         msg_id: &str,
     ) -> Result<Option<serde_json::Value>, String> {
+        // 2026-11-16（ocr high 修复）：走合并视图查找——审批信封可能落在别名 ns
+        // （身份漂移场景），单 ns 查找会让非管理员审批恒落 admin-only 分支 403。
         let inbox = self
-            .collab_inbox_raw(caller_agent_id, caller_agent_key, 200)
+            .collab_inbox_merged(caller_agent_id, caller_agent_key, 200)
             .await?;
         Ok(inbox
             .into_iter()
@@ -10648,7 +11138,30 @@ impl AgentCore {
             )
             .await
             .map_err(|e| format!("a2a_delete 失败: {}", e))?;
-        Ok(val["deleted"].as_u64().unwrap_or(0))
+        let mut total = val["deleted"].as_u64().unwrap_or(0);
+        // 2026-11-16（ocr low 修复）：合并视图按 id 去重后只显示一条，但同一 id
+        // 的副本可能同时存在于本 ns 与别名 ns（memoria 按调用方 ns 删除）；删本
+        // ns 成功后仍遍历别名删净并汇总，避免下轮合并轮询同 id 副本「复活」
+        // （memoria 消息 id = timestamp_millis+type，跨 ns 同 id 还可能是不同消息，
+        // 一并清理才符合合并视图语义）。
+        for aid in self.collab_alias_ids(caller_agent_id).await {
+            if let Some(badge) = self.collab_fetch_badge(&aid).await {
+                let mcp2 = McpClient::new(&self.config.memoria_url, &aid, &badge);
+                match mcp2
+                    .call_json("a2a_delete", &serde_json::json!({ "id": msg_id }))
+                    .await
+                {
+                    Ok(v2) => total += v2["deleted"].as_u64().unwrap_or(0),
+                    Err(e) => {
+                        // 2026-11-16（ocr low）：别名副本删除失败不能静默——本轮仍报
+                        // ok，下轮合并轮询该 id 会「复活」。至少留痕供诊断。
+                        tracing::warn!(target: "collab", aid = %aid, id = %msg_id, err = %e,
+                            "collab_delete_message: 别名 ns 副本删除失败，消息可能复活");
+                    }
+                }
+            }
+        }
+        Ok(total)
     }
 
     /// 解析旧版 `[subject] body` 文本消息为信封各部分（type 降级为 `message`）。
@@ -11029,7 +11542,7 @@ impl AgentCore {
                 }
             }
             let exec_result = self
-                .call_tool_routed(&approval.tool_name, "default", &exec_args, allowed_ns, "")
+                .call_tool_routed(&approval.tool_name, "default", &exec_args, allowed_ns, "", Some(session_id))
                 .await;
             let desc = approval.description.chars().take(120).collect::<String>();
             // 任务 649：按工具真实返回如实上报，杜绝「假成功」
@@ -11132,6 +11645,7 @@ impl AgentCore {
                                 &serde_json::json!({ "sql": sql }),
                                 allowed_ns,
                                 "",
+                                None,
                             )
                             .await
                         {
@@ -11207,6 +11721,7 @@ impl AgentCore {
                         &sql_args,
                         allowed_ns,
                         "",
+                        None,
                     )
                     .await
                 {
@@ -11635,6 +12150,7 @@ impl AgentCore {
         args: &serde_json::Value,
         allowed_ns: &[String],
         trace_id: &str,
+        session_id: Option<&str>,
     ) -> Result<String, String> {
         // ── P2-3 澄清工具：暂停执行向用户澄清（Palantir Request clarification 对标） ──
         // 必须在 resolve_tool_name_middleware 之前拦截：该中间件不识别本内置工具，
@@ -11779,7 +12295,7 @@ impl AgentCore {
                         );
                     }
                     return Box::pin(
-                        self.call_tool_routed("execute_sql", persona_id, &ea, allowed_ns, trace_id),
+                        self.call_tool_routed("execute_sql", persona_id, &ea, allowed_ns, trace_id, session_id),
                     )
                     .await;
                 }
@@ -11794,6 +12310,7 @@ impl AgentCore {
                         &validated,
                         allowed_ns,
                         trace_id,
+                        session_id,
                     ))
                     .await;
                 }
@@ -11936,16 +12453,7 @@ impl AgentCore {
             }
         }
 
-        // Memoria NamespaceArg 工具：LLM/Composer 常漏传 namespace → -32002。
-        // 由引擎注入调用者主 ns（allowed_ns 首个非 *；否则 identity.ns()）。
-        Self::inject_namespace_arg(
-            tool_name,
-            &mut call_args,
-            allowed_ns,
-            &self.config.identity.ns(),
-        );
-
-        // ── A2 文件级 checkpoint：WRITE/dangerous 工具执行前快照其 path 参数指向的现有文件 ──
+        // 工具分级提前到 namespace 注入之前（供 reject_unattributed 判定与 A2 文件快照复用）
         let fc_level = {
             let b = self.boundary.lock().await;
             b.classifier
@@ -11953,6 +12461,87 @@ impl AgentCore {
                 .map(|c| c.classify(tool_name).to_string())
                 .unwrap_or_else(|_| "unknown".to_string())
         };
+
+        // Memoria NamespaceArg 工具：LLM/Composer 常漏传 namespace → -32002。
+        // 由引擎注入调用者主 ns（allowed_ns 首个非 *；否则 identity.ns()）。
+        // D0-NS：session 已知时以身份解析结果为注入源（legacy 安装ID → 隔离区、
+        // admin → main_ns、同事 → 个人 NS）；旁路旧路径保持原优先级。
+        //
+        // 2026-11-07 修：原实现用 caller_ns()，其 Err 分支把所有 NsError 降级成隔离区，
+        // 导致 reject_unattributed=true 时 NoIdentity 也被吞掉、写入照样落库（假开关）。
+        // 改用 resolve_session_ns() 保留错误：无身份 + 写工具 + 开关打开 → 直接拒绝执行；
+        // 只读工具仍放行（隔离区可读），其它错误维持隔离区兜底，false 下行为逐字不变。
+        // ⚠️ 残留缺口（OCR security·medium，2026-11-08，已定性收口）：caller_ns() 仍把
+        // NoIdentity 塌缩为隔离区——reject_unattributed=true 时以下直写路径不拒绝、
+        // 只落隔离区：① 3345 配额键（纯计数，无害）② 3371 注入拦截历史（本地
+        // chat_history 行，非 memoria）③ 11041 检索目标/兴趣词键（读侧，无害）
+        // ④ meetings.rs:1291 会议通知归档。工具执行路径（call_tool_routed）已全量
+        // 保留错误——开关对 LLM 驱动的写路径完全生效；直写路径迁移（各点语义不同：
+        // 计数键/本地行/读目标）留待 §13.5 P3 重构，不宜本轮一刀切。
+        let session_ns = match session_id {
+            Some(s) => match self.resolve_session_ns(s) {
+                Ok(d) => {
+                    if self.config.namespace.log_origin {
+                        tracing::info!(
+                            target: "ns_audit",
+                            session = %s,
+                            ns = %d.ns,
+                            origin = %d.origin,
+                            tool = %tool_name,
+                            "memory ns resolved for tool"
+                        );
+                    }
+                    Some(d.ns)
+                }
+                Err(crate::namespace::NsError::NoIdentity)
+                    if crate::namespace::should_reject_unattributed(
+                        &self.config.namespace,
+                        true,
+                        fc_level == "read",
+                    ) =>
+                {
+                    tracing::warn!(
+                        target: "ns_audit",
+                        session = %s,
+                        tool = %tool_name,
+                        "unattributed write rejected (reject_unattributed=true)"
+                    );
+                    return Err(
+                        "无认证身份：写入已被拒绝（reject_unattributed=true）。请先完成登录绑定。"
+                            .to_string(),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "ns_audit",
+                        session = %s,
+                        error = %e,
+                        "memory ns resolve failed → quarantine"
+                    );
+                    Some(self.config.namespace.quarantine_ns.clone())
+                }
+            },
+            None => None,
+        };
+        // OCR bug·medium：legacy 回滚路径注入优先级逐字保留——旧实现注入源是
+        // 首个非 * 授权项（inject 内部旧链），不使用会话解析结果。
+        let session_ns = if self.config.namespace.effective_policy()
+            == crate::namespace::NsPolicy::Legacy
+        {
+            None
+        } else {
+            session_ns
+        };
+
+        Self::inject_namespace_arg(
+            tool_name,
+            &mut call_args,
+            allowed_ns,
+            &self.config.identity.ns(),
+            session_ns.as_deref(),
+        );
+
+        // ── A2 文件级 checkpoint：WRITE/dangerous 工具执行前快照其 path 参数指向的现有文件 ──
         let fc_snapshots: Vec<String> =
             if fc_level == "write" || fc_level == "dangerous" {
                 crate::file_checkpoint::snapshot_args(args)
@@ -12076,6 +12665,7 @@ impl AgentCore {
                             &verify_args,
                             allowed_ns,
                             trace_id,
+                            session_id,
                         ))
                         .await
                         {
@@ -12407,7 +12997,8 @@ impl AgentCore {
         tool_name: &str,
         args: &mut serde_json::Value,
         allowed_ns: &[String],
-        identity_ns: &str,
+        _identity_ns: &str,
+        session_ns: Option<&str>,
     ) {
         let has_ns = args
             .get("namespace")
@@ -12415,16 +13006,58 @@ impl AgentCore {
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false);
         if has_ns {
+            // SECFIX 2026-11-21：LLM 显式传入的 namespace 必须落在调用者 allowed_ns
+            // 授权范围内，否则收窄到调用者自身命名空间——堵死跨命名空间读取
+            // （如同事智能体读 agent/xujiayan 主记忆区）。
+            let provided = args
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !Self::ns_allowed(&provided, allowed_ns) {
+                let ns = session_ns
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != "*")
+                    .map(str::to_string)
+                    .or_else(|| {
+                        allowed_ns
+                            .iter()
+                            .find(|s| !s.is_empty() && *s != "*")
+                            .cloned()
+                    })
+                    .unwrap_or_else(Self::memoria_main_ns);
+                if !ns.is_empty() && ns != "*" {
+                    tracing::warn!(
+                        tool = %tool_name,
+                        requested_ns = %provided,
+                        clamped_to = %ns,
+                        "SECFIX: namespace 越权请求已收窄到调用者授权范围"
+                    );
+                    if let Some(obj) = args.as_object_mut() {
+                        obj.insert("namespace".to_string(), serde_json::json!(ns));
+                    }
+                }
+            }
             return;
         }
         if !Self::tool_accepts_namespace(tool_name) {
             return;
         }
-        let ns = allowed_ns
-            .iter()
-            .map(|s| s.as_str())
-            .find(|s| !s.is_empty() && *s != "*")
-            .unwrap_or(identity_ns);
+        // 2026-10-29：全权限身份（allowed_ns=["*"]，如 admin）无具体 ns 可注入——
+        // 注意 identity_ns（=agent_id，如 "admin"）不是有效记忆 ns，不能作 fallback
+        // （实测注入 "admin" 后跨会话检索永远落空）。一律兜底主记忆区。
+        let ns = session_ns
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "*")
+            .map(str::to_string)
+            .or_else(|| {
+                allowed_ns
+                    .iter()
+                    .find(|s| !s.is_empty() && *s != "*")
+                    .cloned()
+            })
+            .unwrap_or_else(Self::memoria_main_ns);
         if ns.is_empty() || ns == "*" {
             return;
         }
@@ -12432,6 +13065,34 @@ impl AgentCore {
             obj.insert("namespace".to_string(), serde_json::json!(ns));
             tracing::debug!(tool = %tool_name, namespace = %ns, "inject namespace for memoria tool");
         }
+    }
+
+    /// SECFIX 2026-11-21：target 是否落在 allowed_ns 任一授权前缀内。
+    /// "*" = 全权限（admin）；允许精确命中或授权 ns 为祖先前缀。
+    /// 不允许 target 是授权 ns 的祖先（防借窄授权扩宽读取面）。
+    fn ns_allowed(target: &str, allowed: &[String]) -> bool {
+        if target.is_empty() {
+            return true;
+        }
+        allowed.iter().any(|a| {
+            let a = a.trim();
+            if a.is_empty() {
+                return false;
+            }
+            if a == "*" {
+                return true;
+            }
+            target == a || target.starts_with(&format!("{}/", a))
+        })
+    }
+
+    /// 主记忆区命名空间兜底（memoria 交接协议 v1 配套）：全权限身份无具体 ns 时
+    /// 注入此值，保证跨会话检索落在主记忆区。可用 MEMORIA_MAIN_NS 环境变量覆盖。
+    fn memoria_main_ns() -> String {
+        std::env::var("MEMORIA_MAIN_NS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "agent/xujiayan".to_string())
     }
 
     /// 是否应自动注入 namespace（Memoria 记忆/实体/编排类；dashboard 业务技能不注入）。
@@ -12581,7 +13242,12 @@ impl AgentCore {
 
     /// 快速路径：Harness 模板匹配
     #[tracing::instrument(skip_all, fields(message_len = message.len()))]
-    async fn try_harness_match(&self, message: &str, allowed_ns: &[String]) -> Option<String> {
+    async fn try_harness_match(
+        &self,
+        message: &str,
+        allowed_ns: &[String],
+        session_id: Option<&str>,
+    ) -> Option<String> {
         let context = serde_json::json!({
             "query": message,
             "agent_id": self.config.identity.agent_id,
@@ -12631,7 +13297,7 @@ impl AgentCore {
                     break;
                 }
                 let result = self
-                    .call_tool_routed(tool_name, "default", &args, allowed_ns, "")
+                    .call_tool_routed(tool_name, "default", &args, allowed_ns, "", session_id)
                     .await;
                 if result.is_err() {
                     all_ok = false;
@@ -13041,6 +13707,18 @@ impl AgentCore {
         // 双轨：受控改库扳手 + 本机白名单仓库编辑
         prompt.push_str(crate::db_write::system_hint());
         prompt.push_str(crate::repo_ws::system_hint());
+        // 跨会话记忆接力（memoria 交接协议 v1，2026-10-29）：经网关的智能体都有 memoria
+        // 工具（namespace 由网关自动注入），但没有任何机制告诉它们「要去查」——实测 WB/ZCode
+        // 场景下智能体答「会话相互隔离」。此处平台级注入行为指令，改一处全端生效
+        // （文本与 memoria SERVER_INSTRUCTIONS 保持同义，memoria 侧为正本）。
+        prompt.push_str(
+            "\n## 跨会话记忆接力（memoria）\n\
+             - 你可访问 memoria 跨客户端持久记忆库（ZCode/WorkBuddy 等其他智能体共享；namespace 已由系统自动注入，无需手动指定）。\n\
+             - 用户提到「刚刚 / 之前 / 上一轮 / 我和 zcode / 我和 workbuddy / 别的会话」聊过的事时，第一动作是查记忆：开放问题用 `memory_search`，要最新任务状态/交接锚点用 `memory_context`；严禁回答「不知道 / 会话相互隔离」。\n\
+             - 命中后按最新记录（created_at 最新）作答；内容含「[下一步]」就顺着它接续工作。\n\
+             - 本轮产生新决定/新进展/新卡点时，轮末用 `memory_observe` 写一条三段式交接：[定了什么] … [卡在哪] … [下一步] …（source 写你的 agent 标识），让下一个会话能接上。\n\
+             - memoria 不可达时（工具报错/超时）如实说明，不要阻塞主线、不要编造记忆内容。\n",
+        );
 
         if !knowledge.is_empty() {
             prompt.push_str("## 记忆档案\n");
@@ -13090,6 +13768,7 @@ impl AgentCore {
                 }),
                 allowed_ns,
                 "",
+                None,
             )
             .await
             .unwrap_or_default();
@@ -13102,6 +13781,7 @@ impl AgentCore {
                 }),
                 allowed_ns,
                 "",
+                None,
             )
             .await
             .unwrap_or_default();
@@ -16758,5 +17438,38 @@ mod meeting_invite_tests {
         // 终态守卫在 AgentCore::add_meeting_participant 的 is_terminal()——验证终态/非终态判定
         assert!(meeting("done", Some(MeetingPhase::Done)).is_terminal());
         assert!(!meeting("running", Some(MeetingPhase::Discussing)).is_terminal());
+    }
+}
+
+#[cfg(test)]
+mod pai_tool_face_tests {
+    use super::*;
+
+    /// OCR round2 finding 2：PAI_READ_TOOLS 与 ALWAYS_EXPOSE_TOOLS 必须同步；
+    /// 漂移方向均 fail-closed（少→unknown 黄线需确认，多→工具面被裁），
+    /// 本测试让漂移在 CI 即刻可见，而非等到运行时「工具不存在」。
+    #[test]
+    fn pai_read_tools_are_always_exposed() {
+        for t in crate::boundary::PAI_READ_TOOLS {
+            assert!(
+                AgentCore::ALWAYS_EXPOSE_TOOLS.contains(t),
+                "pai tool `{t}` 在 boundary::PAI_READ_TOOLS 但不在 AgentCore::ALWAYS_EXPOSE_TOOLS"
+            );
+        }
+    }
+
+    /// OCR round5 finding 5：反向漂移锁——ALWAYS_EXPOSE_TOOLS 里的 pai_* 工具
+    /// 必须全部登记在 boundary::PAI_READ_TOOLS（分类 read），否则每次调用
+    /// 都落入 unknown 黄线确认闸（正是要防的运行时故障）。
+    #[test]
+    fn pai_always_exposed_are_registered_read() {
+        for t in AgentCore::ALWAYS_EXPOSE_TOOLS {
+            if t.starts_with("pai_") {
+                assert!(
+                    crate::boundary::PAI_READ_TOOLS.contains(t),
+                    "pai tool `{t}` 在 AgentCore::ALWAYS_EXPOSE_TOOLS 但不在 boundary::PAI_READ_TOOLS"
+                );
+            }
+        }
     }
 }

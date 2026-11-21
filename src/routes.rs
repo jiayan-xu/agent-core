@@ -41,6 +41,8 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/approval/pending", get(handle_approval_pending))
         .route("/api/approval/history", get(handle_approval_history))
         .route("/api/approval/{id}/respond", post(handle_approval_respond))
+        .route("/api/approval/{id}/dingtalk-notify", post(handle_approval_dingtalk_notify))
+        .route("/api/approval/dingtalk-oa-url", get(handle_approval_dingtalk_oa_url))
         .route("/approval-console", get(handle_approval_console))
         .route("/api/ops/briefing", get(handle_ops_briefing))
         // ── P3 平台治理（2026-10-19，从 dashboard 迁出） ──
@@ -67,6 +69,8 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/services", get(handle_services_public))
         // ── Personal Assistant Platform Phase 0（2026-10-23）──
         // 本地助手持 opaque scoped token 调用；用户管理路由在 protected 侧。
+        // ── Phase 1.5（2026-10-26）：发现端点——同事智能体拿门牌即可自取 API 契约 ──
+        .route("/.well-known/assistant-platform", get(crate::handlers::discovery::handle_assistant_discovery))
         .route("/api/assistants/me", get(handle_assistant_me))
         .route("/api/assistants/heartbeat", post(handle_assistant_heartbeat))
         .route("/api/assistants/token/revoke", post(handle_assistant_token_revoke))
@@ -147,6 +151,7 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         .route("/api/collab/peers", get(handle_collab_peers))
         .route("/api/collab/profile", get(handle_collab_profile))
         .route("/api/memory/feedback", post(handle_memory_feedback))
+        .route("/api/memoria-info", get(handle_memoria_info))
         .route("/api/tool/execute", post(handle_tool_execute))
         .route("/api/tool/execute/{id}", get(handle_tool_execute_get))
         .route("/api/tool/auto-writes", get(handle_auto_writes_list))

@@ -112,7 +112,7 @@ pub(crate) async fn handle_approval_pending(
 ) -> Response {
     if !(approval_open_lan() || is_admin(&headers, &st).await) {
         // 部门经理：仅见本部门成员发起的待审项（memoria 注册表 read_write+dept ns 为权威）
-        let (caller, _) = match authenticate(&headers, &st).await {
+        let (caller, _, _) = match authenticate(&headers, &st).await {
             Ok(a) => a,
             Err(r) => return r,
         };
@@ -158,7 +158,7 @@ pub(crate) async fn handle_approval_history(
 ) -> Response {
     // 审批历史绑定注册人身份：任何已注册 agent（badge 认证通过）可查看，
     // 无需 admin key（审批人即注册用户本人）。写操作 respond 仍要求 admin。
-    let (agent_id, _allowed_ns) = match authenticate(&headers, &st).await {
+    let (agent_id, _allowed_ns, _) = match authenticate(&headers, &st).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -183,7 +183,7 @@ pub(crate) async fn handle_approval_respond(
     // 部门经理 → 其 agent_id（仅能批本部门成员的项，可见性与 pending 同规则）
     let mut approver_id = "dashboard-admin".to_string();
     if !(approval_open_lan() || is_admin(&headers, &st).await) {
-        let (caller, _) = match authenticate(&headers, &st).await {
+        let (caller, _, _) = match authenticate(&headers, &st).await {
             Ok(a) => a,
             Err(r) => return r,
         };
@@ -217,6 +217,27 @@ pub(crate) async fn handle_approval_respond(
             return (
                 axum::http::StatusCode::FORBIDDEN,
                 Json(serde_json::json!({"error": "该审批项不在你管辖的部门范围内"})),
+            )
+                .into_response();
+        }
+        // SECFIX 2026-11-21：代码写入类审批（edit_code）只允许 admin 决定，
+        // 部门经理不得审批代码改动——防「改权限系统自身源码」被委托审批放行。
+        let is_code_write = {
+            let guard = st.agent.lock().await;
+            match guard.as_ref() {
+                Some(a) => a
+                    .approval_manager
+                    .get_pending(&id)
+                    .await
+                    .map(|p| p.tool_name == "edit_code")
+                    .unwrap_or(false),
+                None => false,
+            }
+        };
+        if is_code_write {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "代码写入审批（edit_code）仅限管理员决定"})),
             )
                 .into_response();
         }
@@ -298,7 +319,7 @@ pub(crate) async fn handle_approval_respond(
                             }
                         }
                         let result = agent_clone
-                            .call_tool_routed(&tool_name_gw, "default", &exec_args, &allowed_ns, "")
+                            .call_tool_routed(&tool_name_gw, "default", &exec_args, &allowed_ns, "", None)
                             .await;
                         if let Some(exe_id) = &execution_id {
                             match &result {
@@ -325,6 +346,196 @@ pub(crate) async fn handle_approval_respond(
     } else {
         Json(serde_json::json!({"error": "agent not ready"})).into_response()
     }
+}
+
+// ── 钉钉入口（2026-10-26）：审批台内置「推钉钉」按钮的后端 ──────────────────
+//
+// POST /api/approval/{id}/dingtalk-notify
+// 把指定待审单推送到钉钉群自定义机器人（markdown 消息：审批摘要 + 指纹 +
+// 审批台入口提示）。审批动作仍只在平台审批台内完成（钉钉=门铃，非审批通道）——
+// 符合条例 4（无新审批旁路）与 D6（批准只在 PFAiX）。
+// 凭据：DINGTALK_WEBHOOK_URL / DINGTALK_WEBHOOK_SECRET——进程环境优先，
+// 缺失时回退读固定常量路径的密钥文件（与 platform.rs load_platform_key 同模式）。
+
+/// 固定路径常量（部署机固定；文件 ACL 仅 user/SYSTEM/Admins，条例 10）。
+const DINGTALK_KEY_FILE: &str = r"C:\Users\user\.svc-secrets\agent-core.env";
+
+fn dingtalk_env(key: &str) -> String {
+    if let Ok(v) = std::env::var(key) {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if let Ok(content) = std::fs::read_to_string(DINGTALK_KEY_FILE) {
+        let prefix = format!("{key}=");
+        for line in content.lines() {
+            if let Some(v) = line.strip_prefix(&prefix) {
+                let v = v.trim().trim_matches('"').to_string();
+                if !v.is_empty() {
+                    return v;
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// URL-safe base64（无填充）——钉钉 webhook 加签要求。
+fn b64url_nopad(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        out.push(T[(b[0] >> 2) as usize] as char);
+        out.push(T[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(T[(((b[1] & 0x0f) << 2) | (b[2] >> 6)) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(T[(b[2] & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
+pub(crate) async fn handle_approval_dingtalk_notify(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    // SECFIX 2026-11-21：钉钉通知入口与 pending/respond 同门——APPROVAL_OPEN_LAN=0 后
+    // 回退 admin key 校验（否则审批台「推钉钉」按钮在收紧后失效）。
+    if !(approval_open_lan() || is_admin(&headers, &st).await) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "此入口未开放（需 APPROVAL_OPEN_LAN）"})),
+        )
+            .into_response();
+    }
+    let url = dingtalk_env("DINGTALK_WEBHOOK_URL");
+    let secret = dingtalk_env("DINGTALK_WEBHOOK_SECRET");
+    if url.is_empty() || secret.is_empty() {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({
+                "error": "dingtalk_not_configured",
+                "message": "未配置钉钉机器人：在 ~/.svc-secrets/agent-core.env 加 DINGTALK_WEBHOOK_URL 与 DINGTALK_WEBHOOK_SECRET（群机器人 webhook 地址与加签密钥）"
+            })),
+        )
+            .into_response();
+    }
+    // 出站目标锁定钉钉开放平台域名（防 SSRF 显式边界：仅 https://oapi.dingtalk.com）
+    if !url.starts_with("https://oapi.dingtalk.com/") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "webhook 域名必须是 https://oapi.dingtalk.com/…"})),
+        )
+            .into_response();
+    }
+
+    // 取审批单信息
+    let agent = {
+        let guard = st.agent.lock().await;
+        guard.as_ref().map(|a| a.clone())
+    };
+    let Some(agent) = agent else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "服务尚未就绪").into_response();
+    };
+    let Some(p) = agent.approval_manager.get_pending(&id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "审批项不存在或已处理"})),
+        )
+            .into_response();
+    };
+
+    // 组装 markdown 消息（含审批台入口提示；不携带可直接执行的审批链接——
+    // 决策动作仍需进审批台完成身份与指纹校验）
+    let created = chrono::DateTime::from_timestamp(p.created_at as i64, 0)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default();
+    let md = format!(
+        "### 🛡️ PFAiX 审批提醒\n\n**{}** 需人工确认\n\n- 审批号：`{}`\n- 请求方：{}\n- 请求人：{}\n- 创建：{}\n- 操作指纹：`{}`\n\n> 请打开 PFAiX 审批台处理（批准/拒绝在平台内完成）",
+        p.tool_name, p.approval_id, p.requester_id, p.approver_id, created, p.operation_hash
+    );
+
+    // 钉钉加签：sign = base64url(hmac_sha256("{ts}\n{secret}", secret))
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    use hmac::Mac;
+    let mut mac = <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(secret.as_bytes())
+        .expect("hmac key");
+    mac.update(format!("{ts}\n{secret}").as_bytes());
+    let sign = b64url_nopad(&mac.finalize().into_bytes());
+    let hook = format!("{url}&timestamp={ts}&sign={sign}");
+
+    let body = serde_json::json!({
+        "msgtype": "markdown",
+        "markdown": { "title": "PFAiX 审批提醒", "text": md },
+    });
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&hook)
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&body)
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            // 审计（治理侧；审批未变状态）
+            agent
+                .audit_logger
+                .record_event(agent_core::audit::AuditEvent {
+                    ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                    trace_id: agent_core::audit::new_trace_id(),
+                    agent_id: "dashboard-admin".into(),
+                    session_id: Some(id.clone()),
+                    event_type: agent_core::audit::AuditEventType::Custom(
+                        "dingtalk.notified".into(),
+                    ),
+                    detail: format!("approval={} tool={}", p.approval_id, p.tool_name),
+                })
+                .await;
+            Json(serde_json::json!({"ok": true, "notified": id})).into_response()
+        }
+        Ok(r) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("钉钉返回 {}", r.status())})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("推送失败: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/approval/dingtalk-oa-url：钉钉客户端入口目标（审批台「钉钉客户端」按钮用）。
+/// 可配置 DINGTALK_OA_URL（进程环境或 svc-secrets env 文件）：dingtalk:// 深链原样返回；
+/// https 页面由前端包成客户端内嵌页（page/link&pc_slide=true）打开；
+/// 缺省空串 → 前端 dingtalk:// 裸拉起本地客户端（网页门户 oa/www/im.dingtalk.com 均不可用作普通账号入口）。
+pub(crate) async fn handle_approval_dingtalk_oa_url() -> Response {
+    let url = {
+        let u = dingtalk_env("DINGTALK_OA_URL");
+        if u.is_empty() {
+            String::new()
+        } else {
+            u
+        }
+    };
+    Json(serde_json::json!({ "url": url })).into_response()
 }
 
 /// 人工审批台内嵌 HTML（fetch 直连本 agent-core 的 /api/approval/* 端点）

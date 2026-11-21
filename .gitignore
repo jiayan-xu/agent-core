@@ -93,3 +93,4 @@ _local/
 
 # PFAiX 活页发布目录（跑批镜像产物，由 hhv-model publish_pfaix_pages.py 生成，不入库）
 pages/
+plugins/agentcore-mcp/tests/mask_audit_result.json 

@@ -23,6 +23,7 @@ pub mod llm;
 pub mod mcp_client;
 pub mod namespace;
 pub mod orchestration; // ADR-017：LLM 编排层 v2（flash 锚定引导 + Plan-Act-Reflect，默认 OFF）
+pub mod privacy; // P0-5：PII 出口脱敏（车牌/公司/手机/证件 → 占位符）与反掩码（2026-11-11）
 pub mod file_checkpoint;
 pub mod quota;
 pub mod sandbox;
