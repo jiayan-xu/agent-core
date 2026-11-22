@@ -500,6 +500,14 @@ impl Drop for SessionQuotaGuard {
     }
 }
 
+/// P0-2/BizBuddy WriteDedup：受控写查重占坑句柄（None = 本次调用不参与查重）。
+/// 键与 claim 时一致：入口工具名（cw_write 尚未改写为 controlled_db_write）+ 规范化参数指纹。
+struct WriteDedupGuard {
+    session_id: String,
+    tool_name: String,
+    op_hash: String,
+}
+
 struct InboxCache {
     data: Option<Vec<serde_json::Value>>,
     expires_at: f64,
@@ -7220,6 +7228,12 @@ impl AgentCore {
             state,
             &serde_json::json!({}),
         );
+        // P0-2/BizBuddy WriteDedup：终态即任务边界，清空该会话的写查重占坑
+        if matches!(state, CheckpointState::Done | CheckpointState::Failed) {
+            if let Err(e) = self.checkpoint_store.lock().await.clear_session(session_id) {
+                tracing::warn!(session = %session_id, err = %e, "write_dedup: 终态清理失败");
+            }
+        }
     }
 
     /// 把当前进行中的计划进度（plan + 已完成步骤）落盘 checkpoint
@@ -7367,7 +7381,19 @@ impl AgentCore {
                 false,
             )
             .await;
-        let _ = self.checkpoint_store.lock().await.delete(session_id);
+        {
+            let store = self.checkpoint_store.lock().await;
+            let _ = store.delete(session_id);
+            // P0-2/BizBuddy WriteDedup：checkpoint 删除（取消计划）时一并清理该会话占坑。
+            // P3-3（ocr 复核）：与 checkpoint_terminal 同口径，清理失败不静默吞错。
+            if let Err(e) = store.clear_session(session_id) {
+                tracing::warn!(
+                    session = %session_id,
+                    err = %e,
+                    "write_dedup: 取消计划清理失败"
+                );
+            }
+        }
     }
 
     /// 尝试应用计划编辑（当前支持「删除第N步」，并连带移除依赖它的步骤以防悬空）
@@ -11593,6 +11619,17 @@ let content = format!(
             // 真正的传输错误（Err）才保留供人工重试。审计已用 executed 如实标记 DB 是否实际写入。
             if exec_result.is_ok() {
                 self.approval_manager.remove(&approval.approval_id).await;
+                // P0-2/BizBuddy WriteDedup（P2-2 ocr 复核）：审批完成=任务边界，与同会话
+                // 确认路径的 checkpoint_terminal 清理对齐——审批台执行成功消费后清空该
+                // 会话占坑，避免成功摘要跨任务存活，把后续合法重复写误判为命中跳过。
+                // 不动 checkpoint 生命周期（残留 PendingApproval checkpoint 是既有问题，本任务不碰）。
+                if let Err(e) = self.checkpoint_store.lock().await.clear_session(session_id) {
+                    tracing::warn!(
+                        session = %session_id,
+                        err = %e,
+                        "write_dedup: 审批消费后清理失败"
+                    );
+                }
             }
             return Some(reply);
         }
@@ -11804,26 +11841,41 @@ let content = format!(
     /// - honest_note=Some(prefix) 时，reply 应以该前缀如实上报，而非直接标成功；
     /// - honest_note=None 时，才使用「✅ 操作已执行成功」的常规成功文案。
     /// 对非结构化返回（无 success/require_confirm/error 字段的纯文本工具）保守视为成功，保持旧行为。
+    /// P0-2/BizBuddy WriteDedup：跳过重复执行（skipped_duplicate=true）虽带 success:true，
+    /// 但本次未执行任何写操作，必须拦截并如实上报，不得落进「已执行成功」分支。
     fn classify_tool_execution(result: &Result<String, String>) -> (bool, Option<String>) {
         match result {
             Err(e) => (false, Some(format!("⚠️ 工具执行失败：{}", e))),
             Ok(text) => {
                 let v = serde_json::from_str::<serde_json::Value>(text).ok();
-                let (success, require_confirm, error_opt) = match v {
+                let (success, require_confirm, error_opt, skipped_dup) = match v {
                     Some(ref j)
                         if j.get("success").is_some()
                             || j.get("require_confirm").is_some()
-                            || j.get("error").is_some() =>
+                            || j.get("error").is_some()
+                            || j.get("skipped_duplicate").is_some() =>
                     {
                         (
                             j.get("success").and_then(|x| x.as_bool()).unwrap_or(false),
                             j.get("require_confirm").and_then(|x| x.as_bool()).unwrap_or(false),
                             j.get("error").and_then(|x| x.as_str()).map(|s| s.to_string()),
+                            j
+                                .get("skipped_duplicate")
+                                .and_then(|x| x.as_bool())
+                                .unwrap_or(false),
                         )
                     }
                     _ => return (true, None), // 非结构化返回：按旧逻辑视为成功
                 };
-                if success {
+                if skipped_dup {
+                    (
+                        false,
+                        Some(
+                            "ℹ️ 已跳过重复执行（与上次操作指纹相同），本次未重复执行任何写操作。"
+                                .to_string(),
+                        ),
+                    )
+                } else if success {
                     (true, None)
                 } else if require_confirm {
                     (
@@ -12219,6 +12271,88 @@ let content = format!(
             ));
         }
 
+        // ── P0-2/BizBuddy WriteDedup：受控写执行前占坑（防同一操作重复落库/重复外呼） ──
+        // 位置：persona / kill-switch / 配额门控之后、工具名仍是入口名（cw_write 尚未
+        // 改写为 controlled_db_write），保证查重键与登记键一致，且门控拒绝不留占坑残留。
+        // session 缺失（网关直连入口）fail-open：不查重不登记，仅对参与去重的工具记 warn。
+        let write_dedup_guard: Option<WriteDedupGuard> = match crate::controlled_write::lookup(tool_name) {
+            Some(spec) if crate::controlled_write::dedup_applicable(spec, args) => match session_id {
+                Some(sid) => {
+                    let op_hash = crate::approval::compute_operation_hash(
+                        tool_name,
+                        &crate::controlled_write::normalize_dedup_args(tool_name, args),
+                    );
+                    let claim = self
+                        .checkpoint_store
+                        .lock()
+                        .await
+                        .claim_write_dedup(sid, tool_name, &op_hash);
+                    match claim {
+                        Ok(crate::checkpoint::WriteDedupClaim::Claimed) => Some(WriteDedupGuard {
+                            session_id: sid.to_string(),
+                            tool_name: tool_name.clone(),
+                            op_hash,
+                        }),
+                        Ok(crate::checkpoint::WriteDedupClaim::Duplicate { summary }) => {
+                            tracing::info!(
+                                tool = %tool_name,
+                                session = %sid,
+                                "write_dedup: 命中上次成功指纹，跳过重复执行"
+                            );
+                            return Ok(Self::skipped_duplicate_reply(&summary));
+                        }
+                        Ok(crate::checkpoint::WriteDedupClaim::InFlight) => {
+                            tracing::info!(
+                                tool = %tool_name,
+                                session = %sid,
+                                "write_dedup: 同指纹操作执行中，跳过本次调用"
+                            );
+                            return Ok(Self::skipped_duplicate_reply(""));
+                        }
+                        Err(e) => {
+                            // 查重存储异常：fail-open 放行，不因辅助能力阻断业务写
+                            tracing::warn!(
+                                tool = %tool_name,
+                                session = %sid,
+                                err = %e,
+                                "write_dedup: claim 失败，fail-open 放行"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        tool = %tool_name,
+                        "write_dedup: 会话缺失，跳过查重（fail-open）"
+                    );
+                    None
+                }
+            },
+            _ => None,
+        };
+
+        // 执行体单独成函数：所有早退/返回路径（含门控拒绝、改写递归返回）统一由外壳
+        // write_dedup_finalize 收尾，避免在十余个返回点逐一放坑造成漏点（P0-2/BizBuddy）。
+        let exec_result = self
+            .call_tool_routed_exec(tool_name, persona_id, args, allowed_ns, trace_id, session_id)
+            .await;
+        self.write_dedup_finalize(write_dedup_guard, &exec_result)
+            .await;
+        exec_result
+    }
+
+    /// call_tool_routed 的执行体（P0-2/BizBuddy WriteDedup 拆分）：原主体逐字保留；
+    /// 本函数不做任何占坑/放坑，占坑在外壳、收尾经外壳单一出口完成。
+    async fn call_tool_routed_exec(
+        &self,
+        tool_name: &str,
+        persona_id: &str,
+        args: &serde_json::Value,
+        allowed_ns: &[String],
+        trace_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<String, String> {
         // ── 本仓沙箱 FS：默认关闭；启用后仍必须过 hard_guards，禁止绕过 boundary ──
         if crate::local_fs::is_local_fs_tool(tool_name) {
             if !crate::local_fs::is_enabled() {
@@ -12282,7 +12416,9 @@ let content = format!(
             } {
                 return Err(format!("⛔ {}", blocked.reason));
             }
-            match tool_name.as_str() {
+            // P0-2/BizBuddy WriteDedup 拆分：tool_name 已是 &str，直接匹配
+            //（&String 时代的 .as_str() 走 String::as_str，&str 上的 str::as_str 未稳定）
+            match tool_name {
                 crate::db_write::TOOL_SELECT => {
                     let (sql, params) = match crate::db_write::build_select(&args) {
                         Ok(v) => v,
@@ -12688,6 +12824,60 @@ let content = format!(
         }
 
         result
+    }
+
+    /// P0-2/BizBuddy WriteDedup：统一收尾——执行成功登记摘要，未成功释放占坑。
+    /// 由 call_tool_routed 外壳单一出口调用，覆盖执行体所有早退/返回路径，避免漏点：
+    /// - classify 判定真正执行（executed=true）→ 登记摘要（500 字符字符边界截断）；
+    /// - require_confirm / error / Err / 门控拒绝（未产生写入）→ 释放占坑，
+    ///   保留修正重试与审批后续执行能力。
+    /// guard 为 None（不参与查重）时为 no-op。
+    async fn write_dedup_finalize(
+        &self,
+        guard: Option<WriteDedupGuard>,
+        result: &Result<String, String>,
+    ) {
+        let Some(g) = guard else {
+            return;
+        };
+        let (executed, _) = Self::classify_tool_execution(result);
+        let store = self.checkpoint_store.lock().await;
+        let summary = match result {
+            Ok(t) => t.as_str(),
+            Err(_) => "",
+        };
+        // P3-4（ocr 复核）：executed=true 但结果为空串（如非结构化空回执）时改为释放——
+        // 空串摘要一旦登记，claim 的「摘要非空才命中」判定会把它当 in-flight 锁定 600s。
+        let outcome = if executed && !summary.is_empty() {
+            store.finalize_write_dedup(&g.session_id, &g.tool_name, &g.op_hash, summary)
+        } else {
+            store.release_write_dedup(&g.session_id, &g.tool_name, &g.op_hash)
+        };
+        if let Err(e) = outcome {
+            tracing::warn!(
+                tool = %g.tool_name,
+                session = %g.session_id,
+                err = %e,
+                "write_dedup: 收尾失败"
+            );
+        }
+    }
+
+    /// P0-2/BizBuddy WriteDedup：命中跳过时返回的结构化结果。
+    /// success=true 但 skipped_duplicate=true：classify_tool_execution 会拦截该标记，
+    /// 调用方不会把它包装成「操作已执行成功」；summary 为空表示同指纹操作执行中。
+    fn skipped_duplicate_reply(summary: &str) -> String {
+        let note = if summary.is_empty() {
+            "该操作正在执行中，请稍候；若长时间未完成可重新发起。".to_string()
+        } else {
+            format!("上次执行摘要：{}", summary)
+        };
+        serde_json::json!({
+            "success": true,
+            "skipped_duplicate": true,
+            "summary": note,
+        })
+        .to_string()
     }
 
     /// 获取当前 agent 的命名空间路径列表（用于 boundary check_tool 的 namespaces 参数）
@@ -16389,6 +16579,42 @@ mod whitelist_preroute_tests {
         let (executed, note) = AgentCore::classify_tool_execution(&transport);
         assert!(!executed);
         assert!(note.unwrap().contains("timeout"));
+
+        // P0-2/BizBuddy WriteDedup：命中跳过虽带 success:true，但必须拦截为未执行，
+        // 不得落入「非结构化/成功 = 已执行」兜底，否则调用方会回显「✅ 操作已执行成功」。
+        let skipped = Ok(
+            r#"{"success":true,"skipped_duplicate":true,"summary":"上次执行摘要：白名单已更新"}"#
+                .to_string(),
+        );
+        let (executed, note) = AgentCore::classify_tool_execution(&skipped);
+        assert!(!executed);
+        let note = note.unwrap();
+        assert!(note.contains("已跳过重复执行"));
+        assert!(!note.contains("操作已执行成功"));
+    }
+
+    /// P0-2/BizBuddy（复核补测）：命中跳过的结构化回执形状——success=true 但
+    /// skipped_duplicate=true，classify 据此拦截、不得上报「已执行成功」；
+    /// summary 非空=回显上次摘要、空=执行中说明，两种文案都不得为空。
+    #[test]
+    fn skipped_duplicate_reply_shape() {
+        let hit = AgentCore::skipped_duplicate_reply("白名单已更新：苏EZQ117");
+        let v: serde_json::Value = serde_json::from_str(&hit).unwrap();
+        assert_eq!(v["success"], serde_json::json!(true));
+        assert_eq!(v["skipped_duplicate"], serde_json::json!(true));
+        let summary = v["summary"].as_str().unwrap();
+        assert!(summary.contains("白名单已更新"), "非空摘要应回显上次执行内容");
+
+        let inflight = AgentCore::skipped_duplicate_reply("");
+        let v2: serde_json::Value = serde_json::from_str(&inflight).unwrap();
+        assert_eq!(v2["success"], serde_json::json!(true));
+        assert_eq!(v2["skipped_duplicate"], serde_json::json!(true));
+        let summary2 = v2["summary"].as_str().unwrap();
+        assert!(
+            summary2.contains("执行中"),
+            "空摘要应给出「执行中」说明文案，实际：{}",
+            summary2
+        );
     }
 
     /// 会议升级 Step2：旧 meetings.json（无 participant_agents/messages 字段）必须能反序列化，

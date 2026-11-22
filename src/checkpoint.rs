@@ -11,6 +11,24 @@
 
 use rusqlite::{params, Connection};
 
+/// P0-2/BizBuddy WriteDedup：in-flight 占坑超过该秒数视为陈旧（执行方崩溃 /
+/// 释放失败等残留），可被重新占坑。10 分钟来自设计定案。
+const WRITE_DEDUP_STALE_SECS: u64 = 600;
+
+/// P0-2/BizBuddy WriteDedup：登记摘要的最大字符数（按字符截断，绝不切 UTF-8 中间）。
+const WRITE_DEDUP_SUMMARY_CHARS: usize = 500;
+
+/// P0-2/BizBuddy WriteDedup：受控写执行前占坑（claim）的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteDedupClaim {
+    /// 首次占坑成功 → 放行执行
+    Claimed,
+    /// 与上次已成功操作指纹相同 → 跳过执行，返回上次摘要
+    Duplicate { summary: String },
+    /// 同指纹操作正在执行中（未超时）→ 跳过本次调用
+    InFlight,
+}
+
 /// 控制面状态机
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
@@ -94,10 +112,155 @@ impl CheckpointStore {
                     created_at   TEXT DEFAULT (datetime('now')),
                     updated_at   TEXT DEFAULT (datetime('now'))
                 );
-                CREATE INDEX IF NOT EXISTS idx_checkpoint_state ON checkpoints(state);",
+                CREATE INDEX IF NOT EXISTS idx_checkpoint_state ON checkpoints(state);
+                CREATE TABLE IF NOT EXISTS write_dedup (
+                    session_id     TEXT NOT NULL,
+                    tool_name      TEXT NOT NULL,
+                    operation_hash TEXT NOT NULL,
+                    result_summary TEXT,
+                    created_at     INTEGER NOT NULL,
+                    PRIMARY KEY(session_id, tool_name, operation_hash)
+                );",
             )
             .map_err(|e| format!("init checkpoint schema: {}", e))?;
         Ok(())
+    }
+
+    /// P0-2/BizBuddy WriteDedup：受控写执行前占坑。
+    /// - 首次插入成功 → `Claimed`（放行执行）；
+    /// - 已有行且 result_summary 非空 → `Duplicate`（命中上次成功摘要，跳过执行）；
+    /// - 已有行但摘要为空（in-flight）→ 未超 600s 视为进行中返回 `InFlight`；
+    ///   超 600s 视为陈旧残留：DELETE 后重新占坑放行。
+    pub fn claim_write_dedup(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        operation_hash: &str,
+    ) -> Result<WriteDedupClaim, String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let inserted = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO write_dedup
+                    (session_id, tool_name, operation_hash, result_summary, created_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4)",
+                params![session_id, tool_name, operation_hash, now as i64],
+            )
+            .map_err(|e| format!("claim write_dedup: {}", e))?;
+        if inserted == 1 {
+            return Ok(WriteDedupClaim::Claimed);
+        }
+
+        // 已有行：读回判定（result_summary / created_at）
+        let existing: Option<(Option<String>, i64)> = self
+            .conn
+            .query_row(
+                "SELECT result_summary, created_at FROM write_dedup
+                 WHERE session_id=?1 AND tool_name=?2 AND operation_hash=?3",
+                params![session_id, tool_name, operation_hash],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        let (summary, _created_at) = match existing {
+            Some(v) => v,
+            None => {
+                // 理论不可达（INSERT 冲突但读不到行，如跨进程并发删除竞态）：
+                // fail-open 放行，避免误跳过真实写操作
+                tracing::warn!(
+                    session = %session_id,
+                    tool = %tool_name,
+                    "write_dedup: 占坑冲突但读不到行，fail-open 放行"
+                );
+                return Ok(WriteDedupClaim::Claimed);
+            }
+        };
+        // 摘要非空 → 命中上次成功执行
+        if let Some(s) = summary.filter(|s| !s.is_empty()) {
+            return Ok(WriteDedupClaim::Duplicate { summary: s });
+        }
+        // in-flight：超过 600s 视为陈旧 → 清理后重新占坑。
+        // P2-1（ocr 复核）：陈旧性谓词与 DELETE 原子一致（result_summary IS NULL 且
+        // created_at < now-600s），跨进程并发下也不会误删他人刚占的新坑——他人新坑
+        // 删不掉，随后 INSERT OR IGNORE 冲突（again==0）→ InFlight。
+        let cutoff = now.saturating_sub(WRITE_DEDUP_STALE_SECS) as i64;
+        self.conn
+            .execute(
+                "DELETE FROM write_dedup
+                 WHERE session_id=?1 AND tool_name=?2 AND operation_hash=?3
+                   AND result_summary IS NULL AND created_at < ?4",
+                params![session_id, tool_name, operation_hash, cutoff],
+            )
+            .map_err(|e| format!("reclaim write_dedup (delete): {}", e))?;
+        let again = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO write_dedup
+                    (session_id, tool_name, operation_hash, result_summary, created_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4)",
+                params![session_id, tool_name, operation_hash, now as i64],
+            )
+            .map_err(|e| format!("reclaim write_dedup: {}", e))?;
+        if again == 1 {
+            return Ok(WriteDedupClaim::Claimed);
+        }
+        Ok(WriteDedupClaim::InFlight)
+    }
+
+    /// P0-2/BizBuddy WriteDedup：执行**成功**后登记摘要（供后续同指纹调用跳过时回显）。
+    /// 摘要按字符边界截断到 500 字符，绝不截断 UTF-8 中间。
+    pub fn finalize_write_dedup(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        operation_hash: &str,
+        result_summary: &str,
+    ) -> Result<(), String> {
+        let summary: String = result_summary
+            .chars()
+            .take(WRITE_DEDUP_SUMMARY_CHARS)
+            .collect();
+        self.conn
+            .execute(
+                "UPDATE write_dedup SET result_summary=?4
+                 WHERE session_id=?1 AND tool_name=?2 AND operation_hash=?3",
+                params![session_id, tool_name, operation_hash, summary],
+            )
+            .map_err(|e| format!("finalize write_dedup: {}", e))?;
+        Ok(())
+    }
+
+    /// P0-2/BizBuddy WriteDedup：执行**未成功**（require_confirm / error / Err）释放占坑，
+    /// 保留修正重试与审批后续执行能力。
+    pub fn release_write_dedup(
+        &self,
+        session_id: &str,
+        tool_name: &str,
+        operation_hash: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM write_dedup
+                 WHERE session_id=?1 AND tool_name=?2 AND operation_hash=?3",
+                params![session_id, tool_name, operation_hash],
+            )
+            .map_err(|e| format!("release write_dedup: {}", e))?;
+        Ok(())
+    }
+
+    /// P0-2/BizBuddy WriteDedup：任务边界清理——删除该 session 全部占坑行。
+    /// 在 checkpoint 终态（Done/Failed）与 checkpoint 删除路径调用。
+    pub fn clear_session(&self, session_id: &str) -> Result<usize, String> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM write_dedup WHERE session_id=?1",
+                params![session_id],
+            )
+            .map_err(|e| format!("clear write_dedup session: {}", e))?;
+        Ok(n as usize)
     }
 
     /// upsert 一个 checkpoint（状态迁移成功即写）
@@ -328,5 +491,171 @@ mod tests {
         assert!(pa.state != CheckpointState::New); // 会计入恢复
 
         assert!(store.load("zzz").is_none()); // 不存在 => 不计入恢复
+    }
+
+    /// P0-2/BizBuddy WriteDedup：claim / finalize / duplicate / release 全生命周期。
+    /// 首次占坑放行 → in-flight 未超时跳过 → 成功登记摘要后二次调用命中返回摘要 →
+    /// 失败释放后可重试；不同指纹互不影响。
+    #[test]
+    fn write_dedup_claim_finalize_duplicate_release() {
+        let store = CheckpointStore::open_memory().unwrap();
+        // 首次占坑 → 放行
+        assert_eq!(
+            store.claim_write_dedup("s1", "cw_write", "h1").unwrap(),
+            WriteDedupClaim::Claimed
+        );
+        // 同指纹未登记摘要（in-flight 未超时）→ 跳过
+        assert_eq!(
+            store.claim_write_dedup("s1", "cw_write", "h1").unwrap(),
+            WriteDedupClaim::InFlight
+        );
+        // 成功登记摘要 → 二次调用命中返回摘要
+        store
+            .finalize_write_dedup("s1", "cw_write", "h1", "白名单已更新：苏EZQ117")
+            .unwrap();
+        match store.claim_write_dedup("s1", "cw_write", "h1").unwrap() {
+            WriteDedupClaim::Duplicate { summary } => assert!(summary.contains("苏EZQ117")),
+            other => panic!("expect Duplicate, got {:?}", other),
+        }
+        // 不同指纹互不影响
+        assert_eq!(
+            store.claim_write_dedup("s1", "cw_write", "h2").unwrap(),
+            WriteDedupClaim::Claimed
+        );
+        // 失败释放后可重试（保留修正重试能力）
+        store.release_write_dedup("s1", "cw_write", "h2").unwrap();
+        assert_eq!(
+            store.claim_write_dedup("s1", "cw_write", "h2").unwrap(),
+            WriteDedupClaim::Claimed
+        );
+    }
+
+    /// P0-2/BizBuddy WriteDedup：摘要登记按字符边界截断到 500，绝不切 UTF-8 中间。
+    #[test]
+    fn write_dedup_summary_truncated_on_char_boundary() {
+        let store = CheckpointStore::open_memory().unwrap();
+        let long = "汉".repeat(600);
+        store.claim_write_dedup("s", "edit_code", "h").unwrap();
+        store.finalize_write_dedup("s", "edit_code", "h", &long).unwrap();
+        match store.claim_write_dedup("s", "edit_code", "h").unwrap() {
+            WriteDedupClaim::Duplicate { summary } => {
+                assert_eq!(summary.chars().count(), 500);
+                assert_eq!(summary, "汉".repeat(500));
+            }
+            other => panic!("expect Duplicate, got {:?}", other),
+        }
+    }
+
+    /// P0-2/BizBuddy WriteDedup：in-flight 超过 600s 视为陈旧 → DELETE 后重新占坑；
+    /// 重新占坑后 created_at 已刷新，回到未超时语义。
+    #[test]
+    fn write_dedup_stale_inflight_reclaimed() {
+        let store = CheckpointStore::open_memory().unwrap();
+        store.claim_write_dedup("s1", "local_fs_write", "h").unwrap();
+        // 人为把 created_at 拨回 700s 前，模拟执行方崩溃残留的陈旧占坑
+        store
+            .conn
+            .execute(
+                "UPDATE write_dedup SET created_at = created_at - 700 WHERE session_id='s1'",
+                params![],
+            )
+            .unwrap();
+        assert_eq!(
+            store.claim_write_dedup("s1", "local_fs_write", "h").unwrap(),
+            WriteDedupClaim::Claimed
+        );
+        assert_eq!(
+            store.claim_write_dedup("s1", "local_fs_write", "h").unwrap(),
+            WriteDedupClaim::InFlight
+        );
+    }
+
+    /// P0-2/BizBuddy WriteDedup：文件持久化跨 reopen 存活（仿 test_file_durability_across_reopen），
+    /// 且与 checkpoints 同库共存；clear_session 只清目标会话，不波及其它会话。
+    #[test]
+    fn write_dedup_clear_session_and_survive_reopen() {
+        let path = std::env::temp_dir().join(format!("wdedup_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = CheckpointStore::open(path.to_str().unwrap()).unwrap();
+            // 同文件放一条 checkpoint，验证同库共存不互扰
+            store
+                .save("s1", "a", CheckpointState::Done, &serde_json::json!({}))
+                .unwrap();
+            store.claim_write_dedup("s1", "cw_write", "h1").unwrap();
+            store
+                .finalize_write_dedup("s1", "cw_write", "h1", "done")
+                .unwrap();
+            store.claim_write_dedup("s2", "cw_write", "h1").unwrap();
+        }
+        // reopen：占坑与摘要必须存活
+        {
+            let store = CheckpointStore::open(path.to_str().unwrap()).unwrap();
+            assert!(store.load("s1").is_some());
+            match store.claim_write_dedup("s1", "cw_write", "h1").unwrap() {
+                WriteDedupClaim::Duplicate { summary } => assert_eq!(summary, "done"),
+                other => panic!("expect Duplicate, got {:?}", other),
+            }
+            // s2 的 in-flight 占坑（摘要为空、未超时）也应存活
+            assert_eq!(
+                store.claim_write_dedup("s2", "cw_write", "h1").unwrap(),
+                WriteDedupClaim::InFlight
+            );
+            // clear_session 只清目标会话
+            store.clear_session("s1").unwrap();
+            assert_eq!(
+                store.claim_write_dedup("s1", "cw_write", "h1").unwrap(),
+                WriteDedupClaim::Claimed
+            );
+            assert_eq!(
+                store.claim_write_dedup("s2", "cw_write", "h1").unwrap(),
+                WriteDedupClaim::InFlight
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P0-2/BizBuddy（复核补测）：require_confirm 未产生写入 → release → 审批通过后
+    /// 同指纹重 claim 应得 Claimed——「保留修正重试与审批后续执行能力」的语义回归。
+    #[test]
+    fn write_dedup_release_then_reclaim_after_require_confirm() {
+        let store = CheckpointStore::open_memory().unwrap();
+        // 首次发起：占坑放行
+        assert_eq!(
+            store.claim_write_dedup("s1", "cw_write", "h").unwrap(),
+            WriteDedupClaim::Claimed
+        );
+        // 执行返回 require_confirm（未产生写入）→ 释放
+        store.release_write_dedup("s1", "cw_write", "h").unwrap();
+        // 审批通过后同参数重执行 → 重新占坑放行，而不是被旧坑锁死
+        assert_eq!(
+            store.claim_write_dedup("s1", "cw_write", "h").unwrap(),
+            WriteDedupClaim::Claimed
+        );
+    }
+
+    /// P0-2/BizBuddy（复核补测）：两 tokio task 并发同参占坑——经
+    /// Arc<tokio::sync::Mutex<CheckpointStore>> 串行化（与生产 call_tool_routed 的
+    /// `checkpoint_store.lock().await` 同一互斥模型），恰好一个 Claimed、一个 InFlight。
+    #[tokio::test]
+    async fn write_dedup_concurrent_claim_single_winner() {
+        let store = std::sync::Arc::new(tokio::sync::Mutex::new(
+            CheckpointStore::open_memory().unwrap(),
+        ));
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let (r1, r2) = tokio::join!(
+            async move { s1.lock().await.claim_write_dedup("s", "cw_write", "h").unwrap() },
+            async move { s2.lock().await.claim_write_dedup("s", "cw_write", "h").unwrap() },
+        );
+        let single_winner = (matches!(r1, WriteDedupClaim::Claimed)
+            && matches!(r2, WriteDedupClaim::InFlight))
+            || (matches!(r1, WriteDedupClaim::InFlight)
+                && matches!(r2, WriteDedupClaim::Claimed));
+        assert!(
+            single_winner,
+            "expect exactly one Claimed + one InFlight, got {:?} / {:?}",
+            r1, r2
+        );
     }
 }

@@ -69,6 +69,9 @@ pub struct ControlledWriteSpec {
     pub tool: &'static str,
     pub label: &'static str,
     pub strategy: VerifyStrategy,
+    /// P0-2/BizBuddy WriteDedup：是否参与写查重（执行前占坑 + 同指纹跳过）。
+    /// 写/外呼类 true；只读查看类（repo_ws_diff）false。
+    pub dedup: bool,
 }
 
 /// 显式注册表：未列出的写工具不做自动回读，也不因此获得写权限。
@@ -77,36 +80,43 @@ pub static CONTROLLED_WRITES: &[ControlledWriteSpec] = &[
         tool: "sync_whitelist_plates",
         label: "白名单受控写",
         strategy: VerifyStrategy::WhitelistSync,
+        dedup: true,
     },
     ControlledWriteSpec {
         tool: "manage_whitelist",
         label: "白名单管理写",
         strategy: VerifyStrategy::WhitelistWasteType,
+        dedup: true,
     },
     ControlledWriteSpec {
         tool: "local_fs_write",
         label: "沙箱文件写",
         strategy: VerifyStrategy::LocalFsWrite,
+        dedup: true,
     },
     ControlledWriteSpec {
         tool: "edit_code",
         label: "部门改码",
         strategy: VerifyStrategy::EditCodeVerified,
+        dedup: true,
     },
     ControlledWriteSpec {
         tool: "cw_write",
         label: "受控改库写",
         strategy: VerifyStrategy::DbWrite,
+        dedup: true,
     },
     ControlledWriteSpec {
         tool: "repo_ws_write",
         label: "白名单仓写",
         strategy: VerifyStrategy::RepoWsWrite,
+        dedup: true,
     },
     ControlledWriteSpec {
         tool: "repo_ws_diff",
         label: "白名单仓改动",
         strategy: VerifyStrategy::RepoWsWrite,
+        dedup: false,
     },
     ControlledWriteSpec {
         tool: "sync_exception_correction",
@@ -115,6 +125,7 @@ pub static CONTROLLED_WRITES: &[ControlledWriteSpec] = &[
             needle: "updated_db",
             anti_needle: "\"error\"",
         },
+        dedup: true,
     },
     ControlledWriteSpec {
         tool: "manage_samples",
@@ -123,6 +134,7 @@ pub static CONTROLLED_WRITES: &[ControlledWriteSpec] = &[
             needle: "success",
             anti_needle: "\"success\": false",
         },
+        dedup: true,
     },
 ];
 
@@ -132,6 +144,46 @@ pub fn lookup(tool: &str) -> Option<&'static ControlledWriteSpec> {
 
 pub fn is_controlled_write_tool(tool: &str) -> bool {
     lookup(tool).is_some()
+}
+
+/// P0-2/BizBuddy WriteDedup：哈希规范化——顶层剥离 `confirmed` / `dry_run` / `reason`
+/// 三个键后再交给 `crate::approval::compute_operation_hash`。
+/// 背景：审批执行链路会向参数注入 `confirmed=true`（并强制 `dry_run=false`），
+/// 若不剥离，同一操作在「首次发起」与「审批后执行」会算出不同指纹，查重失效。
+/// 其余键（含嵌套结构）逐字保留；args 非对象（数组/标量等非法形态）原样直通。
+/// `tool_name` 目前不参与规范化，保留形参以支撑未来按工具的差异化规则。
+pub fn normalize_dedup_args(_tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
+    const STRIP_KEYS: [&str; 3] = ["confirmed", "dry_run", "reason"];
+    match args {
+        serde_json::Value::Object(map) => {
+            let mut stripped = map.clone();
+            for k in STRIP_KEYS {
+                stripped.remove(k);
+            }
+            serde_json::Value::Object(stripped)
+        }
+        other => other.clone(),
+    }
+}
+
+/// P0-2/BizBuddy WriteDedup：该 (spec, args) 是否参与查重。
+/// 1) 注册表开关为第一道闸（repo_ws_diff 等只读查看类不参与）；
+/// 2) manage_whitelist 的 action=query 是纯查询，不参与去重；
+/// 3) dry_run=true 的预览调用不占坑——预览不产生写副作用，若占坑并登记摘要，
+///    审批后的实写（哈希经 normalize 后与预览一致）会被误判为重复命中而跳过。
+pub fn dedup_applicable(spec: &ControlledWriteSpec, args: &serde_json::Value) -> bool {
+    if !spec.dedup {
+        return false;
+    }
+    if spec.tool == "manage_whitelist"
+        && args.get("action").and_then(|a| a.as_str()) == Some("query")
+    {
+        return false;
+    }
+    if args.get("dry_run").and_then(|d| d.as_bool()) == Some(true) {
+        return false;
+    }
+    true
 }
 
 /// 回读计划：agent 按此调用只读工具或本地比对。
@@ -660,5 +712,82 @@ mod tests {
             }
             other => panic!("{:?}", other),
         }
+    }
+
+    /// P0-2/BizBuddy WriteDedup：哈希规范化——顶层剥离 confirmed / dry_run / reason，
+    /// 其余键（含嵌套）不变；非对象参数直通；剥离前后指纹一致。
+    #[test]
+    fn normalize_dedup_args_strips_confirm_keys() {
+        let args = serde_json::json!({
+            "action": "update_company",
+            "plate": "苏EZQ117",
+            "company_name": "佳士能环境",
+            "confirmed": true,
+            "dry_run": false,
+            "reason": "审批注入"
+        });
+        let n = normalize_dedup_args("sync_whitelist_plates", &args);
+        assert!(n.get("confirmed").is_none());
+        assert!(n.get("dry_run").is_none());
+        assert!(n.get("reason").is_none());
+        assert_eq!(n["action"], "update_company");
+        assert_eq!(n["plate"], "苏EZQ117");
+        // 嵌套对象不受影响（只剥顶层）
+        let nested = normalize_dedup_args(
+            "t",
+            &serde_json::json!({"where": {"confirmed": true, "col": "id"}}),
+        );
+        assert_eq!(nested["where"]["confirmed"], serde_json::json!(true));
+        assert_eq!(nested["where"]["col"], "id");
+        // 非对象形态（数组 / 标量）直通
+        assert_eq!(
+            normalize_dedup_args("t", &serde_json::json!([1, 2, 3])),
+            serde_json::json!([1, 2, 3])
+        );
+        assert_eq!(
+            normalize_dedup_args("t", &serde_json::json!("plain")),
+            serde_json::json!("plain")
+        );
+        // 审批链路注入 confirmed 前后，规范化后指纹一致
+        let with_confirm = serde_json::json!({"a": 1, "confirmed": true});
+        let without_confirm = serde_json::json!({"a": 1});
+        let h1 = crate::approval::compute_operation_hash(
+            "cw_write",
+            &normalize_dedup_args("cw_write", &with_confirm),
+        );
+        let h2 = crate::approval::compute_operation_hash(
+            "cw_write",
+            &normalize_dedup_args("cw_write", &without_confirm),
+        );
+        assert_eq!(h1, h2);
+    }
+
+    /// P0-2/BizBuddy WriteDedup：注册表开关逐条显式（除 repo_ws_diff 外全部 true）；
+    /// manage_whitelist 纯查询排除；dry_run=true 预览不占坑；普通写参与去重。
+    #[test]
+    fn dedup_applicable_registry_gates() {
+        // 逐条显式赋值：写/外呼类 true，repo_ws_diff（只读查看）false
+        for spec in CONTROLLED_WRITES {
+            let expect = spec.tool != "repo_ws_diff";
+            assert_eq!(spec.dedup, expect, "tool {}", spec.tool);
+        }
+        // 只读查看类不参与去重
+        let diff = lookup("repo_ws_diff").unwrap();
+        assert!(!dedup_applicable(diff, &serde_json::json!({"path": "/repo/a"})));
+        // manage_whitelist 纯查询排除，管理写参与
+        let mw = lookup("manage_whitelist").unwrap();
+        assert!(!dedup_applicable(mw, &serde_json::json!({"action": "query"})));
+        assert!(dedup_applicable(
+            mw,
+            &serde_json::json!({"action": "update_waste_type", "plate": "苏EZQ117"})
+        ));
+        // dry_run=true 预览不占坑（保证审批后实写可执行）
+        let edit = lookup("edit_code").unwrap();
+        assert!(!dedup_applicable(edit, &serde_json::json!({"dry_run": true})));
+        assert!(dedup_applicable(edit, &serde_json::json!({"dry_run": false})));
+        assert!(dedup_applicable(edit, &serde_json::json!({})));
+        // 普通写参与
+        let cw = lookup("cw_write").unwrap();
+        assert!(dedup_applicable(cw, &serde_json::json!({"table": "vehicle_whitelist"})));
     }
 }
