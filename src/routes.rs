@@ -102,6 +102,8 @@ pub(crate) fn build_router(state: Arc<AppState>, cors: CorsLayer) -> Router {
         );
 
     let protected = Router::new()
+        // 身份验证原语：dashboard 等组件校验 (agent_id, badge) 有效性（2026-11-23）
+        .route("/api/auth/verify", get(handle_auth_verify))
         .route("/api/chat", post(handle_chat))
         .route("/api/chat/stream", get(handle_chat_stream))
         .nest(
@@ -220,4 +222,43 @@ pub(crate) fn build_updates_only_router(state: std::sync::Arc<crate::state::AppS
             )
         })
         .with_state(state)
+}
+
+#[cfg(test)]
+mod auth_verify_route_tests {
+    // 拼接构造，避免锚点字面量在本测试内自匹配（include_str! 含测试自身）
+    const ROUTE: &str =
+        concat!(".route(", "\"/api/auth/verify\"", ", get(handle_auth_verify))");
+
+    #[test]
+    fn auth_verify_route_is_registered_exactly_once() {
+        let source: &str = include_str!("routes.rs");
+        assert_eq!(source.matches(ROUTE).count(), 1);
+    }
+
+    #[test]
+    fn auth_verify_route_sits_behind_auth_middleware() {
+        let source: &str = include_str!("routes.rs");
+        let public_at = source
+            .find("let public = Router::new()")
+            .expect("public router");
+        let protected_at = source
+            .find("let protected = Router::new()")
+            .expect("protected router");
+        let middleware_at = source
+            .find(".layer(from_fn_with_state(state.clone(), auth_middleware))")
+            .expect("auth middleware on protected router");
+        let route_at = source.find(ROUTE).expect("auth/verify route");
+
+        // 声明在 protected 组内（protected_at..middleware_at），后续整体套 auth_middleware
+        assert!(
+            route_at > protected_at && route_at < middleware_at,
+            "route must be declared on the protected router, got route={route_at} protected={protected_at} middleware={middleware_at}"
+        );
+        // public 组内不得出现同一路由（否则匿名可验证，绕过语义复发）
+        assert!(
+            source[public_at..protected_at].find(ROUTE).is_none(),
+            "auth/verify must not be registered on the public router"
+        );
+    }
 }
