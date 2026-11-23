@@ -457,7 +457,14 @@ pub(crate) async fn handle_memory_feedback(
     // 正常路径 authenticate 刚写入缓存，必有条目；缺失则 fail-closed（空授权），
     // 默认 clamp（不显式传 ns）不依赖授权，行为不受影响。
     let write_ns = raw_ns.unwrap_or_default();
+    // OCR 复审 medium（2026-11-23）：封存名单 / 授权策略须用已加载的
+    // [namespace] 配置（agent.toml），而非 NamespaceConfig::default()——
+    // 运维在 agent.toml 追加 write_deny_ns 时，chat 链路（resolve_session_ns）
+    // 会生效而 feedback 写闸仍用编译期默认，形成 under-blocking。
+    // remember_opinion 走 admin key，本闸是该路径唯一本地防线。
+    let ns_cfg = st.config.lock().await.namespace.clone();
     let ns = match clamp_memory_feedback_ns(
+        &ns_cfg,
         &agent_id,
         &write_ns,
         body.get("namespace").and_then(|v| v.as_str()),
@@ -508,8 +515,11 @@ pub(crate) async fn handle_memory_feedback(
 /// - 未显式传 ns → clamp 到 `agent/{agent_id}`（本人隔离库）；
 /// - 显式 ns → 过 `resolve_memory_ns`（封存名单 + admin 例外），
 ///   其内部 `ns_grants_access` 仅放行 ==/子级授权（无祖先方向）。
+/// `cfg` 传调用方已加载的 `NamespaceConfig`（agent.toml `[namespace]`），使
+/// 运维追加的 `write_deny_ns` 对本闸即时生效（OCR 复审 medium，2026-11-23）。
 /// 错误返回人类可读原因（NsError::Display），由调用方回传 403。
 pub(crate) fn clamp_memory_feedback_ns(
+    cfg: &agent_core::namespace::NamespaceConfig,
     agent_id: &str,
     allowed_ns: &[String],
     explicit: Option<&str>,
@@ -517,13 +527,12 @@ pub(crate) fn clamp_memory_feedback_ns(
     let Some(explicit) = explicit.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(format!("agent/{}", agent_id));
     };
-    let cfg = agent_core::namespace::NamespaceConfig::default();
     let caller = agent_core::namespace::NsCaller {
         user_id: agent_id.to_string(),
         allowed_ns: allowed_ns.to_vec(),
         from_usertag: false,
     };
-    match agent_core::namespace::resolve_memory_ns(&cfg, Some(&caller), None, Some(explicit)) {
+    match agent_core::namespace::resolve_memory_ns(cfg, Some(&caller), None, Some(explicit)) {
         Ok(d) => Ok(d.ns),
         Err(e) => Err(e.to_string()),
     }
@@ -1159,6 +1168,20 @@ pub(crate) async fn handle_collab_delete(
 pub(crate) mod collab_policy_tests {
     use super::*;
 
+    /// 测试用默认配置封装；handler 侧传入 AppState 加载的 [namespace] 配置
+    fn clamp(
+        agent_id: &str,
+        allowed_ns: &[String],
+        explicit: Option<&str>,
+    ) -> Result<String, String> {
+        clamp_memory_feedback_ns(
+            &agent_core::namespace::NamespaceConfig::default(),
+            agent_id,
+            allowed_ns,
+            explicit,
+        )
+    }
+
     #[test]
     fn org_broadcast_requires_whitelist() {
         let ns = vec![format!("org/{}", org_company())];
@@ -1189,12 +1212,12 @@ pub(crate) mod collab_policy_tests {
     #[test]
     fn feedback_ns_clamps_to_self_by_default() {
         assert_eq!(
-            clamp_memory_feedback_ns("alice", &[], None).unwrap(),
+            clamp("alice", &[], None).unwrap(),
             "agent/alice"
         );
         // 空串/纯空白显式值视同未传
         assert_eq!(
-            clamp_memory_feedback_ns("alice", &[], Some("  ")).unwrap(),
+            clamp("alice", &[], Some("  ")).unwrap(),
             "agent/alice"
         );
     }
@@ -1203,23 +1226,23 @@ pub(crate) mod collab_policy_tests {
     fn feedback_ns_explicit_requires_subtree_grant() {
         let ns = vec!["agent/alice".to_string(), "org/co/dept/eng".to_string()];
         // 本人库与子级：放行
-        assert!(clamp_memory_feedback_ns("alice", &ns, Some("agent/alice")).is_ok());
-        assert!(clamp_memory_feedback_ns("alice", &ns, Some("agent/alice/notes")).is_ok());
-        assert!(clamp_memory_feedback_ns("alice", &ns, Some("org/co/dept/eng")).is_ok());
+        assert!(clamp("alice", &ns, Some("agent/alice")).is_ok());
+        assert!(clamp("alice", &ns, Some("agent/alice/notes")).is_ok());
+        assert!(clamp("alice", &ns, Some("org/co/dept/eng")).is_ok());
         // 他人库 / 非授权子树 / 祖先方向：拒绝
-        assert!(clamp_memory_feedback_ns("alice", &ns, Some("agent/bob")).is_err());
-        assert!(clamp_memory_feedback_ns("alice", &ns, Some("org/co/dept/finance")).is_err());
+        assert!(clamp("alice", &ns, Some("agent/bob")).is_err());
+        assert!(clamp("alice", &ns, Some("org/co/dept/finance")).is_err());
         // 授权仅含子级时，祖先 agent/alice 不因子级授权而放行（ns_grants_access 仅 ==/子级）
         let child_only = vec!["agent/alice/sub".to_string()];
-        assert!(clamp_memory_feedback_ns("alice", &child_only, Some("agent/alice")).is_err());
+        assert!(clamp("alice", &child_only, Some("agent/alice")).is_err());
     }
 
     #[test]
     fn feedback_ns_admin_bypasses_grant_but_not_denylist() {
         let wildcard = vec!["*".to_string()];
-        assert!(clamp_memory_feedback_ns("admin", &wildcard, Some("agent/other")).is_ok());
+        assert!(clamp("admin", &wildcard, Some("agent/other")).is_ok());
         // 封存名单对 admin 同样生效（resolve_memory_ns 显式分支先查 is_write_denied）
-        assert!(clamp_memory_feedback_ns("admin", &wildcard, Some("agent/user")).is_err());
+        assert!(clamp("admin", &wildcard, Some("agent/user")).is_err());
     }
 
     /// P1-1b 回归锁（2026-11-23 生产验证发现）：feedback 写闸必须取 ns_cache 中
@@ -1242,10 +1265,11 @@ pub(crate) mod collab_policy_tests {
             .expect("handle_memory_feedback body")
             .replace("\r\n", "\n");
         assert!(!body.is_empty());
-        // 从 ns_cache 取原始授予（(raw, enriched, ts) 三元组首项）
+        // 从 ns_cache 取原始授予（NsCacheEntry.raw_ns）
         assert!(body.contains("cache.get(&agent_id).map(|e| e.raw_ns.clone())"));
-        // clamp 传入 write_ns（原始授予），而非 allowed_ns（enrich 后）
+        // clamp 传入 write_ns（原始授予）+ 已加载的 ns_cfg，而非 allowed_ns（enrich 后）
         assert!(body.contains("&write_ns"));
+        assert!(body.contains("&ns_cfg"));
         assert!(!body.contains(
             "clamp_memory_feedback_ns(\n        &agent_id,\n        &allowed_ns,"
         ));

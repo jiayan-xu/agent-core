@@ -231,7 +231,8 @@ pub(crate) async fn handle_documents_archive(
     headers: axum::http::HeaderMap,
     Json(req): Json<ArchiveDocumentRequest>,
 ) -> axum::response::Response {
-    let (agent_id, allowed_ns, _) = match authenticate(&headers, &st).await {
+    // allowed_ns（enrich 后）不参与本 handler 的授权判定——写闸用 ns_cache 原始授予
+    let (agent_id, _allowed_ns, _) = match authenticate(&headers, &st).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -332,7 +333,19 @@ pub(crate) async fn handle_documents_archive(
     } else {
         req.namespace.trim().to_string()
     };
-    if !caller_ns_covers(&allowed_ns, &namespace) {
+    // OCR 复审 medium（2026-11-23）：写闸与 feedback / collab_send 同口径（P1-1b）——
+    // 取 ns_cache 中 Memoria 原始授予，ns_grants_access 仅放行 ==/子级（无祖先方向）。
+    // 此前用 authenticate 返回的 enrich 后 allowed_ns + 对称的 caller_ns_covers：
+    // enrich 注入的部门工具包 ns 会让本闸对整个 org/… 子树恒过，与 state.rs
+    // 「enrich 后 ns 不得作写授权」的契约矛盾（本端点上传用调用方自己的 key，
+    // Memoria 服务端校验仍是最终权威，故影响面有界，但本地闸形同虚设）。
+    // 缓存缺失 fail-closed。
+    let write_grants = {
+        let cache = st.ns_cache.lock().await;
+        cache.get(&agent_id).map(|e| e.raw_ns.clone())
+    }
+    .unwrap_or_default();
+    if !agent_core::namespace::ns_grants_access(&write_grants, &namespace) {
         return (
             axum::http::StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({
@@ -342,7 +355,37 @@ pub(crate) async fn handle_documents_archive(
             .into_response();
     }
 
-    let meta = match std::fs::metadata(&p) {
+    // OCR 复审 high（2026-11-23）：TOCTOU——此前 resolve_archive_path 校验 canonical
+    // 路径后，又用 std::fs::read / metadata 重新打开；附件目录写者可在校验与读取
+    // 之间把文件换成指向 ~/.svc-secrets 的符号链接，SYSTEM 服务即读出白名单外目标
+    // （且绕过 is_sensitive_archive_path，它校验的是换链前路径）。改为：以 no-follow
+    // 语义打开一次（Windows FILE_FLAG_OPEN_REPARSE_POINT 打开链接本身而非目标，
+    // 普通文件不受影响），大小与内容都取自同一句柄——换链发生在打开之后对本次
+    // 读取无效；再以重解析点属性兜底硬拒。
+    use std::io::Read as _;
+    let mut file = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000 (open the link, do not follow)
+            opts.custom_flags(0x0020_0000);
+        }
+        match opts.open(&p) {
+            Ok(f) => f,
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"error": format!("无法打开文件: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    };
+    const MAX: u64 = 20 * 1024 * 1024;
+    // 大小与读取同源（同一句柄，避免二次打开）
+    let meta = match file.metadata() {
         Ok(m) => m,
         Err(e) => {
             return (
@@ -352,7 +395,19 @@ pub(crate) async fn handle_documents_archive(
                 .into_response();
         }
     };
-    const MAX: u64 = 20 * 1024 * 1024;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_REPARSE_POINT = 0x400：句柄落在链接本身时读取前硬拒——
+        // 纵深防御，不依赖单个 open flag 的行为差异
+        if meta.file_attributes() & 0x0400 != 0 {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({"error": "拒绝符号链接 / 重解析点文件"})),
+            )
+                .into_response();
+        }
+    }
     if meta.len() > MAX {
         return (
             axum::http::StatusCode::PAYLOAD_TOO_LARGE,
@@ -360,16 +415,14 @@ pub(crate) async fn handle_documents_archive(
         )
             .into_response();
     }
-    let bytes = match std::fs::read(&p) {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                axum::Json(serde_json::json!({"error": format!("读文件失败: {e}")})),
-            )
-                .into_response();
-        }
-    };
+    let mut bytes = Vec::new();
+    if let Err(e) = std::io::Read::take(&mut file, MAX).read_to_end(&mut bytes) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": format!("读文件失败: {e}")})),
+        )
+            .into_response();
+    }
 
     let server = { st.config.lock().await.server.clone() };
     let mime = match ext.as_str() {
