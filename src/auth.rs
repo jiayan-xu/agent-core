@@ -114,8 +114,8 @@ pub(crate) async fn authenticate(
         let cache = st.ns_cache.lock().await;
         cache
             .get(&agent_id)
-            .filter(|(_, ts)| ts.elapsed() < Duration::from_secs(60))
-            .map(|(ns, _)| ns.clone())
+            .filter(|(_, _, ts)| ts.elapsed() < Duration::from_secs(60))
+            .map(|(_, enriched, _)| enriched.clone())
             .unwrap_or_default()
     };
     if allowed_ns.is_empty() {
@@ -191,11 +191,15 @@ pub(crate) async fn authenticate(
             // 不向外部暴露内部错误细节（R6）
             return Err(unauthorized("身份校验失败，请稍后重试"));
         }
-        // P0：固废本部门工具包 ns  enrichment，保证 dashboard 技能可见
+        // P0：固废本部门工具包 ns  enrichment，保证 dashboard 技能可见。
+        // P1-1b：缓存同时保留 Memoria 原始授予——enrich 仅为读/技能可见性，
+        // 写闸（feedback 等）须用原始授予，否则任意认证 agent 可借 org ns
+        // 越权写共享库（Memoria badge 并未授予该 ns）。
+        let raw_ns = allowed_ns.clone();
         agent_core::dept_ops::enrich_allowed_ns(&mut allowed_ns);
         st.ns_cache.lock().await.insert(
             agent_id.clone(),
-            (allowed_ns.clone(), std::time::Instant::now()),
+            (raw_ns, allowed_ns.clone(), std::time::Instant::now()),
         );
     }
     Ok((agent_id, allowed_ns, from_usertag))

@@ -398,14 +398,15 @@ pub(crate) async fn handle_collab_inbox(
 /// - `kind`: `preference` | `decision` | `affirm`（affirm→preference+pref）
 /// - `content`: 正文（必填）
 /// - `tag`: 可选 hard_rule|pref|style（仅 preference）
-/// - `namespace`: 可选；默认 clamp 到 `agent/{x-agent-id}`；显式值须过 NS 授权
-///   （resolve_memory_ns 封存名单 + ns_grants_access 仅 ==/子级，P1-1 修复）
+/// - `namespace`: 可选；默认 clamp 到 `agent/{x-agent-id}`；显式值须过 Memoria
+///   原始授予（resolve_memory_ns 封存名单 + ns_grants_access 仅 ==/子级，
+///   P1-1 修复；写闸不用 enrich 后列表，P1-1b）
 pub(crate) async fn handle_memory_feedback(
     State(st): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
 ) -> axum::response::Response {
-    let (agent_id, allowed_ns, _) = match authenticate(&headers, &st).await {
+    let (agent_id, _allowed_ns, _) = match authenticate(&headers, &st).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -446,9 +447,19 @@ pub(crate) async fn handle_memory_feedback(
     // P1-1 修复（2026-11-23 全量审查）：此前取 body 的 namespace 直接传 admin-key 的
     // remember_opinion（绕过 NS 门），任意认证 agent 可向任意 ns（含主库 agent/xujiayan）
     // 注入偏好/决策。现统一走 clamp_memory_feedback_ns 单点决策。
+    // P1-1b：写闸只认 Memoria 原始授予。authenticate 返回的 allowed_ns 已被
+    // enrich_allowed_ns 注入部门工具包 ns（org/…，仅为技能可见性），复用它会让
+    // 任意认证 agent 显式写共享 org 库——Memoria badge 并未授予该 ns。
+    let raw_ns = {
+        let cache = st.ns_cache.lock().await;
+        cache.get(&agent_id).map(|(raw, _, _)| raw.clone())
+    };
+    // 正常路径 authenticate 刚写入缓存，必有条目；缺失则 fail-closed（空授权），
+    // 默认 clamp（不显式传 ns）不依赖授权，行为不受影响。
+    let write_ns = raw_ns.unwrap_or_default();
     let ns = match clamp_memory_feedback_ns(
         &agent_id,
-        &allowed_ns,
+        &write_ns,
         body.get("namespace").and_then(|v| v.as_str()),
     ) {
         Ok(ns) => ns,
@@ -529,7 +540,7 @@ pub(crate) async fn handle_collab_send(
     headers: axum::http::HeaderMap,
     axum::extract::Json(body): axum::extract::Json<CollabSendBody>,
 ) -> axum::response::Response {
-    let (agent_id, allowed_ns, _) = match authenticate(&headers, &st).await {
+    let (agent_id, _allowed_ns, _) = match authenticate(&headers, &st).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -552,10 +563,23 @@ pub(crate) async fn handle_collab_send(
             .into_response();
     }
 
+    // P1-1c（2026-11-23 生产验证）：可达闸只认 Memoria 原始授予。authenticate
+    // 返回的 allowed_ns 已被 enrich_allowed_ns 注入部门工具包 ns（含
+    // dept/engineering、proj/gufei，仅为 dashboard 技能可见性），复用它会让任意
+    // 认证 agent 对整工程部广播（含 approval_request）/整固废项目广播——Memoria
+    // badge 并未授予这些 ns。与 feedback 写闸（P1-1b）同根因、同处置。
+    let raw_ns = {
+        let cache = st.ns_cache.lock().await;
+        cache.get(&agent_id).map(|(raw, _, _)| raw.clone())
+    };
+    // fail-closed：authenticate 成功后缓存必有条目；缺失（不应发生）时按空授权
+    // 处理——scope=agent 私信不受影响（其闸不查 ns），org/dept/proj 广播一律拒绝。
+    let reach_ns = raw_ns.unwrap_or_default();
+
     // 2) 可达策略（§3.3）
     let scope = body.scope.trim();
     let scope_id = body.scope_id.clone().unwrap_or_default();
-    if let Err(msg) = collab_reachability(&agent_id, &allowed_ns, scope, &scope_id, etype) {
+    if let Err(msg) = collab_reachability(&agent_id, &reach_ns, scope, &scope_id, etype) {
         return (
             axum::http::StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({"error": msg})),
@@ -564,7 +588,8 @@ pub(crate) async fn handle_collab_send(
     }
 
     // 3) 构建信封（§3.1）
-    let from_ns = allowed_ns
+    // from_ns 取 Memoria 原始授予首项（调用方真实 canonical ns），不用 enrich 后列表
+    let from_ns = reach_ns
         .first()
         .cloned()
         .unwrap_or_else(|| format!("agent/{}", agent_id));
@@ -1195,5 +1220,81 @@ pub(crate) mod collab_policy_tests {
         assert!(clamp_memory_feedback_ns("admin", &wildcard, Some("agent/other")).is_ok());
         // 封存名单对 admin 同样生效（resolve_memory_ns 显式分支先查 is_write_denied）
         assert!(clamp_memory_feedback_ns("admin", &wildcard, Some("agent/user")).is_err());
+    }
+
+    /// P1-1b 回归锁（2026-11-23 生产验证发现）：feedback 写闸必须取 ns_cache 中
+    /// 的 Memoria 原始授予，不得复用 authenticate 返回的 enrich 后 allowed_ns——
+    /// enrich 仅为技能可见性注入 org/dept ns，复用它等于任意认证 agent 可显式写
+    /// 共享 org 库（Memoria badge 并未授予）。
+    #[test]
+    fn feedback_write_gate_uses_raw_memoria_grant_not_enriched() {
+        const SOURCE: &str = include_str!("collab.rs");
+        const START_ANCHOR: &str = "pub(crate) async fn handle_memory_feedback(";
+        const END_ANCHOR: &str = "pub(crate) fn clamp_memory_feedback_ns(";
+        // 2 处：函数定义 + 本测试的锚点常量字面量（与 identity.rs 同口径）
+        assert_eq!(SOURCE.matches(START_ANCHOR).count(), 2);
+        assert!(SOURCE.matches(END_ANCHOR).count() >= 2);
+        // 归一 CRLF → LF，后续断言不依赖行尾风格
+        let body: String = SOURCE
+            .split(START_ANCHOR)
+            .nth(1)
+            .and_then(|s| s.split(END_ANCHOR).next())
+            .expect("handle_memory_feedback body")
+            .replace("\r\n", "\n");
+        assert!(!body.is_empty());
+        // 从 ns_cache 取原始授予（(raw, enriched, ts) 三元组首项）
+        assert!(body.contains("cache.get(&agent_id).map(|(raw, _, _)| raw.clone())"));
+        // clamp 传入 write_ns（原始授予），而非 allowed_ns（enrich 后）
+        assert!(body.contains("&write_ns"));
+        assert!(!body.contains(
+            "clamp_memory_feedback_ns(\n        &agent_id,\n        &allowed_ns,"
+        ));
+    }
+
+    /// P1-1c 回归锁（2026-11-23 生产验证发现）：collab 可达闸必须用 Memoria
+    /// 原始授予。enrich 注入的 dept_toolkit_ns 含 `dept/engineering`/`proj/gufei`，
+    /// 复用 enrich 后 allowed_ns 等于任意认证 agent 可对整工程部（含
+    /// approval_request）/整固废项目广播。
+    #[test]
+    fn collab_reachability_gate_uses_raw_memoria_grant() {
+        const SOURCE: &str = include_str!("collab.rs");
+        const START_ANCHOR: &str = "pub(crate) async fn handle_collab_send(";
+        const END_ANCHOR: &str = "pub(crate) fn peers_ns_of(";
+        // 2 处：函数定义 + 本测试的锚点常量字面量
+        assert_eq!(SOURCE.matches(START_ANCHOR).count(), 2);
+        assert!(SOURCE.matches(END_ANCHOR).count() >= 2);
+        // 归一 CRLF → LF，后续断言不依赖行尾风格
+        let body: String = SOURCE
+            .split(START_ANCHOR)
+            .nth(1)
+            .and_then(|s| s.split(END_ANCHOR).next())
+            .expect("handle_collab_send body")
+            .replace("\r\n", "\n");
+        assert!(!body.is_empty());
+        // 从 ns_cache 取原始授予
+        assert!(body.contains("cache.get(&agent_id).map(|(raw, _, _)| raw.clone())"));
+        // 可达闸与 from_ns 都基于 reach_ns（原始授予）
+        assert!(body.contains("collab_reachability(&agent_id, &reach_ns"));
+        assert!(body.contains("reach_ns\n        .first()"));
+        // 不得回退到 enrich 后的 allowed_ns
+        assert!(!body.contains("collab_reachability(&agent_id, &allowed_ns"));
+    }
+
+    /// 行为对照：enrich 后的部门工具包 ns 会让非部门成员通过 dept/proj 可达闸，
+    /// 原始授予（不含 dept ns）则正确拒绝——证明写闸用原始授予的必要性。
+    #[test]
+    fn dept_toolkit_enrichment_cannot_satisfy_reachability_alone() {
+        let raw = vec!["agent/u1".to_string(), "org/co".to_string()];
+        let enriched = vec![
+            "agent/u1".to_string(),
+            "org/co".to_string(),
+            "org/co/dept/engineering/proj/gufei".to_string(),
+        ];
+        // 原始授予：非工程部成员，dept 广播拒绝
+        assert!(collab_reachability("u1", &raw, "dept", "engineering", "notify").is_err());
+        assert!(collab_reachability("u1", &raw, "proj", "gufei", "notify").is_err());
+        // enrich 后列表：会误放行（这正是 handler 不得传它的原因）
+        assert!(collab_reachability("u1", &enriched, "dept", "engineering", "notify").is_ok());
+        assert!(collab_reachability("u1", &enriched, "proj", "gufei", "notify").is_ok());
     }
 }

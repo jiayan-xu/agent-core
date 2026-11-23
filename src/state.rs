@@ -31,10 +31,13 @@ pub(crate) struct AppState {
     /// 部门注册表缓存（memoria agent_list 快照：成员归属 + 经理管辖），TTL 300s 懒刷新。
     /// 部门经理判定权威在 memoria 注册表（read_write + dept ns），此处仅同步缓存。
     pub(crate) dept_cache: tokio::sync::Mutex<Option<std::sync::Arc<crate::auth::DeptCache>>>,
-    /// 命名空间授权缓存 agent_id → (allowed_ns, 获取时间)
+    /// 命名空间授权缓存 agent_id → (Memoria 原始授予 ns, enrich 后 ns, 获取时间)
+    /// 原始授予仅含 Memoria badge 真实授予，用于写闸（feedback 等，P1-1b）；
+    /// enrich 后含部门工具包 ns，用于技能可见性 / 读路径，不得作写授权。
     /// 仅以 agent_id 为 key（token 已在 Memoria 端验证过，不在内存留存明文 key，P1-1）
     /// 短 TTL（60s）以在「每次请求反查 memoria」的性能与「权限即时生效」间取平衡（R1）
-    pub(crate) ns_cache: tokio::sync::Mutex<HashMap<String, (Vec<String>, std::time::Instant)>>,
+    pub(crate) ns_cache:
+        tokio::sync::Mutex<HashMap<String, (Vec<String>, Vec<String>, std::time::Instant)>>,
     /// 协作收件箱「已读游标」：agent_id → 最近一次查看的 ISO 时间（用于未读计数）
     pub(crate) collab_seen: tokio::sync::Mutex<HashMap<String, String>>,
     /// Dream 巩固：上次成功跑完的本地日历日（YYYY-MM-DD），避免 02–05 点巡检重复巩固
