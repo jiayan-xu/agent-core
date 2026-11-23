@@ -18,6 +18,24 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 
+/// ns 授权缓存条目。
+///
+/// 绑定「写入该条目时调用方呈现的 key 指纹」——缓存命中仍须指纹一致，
+/// 否则 `authenticate` 在缓存命中时跳过 Memoria badge 校验，任何请求
+/// 冒充该 agent_id + 任意 key 即可通过全部受保护端点。
+/// （P0 绕过，2026-11-23 生产因果实锤：真实 badge 一发 → 紧接垃圾 key 200；
+/// 冷缓存垃圾 key 正确 401。）
+#[derive(Clone)]
+pub(crate) struct NsCacheEntry {
+    /// 写入时呈现 key 的指纹（仅进程内比较；缓存随进程重启清空，不跨进程）
+    pub(crate) key_fp: u64,
+    /// Memoria 原始授予 ns（写闸用，P1-1b）
+    pub(crate) raw_ns: Vec<String>,
+    /// enrich 后 ns（技能/读可见性用，不得作写授权）
+    pub(crate) enriched_ns: Vec<String>,
+    pub(crate) ts: std::time::Instant,
+}
+
 pub(crate) struct AppState {
     pub(crate) config: Mutex<Config>,
     /// 用 Arc 包装：chat/consolidate 等 handler 克隆 Arc 后立即释放全局锁，
@@ -31,13 +49,12 @@ pub(crate) struct AppState {
     /// 部门注册表缓存（memoria agent_list 快照：成员归属 + 经理管辖），TTL 300s 懒刷新。
     /// 部门经理判定权威在 memoria 注册表（read_write + dept ns），此处仅同步缓存。
     pub(crate) dept_cache: tokio::sync::Mutex<Option<std::sync::Arc<crate::auth::DeptCache>>>,
-    /// 命名空间授权缓存 agent_id → (Memoria 原始授予 ns, enrich 后 ns, 获取时间)
-    /// 原始授予仅含 Memoria badge 真实授予，用于写闸（feedback 等，P1-1b）；
-    /// enrich 后含部门工具包 ns，用于技能可见性 / 读路径，不得作写授权。
-    /// 仅以 agent_id 为 key（token 已在 Memoria 端验证过，不在内存留存明文 key，P1-1）
+    /// ns 授权缓存 agent_id → NsCacheEntry（key 指纹 + 原始授予 + enrich 后 + 时间）
+    /// 条目按 agent_id 索引，但**消费时必须校验 key 指纹**（见 NsCacheEntry 注释）；
+    /// 原始授予用于写闸（feedback 等，P1-1b），enrich 后用于技能/读可见性。
+    /// 不在内存留存明文 key，仅存指纹（P1-1 口径）。
     /// 短 TTL（60s）以在「每次请求反查 memoria」的性能与「权限即时生效」间取平衡（R1）
-    pub(crate) ns_cache:
-        tokio::sync::Mutex<HashMap<String, (Vec<String>, Vec<String>, std::time::Instant)>>,
+    pub(crate) ns_cache: tokio::sync::Mutex<HashMap<String, NsCacheEntry>>,
     /// 协作收件箱「已读游标」：agent_id → 最近一次查看的 ISO 时间（用于未读计数）
     pub(crate) collab_seen: tokio::sync::Mutex<HashMap<String, String>>,
     /// Dream 巩固：上次成功跑完的本地日历日（YYYY-MM-DD），避免 02–05 点巡检重复巩固

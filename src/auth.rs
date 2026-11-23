@@ -14,7 +14,7 @@ use axum::response::IntoResponse;
 use agent_core::mcp_client::McpClient;
 
 use crate::config::{env_memoria_admin_key, extract_register_badge, memoria_proxy_client};
-use crate::state::AppState;
+use crate::state::{AppState, NsCacheEntry};
 
 /// 构造 401 未授权响应
 pub(crate) fn unauthorized(message: &str) -> axum::response::Response {
@@ -46,6 +46,29 @@ pub(crate) fn percent_decode_agent_id(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 呈现 key 的进程内指纹（仅 ns_cache 命中判定用）。
+///
+/// 缓存随进程重启清空，只需同进程内稳定；不落盘、不回传。
+/// P0 修复（2026-11-23）：旧 `ns_cache` 按 agent_id 单键且命中即返回，
+/// 从未校验本次请求的 key——真实 badge 暖一次缓存后，TTL 内任意 key
+/// 冒充该身份可过全部受保护端点（生产因果实锤：real→garbage=200，
+/// 冷缓存 garbage=401）。
+fn agent_key_fingerprint(key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
+/// ns_cache 可用判定：未过期 **且** 指纹与本次请求一致。
+///
+/// 不一致 → 返回 false → 走 Memoria `get_allowed_ns` 用本次 key 实测验证。
+/// 正确 key 的缓存快路径与「Memoria 短暂不可用时的韧性」均保留（指纹
+/// 匹配即免 RPC）；错误 key 必付一次 RPC 后 401（fail-closed）。
+fn ns_cache_usable(entry: &NsCacheEntry, key_fp: u64, ttl: Duration) -> bool {
+    entry.ts.elapsed() < ttl && entry.key_fp == key_fp
 }
 
 pub(crate) async fn authenticate(
@@ -110,13 +133,17 @@ pub(crate) async fn authenticate(
         let cfg = st.config.lock().await;
         cfg.server.clone()
     };
+    let key_fp = agent_key_fingerprint(&agent_key);
     let mut allowed_ns: Vec<String> = {
         let cache = st.ns_cache.lock().await;
-        cache
-            .get(&agent_id)
-            .filter(|(_, _, ts)| ts.elapsed() < Duration::from_secs(60))
-            .map(|(_, enriched, _)| enriched.clone())
-            .unwrap_or_default()
+        // P0 修复（2026-11-23）：命中仍须 key 指纹一致——旧实现在此直接信任
+        // agent_id 维度的缓存，跳过 badge 校验（见 agent_key_fingerprint 注释）。
+        match cache.get(&agent_id) {
+            Some(e) if ns_cache_usable(e, key_fp, Duration::from_secs(60)) => {
+                e.enriched_ns.clone()
+            }
+            _ => Vec::new(),
+        }
     };
     if allowed_ns.is_empty() {
         let mcp = McpClient::new(&server, &agent_id, &agent_key);
@@ -199,7 +226,12 @@ pub(crate) async fn authenticate(
         agent_core::dept_ops::enrich_allowed_ns(&mut allowed_ns);
         st.ns_cache.lock().await.insert(
             agent_id.clone(),
-            (raw_ns, allowed_ns.clone(), std::time::Instant::now()),
+            NsCacheEntry {
+                key_fp,
+                raw_ns,
+                enriched_ns: allowed_ns.clone(),
+                ts: std::time::Instant::now(),
+            },
         );
     }
     Ok((agent_id, allowed_ns, from_usertag))
@@ -418,5 +450,89 @@ mod dept_cache_tests {
         assert!(eng.contains("engineering"), "proj 子路径归到部门");
         assert!(!c.managers.contains_key("legacy_org"), "旧式 dept/<company> 公司段不当部门");
         assert!(c.members.get("legacy_org").is_none(), "公司段不产生部门归属");
+    }
+}
+
+#[cfg(test)]
+mod ns_cache_gate_tests {
+    use super::*;
+
+    fn entry(key_fp: u64, age: Duration) -> NsCacheEntry {
+        NsCacheEntry {
+            key_fp,
+            raw_ns: vec!["agent/x".to_string()],
+            enriched_ns: vec!["agent/x".to_string()],
+            ts: std::time::Instant::now() - age,
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_stable_for_same_key_and_differs_otherwise() {
+        assert_eq!(
+            agent_key_fingerprint("secret"),
+            agent_key_fingerprint("secret")
+        );
+        assert_ne!(
+            agent_key_fingerprint("secret"),
+            agent_key_fingerprint("garbage")
+        );
+        assert_ne!(agent_key_fingerprint(""), agent_key_fingerprint("secret"));
+    }
+
+    /// P0 回归锁：缓存命中须同时满足「未过期 + key 指纹一致」。
+    /// 指纹不一致 → 必须回退 Memoria 用本次 key 实测——否则
+    /// 「真实 badge 暖一次缓存 → TTL 内任意 key 冒充该身份」复发
+    /// （2026-11-23 生产因果实锤的正是这个洞）。
+    #[test]
+    fn cache_hit_requires_matching_key_fingerprint() {
+        let ttl = Duration::from_secs(60);
+        let fp = agent_key_fingerprint("real-badge");
+        // 未过期 + 指纹一致 → 命中（正确 key 的快路径与断网韧性保留）
+        assert!(ns_cache_usable(
+            &entry(fp, Duration::from_secs(5)),
+            fp,
+            ttl
+        ));
+        // 指纹不一致 → 拒（垃圾 key 即使缓存新鲜也走 Memoria）
+        assert!(!ns_cache_usable(
+            &entry(fp, Duration::from_secs(5)),
+            agent_key_fingerprint("garbage"),
+            ttl
+        ));
+        // 过期 → 拒（权限即时生效语义保留）
+        assert!(!ns_cache_usable(
+            &entry(fp, Duration::from_secs(120)),
+            fp,
+            ttl
+        ));
+    }
+
+    /// 源码锚定：authenticate 的缓存读取必须经过 ns_cache_usable 闸，
+    /// 且指纹由本次请求的 agent_key 计算——防将来改回「按 agent_id 直信」。
+    #[test]
+    fn authenticate_cache_read_goes_through_usable_gate() {
+        let source: &str = include_str!("auth.rs");
+        // 只取 authenticate 函数体（止于其后的 AuthContext 定义），
+        // 排除本测试模块内对 ns_cache_usable 的正常调用
+        let auth_body: &str = source
+            .split("pub(crate) async fn authenticate(")
+            .nth(1)
+            .expect("authenticate")
+            .split("pub(crate) struct AuthContext")
+            .next()
+            .expect("auth_body end anchor");
+        // 拼接构造锚点，避免测试自身字面量自匹配（include_str! 含本测试）
+        let fp_needle: &str = concat!("agent_key_fingerprint(", "&agent_key)");
+        let gate_needle: &str = concat!("ns_cache", "_usable(");
+        assert!(
+            auth_body.contains(fp_needle),
+            "fingerprint must be computed from the presented key"
+        );
+        let gate_rel = auth_body
+            .find(gate_needle)
+            .expect("cache read must go through ns_cache_usable");
+        // 闸应落在 authenticate 开头的缓存读段
+        assert!(gate_rel < 3000, "usable gate too deep: offset={gate_rel}");
+        assert_eq!(auth_body.matches(gate_needle).count(), 1);
     }
 }

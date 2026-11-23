@@ -452,7 +452,7 @@ pub(crate) async fn handle_memory_feedback(
     // 任意认证 agent 显式写共享 org 库——Memoria badge 并未授予该 ns。
     let raw_ns = {
         let cache = st.ns_cache.lock().await;
-        cache.get(&agent_id).map(|(raw, _, _)| raw.clone())
+        cache.get(&agent_id).map(|e| e.raw_ns.clone())
     };
     // 正常路径 authenticate 刚写入缓存，必有条目；缺失则 fail-closed（空授权），
     // 默认 clamp（不显式传 ns）不依赖授权，行为不受影响。
@@ -570,7 +570,7 @@ pub(crate) async fn handle_collab_send(
     // badge 并未授予这些 ns。与 feedback 写闸（P1-1b）同根因、同处置。
     let raw_ns = {
         let cache = st.ns_cache.lock().await;
-        cache.get(&agent_id).map(|(raw, _, _)| raw.clone())
+        cache.get(&agent_id).map(|e| e.raw_ns.clone())
     };
     // fail-closed：authenticate 成功后缓存必有条目；缺失（不应发生）时按空授权
     // 处理——scope=agent 私信不受影响（其闸不查 ns），org/dept/proj 广播一律拒绝。
@@ -1243,7 +1243,7 @@ pub(crate) mod collab_policy_tests {
             .replace("\r\n", "\n");
         assert!(!body.is_empty());
         // 从 ns_cache 取原始授予（(raw, enriched, ts) 三元组首项）
-        assert!(body.contains("cache.get(&agent_id).map(|(raw, _, _)| raw.clone())"));
+        assert!(body.contains("cache.get(&agent_id).map(|e| e.raw_ns.clone())"));
         // clamp 传入 write_ns（原始授予），而非 allowed_ns（enrich 后）
         assert!(body.contains("&write_ns"));
         assert!(!body.contains(
@@ -1272,7 +1272,7 @@ pub(crate) mod collab_policy_tests {
             .replace("\r\n", "\n");
         assert!(!body.is_empty());
         // 从 ns_cache 取原始授予
-        assert!(body.contains("cache.get(&agent_id).map(|(raw, _, _)| raw.clone())"));
+        assert!(body.contains("cache.get(&agent_id).map(|e| e.raw_ns.clone())"));
         // 可达闸与 from_ns 都基于 reach_ns（原始授予）
         assert!(body.contains("collab_reachability(&agent_id, &reach_ns"));
         assert!(body.contains("reach_ns\n        .first()"));
