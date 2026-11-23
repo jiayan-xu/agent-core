@@ -10968,9 +10968,20 @@ let content = format!(
         to_agent: &str,
         envelope: &serde_json::Value,
     ) -> Result<String, String> {
+        // P1-3 修复（2026-11-23 全量审查）：发送前按 Memoria `to` 白名单口径预校验
+        // （仅字母/数字/下划线/连字符，≤64）。`sanitize_user_id` 允许点号（user_id
+        // 历史口径），Memoria 拒点号——非法 to 直接失败返回可区分错误，由调用方
+        // 计入 failed（fan-out）或回传 502（点对点），不再空耗一次 memoria 往返。
+        if !Self::a2a_to_id_valid(to_agent) {
+            return Err(format!(
+                "to_agent 格式非法（仅允许字母/数字/下划线/连字符，≤64 字符）: {}",
+                to_agent
+            ));
+        }
         // A2A 协议最小兼容：发送前补 messageId/conversationId/sender/parts（不覆盖已有）
         let env_enriched = Self::a2a_enrich_envelope(envelope.clone(), &self.config.identity.agent_id);
-        self.mcp
+        let resp = self
+            .mcp
             .call(
                 "a2a_send",
                 &serde_json::json!({
@@ -10984,7 +10995,35 @@ let content = format!(
                 }),
             )
             .await
-            .map_err(|e| format!("a2a_send 失败: {}", e))
+            .map_err(|e| format!("a2a_send 失败: {}", e))?;
+        // P1-3 修复：Memoria 业务失败（status=error：to 白名单拒绝 / NS 写闸拒绝 /
+        // admin required 等）同样以 HTTP 200 + JSON-RPC 成功返回，此前未解析返回体
+        // 一律当作送达计入 sent——假阳性。现解析返回体：仅 status=="sent" 视为成功；
+        // 其余（含非 JSON 返回体）返回携带 memoria message 的可区分错误。
+        let v: serde_json::Value = serde_json::from_str(&resp).map_err(|e| {
+            let excerpt: String = resp.chars().take(200).collect();
+            format!("a2a_send 返回非 JSON（{}）: {}", e, excerpt)
+        })?;
+        if v.get("status").and_then(|s| s.as_str()) == Some("sent") {
+            Ok(resp)
+        } else {
+            let msg = v
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or(resp.as_str());
+            Err(format!("a2a_send 业务失败（to={}）: {}", to_agent, msg))
+        }
+    }
+
+    /// Memoria `a2a_send` 的 `to` 白名单口径（memoria mcp_server.rs a2a_send 分支）：
+    /// 仅 ASCII 字母/数字/下划线/连字符，最长 64。与 `sanitize_user_id`（允许点号）
+    /// 口径不一致，发送前须按本口径预校验。
+    fn a2a_to_id_valid(to_agent: &str) -> bool {
+        !to_agent.is_empty()
+            && to_agent.len() <= 64
+            && to_agent
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     }
 
     // ── P1-B 递归持久子 agent（句柄 + A2A 路由 + 断线续跑）──
@@ -17697,5 +17736,25 @@ mod pai_tool_face_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod a2a_to_id_tests {
+    use super::AgentCore;
+
+    /// P1-3 修复（2026-11-23）：与 Memoria `to` 白名单口径对齐——
+    /// 仅 ASCII 字母/数字/下划线/连字符，≤64；拒绝空串/点号/斜杠/中文/超长。
+    #[test]
+    fn a2a_to_id_matches_memoria_whitelist() {
+        assert!(AgentCore::a2a_to_id_valid("jarvis"));
+        assert!(AgentCore::a2a_to_id_valid("cs-pufa-2nd-thermal_engineering_xujiayan"));
+        assert!(AgentCore::a2a_to_id_valid(&"a".repeat(64)));
+        // 点号：sanitize_user_id 允许，Memoria 拒——本口径必须同样拒
+        assert!(!AgentCore::a2a_to_id_valid("john.doe"));
+        assert!(!AgentCore::a2a_to_id_valid("agent/xujiayan"));
+        assert!(!AgentCore::a2a_to_id_valid(""));
+        assert!(!AgentCore::a2a_to_id_valid("中文id"));
+        assert!(!AgentCore::a2a_to_id_valid(&"a".repeat(65)));
     }
 }

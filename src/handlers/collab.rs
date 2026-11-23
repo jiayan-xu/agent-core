@@ -398,13 +398,14 @@ pub(crate) async fn handle_collab_inbox(
 /// - `kind`: `preference` | `decision` | `affirm`（affirm→preference+pref）
 /// - `content`: 正文（必填）
 /// - `tag`: 可选 hard_rule|pref|style（仅 preference）
-/// - `namespace`: 可选；默认 `agent/{x-agent-id}`
+/// - `namespace`: 可选；默认 clamp 到 `agent/{x-agent-id}`；显式值须过 NS 授权
+///   （resolve_memory_ns 封存名单 + ns_grants_access 仅 ==/子级，P1-1 修复）
 pub(crate) async fn handle_memory_feedback(
     State(st): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
 ) -> axum::response::Response {
-    let (agent_id, _allowed_ns, _) = match authenticate(&headers, &st).await {
+    let (agent_id, allowed_ns, _) = match authenticate(&headers, &st).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -442,12 +443,23 @@ pub(crate) async fn handle_memory_feedback(
         .get("tag")
         .and_then(|v| v.as_str())
         .unwrap_or(default_tag);
-    let ns = body
-        .get("namespace")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("agent/{}", agent_id));
+    // P1-1 修复（2026-11-23 全量审查）：此前取 body 的 namespace 直接传 admin-key 的
+    // remember_opinion（绕过 NS 门），任意认证 agent 可向任意 ns（含主库 agent/xujiayan）
+    // 注入偏好/决策。现统一走 clamp_memory_feedback_ns 单点决策。
+    let ns = match clamp_memory_feedback_ns(
+        &agent_id,
+        &allowed_ns,
+        body.get("namespace").and_then(|v| v.as_str()),
+    ) {
+        Ok(ns) => ns,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({"error": format!("namespace 不可写: {}", e)})),
+            )
+                .into_response();
+        }
+    };
 
     let guard = st.agent.lock().await;
     let Some(ref agent) = *guard else {
@@ -474,6 +486,35 @@ pub(crate) async fn handle_memory_feedback(
             axum::Json(serde_json::json!({"error": e})),
         )
             .into_response(),
+    }
+}
+
+/// P1-1 修复（2026-11-23 全量审查）：feedback ns 单点决策。
+///
+/// 此前 handler 取 body 的 namespace 直接传 admin-key 的 `remember_opinion`
+/// （绕过 NS 门），任意认证 agent 可向任意 ns 注入偏好/决策。现口径对齐
+/// `handle_assistant_memory_write`（assistants.rs 强制 `agent/{user_id}`）：
+/// - 未显式传 ns → clamp 到 `agent/{agent_id}`（本人隔离库）；
+/// - 显式 ns → 过 `resolve_memory_ns`（封存名单 + admin 例外），
+///   其内部 `ns_grants_access` 仅放行 ==/子级授权（无祖先方向）。
+/// 错误返回人类可读原因（NsError::Display），由调用方回传 403。
+pub(crate) fn clamp_memory_feedback_ns(
+    agent_id: &str,
+    allowed_ns: &[String],
+    explicit: Option<&str>,
+) -> Result<String, String> {
+    let Some(explicit) = explicit.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(format!("agent/{}", agent_id));
+    };
+    let cfg = agent_core::namespace::NamespaceConfig::default();
+    let caller = agent_core::namespace::NsCaller {
+        user_id: agent_id.to_string(),
+        allowed_ns: allowed_ns.to_vec(),
+        from_usertag: false,
+    };
+    match agent_core::namespace::resolve_memory_ns(&cfg, Some(&caller), None, Some(explicit)) {
+        Ok(d) => Ok(d.ns),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -1116,5 +1157,43 @@ pub(crate) mod collab_policy_tests {
     fn peer_in_company_filter() {
         assert!(peer_in_company("agent/x,org/cs-pufa-2nd-thermal"));
         assert!(!peer_in_company("agent/y,org/other-co"));
+    }
+
+    /// P1-1 修复（2026-11-23）：feedback ns 越权写封堵——
+    /// 默认 clamp 本人库；显式 ns 仅放行授权子树；admin 例外但对封存名单同样生效。
+    #[test]
+    fn feedback_ns_clamps_to_self_by_default() {
+        assert_eq!(
+            clamp_memory_feedback_ns("alice", &[], None).unwrap(),
+            "agent/alice"
+        );
+        // 空串/纯空白显式值视同未传
+        assert_eq!(
+            clamp_memory_feedback_ns("alice", &[], Some("  ")).unwrap(),
+            "agent/alice"
+        );
+    }
+
+    #[test]
+    fn feedback_ns_explicit_requires_subtree_grant() {
+        let ns = vec!["agent/alice".to_string(), "org/co/dept/eng".to_string()];
+        // 本人库与子级：放行
+        assert!(clamp_memory_feedback_ns("alice", &ns, Some("agent/alice")).is_ok());
+        assert!(clamp_memory_feedback_ns("alice", &ns, Some("agent/alice/notes")).is_ok());
+        assert!(clamp_memory_feedback_ns("alice", &ns, Some("org/co/dept/eng")).is_ok());
+        // 他人库 / 非授权子树 / 祖先方向：拒绝
+        assert!(clamp_memory_feedback_ns("alice", &ns, Some("agent/bob")).is_err());
+        assert!(clamp_memory_feedback_ns("alice", &ns, Some("org/co/dept/finance")).is_err());
+        // 授权仅含子级时，祖先 agent/alice 不因子级授权而放行（ns_grants_access 仅 ==/子级）
+        let child_only = vec!["agent/alice/sub".to_string()];
+        assert!(clamp_memory_feedback_ns("alice", &child_only, Some("agent/alice")).is_err());
+    }
+
+    #[test]
+    fn feedback_ns_admin_bypasses_grant_but_not_denylist() {
+        let wildcard = vec!["*".to_string()];
+        assert!(clamp_memory_feedback_ns("admin", &wildcard, Some("agent/other")).is_ok());
+        // 封存名单对 admin 同样生效（resolve_memory_ns 显式分支先查 is_write_denied）
+        assert!(clamp_memory_feedback_ns("admin", &wildcard, Some("agent/user")).is_err());
     }
 }
