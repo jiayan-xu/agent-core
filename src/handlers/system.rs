@@ -249,6 +249,26 @@ pub(crate) async fn handle_config(State(st): State<Arc<AppState>>) -> Json<serde
     }))
 }
 
+/// 身份验证原语（2026-11-23 安全修复）：受保护，供 dashboard 等平台组件
+/// 校验 (X-Agent-Id, X-Agent-Key) 是否为 agent-core 认可的有效身份。
+///
+/// 有效 badge → 200 `{ok, agent_id}`；无效 → 401。区别于公开的
+/// `/api/config`（无鉴权恒 200）：dashboard 的 `_verify_agent_core` 曾把
+/// 非 admin 身份的验证目标设为 `/api/config`，导致伪造 `X-Agent-Id:
+/// tray-local` + 任意 key 即可通过 `_check_auth`/`require_write_permission`
+/// （覆盖 14 个 router 的全部写端点，生产探针实证 200）。
+pub(crate) async fn handle_auth_verify(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    match authenticate(&headers, &st).await {
+        Ok((agent_id, _, _)) => {
+            Json(serde_json::json!({"ok": true, "agent_id": agent_id})).into_response()
+        }
+        Err(r) => r,
+    }
+}
+
 pub(crate) async fn handle_save_config(
     State(st): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,

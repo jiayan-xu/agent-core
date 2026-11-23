@@ -170,7 +170,7 @@ pub(crate) fn caller_ns_covers(allowed: &[String], target: &str) -> bool {
 
 #[derive(Deserialize)]
 pub(crate) struct ArchiveDocumentRequest {
-    /// 本机绝对路径（PFAiX 对话栏附件）
+    /// 本机绝对路径（PFAiX 对话栏附件）；须位于附件白名单目录内（见 pfaix_attach_dir）
     path: String,
     #[serde(default)]
     filename: String,
@@ -179,13 +179,60 @@ pub(crate) struct ArchiveDocumentRequest {
     namespace: String,
 }
 
+/// 附件归档白名单根（P1-2 修复，2026-11-23 全量审查）：PFAiX 对话栏附件先落此目录，
+/// /api/documents/archive 仅允许读取其中文件。默认运行目录下 `attach/`，
+/// 可用 PFAIX_ATTACH_DIR 覆盖（与 handlers/system.rs PFAIX_PAGES_DIR 同款 env 覆盖模式）。
+pub(crate) fn pfaix_attach_dir() -> std::path::PathBuf {
+    std::env::var("PFAIX_ATTACH_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join("attach")
+        })
+}
+
+/// P1-2 纵深防御（2026-11-23）：敏感路径硬拒——即便白名单根被误配到敏感目录，
+/// 也绝不读取密钥目录（.svc-secrets）与脱敏映射目录（pfaix_agents）。
+/// 归一化分隔符与小写后子串匹配，覆盖 `\` / `/` 与大小写变体（Windows 路径
+/// 大小写不敏感，canonicalize 保留原大小写，故必须归一后比较）。
+pub(crate) fn is_sensitive_archive_path(p: &std::path::Path) -> bool {
+    let norm = p.to_string_lossy().replace('\\', "/").to_lowercase();
+    norm.contains(".svc-secrets") || norm.contains("pfaix_agents")
+}
+
+/// P1-2 白名单单点判定（可单测）：绝对路径 → canonicalize 归一（防符号链接 /
+/// 8.3 短名 / `..` 绕过）→ 必须落在白名单根内（`Path::starts_with` 按组件比较，
+/// 兄弟目录如 `attach_evil` 不会误命中 `attach`）。错误码：
+/// - `abs`：非绝对路径
+/// - `missing`：白名单根或目标不存在（统一报错，防差异探测）
+/// - `outside`：目标在白名单外
+pub(crate) fn resolve_archive_path(
+    root: &std::path::Path,
+    raw: &str,
+) -> Result<std::path::PathBuf, &'static str> {
+    let p = std::path::Path::new(raw);
+    if !p.is_absolute() {
+        return Err("abs");
+    }
+    let (Ok(root_canon), Ok(p_canon)) = (std::fs::canonicalize(root), std::fs::canonicalize(p))
+    else {
+        return Err("missing");
+    };
+    if !p_canon.starts_with(&root_canon) {
+        return Err("outside");
+    }
+    Ok(p_canon)
+}
+
 /// PFAiX 对话栏 → 部门共享文档归档：读本机文件，转发 Memoria `POST /api/documents`
 pub(crate) async fn handle_documents_archive(
     State(st): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Json(req): Json<ArchiveDocumentRequest>,
 ) -> axum::response::Response {
-    let (agent_id, allowed_ns, _) = match authenticate(&headers, &st).await {
+    // allowed_ns（enrich 后）不参与本 handler 的授权判定——写闸用 ns_cache 原始授予
+    let (agent_id, _allowed_ns, _) = match authenticate(&headers, &st).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -210,11 +257,51 @@ pub(crate) async fn handle_documents_archive(
         )
             .into_response();
     }
-    let p = std::path::Path::new(path);
-    if !p.is_absolute() || !p.is_file() {
+    // P1-2 修复（2026-11-23 全量审查）：此前仅要求「绝对路径存在」且扩展名校验作用在
+    // 请求体 filename（客户端任意传），任意认证 agent 可令 SYSTEM 权限服务读取本机
+    // 任意文件（如 ~/.svc-secrets 密钥）并转发出去。现改为：
+    //   1) 附件白名单目录（PFAIX_ATTACH_DIR，默认运行目录 attach/）内才可读；
+    //   2) canonicalize 归一（防符号链接 / 8.3 短名 / .. 绕过，目录不存在与文件不存在
+    //      统一报错避免差异探测）；
+    //   3) 敏感路径黑名单硬拒（纵深防御，见 is_sensitive_archive_path）；
+    //   4) 扩展名以真实文件 p.extension() 为准（不再信任客户端 filename）。
+    let root = pfaix_attach_dir();
+    let p = match resolve_archive_path(&root, path) {
+        Ok(p) => p,
+        Err("abs") => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "path 须为绝对文件路径"})),
+            )
+                .into_response();
+        }
+        Err("missing") => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": format!(
+                        "path 须为附件白名单目录内已存在的文件（白名单目录：{}；目录不存在或文件不存在均会报此错）",
+                        root.display()
+                    )
+                })),
+            )
+                .into_response();
+        }
+        Err("outside") => {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({
+                    "error": format!("path 须位于附件白名单目录内（白名单目录：{}）", root.display())
+                })),
+            )
+                .into_response();
+        }
+        Err(_) => unreachable!("resolve_archive_path 错误码收敛于 abs|missing|outside"),
+    };
+    if is_sensitive_archive_path(&p) {
         return (
-            axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({"error": "path 须为本机已存在的绝对文件路径"})),
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"error": "path 命中敏感路径黑名单"})),
         )
             .into_response();
     }
@@ -227,12 +314,13 @@ pub(crate) async fn handle_documents_archive(
     } else {
         req.filename.trim().to_string()
     };
-    let lower = filename.to_lowercase();
-    if !(lower.ends_with(".pdf")
-        || lower.ends_with(".docx")
-        || lower.ends_with(".xlsx")
-        || lower.ends_with(".xls"))
-    {
+    // 扩展名以真实文件为准（此前作用在客户端可任意传的 filename 上，形同虚设）
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "pdf" | "docx" | "xlsx" | "xls") {
         return (
             axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
             axum::Json(serde_json::json!({"error": "仅支持 .pdf / .docx / .xlsx / .xls"})),
@@ -245,7 +333,19 @@ pub(crate) async fn handle_documents_archive(
     } else {
         req.namespace.trim().to_string()
     };
-    if !caller_ns_covers(&allowed_ns, &namespace) {
+    // OCR 复审 medium（2026-11-23）：写闸与 feedback / collab_send 同口径（P1-1b）——
+    // 取 ns_cache 中 Memoria 原始授予，ns_grants_access 仅放行 ==/子级（无祖先方向）。
+    // 此前用 authenticate 返回的 enrich 后 allowed_ns + 对称的 caller_ns_covers：
+    // enrich 注入的部门工具包 ns 会让本闸对整个 org/… 子树恒过，与 state.rs
+    // 「enrich 后 ns 不得作写授权」的契约矛盾（本端点上传用调用方自己的 key，
+    // Memoria 服务端校验仍是最终权威，故影响面有界，但本地闸形同虚设）。
+    // 缓存缺失 fail-closed。
+    let write_grants = {
+        let cache = st.ns_cache.lock().await;
+        cache.get(&agent_id).map(|e| e.raw_ns.clone())
+    }
+    .unwrap_or_default();
+    if !agent_core::namespace::ns_grants_access(&write_grants, &namespace) {
         return (
             axum::http::StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({
@@ -255,7 +355,37 @@ pub(crate) async fn handle_documents_archive(
             .into_response();
     }
 
-    let meta = match std::fs::metadata(p) {
+    // OCR 复审 high（2026-11-23）：TOCTOU——此前 resolve_archive_path 校验 canonical
+    // 路径后，又用 std::fs::read / metadata 重新打开；附件目录写者可在校验与读取
+    // 之间把文件换成指向 ~/.svc-secrets 的符号链接，SYSTEM 服务即读出白名单外目标
+    // （且绕过 is_sensitive_archive_path，它校验的是换链前路径）。改为：以 no-follow
+    // 语义打开一次（Windows FILE_FLAG_OPEN_REPARSE_POINT 打开链接本身而非目标，
+    // 普通文件不受影响），大小与内容都取自同一句柄——换链发生在打开之后对本次
+    // 读取无效；再以重解析点属性兜底硬拒。
+    use std::io::Read as _;
+    let mut file = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000 (open the link, do not follow)
+            opts.custom_flags(0x0020_0000);
+        }
+        match opts.open(&p) {
+            Ok(f) => f,
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"error": format!("无法打开文件: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    };
+    const MAX: u64 = 20 * 1024 * 1024;
+    // 大小与读取同源（同一句柄，避免二次打开）
+    let meta = match file.metadata() {
         Ok(m) => m,
         Err(e) => {
             return (
@@ -265,7 +395,19 @@ pub(crate) async fn handle_documents_archive(
                 .into_response();
         }
     };
-    const MAX: u64 = 20 * 1024 * 1024;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_REPARSE_POINT = 0x400：句柄落在链接本身时读取前硬拒——
+        // 纵深防御，不依赖单个 open flag 的行为差异
+        if meta.file_attributes() & 0x0400 != 0 {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({"error": "拒绝符号链接 / 重解析点文件"})),
+            )
+                .into_response();
+        }
+    }
     if meta.len() > MAX {
         return (
             axum::http::StatusCode::PAYLOAD_TOO_LARGE,
@@ -273,26 +415,21 @@ pub(crate) async fn handle_documents_archive(
         )
             .into_response();
     }
-    let bytes = match std::fs::read(p) {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                axum::Json(serde_json::json!({"error": format!("读文件失败: {e}")})),
-            )
-                .into_response();
-        }
-    };
+    let mut bytes = Vec::new();
+    if let Err(e) = std::io::Read::take(&mut file, MAX).read_to_end(&mut bytes) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": format!("读文件失败: {e}")})),
+        )
+            .into_response();
+    }
 
     let server = { st.config.lock().await.server.clone() };
-    let mime = if lower.ends_with(".pdf") {
-        "application/pdf"
-    } else if lower.ends_with(".docx") {
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    } else if lower.ends_with(".xlsx") {
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    } else {
-        "application/vnd.ms-excel"
+    let mime = match ext.as_str() {
+        "pdf" => "application/pdf",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => "application/vnd.ms-excel",
     };
     let part = match reqwest::multipart::Part::bytes(bytes)
         .file_name(filename.clone())
@@ -446,40 +583,12 @@ pub(crate) async fn handle_register(
             agent_id.clone(),
             (badge_token.clone(), std::time::Instant::now()),
         );
-        // 管理员名单提权：display_name（中文名）命中 AGENT_ADMIN_NAMES 的注册者，
-        // 自动提升 permission=admin + namespace 追加 `*`——PFAiX 用自己身份即可见审批，
-        // 无需在每台客户端手动填 MEMORIA_ADMIN_KEY（老大反馈：手动填 key 多此一举且有泄密面）。
-        let admin_names = std::env::var("AGENT_ADMIN_NAMES").unwrap_or_default();
-        let is_admin_reg = admin_names
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .any(|n| {
-                n == display_name.trim()
-                    || n == name.trim()
-                    || n == agent_id
-            });
-        if is_admin_reg {
-            let admin_key2 = env_memoria_admin_key(&cfg_admin);
-            let mcp2 = memoria_proxy_client(&server, &cfg_admin);
-            let admin_ns = if namespace.contains('*') {
-                namespace.clone()
-            } else {
-                format!("{},*", namespace)
-            };
-            let _ = mcp2
-                .call_json(
-                    "agent_update",
-                    &serde_json::json!({
-                        "agent_id": &agent_id,
-                        "admin_key": &admin_key2,
-                        "namespace": &admin_ns,
-                        "permission": "admin",
-                    }),
-                )
-                .await;
-            tracing::info!(target: "agent.register", agent=%agent_id, "管理员名单命中，已提权 admin");
-        }
+        // 2026-11-23 P0 修复：删除原「管理员名单提权」块——旧逻辑读名单环境变量，
+        // 命中 display_name / name / agent_id 任一即在本端点调 Memoria 档案更新接口
+        // 设为 admin 并追加 `*` 命名空间。本端点无鉴权（auth_middleware 豁免）
+        // 且挂在局域网监听上，姓名属公开信息，任意局域网用户可自助获得 admin badge。
+        // 提权唯一入口收敛到 handle_agent_repair（admin 鉴权）与 Memoria 控制台；
+        // 下方 regression 测试护栏防止该逻辑回归。
     }
 
     // 审计日志：记录身份注册（admin + ADMIN_KEY，禁止 admin + jarvis badge）
@@ -1100,5 +1209,164 @@ mod dept_canonical_tests {
         assert_eq!(canonicalize_dept("gufei"), "gufei"); // 项目码误用历史值：不映射不阻断
         assert_eq!(canonicalize_dept(""), "");
         assert_eq!(canonicalize_dept("  运行部  "), "yunxing"); // trim 后命中
+    }
+}
+
+/// P0 回归护栏（2026-11-23）：注册端点公开无鉴权（auth_middleware 豁免 + LAN 监听），
+/// 曾存在「姓名命中名单即自动提权 admin」漏洞——局域网任意人可用公开姓名自助获得
+/// admin badge。该块已整体删除；本模块以编译期嵌入源码做静态断言，防止逻辑回归。
+/// 注意：include_str! 嵌入本文件全文，断言锚点字符串用 concat! 分段拼接，
+/// 避免本模块自身的注释/消息包含连续目标字面量导致误报。
+#[cfg(test)]
+mod register_escalation_regression_tests {
+    /// 本文件源码（编译期嵌入，无运行时文件依赖）。
+    const SOURCE: &str = include_str!("identity.rs");
+    /// 旧漏洞读取的环境变量名（分段拼接，避免本文件出现连续字面量）。
+    const ADMIN_NAMES_ENV: &str = concat!("AGENT_", "ADMIN", "_NAMES");
+
+    /// 定位 handle_register 函数体（从签名起到紧随其后的 AgentRepairRequest 结构体为止）。
+    /// 2026-11-23 ocr 审查修复：锚点字符串在本测试模块自身也各出现一次，split().nth(1)
+    /// 在定义被改名/移动时不会返回 None 而是提取到测试自身源码碎片——三个断言会全部
+    /// 空洞通过。必须先断言锚点命中次数，锚点漂移时以「护栏自身失效」响亮失败。
+    fn handle_register_body() -> String {
+        const START_ANCHOR: &str = "pub(crate) async fn handle_register(";
+        const END_ANCHOR: &str = "struct AgentRepairRequest";
+        // 各应命中 2 次：定义处 + 本测试模块内的字面量。
+        assert_eq!(
+            SOURCE.matches(START_ANCHOR).count(),
+            2,
+            "回归护栏锚点失效：handle_register 定义缺失或被改名，请同步更新锚点字符串"
+        );
+        assert!(
+            SOURCE.matches(END_ANCHOR).count() >= 2,
+            "回归护栏锚点失效：AgentRepairRequest 锚点缺失/改名/移动，扫描范围将失控扩大（会误伤 handle_agent_repair 的合法 agent_update）"
+        );
+        SOURCE
+            .split(START_ANCHOR)
+            .nth(1)
+            .and_then(|s| s.split(END_ANCHOR).next())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
+    fn handle_register_must_not_reference_admin_names_env() {
+        // 限定到 handle_register 函数体（与其余两个护栏同作用域）：handle_agent_repair
+        // 是合法提权入口，未来若其引入名单类配置不应被本护栏误报为 P0 回归。
+        let body = handle_register_body();
+        assert!(
+            !body.is_empty(),
+            "未能定位 handle_register 函数体（测试护栏自身失效，请检查锚点字符串）"
+        );
+        assert!(
+            !body.contains(ADMIN_NAMES_ENV),
+            "handle_register 不应引用管理员名单环境变量：公开注册端点禁止姓名匹配自动提权（P0，2026-11-23 已修复）"
+        );
+    }
+
+    #[test]
+    fn handle_register_must_not_call_agent_update() {
+        let body = handle_register_body();
+        assert!(
+            !body.is_empty(),
+            "未能定位 handle_register 函数体（测试护栏自身失效，请检查锚点字符串）"
+        );
+        assert!(
+            !body.contains("agent_update"),
+            "handle_register 内不应出现 agent_update：注册流程禁止任何提权调用（P0 回归护栏）"
+        );
+    }
+
+    #[test]
+    fn handle_register_must_not_grant_wildcard_namespace() {
+        let body = handle_register_body();
+        assert!(
+            !body.is_empty(),
+            "未能定位 handle_register 函数体（测试护栏自身失效，请检查锚点字符串）"
+        );
+        assert!(
+            !body.contains("\"{},*\""),
+            "handle_register 内不应出现通配命名空间追加：原提权块遗留（P0 回归护栏）"
+        );
+    }
+}
+
+/// P1-2 回归护栏（2026-11-23）：/api/documents/archive 任意绝对路径读封堵——
+/// 白名单目录判定 + 敏感路径硬拒 + 扩展名以真实文件为准。
+#[cfg(test)]
+mod documents_archive_whitelist_tests {
+    use super::{is_sensitive_archive_path, resolve_archive_path};
+
+    /// 敏感路径黑名单：.svc-secrets 密钥目录与 pfaix_agents 脱敏映射目录，
+    /// 含 `\` / `/` 与大小写变体一律拒绝；普通附件路径放行。
+    #[test]
+    fn sensitive_paths_are_hard_denied() {
+        assert!(is_sensitive_archive_path(std::path::Path::new(
+            "C:\\Users\\user\\.svc-secrets\\agent-core.env"
+        )));
+        assert!(is_sensitive_archive_path(std::path::Path::new(
+            "C:/Users/user/.SVC-SECRETS/memoria.env"
+        )));
+        assert!(is_sensitive_archive_path(std::path::Path::new(
+            "D:\\pfaix_agents\\mapping.json"
+        )));
+        assert!(is_sensitive_archive_path(std::path::Path::new(
+            "D:/PFAIX_Agents/sub/x.pdf"
+        )));
+        // 白名单内的普通路径放行
+        assert!(!is_sensitive_archive_path(std::path::Path::new(
+            "C:\\attach\\report.pdf"
+        )));
+    }
+
+    /// 白名单判定：白名单内文件放行；兄弟目录（attach_evil 非 attach 子级）、
+    /// 白名单外路径、相对路径一律拒绝。
+    #[test]
+    fn whitelist_scopes_reads_to_attach_root() {
+        let base = std::env::temp_dir().join(format!("acore-attach-test-{}", std::process::id()));
+        let root = base.join("attach");
+        let sibling = base.join("attach_evil");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(root.join("report.pdf"), b"pdf").unwrap();
+        std::fs::write(sibling.join("secret.env"), b"x").unwrap();
+        let outside = base.join("outside.txt");
+        std::fs::write(&outside, b"x").unwrap();
+
+        // 白名单内：放行并返回归一化路径
+        let inside = resolve_archive_path(&root, &root.join("report.pdf").to_string_lossy());
+        assert_eq!(
+            inside.unwrap(),
+            std::fs::canonicalize(root.join("report.pdf")).unwrap()
+        );
+        // 兄弟目录（attach_evil）：Path::starts_with 按组件比较，不得误命中 attach
+        let sib = resolve_archive_path(&root, &sibling.join("secret.env").to_string_lossy());
+        assert_eq!(sib.unwrap_err(), "outside");
+        // 白名单外任意绝对路径：拒绝（修复前这里会被放行读取）
+        let out = resolve_archive_path(&root, &outside.to_string_lossy());
+        assert_eq!(out.unwrap_err(), "outside");
+        // 相对路径：拒绝
+        assert_eq!(resolve_archive_path(&root, "report.pdf").unwrap_err(), "abs");
+        // 不存在的目标：missing（与目录不存在统一，防差异探测）
+        let gone = resolve_archive_path(&root, &root.join("nope.pdf").to_string_lossy());
+        assert_eq!(gone.unwrap_err(), "missing");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Windows 大小写不敏感：canonicalize 归一后大小写变体应命中白名单内目标
+    /// （canonicalize 返回磁盘真实大小写，starts_with 组件比较自动归一）。
+    #[cfg(windows)]
+    #[test]
+    fn whitelist_matches_case_insensitive_on_windows() {
+        let base =
+            std::env::temp_dir().join(format!("acore-attach-case-{}", std::process::id()));
+        let root = base.join("attach");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Report.PDF"), b"pdf").unwrap();
+        let via_upper =
+            resolve_archive_path(&root, &root.join("REPORT.pdf").to_string_lossy());
+        assert!(via_upper.is_ok(), "大小写变体应经 canonicalize 归一后命中");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
