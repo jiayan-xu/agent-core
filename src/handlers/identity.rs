@@ -446,40 +446,12 @@ pub(crate) async fn handle_register(
             agent_id.clone(),
             (badge_token.clone(), std::time::Instant::now()),
         );
-        // 管理员名单提权：display_name（中文名）命中 AGENT_ADMIN_NAMES 的注册者，
-        // 自动提升 permission=admin + namespace 追加 `*`——PFAiX 用自己身份即可见审批，
-        // 无需在每台客户端手动填 MEMORIA_ADMIN_KEY（老大反馈：手动填 key 多此一举且有泄密面）。
-        let admin_names = std::env::var("AGENT_ADMIN_NAMES").unwrap_or_default();
-        let is_admin_reg = admin_names
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .any(|n| {
-                n == display_name.trim()
-                    || n == name.trim()
-                    || n == agent_id
-            });
-        if is_admin_reg {
-            let admin_key2 = env_memoria_admin_key(&cfg_admin);
-            let mcp2 = memoria_proxy_client(&server, &cfg_admin);
-            let admin_ns = if namespace.contains('*') {
-                namespace.clone()
-            } else {
-                format!("{},*", namespace)
-            };
-            let _ = mcp2
-                .call_json(
-                    "agent_update",
-                    &serde_json::json!({
-                        "agent_id": &agent_id,
-                        "admin_key": &admin_key2,
-                        "namespace": &admin_ns,
-                        "permission": "admin",
-                    }),
-                )
-                .await;
-            tracing::info!(target: "agent.register", agent=%agent_id, "管理员名单命中，已提权 admin");
-        }
+        // 2026-11-23 P0 修复：删除原「管理员名单提权」块——旧逻辑读名单环境变量，
+        // 命中 display_name / name / agent_id 任一即在本端点调 Memoria 档案更新接口
+        // 设为 admin 并追加 `*` 命名空间。本端点无鉴权（auth_middleware 豁免）
+        // 且挂在局域网监听上，姓名属公开信息，任意局域网用户可自助获得 admin badge。
+        // 提权唯一入口收敛到 handle_agent_repair（admin 鉴权）与 Memoria 控制台；
+        // 下方 regression 测试护栏防止该逻辑回归。
     }
 
     // 审计日志：记录身份注册（admin + ADMIN_KEY，禁止 admin + jarvis badge）
@@ -1100,5 +1072,84 @@ mod dept_canonical_tests {
         assert_eq!(canonicalize_dept("gufei"), "gufei"); // 项目码误用历史值：不映射不阻断
         assert_eq!(canonicalize_dept(""), "");
         assert_eq!(canonicalize_dept("  运行部  "), "yunxing"); // trim 后命中
+    }
+}
+
+/// P0 回归护栏（2026-11-23）：注册端点公开无鉴权（auth_middleware 豁免 + LAN 监听），
+/// 曾存在「姓名命中名单即自动提权 admin」漏洞——局域网任意人可用公开姓名自助获得
+/// admin badge。该块已整体删除；本模块以编译期嵌入源码做静态断言，防止逻辑回归。
+/// 注意：include_str! 嵌入本文件全文，断言锚点字符串用 concat! 分段拼接，
+/// 避免本模块自身的注释/消息包含连续目标字面量导致误报。
+#[cfg(test)]
+mod register_escalation_regression_tests {
+    /// 本文件源码（编译期嵌入，无运行时文件依赖）。
+    const SOURCE: &str = include_str!("identity.rs");
+    /// 旧漏洞读取的环境变量名（分段拼接，避免本文件出现连续字面量）。
+    const ADMIN_NAMES_ENV: &str = concat!("AGENT_", "ADMIN", "_NAMES");
+
+    /// 定位 handle_register 函数体（从签名起到紧随其后的 AgentRepairRequest 结构体为止）。
+    /// 2026-11-23 ocr 审查修复：锚点字符串在本测试模块自身也各出现一次，split().nth(1)
+    /// 在定义被改名/移动时不会返回 None 而是提取到测试自身源码碎片——三个断言会全部
+    /// 空洞通过。必须先断言锚点命中次数，锚点漂移时以「护栏自身失效」响亮失败。
+    fn handle_register_body() -> String {
+        const START_ANCHOR: &str = "pub(crate) async fn handle_register(";
+        const END_ANCHOR: &str = "struct AgentRepairRequest";
+        // 各应命中 2 次：定义处 + 本测试模块内的字面量。
+        assert_eq!(
+            SOURCE.matches(START_ANCHOR).count(),
+            2,
+            "回归护栏锚点失效：handle_register 定义缺失或被改名，请同步更新锚点字符串"
+        );
+        assert!(
+            SOURCE.matches(END_ANCHOR).count() >= 2,
+            "回归护栏锚点失效：AgentRepairRequest 锚点缺失/改名/移动，扫描范围将失控扩大（会误伤 handle_agent_repair 的合法 agent_update）"
+        );
+        SOURCE
+            .split(START_ANCHOR)
+            .nth(1)
+            .and_then(|s| s.split(END_ANCHOR).next())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
+    fn handle_register_must_not_reference_admin_names_env() {
+        // 限定到 handle_register 函数体（与其余两个护栏同作用域）：handle_agent_repair
+        // 是合法提权入口，未来若其引入名单类配置不应被本护栏误报为 P0 回归。
+        let body = handle_register_body();
+        assert!(
+            !body.is_empty(),
+            "未能定位 handle_register 函数体（测试护栏自身失效，请检查锚点字符串）"
+        );
+        assert!(
+            !body.contains(ADMIN_NAMES_ENV),
+            "handle_register 不应引用管理员名单环境变量：公开注册端点禁止姓名匹配自动提权（P0，2026-11-23 已修复）"
+        );
+    }
+
+    #[test]
+    fn handle_register_must_not_call_agent_update() {
+        let body = handle_register_body();
+        assert!(
+            !body.is_empty(),
+            "未能定位 handle_register 函数体（测试护栏自身失效，请检查锚点字符串）"
+        );
+        assert!(
+            !body.contains("agent_update"),
+            "handle_register 内不应出现 agent_update：注册流程禁止任何提权调用（P0 回归护栏）"
+        );
+    }
+
+    #[test]
+    fn handle_register_must_not_grant_wildcard_namespace() {
+        let body = handle_register_body();
+        assert!(
+            !body.is_empty(),
+            "未能定位 handle_register 函数体（测试护栏自身失效，请检查锚点字符串）"
+        );
+        assert!(
+            !body.contains("\"{},*\""),
+            "handle_register 内不应出现通配命名空间追加：原提权块遗留（P0 回归护栏）"
+        );
     }
 }
