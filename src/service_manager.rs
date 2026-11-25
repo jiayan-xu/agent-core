@@ -65,6 +65,15 @@ fn default_restart_policy() -> String {
 fn default_true() -> bool {
     true
 }
+fn default_probe_timeout() -> u64 {
+    3
+}
+fn default_keepalive_fails() -> u32 {
+    4
+}
+fn default_slow_confirm() -> u64 {
+    10
+}
 
 /// 单个被管服务的配置（`[[services]]` 表）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +131,31 @@ pub struct ServiceConfig {
     /// 本服务专属环境变量。
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// 单次健康探测的超时（秒）。默认 3。
+    ///
+    /// 为什么需要（2026-11-25）：此前写死 3 秒且挂在全局 reqwest client 上，
+    /// 所有服务共用同一个判据。dashboard 的 `/health` 要走 WMI 扫全机进程再探
+    /// 各端口，机器忙时经常超过 3 秒，「进程活着但应答慢」被当成「进程卡死」——
+    /// 2026-11-25 10:48 与 11-23 两次把活进程树杀重启，同事页面无故瞬断。
+    /// 改为按服务配置，配合 [`Self::slow_confirm_sec`] 区分「慢」与「死」。
+    /// 注意：该值同时作用于 `start()` 里「拉起后等就绪」的轮询探测（40 轮），
+    /// 配置过大会把一次启动的等待时间按比例放大，请保持在个位数秒。
+    #[serde(default = "default_probe_timeout")]
+    pub probe_timeout_sec: u64,
+    /// `on-failure` 策略下连续失败多少轮才考虑动手。默认 4。
+    ///
+    /// 为什么需要（2026-11-25）：此前写死 2 轮，30s 周期下只有 60s 观察窗，
+    /// 撞上机器繁忙的探测慢就可能误杀；放宽为可配置阈值（默认 4 轮 = 120s）
+    /// 给慢服务更多恢复机会。`always` 策略不受此项影响（失败即动手）。
+    #[serde(default = "default_keepalive_fails")]
+    pub keepalive_fails: u32,
+    /// 「慢确认」超时（秒）。默认 10。
+    ///
+    /// 为什么需要（2026-11-25）：超过宽限期、探测失败、准备树杀旧进程前，
+    /// 先用这个更长的超时再探一次——成功则说明服务只是慢不是死，
+    /// 不杀不重启。这是 2026-11-25 10:48「活进程被树杀」事故的直接对策。
+    #[serde(default = "default_slow_confirm")]
+    pub slow_confirm_sec: u64,
 }
 
 /// 对外暴露的服务状态快照。
@@ -156,13 +190,27 @@ struct Runtime {
 pub struct ServiceManager {
     configs: Vec<ServiceConfig>,
     rt: std::sync::Arc<Mutex<HashMap<String, Runtime>>>,
+    /// 停机接口客户端（`stop_path` POST）：保留改动前的 3s 超时，stop() 行为不变。
     http: reqwest::Client,
+    /// 健康探测客户端：client 级不设超时，逐请求超时按服务配置落实（2026-11-25）。
+    probe_http: reqwest::Client,
 }
 
 impl ServiceManager {
     pub fn new(configs: Vec<ServiceConfig>) -> Self {
+        // 停机用：维持改动前的 3s 全局超时（stop_path 不参与保活判据，行为不动）。
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
+            // 健康探测只打本机回环，禁跳转、禁代理
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default();
+        // 探测用：**不设** client 级超时——改动前所有服务共用一个 3s 判据，
+        // 「进程活着但应答慢」与「进程卡死」区分不了（2026-11-25 误杀根因）。
+        // 每个服务的超时 = ServiceConfig::probe_timeout_sec，由 probe_with_timeout
+        // 用 tokio::time::timeout 逐请求落实。
+        let probe_http = reqwest::Client::builder()
             // 健康探测只打本机回环，禁跳转、禁代理
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -172,6 +220,7 @@ impl ServiceManager {
             configs,
             rt: std::sync::Arc::new(Mutex::new(HashMap::new())),
             http,
+            probe_http,
         }
     }
 
@@ -196,7 +245,16 @@ impl ServiceManager {
     }
 
     /// 可用性判定：端口 + 健康路径（含 fallback_port 语义）。
+    /// HTTP 阶段超时取该服务配置的 `probe_timeout_sec`。
     async fn probe(&self, c: &ServiceConfig) -> bool {
+        self.probe_with_timeout(c, c.probe_timeout_sec).await
+    }
+
+    /// 同 [`probe`](Self::probe)，但 HTTP 超时由调用方给定（慢确认用更长的超时）。
+    ///
+    /// 超时与传输错误走同一 fallback 分支，成功判据（状态码 / fallback_port）
+    /// 与改动前逐字一致——只是「多久算超时」从全局 3s 变成按服务配置。
+    async fn probe_with_timeout(&self, c: &ServiceConfig, timeout_sec: u64) -> bool {
         if !self.port_open(c.port) {
             return false;
         }
@@ -204,7 +262,18 @@ impl ServiceManager {
             return true;
         }
         let url = format!("http://127.0.0.1:{}{}", c.port, c.health);
-        match self.http.get(&url).send().await {
+        // client 级不设超时，逐请求用 tokio::time::timeout 落实「这个服务的」超时
+        // （2026-11-25：reqwest 的 client timeout 是全局的，无法按服务区分
+        // 「进程活着但应答慢」与「进程卡死」，正是误杀根因）。
+        let send = self.probe_http.get(&url).send();
+        // 下限 1 秒：配置误写 0 时，带 health 路径的探测会「立即超时」恒失败
+        // （有慢确认兜底不会误杀，但每轮都要白等一次慢确认）。
+        let res = match tokio::time::timeout(Duration::from_secs(timeout_sec.max(1)), send).await {
+            Ok(r) => r,
+            // 超时与传输错误同语义：只有显式 fallback 才认定正常
+            Err(_) => return c.fallback_port && self.port_open(c.port),
+        };
+        match res {
             Ok(r) => {
                 if r.status().as_u16() == c.expect {
                     return true;
@@ -217,11 +286,52 @@ impl ServiceManager {
         }
     }
 
+    /// 「慢确认」探测：用服务配置的 `slow_confirm_sec` 超时再探一次。
+    ///
+    /// 与 [`probe`](Self::probe) 的成功判据完全相同，只是超时更长——
+    /// 树杀旧进程前的最后一道闸（2026-11-25：区分「活着但慢」与「卡死」）。
+    async fn slow_confirm(&self, c: &ServiceConfig) -> bool {
+        self.probe_with_timeout(c, c.slow_confirm_sec).await
+    }
+
     /// 启动一个服务。已在跑则直接返回其外部 pid 语义（不重复起）。
     pub async fn start(&self, key: &str) -> Result<String, String> {
         let c = self.cfg(key).ok_or_else(|| format!("未知服务: {key}"))?;
         if self.probe(c).await {
             return Ok(format!("{} 已在运行（端口 {}）", c.name, c.port));
+        }
+
+        // ── 慢确认（2026-11-25）：探测失败不等于进程卡死 ──
+        // 探测失败有三种可能：真卡死、还没起来、**活着但应答慢**。
+        // dashboard 的 /health 要走 WMI 扫全机进程，机器忙时经常超过 3s——
+        // 2026-11-25 10:48 与 11-23 两次，活进程因此被树杀重启、同事页面瞬断。
+        // 所以探测失败后一律先用更长的 slow_confirm_sec 再探一次：成功则说明
+        // 服务只是慢不是死，不杀不重启也不重复拉起；失败才落到下方原有逻辑。
+        //
+        // 为什么不限「手里有存活句柄」：本模块拉起的进程之外还有外部实例
+        // （如旧看护脚本拉起的 memoria），它们没有句柄——探测超时若不拦，
+        // 下方会直接再 spawn 一个重复进程。端口没开时 slow_confirm 立即返回
+        // false，不会拖慢真正宕机时的拉起。
+        //
+        // 句柄在慢确认期间仍留在槽里（不 take）：成功路径天然没有
+        // 「取出来又放回」的并发窗口，下方原有实现一字未改。
+        if self.slow_confirm(c).await {
+            // 慢确认成功：进程活着只是慢，不杀不重启，清零该服务失败计数
+            {
+                let mut rt = self.rt.lock().await;
+                if let Some(slot) = rt.get_mut(key) {
+                    slot.fail_count = 0;
+                }
+            }
+            tracing::warn!(
+                target: "agent.services",
+                "服务 {} 探测超时但 {} 秒内慢确认成功，不重启",
+                c.name, c.slow_confirm_sec
+            );
+            return Ok(format!(
+                "{} 探测超时但 {} 秒内慢确认成功，不重启",
+                c.name, c.slow_confirm_sec
+            ));
         }
 
         // 修复泄漏（2026-11-03）：probe 失败但旧子进程可能还活着（卡死但占 CPU、
@@ -670,14 +780,20 @@ impl ServiceManager {
                 }
                 continue;
             }
-            // 累计失败次数；on-failure 要求 ≥2 次才动手（对齐托盘防抖语义）
+            // 累计失败次数；on-failure 达到 keepalive_fails 轮才动手（默认 4 轮）
             let fails = {
                 let mut rt = self.rt.lock().await;
                 let slot = rt.entry(c.key.clone()).or_default();
                 slot.fail_count = slot.fail_count.saturating_add(1);
                 slot.fail_count
             };
-            if c.restart == "on-failure" && fails < 2 {
+            if c.restart == "on-failure" && fails < c.keepalive_fails {
+                // 被防抖挡住：留一条可检索日志，事后能区分「在防抖」与「漏保活」
+                tracing::info!(
+                    target: "agent.services",
+                    "服务 {} 保活防抖中：连续失败 {} 轮 < 阈值 {}，本轮不动手",
+                    c.name, fails, c.keepalive_fails
+                );
                 continue;
             }
             match self.start(&c.key).await {
@@ -711,7 +827,45 @@ mod tests {
             stop_path: String::new(),
             kill_by_port: true,
             env: HashMap::new(),
+            probe_timeout_sec: 3,
+            keepalive_fails: 4,
+            slow_confirm_sec: 10,
         }
+    }
+
+    /// 最小假 HTTP 服务：读到请求后等 `delay` 再回 200。
+    /// `port`=0 表示由系统分配。返回 (实际端口, 接受循环句柄)。
+    async fn spawn_fake_http(port: u16, delay: Duration) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap_or_else(|e| panic!("绑假服务端口 {port} 失败: {e}"));
+        let actual = listener.local_addr().expect("读本地地址").port();
+        let handle = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                // 每连接一个任务：慢应答不能堵住接受循环（真实服务也是这样）
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    tokio::time::sleep(delay).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        (actual, handle)
+    }
+
+    /// 预留一个「此刻无人监听」的端口：绑上拿到端口号后立刻放开。
+    fn closed_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("绑临时端口");
+        let port = l.local_addr().expect("读本地地址").port();
+        drop(l);
+        port
     }
 
     #[tokio::test]
@@ -753,5 +907,100 @@ mod tests {
     async fn tick_skips_off_policy() {
         let m = ServiceManager::new(vec![cfg("off", 59997)]); // restart="off"
         assert!(m.tick().await.is_empty());
+    }
+
+    /// 阈值防抖：on-failure 连续失败未达 keepalive_fails 时不动手。
+    /// 端口无人监听 + exe 不存在 → 第 4 轮动手必然失败，动作带「保活失败」。
+    #[tokio::test]
+    async fn tick_debounces_until_keepalive_fails_threshold() {
+        let mut c = cfg("deb", closed_port());
+        c.restart = "on-failure".into();
+        c.keepalive_fails = 4;
+        c.exe = "definitely-not-exists-xyz".into();
+        let m = ServiceManager::new(vec![c]);
+
+        for i in 1..=3 {
+            let actions = m.tick().await;
+            assert!(
+                actions.is_empty(),
+                "第 {i} 轮应被防抖挡住，实际动作: {actions:?}"
+            );
+            let st = m.status().await;
+            assert_eq!(
+                st[0].fail_count, i,
+                "第 {i} 轮后 fail_count 应累计到 {i}"
+            );
+        }
+
+        let actions = m.tick().await;
+        assert_eq!(actions.len(), 1, "第 4 轮应动手，实际: {actions:?}");
+        assert!(
+            actions[0].contains("[保活失败]"),
+            "第 4 轮动作应为保活失败，实际: {}",
+            actions[0]
+        );
+    }
+
+    /// 慢确认成功：应答延迟 1.5s 超过 1s 探测超时，但落在 5s 慢确认内。
+    #[tokio::test]
+    async fn slow_confirm_succeeds_when_probe_times_out() {
+        let (port, _server) = spawn_fake_http(0, Duration::from_millis(1500)).await;
+        let mut c = cfg("slow", port);
+        c.health = "/health".into();
+        c.probe_timeout_sec = 1;
+        c.slow_confirm_sec = 5;
+        let probe_cfg = c.clone();
+        let m = ServiceManager::new(vec![c]);
+
+        assert!(!m.probe(&probe_cfg).await, "1s 探测应超时判失败");
+        assert!(m.slow_confirm(&probe_cfg).await, "5s 慢确认应成功");
+    }
+
+    /// 慢确认失败：应答延迟 1.5s 超过 1s 慢确认超时，且不得等满应答时间。
+    #[tokio::test]
+    async fn slow_confirm_fails_when_response_exceeds_timeout() {
+        let (port, _server) = spawn_fake_http(0, Duration::from_millis(1500)).await;
+        let mut c = cfg("slowfail", port);
+        c.health = "/health".into();
+        c.probe_timeout_sec = 1;
+        c.slow_confirm_sec = 1;
+        let probe_cfg = c.clone();
+        let m = ServiceManager::new(vec![c]);
+
+        let t0 = Instant::now();
+        assert!(
+            !m.slow_confirm(&probe_cfg).await,
+            "1.5s 应答超过 1s 慢确认，应判失败"
+        );
+        let elapsed = t0.elapsed();
+        // 余量放宽到 1.9s（应答 1.5s）：若实现等满了应答，上面那条断言会先失败，
+        // 这里只拦「明显超时后才返回」的回归，避免高负载机器上因调度抖动误报。
+        assert!(
+            elapsed < Duration::from_millis(1900),
+            "应在约 1s 超时返回，不得等满 1.5s 应答，实际耗时 {elapsed:?}"
+        );
+    }
+
+    /// 外部实例（本模块手里没有句柄，如旧看护脚本拉起的 memoria）慢但在运行：
+    /// start() 不得再拉一个重复进程，应慢确认成功后直接返回。
+    #[tokio::test]
+    async fn start_does_not_spawn_duplicate_for_slow_external_instance() {
+        let (port, _server) = spawn_fake_http(0, Duration::from_millis(1500)).await;
+        let mut c = cfg("ext", port);
+        c.health = "/health".into();
+        c.probe_timeout_sec = 1;
+        c.slow_confirm_sec = 5;
+        // exe 指向不存在的路径：若没被慢确认拦住，下面会走到启动失败分支返回 Err
+        c.exe = "definitely-not-exists-xyz".into();
+        let m = ServiceManager::new(vec![c]);
+
+        let msg = m
+            .start("ext")
+            .await
+            .expect("慢确认成功应返回 Ok，不得尝试启动");
+        assert!(msg.contains("慢确认"), "unexpected: {msg}");
+        let st = m.status().await;
+        assert!(st[0].pid.is_none(), "不应拉起新进程");
+        assert_eq!(st[0].fail_count, 0, "慢确认成功应清零失败计数");
     }
 }
